@@ -23,8 +23,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if Path.cwd() != _PROJECT_ROOT:
     os.chdir(_PROJECT_ROOT)
 
-from dotenv import load_dotenv
 from agent_full_v2 import Agent
+from config import load as load_config
 from cron_scheduler import CronScheduler
 from goal import CLEAR_ALIASES, GoalError
 from paths import CHAT_HISTORY_DIR, DURABLE_PATH
@@ -41,7 +41,8 @@ except ImportError:
 
 
 def main() -> None:
-    load_dotenv(override=True)
+    # 自举配置：真实环境变量 > 项目级 .aigent/config.json > ~/.aigent/config.json > .env > 默认值
+    load_config()
 
     # ── s14：启动 CronScheduler（定时任务调度器）──
     cron_scheduler = CronScheduler(CHAT_HISTORY_DIR, DURABLE_PATH)

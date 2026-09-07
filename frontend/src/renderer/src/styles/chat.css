@@ -272,29 +272,3 @@
   background: var(--color-bg-main);
 }
 
-/* 快捷命令 chips（空态） */
-.quickchips {
-  display: flex;
-  gap: var(--sp-2);
-  justify-content: center;
-  margin-top: var(--sp-3);
-  flex-wrap: wrap;
-}
-.quickchip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-4);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-pill);
-  background: var(--color-bg-main);
-  font-size: var(--fs-sm);
-  color: var(--color-text-primary);
-}
-.quickchip:hover {
-  border-color: var(--color-accent);
-  color: var(--color-accent);
-}
-.chip-icon {
-  font-size: var(--fs-md);
-}

@@ -17,8 +17,8 @@ class LLMClient:
     """
 
     def __init__(self):
-        # 加载环境变量
-        load_dotenv(override=True)
+        # 加载环境变量：仅填充空缺，不覆盖 config.load() 已注入的 ~/.aigent 配置
+        load_dotenv(override=False)
 
         
         self.api_key = os.environ.get("OPENAI_API_KEY", "")

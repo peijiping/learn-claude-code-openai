@@ -12,21 +12,23 @@ paths.py - 路径配置（单一事实来源）
 
 from pathlib import Path
 
+from config import AIGENT_HOME, migrate_legacy
+
 
 # ── 根目录（启动 agent 时的当前工作目录） ──────────────────────────
 ROOT_DIR = Path.cwd()
 
-# 应用自身 home 目录（存放 skills / worktree / 项目元数据 / 应用配置）
-HOME_DIR = ROOT_DIR / "WorkSpace/HomeDir"
+# 应用自身 home 目录（用户级，存放 skills / worktree / MCP 配置 / 应用配置）。
+# 位于 ~/.aigent（config.py 定义），原 WorkSpace/HomeDir 内容由 migrate_legacy 一次性搬迁。
 
 # 技能目录
-SKILLS_DIR = HOME_DIR / "skills"
+SKILLS_DIR = AIGENT_HOME / "skills"
 
 # worktree 目录（git worktree 实验分支挂载点）
-WORKTREE_DIR = HOME_DIR / "worktrees"
+WORKTREE_DIR = AIGENT_HOME / "worktrees"
 
 # MCP 配置目录（真实 MCP：JSON 配置 + 本地示例 server 同目录）
-MCP_DIR = HOME_DIR / "mcp"
+MCP_DIR = AIGENT_HOME / "mcp"
 # MCP 服务器配置文件（mcpServers 格式，多服务器）
 MCP_CONFIG = MCP_DIR / "mcp_servers.json"
 
@@ -72,7 +74,11 @@ WORKFLOW_LAST_RUN = WORKFLOW_DIR / "last_run.txt"
 
 
 def ensure_dirs() -> None:
-    """一次性创建所有需要预先存在的目录（幂等）。"""
+    """一次性创建所有需要预先存在的目录（幂等）。
+
+    先执行一次性迁移（WorkSpace/HomeDir → ~/.aigent），再创建运行时目录。
+    """
+    migrate_legacy(ROOT_DIR / "WorkSpace" / "HomeDir")
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     TODO_DIR.mkdir(parents=True, exist_ok=True)

@@ -2,9 +2,8 @@ import { useState } from 'react'
 import { useAgentStore } from '@store/agentStore'
 import MessageList from './MessageList'
 import InputBox from './InputBox'
-import QuickChips from './QuickChips'
 
-/** 中央聊天面板：空态品牌 / 消息流 + 输入区 + 空态快捷 chips */
+/** 中央聊天面板：空态品牌 / 消息流 + 输入区 */
 export default function ChatPanel(): JSX.Element {
   const messages = useAgentStore((s) => s.messages)
   const send = useAgentStore((s) => s.send)
@@ -21,7 +20,7 @@ export default function ChatPanel(): JSX.Element {
       {messages.length === 0 ? (
         <div className="empty-state">
           <div className="brand-logo">&lt;/&gt;</div>
-          <div className="brand-text">Code with TRAE</div>
+          <div className="brand-text">Anything for You</div>
         </div>
       ) : (
         <MessageList />
@@ -29,7 +28,6 @@ export default function ChatPanel(): JSX.Element {
 
       <div className="composer-wrap">
         <InputBox value={draft} onChange={setDraft} onSend={doSend} />
-        {messages.length === 0 && <QuickChips onPick={setDraft} />}
       </div>
     </main>
   )

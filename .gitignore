@@ -230,3 +230,6 @@ analysis_progress.md
 
 WorkSpace/
 skills/
+
+# 项目级 Aigent 覆盖配置（密钥勿入库；用户级配置在 ~/.aigent，仓库外）
+.aigent/

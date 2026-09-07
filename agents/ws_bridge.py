@@ -14,8 +14,11 @@ import os
 import websockets
 
 from agent_full_v2 import Agent
+from config import load as load_config
 from streaming_client import WSSink
 
+# 启动即自举配置（Electron spawn 的 cwd 为仓库根，config.py 按 cwd 解析项目级配置）
+load_config()
 
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
 
