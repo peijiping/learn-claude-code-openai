@@ -27,14 +27,18 @@ function broadcastStatus(status: string): void {
   mainWindow?.webContents.send('agent:status', status)
 }
 
-function request(kind: string): Promise<unknown> {
-  ws.send(JSON.stringify({ kind }))
+function request(
+  outKind: string,
+  matchKind: string = outKind,
+  payload?: Record<string, unknown>
+): Promise<unknown> {
+  ws.send(JSON.stringify({ kind: outKind, ...(payload ? { payload } : {}) }))
   return new Promise((resolve) => {
     let settled = false
     const timer = setTimeout(() => {
       if (settled) return
       settled = true
-      const i = pending.findIndex((p) => p.kind === kind && p.timer === timer)
+      const i = pending.findIndex((p) => p.kind === matchKind && p.timer === timer)
       if (i >= 0) pending.splice(i, 1)
       resolve(null)
     }, 5000)
@@ -44,7 +48,7 @@ function request(kind: string): Promise<unknown> {
       clearTimeout(timer)
       resolve(v)
     }
-    pending.push({ kind, resolve: handleResult, timer })
+    pending.push({ kind: matchKind, resolve: handleResult, timer })
   })
 }
 
@@ -113,6 +117,13 @@ function createWindow(): void {
   )
   ipcMain.handle('agent:tasks', (e) => (isTrustedSender(e) ? request('tasks') : null))
   ipcMain.handle('agent:skills', (e) => (isTrustedSender(e) ? request('skills') : null))
+  ipcMain.handle('agent:llmConfigGet', (e) =>
+    isTrustedSender(e) ? request('llm_config_get', 'llm_config') : null
+  )
+  ipcMain.handle('agent:llmConfigSave', (e, payload: { config?: unknown }) => {
+    if (!isTrustedSender(e) || payload?.config === undefined) return null
+    return request('llm_config_save', 'llm_config', { config: payload.config })
+  })
   ipcMain.handle('agent:connectionStatus', (e) => {
     if (!isTrustedSender(e)) return 'disconnected'
     return ws.currentStatus

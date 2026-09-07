@@ -174,6 +174,35 @@ class Agent:
         self.session_file: Path | None = None
         self.history_messages: list = []
 
+    def reload_llm_bindings(self) -> dict:
+        """
+        配置热切换：进程内就地重建全部 LLM 绑定，无需重启。
+        调用前须先 load_llm_config()（把 llmconfig.json 映射进 env）。
+
+        逐个重建：
+        - 自身 model / fallback_model / llm_client / recovery
+        - workflow_manager、goal_controller 评估器、subagent_runner、teammate_manager
+        """
+        self.model = os.environ.get("OPENAI_MODEL_ID", "")
+        self.fallback_model = os.environ.get("FALLBACK_MODEL_ID", "")
+        if not os.environ.get("OPENAI_API_KEY"):
+            return {"applied": False, "reason": "未配置 API Key"}
+        # 重建 OpenAI 客户端（持有新的 api_key / base_url）
+        self.llm_client = LLMClient().llm
+        # 错误恢复状态机绑定新主/备模型
+        self.recovery = ErrorRecovery(
+            primary_model=self.model, fallback_model=self.fallback_model
+        )
+        # 各协作对象就地换绑定（复用既有 set_llm 接缝）
+        self.workflow_manager.set_llm(self.llm_client, self.model)
+        self.goal_controller.set_llm(
+            self.llm_client,
+            os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model,
+        )
+        self.subagent_runner.set_llm(self.llm_client, self.model)
+        self.teammate_manager.set_llm(self.llm_client, self.model)
+        return {"applied": True, "primary": self.model, "fallback": self.fallback_model}
+
     # ── silent 打印辅助 ──────────────────────────────────────────
     def _print(self, *args, **kwargs):
         """silent 模式下抑制所有 print 输出（cron 定时任务用）。"""

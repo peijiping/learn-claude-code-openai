@@ -15,10 +15,13 @@ import websockets
 
 from agent_full_v2 import Agent
 from config import load as load_config
+from llm_config import get_config, load_llm_config, save_config
 from streaming_client import WSSink
 
 # 启动即自举配置（Electron spawn 的 cwd 为仓库根，config.py 按 cwd 解析项目级配置）
 load_config()
+# 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
+load_llm_config()
 
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
 
@@ -113,6 +116,27 @@ async def handle(ws):
             elif kind == "skills":
                 text = await asyncio.to_thread(agent.skills.list_skills)
                 await ws.send(_envelope("skills", {"text": text}))
+
+            elif kind == "llm_config_get":
+                await ws.send(_envelope("llm_config", {"config": get_config()}))
+
+            elif kind == "llm_config_save":
+                config = payload.get("config") or {}
+                try:
+                    saved = await asyncio.to_thread(save_config, config)
+                    # 重新映射进 env 并就地热切换 LLM 绑定，立即生效（无需重启）
+                    await asyncio.to_thread(load_llm_config)
+                    result = await asyncio.to_thread(agent.reload_llm_bindings)
+                except ValueError as exc:
+                    await ws.send(_envelope("error", {"msg": f"保存失败：{exc}"}))
+                else:
+                    ok = result.get("applied", False)
+                    await ws.send(_envelope("llm_config", {
+                        "config": get_config(),
+                        "applied": ok,
+                        "msg": (f"模型配置已生效（{result.get('primary')}）"
+                                if ok else result.get("reason", "未生效")),
+                    }))
 
             else:
                 await ws.send(_envelope("error", {"msg": f"unknown kind: {kind}"}))

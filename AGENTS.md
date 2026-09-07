@@ -32,7 +32,7 @@ agent.init_session(resume=False)   # 新会话（cron 用）
 agent.run_turn("[Scheduled] ...")  # 非交互单轮
 ```
 
-同级模块：`tools.py` / `agent_cli.py` / `subagent.py` / `skills.py` / `todo_manager.py` / `task_manager.py` / `background_manager.py` / `compact.py` / `session_manage.py` / `message_bus.py` / `teammate_manager.py` / `llm_manage.py`
+同级模块：`tools.py` / `agent_cli.py` / `subagent.py` / `skills.py` / `todo_manager.py` / `task_manager.py` / `background_manager.py` / `compact.py` / `session_manage.py` / `message_bus.py` / `teammate_manager.py` / `llm_manage.py` / `llm_config.py`
 
 ## 核心模式
 

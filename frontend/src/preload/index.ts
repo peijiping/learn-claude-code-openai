@@ -23,6 +23,11 @@ const agent = {
   skills: (): Promise<string> => ipcRenderer.invoke('agent:skills'),
   getConnectionStatus: (): Promise<string> => ipcRenderer.invoke('agent:connectionStatus'),
 
+  /** 大模型配置（llmconfig.json）：读 / 保存（保存即热切换生效） */
+  llmConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:llmConfigGet'),
+  llmConfigSave: (config: unknown): Promise<unknown> =>
+    ipcRenderer.invoke('agent:llmConfigSave', { config }),
+
   /** 订阅后端事件与连接状态变化（返回取消订阅函数） */
   onEvent: (cb: (e: unknown) => void): (() => void) => {
     const listener = (_: Electron.IpcRendererEvent, data: unknown): void => cb(data)

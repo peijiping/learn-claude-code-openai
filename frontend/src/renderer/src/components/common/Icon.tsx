@@ -59,7 +59,27 @@ const paths: Record<string, ReactNode> = {
     </>
   ),
   refresh: <path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" />,
-  check: <path d="m4 12.5 5 5L20 6.5" />
+  check: <path d="m4 12.5 5 5L20 6.5" />,
+  trash: (
+    <>
+      <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6M14 11v6" />
+    </>
+  ),
+  close: <path d="M18 6 6 18M6 6l12 12" />,
+  eye: (
+    <>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
+  eyeSlash: (
+    <>
+      <path d="M17.9 6.1A10.5 10.5 0 0 0 12 5C5 5 2 12 2 12s1.5 3.2 4.2 5.4M9.9 4.2A9.9 9.9 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.2 3.5M6.6 6.6C3.8 8.6 2 12 2 12s3 8 10 8a9.8 9.8 0 0 0 5.4-1.6" />
+      <path d="m2 2 20 20" />
+    </>
+  )
 }
 
 interface IconProps {

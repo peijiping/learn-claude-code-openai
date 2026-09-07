@@ -94,12 +94,22 @@ def _seed_from_env_file() -> None:
         print(f"[config] 已从 .env 生成 {CREDENTIALS_FILE}（权限 0600）")
 
 
+def _print_first_run_guide() -> None:
+    """全新首次启动：目录骨架已建好，打印配置引导。"""
+    print(f"[config] 首次启动：已创建配置目录 {AIGENT_HOME}")
+    print(f"[config]   非敏感配置 → {CONFIG_FILE}（键名参考 .env.example）")
+    print(f"[config]   API Key/密钥 → {CREDENTIALS_FILE}（权限 0600），或用同名环境变量")
+    print("[config]   未配置项将使用代码默认值")
+
+
 def migrate_legacy(legacy_home: Path) -> None:
     """
     一次性迁移（幂等）：legacy_home（WorkSpace/HomeDir）下的 skills/worktrees/mcp
     搬迁到 ~/.aigent/ 对应目录；config.json 缺失时从 .env 生成种子。
+    全新环境（~/.aigent 不存在）时预建目录骨架并打印首次启动引导。
     由 paths.py 的 ensure_dirs() 在导入期调用，传 ROOT_DIR/"WorkSpace/HomeDir"。
     """
+    first_run = not AIGENT_HOME.exists()
     AIGENT_HOME.mkdir(parents=True, exist_ok=True)
     for name in ("skills", "worktrees", "mcp"):
         src = legacy_home / name
@@ -107,6 +117,15 @@ def migrate_legacy(legacy_home: Path) -> None:
         if src.exists() and not dst.exists():
             src.rename(dst)
             print(f"[config] 已迁移 {src} → {dst}")
+        elif not dst.exists():
+            # 全新启动：预建目录骨架
+            dst.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         _seed_from_env_file()
+        if not CONFIG_FILE.exists():
+            # 无 .env 可播种：生成空配置，参数全部走代码默认值
+            CONFIG_FILE.write_text("{}\n", encoding="utf-8")
+            print(f"[config] 已创建空配置 {CONFIG_FILE}（参数将使用代码默认值）")
     ensure_credentials_permission()
+    if first_run:
+        _print_first_run_guide()

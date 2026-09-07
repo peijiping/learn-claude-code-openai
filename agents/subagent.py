@@ -61,6 +61,11 @@ class SubAgent:
         self.sub_llm_client = LLMClient().llm
         self.model = os.environ.get("OPENAI_MODEL_ID", "")
 
+    def set_llm(self, llm_client, model: str) -> None:
+        """配置热切换：就地重建子智能体的 LLM 绑定（无需重建实例）。"""
+        self.sub_llm_client = llm_client
+        self.model = model
+
     @staticmethod
     def _extract_content(response) -> str:
         """

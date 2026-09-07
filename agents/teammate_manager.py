@@ -97,6 +97,11 @@ class TeammateManager:
         # s18：队友 → 绑定的 worktree 路径（Path | None），文件操作以此为工作根
         self._member_worktrees: dict[str, Path | None] = {}
 
+    def set_llm(self, llm_client, model: str) -> None:
+        """配置热切换：就地重建队友协作的 LLM 绑定（无需重建实例）。"""
+        self.llm_client = llm_client
+        self.model = model
+
     # ═══════════════════════════════════════════════════════════
     #  团队配置持久化（config.json）
     # ═══════════════════════════════════════════════════════════

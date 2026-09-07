@@ -31,6 +31,38 @@ export type UiEvent =
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { num: number; message_count: number } }
+  | { kind: 'llm_config'; payload: LlmConfigResult }
+
+/** 大模型配置（来自后端 llmconfig.json，服务商预置数据由 providers 字段下发） */
+export interface LlmProviderModel {
+  id: string
+  display_name: string
+}
+export interface LlmProvider {
+  name: string
+  base_url: string
+  models: LlmProviderModel[]
+}
+export interface LlmModel {
+  id: string
+  provider: string
+  display_name: string
+  /** 实际提交给 API 的模型 id */
+  model: string
+  base_url: string
+  api_key: string
+  enabled: boolean
+}
+export interface LlmConfig {
+  active_model_id: string | null
+  models: LlmModel[]
+  providers?: Record<string, LlmProvider>
+}
+export interface LlmConfigResult {
+  config: LlmConfig
+  applied?: boolean
+  msg?: string
+}
 
 export interface SessionMeta {
   num: number
@@ -48,6 +80,8 @@ export type ControlKind =
   | 'goal_status'
   | 'tasks'
   | 'skills'
+  | 'llm_config_get'
+  | 'llm_config_save'
 
 export interface WsOutbound {
   kind: ControlKind | 'ping'

@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 import { Icon } from '@components/common/Icon'
 import { useAgentStore } from '@store/agentStore'
 
@@ -12,8 +12,16 @@ interface InputBoxProps {
 export default function InputBox({ value, onChange, onSend }: InputBoxProps): JSX.Element {
   const isSending = useAgentStore((s) => s.isSending)
   const stop = useAgentStore((s) => s.stop)
+  const llmConfig = useAgentStore((s) => s.llmConfig)
+  const llmSaving = useAgentStore((s) => s.llmSaving)
+  const setActiveModel = useAgentStore((s) => s.setActiveModel)
   const taRef = useRef<HTMLTextAreaElement>(null)
-  const modelName = 'DeepSeek-V4-Flash'
+  const [modelOpen, setModelOpen] = useState(false)
+
+  // 从 llmconfig 推导当前激活模型（与后端 apply_to_env 的 primary 推导一致）
+  const enabled = (llmConfig?.models ?? []).filter((m) => m.enabled)
+  const active =
+    enabled.find((m) => m.id === llmConfig?.active_model_id) ?? enabled[0] ?? null
 
   const autoGrow = (el: HTMLTextAreaElement): void => {
     el.style.height = 'auto'
@@ -59,10 +67,38 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
         </div>
 
         <div className="toolbar-right">
-          <button className="tool-btn model" title="模型选择（占位）">
-            <span className="model-name">{modelName}</span>
-            <Icon name="chevronDown" size={12} />
-          </button>
+          <div className="model-select">
+            <button
+              className="tool-btn model"
+              title="切换模型"
+              disabled={enabled.length === 0 || llmSaving}
+              onClick={() => setModelOpen((v) => !v)}
+            >
+              <span className="model-name">{llmSaving ? '切换中…' : active?.display_name ?? '未配置模型'}</span>
+              <Icon name="chevronDown" size={12} />
+            </button>
+            {modelOpen && enabled.length > 0 && (
+              <>
+                <div className="model-menu-mask" onClick={() => setModelOpen(false)} />
+                <div className="model-menu">
+                  {enabled.map((m) => (
+                    <button
+                      key={m.id}
+                      className={`model-menu-item ${m.id === active?.id ? 'active' : ''}`}
+                      onClick={() => {
+                        setModelOpen(false)
+                        if (m.id !== active?.id) void setActiveModel(m.id)
+                      }}
+                    >
+                      <span className={`model-dot ${m.provider === 'deepseek' ? 'dp' : 'sf'}`} />
+                      <span className="model-menu-name">{m.display_name || m.id}</span>
+                      {m.id === active?.id && <Icon name="check" size={13} />}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
           <button className="tool-btn" title="通知开关（占位）">
             <Icon name="bell" size={16} />
           </button>

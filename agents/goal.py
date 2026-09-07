@@ -352,6 +352,11 @@ class GoalController:
         self.last_status: dict[str, Any] | None = None  # 最后一次状态事件（兜底展示用）
         self.consecutive_blocks = 0     # 连续被判"未完成"的次数（用于触发 limit）
 
+    def set_llm(self, llm_client, model: str) -> None:
+        """配置热切换：就地更新评估器的 LLM 绑定（无需重建/丢目标状态）。"""
+        self.evaluator.llm_client = llm_client
+        self.evaluator.model = model
+
     def begin_query(self) -> None:
         """在每一轮查询开始前重置连续 block 计数。
 

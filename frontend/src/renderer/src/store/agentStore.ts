@@ -1,8 +1,9 @@
 import { create } from 'zustand'
-import type { AgentEvent, SessionMeta, UiEvent } from '@protocols/agentProtocol'
+import type { AgentEvent, SessionMeta, UiEvent, LlmConfig } from '@protocols/agentProtocol'
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
+export type SettingsTab = 'general' | 'model' | 'about'
 
 export interface ToolCallMsg {
   id: string
@@ -22,8 +23,6 @@ export interface Message {
   usage: Record<string, number>
 }
 
-export type PanelKind = 'goal' | 'tasks' | 'skills' | 'settings'
-
 interface AgentState {
   connection: ConnState
   python: PythonState
@@ -32,8 +31,9 @@ interface AgentState {
   activeSession: number | null
   isSending: boolean
   settingsOpen: boolean
-  activePanel: PanelKind | null
-  panelText: string
+  settingsTab: SettingsTab
+  llmConfig: LlmConfig | null
+  llmSaving: boolean
   toast: string | null
   toastType: 'info' | 'error'
 
@@ -46,8 +46,11 @@ interface AgentState {
   newSession: () => Promise<void>
   switchSession: (num: number) => Promise<void>
   clearSession: () => Promise<void>
-  openPanel: (k: PanelKind) => Promise<void>
+  openSettings: (tab?: SettingsTab) => void
   closeSettings: () => void
+  loadLlConfig: () => Promise<void>
+  saveLlConfig: (config: LlmConfig) => Promise<boolean>
+  setActiveModel: (id: string) => Promise<void>
   clearToast: () => void
 }
 
@@ -69,8 +72,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   activeSession: null,
   isSending: false,
   settingsOpen: false,
-  activePanel: null,
-  panelText: '',
+  settingsTab: 'model',
+  llmConfig: null,
+  llmSaving: false,
   toast: null,
   toastType: 'info',
 
@@ -121,9 +125,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       }
       case 'goal_status':
       case 'tasks':
-      case 'skills': {
-        const text = (ev.payload as { text?: string })?.text ?? ''
-        set({ panelText: text })
+      case 'skills':
+        // 目标/待办/技能面板已并入设置弹窗，此三类事件不再单独展示
+        break
+      case 'llm_config': {
+        const payload = ev.payload as { config?: LlmConfig; applied?: boolean; msg?: string }
+        if (payload?.config) set({ llmConfig: payload.config })
+        if (payload?.msg) set({ toast: payload.msg, toastType: 'info' })
         break
       }
       case 'error': {
@@ -160,14 +168,43 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     get().refreshSessions()
   },
 
-  openPanel: async (k) => {
-    set({ settingsOpen: true, activePanel: k, panelText: '加载中…' })
-    if (k === 'goal') set({ panelText: (await window.agent.goalStatus()) || '—' })
-    else if (k === 'tasks') set({ panelText: (await window.agent.tasks()) || '—' })
-    else if (k === 'skills') set({ panelText: (await window.agent.skills()) || '—' })
-    else set({ panelText: '(设置面板占位，后续增量)' })
+  openSettings: (tab = 'model') => {
+    set({ settingsOpen: true, settingsTab: tab })
+    // 打开模型页时拉取最新配置（服务商预置数据一并下发）
+    if (tab === 'model' && !get().llmConfig) void get().loadLlConfig()
   },
-  closeSettings: () => set({ settingsOpen: false, activePanel: null, panelText: '' }),
+  closeSettings: () => set({ settingsOpen: false }),
+  loadLlConfig: async () => {
+    try {
+      const res = (await window.agent.llmConfigGet()) as { config?: LlmConfig } | null
+      if (res?.config) set({ llmConfig: res.config })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  saveLlConfig: async (config) => {
+    set({ llmSaving: true })
+    try {
+      const res = (await window.agent.llmConfigSave(config)) as {
+        config?: LlmConfig
+        applied?: boolean
+        msg?: string
+      } | null
+      if (res?.config) set({ llmConfig: res.config })
+      if (res?.msg) set({ toast: res.msg, toastType: 'info' })
+      return res?.applied ?? false
+    } catch {
+      set({ toast: '保存模型配置失败', toastType: 'error' })
+      return false
+    } finally {
+      set({ llmSaving: false })
+    }
+  },
+  setActiveModel: async (id) => {
+    const cfg = get().llmConfig
+    if (!cfg) return
+    await get().saveLlConfig({ active_model_id: id, models: cfg.models })
+  },
   clearToast: () => set({ toast: null })
 }))
 

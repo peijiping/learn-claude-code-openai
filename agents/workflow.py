@@ -533,6 +533,11 @@ class WorkflowManager:
         self._run_locks_guard = threading.Lock()
         self._run_locks: dict[str, threading.Lock] = {}
 
+    def set_llm(self, llm_client, model: str) -> None:
+        """配置热切换：就地重建工作流子智能体的 LLM 绑定（无需重建实例）。"""
+        self.llm_client = llm_client
+        self.model = model
+
     # ── 注册表管理 ──────────────────────────────────────────
     def register(self, name: str, meta: dict, script_fn) -> None:
         """注册一个工作流：name 必须与 meta.name 一致，script_fn 为

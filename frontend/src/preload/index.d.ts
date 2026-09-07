@@ -8,6 +8,8 @@ export interface AgentApi {
   tasks: () => Promise<string>
   skills: () => Promise<string>
   getConnectionStatus: () => Promise<string>
+  llmConfigGet: () => Promise<unknown>
+  llmConfigSave: (config: unknown) => Promise<unknown>
   onEvent: (cb: (e: unknown) => void) => () => void
   onStatus: (cb: (status: string) => void) => () => void
   onPythonStatus: (cb: (status: string) => void) => () => void

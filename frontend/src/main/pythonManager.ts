@@ -76,7 +76,9 @@ export class PythonManager {
       return
     }
 
-    const child = spawn(python, [script], {
+    // -u 无缓冲：Python 输出到 pipe 默认全缓冲，不加 -u 时 "WS server listening"
+    // 等 banner 会滞留缓冲区，readyProbe 永远探测不到，UI 误判后端未就绪/崩溃。
+    const child = spawn(python, ['-u', script], {
       cwd: repoRoot,
       env: { ...process.env, AGENT_WS_PORT: port },
       stdio: ['ignore', 'pipe', 'pipe']

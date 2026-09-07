@@ -25,6 +25,7 @@ if Path.cwd() != _PROJECT_ROOT:
 
 from agent_full_v2 import Agent
 from config import load as load_config
+from llm_config import load_llm_config
 from cron_scheduler import CronScheduler
 from goal import CLEAR_ALIASES, GoalError
 from paths import CHAT_HISTORY_DIR, DURABLE_PATH
@@ -43,6 +44,8 @@ except ImportError:
 def main() -> None:
     # 自举配置：真实环境变量 > 项目级 .aigent/config.json > ~/.aigent/config.json > .env > 默认值
     load_config()
+    # 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
+    load_llm_config()
 
     # ── s14：启动 CronScheduler（定时任务调度器）──
     cron_scheduler = CronScheduler(CHAT_HISTORY_DIR, DURABLE_PATH)
