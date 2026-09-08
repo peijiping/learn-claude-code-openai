@@ -107,6 +107,29 @@ function createWindow(): void {
   ipcMain.handle('agent:listSessions', (e) =>
     isTrustedSender(e) ? request('sessions_list') : null
   )
+  // 会话管理：重命名 / 软删除（回收站）/ 还原 / 批量永久删除 / 回收站列表
+  ipcMain.handle(
+    'agent:renameSession',
+    (e, payload: { num?: number; title?: string }) => {
+      if (!isTrustedSender(e) || typeof payload?.num !== 'number' || !payload?.title) return null
+      return request('session_rename', 'sessions', { num: payload.num, title: payload.title })
+    }
+  )
+  ipcMain.handle('agent:trashSession', (e, payload: { num?: number }) => {
+    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return null
+    return request('session_trash', 'sessions', { num: payload.num })
+  })
+  ipcMain.handle('agent:restoreSession', (e, payload: { num?: number }) => {
+    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return null
+    return request('session_restore', 'sessions', { num: payload.num })
+  })
+  ipcMain.handle('agent:deleteSessions', (e, payload: { nums?: number[] }) => {
+    if (!isTrustedSender(e) || !Array.isArray(payload?.nums) || payload.nums.length === 0) return null
+    return request('session_delete', 'session_delete_result', { nums: payload.nums })
+  })
+  ipcMain.handle('agent:listTrash', (e) =>
+    isTrustedSender(e) ? request('trash_list', 'sessions_trashed') : null
+  )
   ipcMain.handle('agent:goalStatus', (e) =>
     isTrustedSender(e) ? request('goal_status') : null
   )

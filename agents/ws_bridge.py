@@ -10,8 +10,12 @@ ws_bridge.py - 桌面端桥层（新增，不修改 agent_full_v2.py）
 import asyncio
 import json
 import os
+import re
+import threading
+from typing import Optional
 
 import websockets
+from openai import OpenAI
 
 from agent_full_v2 import Agent
 from config import load as load_config
@@ -37,10 +41,129 @@ def _envelope(kind: str, payload: dict) -> str:
     return json.dumps({"kind": kind, "payload": payload}, ensure_ascii=False)
 
 
-def _session_meta(item):
-    """session_manager.list_sessions() 的条目：tuple[int, Path, int]"""
-    num, path, msg_count = item
-    return {"num": num, "message_count": msg_count, "file": path.name}
+def _session_meta(item: dict) -> dict:
+    """session_manager.list_sessions() 的条目已是元数据 dict，直接透传。"""
+    return dict(item)
+
+
+# ── 会话标题生成（独立 daemon 线程，先于主对话请求发出） ──────────────
+
+TITLE_SYSTEM_PROMPT = (
+    "你是会话标题生成器。根据用户的首条消息生成一个不超过16个字的简短标题，"
+    "概括用户意图。直接输出标题文本：不要引号、不要句号、不要任何解释。"
+)
+
+# 标题请求专用短超时：独立小客户端，不与主对话共用连接池/超时/重试策略。
+# 若服务端串行排队，标题请求也要在 TITLE_TIMEOUT 秒内出结果或降级兜底，
+# 绝不悬挂到主 turn 结束（主客户端 timeout=1200s + 3 次重试，绝不复用）。
+TITLE_TIMEOUT = 30
+# max_tokens 必须给足：推理模型（如 deepseek-v4-flash）的思考过程也计入
+# completion 预算，预算太小会被 reasoning_tokens 吃光导致 content 为空/
+# 只挤出单字。1000 对"思考 + 16 字标题"足够，成本可忽略。
+TITLE_MAX_TOKENS = 1000
+
+# 同一会话的标题线程去重（clear 后重发首条消息等场景），防止并发重复写索引
+_title_threads_lock = threading.Lock()
+_title_inflight: set = set()
+
+
+def _generate_session_title(first_user_text: str) -> Optional[str]:
+    """用独立短超时客户端发一次极小的非流式请求生成标题；任何异常返回 None（调用方降级）。"""
+    text = (first_user_text or "").strip()
+    if not text:
+        return None
+    try:
+        # 独立客户端：只复用主客户端的鉴权/地址配置，连接池、超时、重试全部独立
+        client = OpenAI(
+            api_key=agent.llm_client.api_key,
+            base_url=str(agent.llm_client.base_url),
+            timeout=TITLE_TIMEOUT,
+            max_retries=0,
+        )
+        resp = client.chat.completions.create(
+            model=agent.model,
+            messages=[
+                {"role": "system", "content": TITLE_SYSTEM_PROMPT},
+                {"role": "user", "content": text[:2000]},
+            ],
+            max_tokens=TITLE_MAX_TOKENS,
+            temperature=0.3,
+        )
+        title = (resp.choices[0].message.content or "").strip().strip('"“”').strip()
+        title = re.sub(r"\s+", " ", title)
+        title = title.rstrip("。，,．.！!？?；;：:、")
+        # 合法性校验：单字/空串拒绝（如推理模型预算被吃光只挤出"写"），走降级兜底
+        if len(title) < 2:
+            return None
+        return title[:24]
+    except Exception:
+        return None
+
+
+def _fallback_title(first_user_text: str) -> Optional[str]:
+    """标题请求失败/不合法时的兜底：按标点切分取首个语义片段。
+
+    例："帮我写一个简单的python程序，越简单越好…" → "帮我写一个简单的python程序"，
+    而不是盲目截断 20 字（可能在词中间断开或只剩半句话）。
+    """
+    text = re.sub(r"\s+", " ", (first_user_text or "").strip())
+    if not text:
+        return None
+    first_clause = re.split(r"[，,。．.！!？?；;：:、\n]", text, maxsplit=1)[0].strip()
+    if len(first_clause) < 4:  # 首个标点出现太早，整句兜底
+        first_clause = text
+    return first_clause[:16] or None
+
+
+def _title_worker(loop, ws, session_num: int, first_user_text: str) -> None:
+    """标题线程主体：生成 → 写索引 → 回发会话列表。任何异常静默吞掉，绝不影响主对话。"""
+    try:
+        title = _generate_session_title(first_user_text)
+        source = "auto"
+        if not title:
+            title = _fallback_title(first_user_text)
+            source = "trunc"
+        if title:
+            sm = _ensure_session_manager()
+            sm.set_auto_title(session_num, title, source)
+            # 从工作线程安全地把"刷新会话列表"调度回事件循环
+            asyncio.run_coroutine_threadsafe(_reply_sessions(ws), loop)
+    except Exception:
+        pass
+    finally:
+        with _title_threads_lock:
+            _title_inflight.discard(session_num)
+
+
+def _start_title_thread(ws, session_num: int, first_user_text: str) -> None:
+    """收到首条消息立即启动独立 daemon 标题线程。
+
+    必须在 run_turn 线程提交之前调用：标题请求先于主对话请求到达服务端，
+    即使服务端串行排队（本地模型/单并发代理），标题也能最先被处理。
+    线程完全独立于会话的 run_turn/agent_loop 生命周期，turn 中途完成即回发。
+    """
+    loop = asyncio.get_running_loop()
+    with _title_threads_lock:
+        if session_num in _title_inflight:
+            return  # 同会话已有标题线程在跑，跳过
+        _title_inflight.add(session_num)
+    threading.Thread(
+        target=_title_worker,
+        args=(loop, ws, session_num, first_user_text),
+        name=f"session-title-{session_num}",
+        daemon=True,
+    ).start()
+
+
+def _has_real_user_turn(messages: list) -> bool:
+    """历史中是否已有真实用户消息（排除 <system-reminder> 系统注入）。"""
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        if _text_of(m.get("content")).startswith("<system-reminder>"):
+            continue
+        return True
+    return False
 
 
 def _ensure_session_manager():
@@ -129,15 +252,26 @@ async def handle(ws):
                 # 首条消息带 fresh=true；后端无激活会话时也强制新建。
                 # 先建会话并回发 session 信封（前端尽早拿到新会话号），
                 # 再跑 run_turn（阻塞调用丢线程池，让 writer 持续吐流式事件）。
+                fresh_created = False
                 if payload.get("fresh") or agent.session_num is None:
                     await asyncio.to_thread(agent.init_session, resume=False)
+                    fresh_created = True
                     await ws.send(_envelope("session", {
                         "num": agent.session_num,
                         "message_count": 0,
                     }))
                     await _reply_sessions(ws)
-                await asyncio.to_thread(agent.run_turn, payload.get("text", ""))
-                # 一轮结束后回发列表，让新会话/计数即时可见
+                # 标题生成判定：新建会话、或当前会话此前没有任何真实 user 消息（首轮）
+                # 独立 daemon 线程立即启动，且先于 run_turn 提交——标题请求最先到达
+                # 服务端，不受主对话流式请求排队影响；turn 进行中即可见标题。
+                first_user_text = payload.get("text", "")
+                needs_title = fresh_created or not _has_real_user_turn(agent.history_messages)
+                if needs_title and agent.session_num is not None:
+                    _start_title_thread(ws, agent.session_num, first_user_text)
+                # run_turn 阻塞调用丢线程池，让 writer 持续吐流式事件；
+                # 标题线程与此完全解耦，无需在 turn 结束后等待
+                await asyncio.to_thread(agent.run_turn, first_user_text)
+                # 一轮结束后回发列表，让新会话/计数/标题即时可见
                 await _reply_sessions(ws)
 
             elif kind == "session_switch":
@@ -167,6 +301,72 @@ async def handle(ws):
 
             elif kind == "sessions_list":
                 await _reply_sessions(ws)
+
+            elif kind == "session_rename":
+                sm = _ensure_session_manager()
+                try:
+                    await asyncio.to_thread(
+                        sm.rename_session,
+                        int(payload.get("num", 0)), str(payload.get("title", "")),
+                    )
+                except FileNotFoundError:
+                    await ws.send(_envelope("error", {"msg": f"session {payload.get('num')} not found"}))
+                except ValueError as exc:
+                    await ws.send(_envelope("error", {"msg": f"重命名失败：{exc}"}))
+                else:
+                    await _reply_sessions(ws)
+
+            elif kind == "session_trash":
+                sm = _ensure_session_manager()
+                num = int(payload.get("num", 0))
+                try:
+                    await asyncio.to_thread(sm.trash_session, num)
+                except (FileNotFoundError, ValueError):
+                    await ws.send(_envelope("error", {"msg": f"session {num} not found"}))
+                else:
+                    # 删除的是当前激活会话：置空 agent 会话态
+                    # （惰性会话机制下，下条 chat 会自动新建）
+                    if agent.session_num == num:
+                        agent.session_num = None
+                        agent.session_file = None
+                        agent.history_messages = []
+                    await _reply_sessions(ws)
+
+            elif kind == "session_restore":
+                sm = _ensure_session_manager()
+                try:
+                    await asyncio.to_thread(sm.restore_session, int(payload.get("num", 0)))
+                except (FileNotFoundError, ValueError):
+                    await ws.send(_envelope("error", {"msg": f"session {payload.get('num')} not found"}))
+                else:
+                    await _reply_sessions(ws)
+
+            elif kind == "session_delete":
+                # 批量永久删除：逐个执行，单条失败不断整批
+                sm = _ensure_session_manager()
+                nums = payload.get("nums") or []
+                deleted, failed = [], []
+                for n in nums:
+                    try:
+                        num = int(n)
+                        ok = await asyncio.to_thread(sm.delete_session_permanent, num)
+                    except (TypeError, ValueError):
+                        continue
+                    if ok:
+                        deleted.append(num)
+                    else:
+                        failed.append(num)
+                await ws.send(_envelope("session_delete_result", {
+                    "deleted": deleted, "failed": failed,
+                }))
+                await _reply_sessions(ws)
+
+            elif kind == "trash_list":
+                sm = _ensure_session_manager()
+                items = await asyncio.to_thread(sm.list_sessions, "trashed")
+                await ws.send(_envelope("sessions_trashed", {
+                    "sessions": [_session_meta(i) for i in items],
+                }))
 
             elif kind == "goal_status":
                 text = await asyncio.to_thread(agent.goal_status)

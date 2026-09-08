@@ -16,6 +16,17 @@ const agent = {
     ipcRenderer.invoke('agent:clearSession'),
   listSessions: (): Promise<unknown[]> => ipcRenderer.invoke('agent:listSessions'),
 
+  /** 会话管理：重命名 / 软删除（回收站）/ 还原 / 批量永久删除 / 回收站列表 */
+  renameSession: (num: number, title: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:renameSession', { num, title }),
+  trashSession: (num: number): Promise<unknown> =>
+    ipcRenderer.invoke('agent:trashSession', { num }),
+  restoreSession: (num: number): Promise<unknown> =>
+    ipcRenderer.invoke('agent:restoreSession', { num }),
+  deleteSessions: (nums: number[]): Promise<unknown> =>
+    ipcRenderer.invoke('agent:deleteSessions', { nums }),
+  listTrash: (): Promise<unknown[]> => ipcRenderer.invoke('agent:listTrash'),
+
   /** 状态类查询 */
   goalStatus: (): Promise<string> => ipcRenderer.invoke('agent:goalStatus'),
   tasks: (): Promise<string> => ipcRenderer.invoke('agent:tasks'),

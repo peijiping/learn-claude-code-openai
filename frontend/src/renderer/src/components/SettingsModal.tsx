@@ -1,23 +1,27 @@
 import { useAgentStore, type SettingsTab } from '@store/agentStore'
 import { Icon } from '@components/common/Icon'
 import ModelSettings from './Settings/ModelSettings'
+import TrashSettings from './Settings/TrashSettings'
 
 const NAV: { key: SettingsTab; label: string }[] = [
   { key: 'general', label: '通用' },
   { key: 'model', label: '模型' },
+  { key: 'trash', label: '回收站' },
   { key: 'about', label: '关于' }
 ]
 
-/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/关于）。 */
+/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/回收站/关于）。 */
 export default function SettingsModal(): JSX.Element {
   const tab = useAgentStore((s) => s.settingsTab)
   const openSettings = useAgentStore((s) => s.openSettings)
   const closeSettings = useAgentStore((s) => s.closeSettings)
   const loadLlConfig = useAgentStore((s) => s.loadLlConfig)
+  const refreshTrash = useAgentStore((s) => s.refreshTrash)
 
   const switchTab = (k: SettingsTab): void => {
     openSettings(k)
     if (k === 'model') void loadLlConfig()
+    if (k === 'trash') void refreshTrash()
   }
 
   return (
@@ -44,6 +48,7 @@ export default function SettingsModal(): JSX.Element {
           </div>
           <div className="settings-body">
             {tab === 'model' && <ModelSettings />}
+            {tab === 'trash' && <TrashSettings />}
             {tab === 'general' && <GeneralSettings />}
             {tab === 'about' && <AboutSettings />}
           </div>

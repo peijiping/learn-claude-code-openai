@@ -3,7 +3,12 @@ import type { AgentEvent, HistoryMessage, SessionMeta, UiEvent, LlmConfig } from
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
-export type SettingsTab = 'general' | 'model' | 'about'
+export type SettingsTab = 'general' | 'model' | 'trash' | 'about'
+
+/** 会话显示名：无标题（未生成/老会话）回退 session_N */
+export function sessionDisplayName(s: SessionMeta): string {
+  return s.title?.trim() || `session_${s.num}`
+}
 
 export interface ToolCallMsg {
   id: string
@@ -28,6 +33,7 @@ interface AgentState {
   python: PythonState
   messages: Message[]
   sessions: SessionMeta[]
+  trashSessions: SessionMeta[]
   activeSession: number | null
   isSending: boolean
   settingsOpen: boolean
@@ -43,9 +49,14 @@ interface AgentState {
   stop: () => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
+  refreshTrash: () => Promise<void>
   newSession: () => Promise<void>
   switchSession: (num: number) => Promise<void>
   clearSession: () => Promise<void>
+  renameSession: (num: number, title: string) => Promise<void>
+  trashSession: (num: number) => Promise<void>
+  restoreSession: (num: number) => Promise<void>
+  deleteSessions: (nums: number[]) => Promise<void>
   openSettings: (tab?: SettingsTab) => void
   closeSettings: () => void
   loadLlConfig: () => Promise<void>
@@ -82,6 +93,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   python: 'stopped',
   messages: [],
   sessions: [],
+  trashSessions: [],
   activeSession: null,
   isSending: false,
   settingsOpen: false,
@@ -139,6 +151,20 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (typeof num === 'number') set({ activeSession: num })
         break
       }
+      case 'sessions_trashed': {
+        // 回收站列表（trash_list 的回发），与任务树的 sessions 列表分开存放
+        const payload = ev.payload as { sessions?: SessionMeta[] } | null
+        if (Array.isArray(payload?.sessions)) set({ trashSessions: payload.sessions })
+        break
+      }
+      case 'session_delete_result': {
+        const payload = ev.payload as { deleted?: number[]; failed?: number[] } | null
+        const deleted = payload?.deleted?.length ?? 0
+        const failed = payload?.failed?.length ?? 0
+        if (deleted > 0) showToast(`已彻底删除 ${deleted} 个会话`, 'info')
+        if (failed > 0) showToast(`${failed} 个会话删除失败`, 'error', 4000)
+        break
+      }
       case 'session_history': {
         // 切换会话：后端回放该会话历史消息，整体替换当前消息流
         const payload = ev.payload as { num?: number; messages?: HistoryMessage[] } | null
@@ -194,6 +220,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 
+  refreshTrash: async () => {
+    try {
+      const list = (await window.agent.listTrash()) as SessionMeta[]
+      // 同 refreshSessions 的防御：非数组返回直接忽略
+      if (!Array.isArray(list)) return
+      set({ trashSessions: list })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+
   /** 新建任务：纯前端行为——清空消息流、回到欢迎空态；jsonl 由首条消息发送时惰性创建 */
   newSession: () => {
     set({ messages: [], activeSession: null })
@@ -207,6 +244,54 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   clearSession: async () => {
     await window.agent.clearSession()
     get().refreshSessions()
+  },
+
+  renameSession: async (num, title) => {
+    const t = title.trim()
+    if (!t) return
+    try {
+      await window.agent.renameSession(num, t)
+    } catch {
+      showToast('重命名失败', 'error', 4000)
+    }
+    // 成功路径由后端 sessions 事件刷新；这里兜底刷一次列表
+    await get().refreshSessions()
+  },
+  trashSession: async (num) => {
+    try {
+      await window.agent.trashSession(num)
+    } catch {
+      showToast('删除失败', 'error', 4000)
+      return
+    }
+    // 删除的是当前激活会话：回到欢迎空态（后端已置空会话态）
+    if (get().activeSession === num) await get().newSession()
+    await get().refreshSessions()
+    await get().refreshTrash()
+    showToast('已移入回收站', 'info')
+  },
+  restoreSession: async (num) => {
+    try {
+      await window.agent.restoreSession(num)
+    } catch {
+      showToast('还原失败', 'error', 4000)
+      return
+    }
+    await get().refreshSessions()
+    await get().refreshTrash()
+    showToast('已还原会话', 'info')
+  },
+  deleteSessions: async (nums) => {
+    if (nums.length === 0) return
+    try {
+      await window.agent.deleteSessions(nums)
+    } catch {
+      showToast('删除失败', 'error', 4000)
+      return
+    }
+    // 结果 toast 由 session_delete_result 事件触发；这里刷新两个列表
+    await get().refreshSessions()
+    await get().refreshTrash()
   },
 
   openSettings: (tab = 'model') => {

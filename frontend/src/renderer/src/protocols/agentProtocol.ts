@@ -30,8 +30,10 @@ export type UiEvent =
   | { kind: 'tasks'; payload: { text: string } }
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
+  | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { num: number; message_count: number } }
   | { kind: 'session_history'; payload: { num: number; messages: HistoryMessage[] } }
+  | { kind: 'session_delete_result'; payload: { deleted: number[]; failed: number[] } }
   | { kind: 'llm_config'; payload: LlmConfigResult }
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
@@ -93,8 +95,17 @@ export interface LlmConfigResult {
   msg?: string
 }
 
+/** 会话元数据（来自后端 index.jsonl + 会话文件统计） */
 export interface SessionMeta {
   num: number
+  /** 会话标题；null = 未生成（UI 回退显示 session_N） */
+  title: string | null
+  /** 标题来源：none 未生成 / auto LLM 生成 / trunc 截断兜底 / user 手动重命名 */
+  title_source?: 'auto' | 'user' | 'trunc' | 'none'
+  status?: 'active' | 'trashed'
+  created_at?: string
+  updated_at?: string
+  trashed_at?: string | null
   message_count: number
   file?: string
 }
@@ -105,6 +116,11 @@ export type ControlKind =
   | 'session_switch'
   | 'session_clear'
   | 'sessions_list'
+  | 'session_rename'
+  | 'session_trash'
+  | 'session_restore'
+  | 'session_delete'
+  | 'trash_list'
   | 'goal_status'
   | 'tasks'
   | 'skills'

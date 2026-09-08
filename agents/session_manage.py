@@ -15,10 +15,18 @@ session_manage.py - 会话管理模块
 """
 
 import json
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from context_compact import ContextCompact
+from paths import DEFAULT_PROJECT_SLUG, todo_file_for_session
+
+
+def _now_iso() -> str:
+    """本地时间秒级 isoformat（单机桌面产品，无时区转换需求）。"""
+    return datetime.now().isoformat(timespec="seconds")
 
 
 class SessionManager:
@@ -43,6 +51,9 @@ class SessionManager:
             tool_results_dir=chat_history_dir.parent / ".task_outputs" / "tool-results",
         )
         self.chat_history_dir.mkdir(parents=True, exist_ok=True)
+        # 索引读-改-写互斥锁：标题生成等后台线程与 UI 管理操作并发更新索引时，
+        # 防止两个 RMW 交错导致丢更新（JSONL 原子替换只保证单次写不损坏）
+        self._index_lock = threading.Lock()
 
     def format_context_label(self, messages: list) -> str:
         """格式化当前上下文窗口显示信息。"""
@@ -467,6 +478,8 @@ class SessionManager:
         new_num = max_num + 1
         new_file = self.get_session_file(new_num)
         new_file.touch()
+        # 同步写入元数据索引条目（标题/创建时间/状态/项目归属）
+        self.ensure_index_entry(new_num)
         return new_num, new_file
 
     def init_session(self) -> tuple[int, Path, list]:
@@ -508,26 +521,254 @@ class SessionManager:
         messages = self.load_session_history(target_file)
         return target_num, target_file, messages
 
-    def list_sessions(self) -> list[tuple[int, Path, int]]:
+    # ═══════════════════════════════════════════════════════════
+    #  会话元数据（index.jsonl，每行一条会话元数据）
+    #  与 session_<N>.jsonl 通过文件名关联；以文件名（含前缀）为键，
+    #  避免 session_ / cron_ 前缀共用目录时编号冲突。
+    # ═══════════════════════════════════════════════════════════
+
+    @property
+    def index_file(self) -> Path:
+        """会话元数据索引文件（与 chat history 同目录）。"""
+        return self.chat_history_dir / "index.jsonl"
+
+    def _num_from_stem(self, stem: str) -> Optional[int]:
+        """从文件 stem 解析会话编号（"session_3"/"cron_12" → 3/12）。"""
+        try:
+            return int(stem.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def load_index(self) -> dict[str, dict]:
+        """读取元数据索引：{jsonl 文件名: 元数据 dict}；坏行跳过。"""
+        entries: dict[str, dict] = {}
+        if not self.index_file.exists():
+            return entries
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("file"):
+                        entries[str(obj["file"])] = obj
+        except OSError as e:
+            print(f"读取会话元数据索引失败: {e}")
+        return entries
+
+    def save_index(self, entries: dict[str, dict]) -> None:
+        """原子重写元数据索引（tmp + replace，同 save_session_history 模式）。"""
+        index = self.index_file
+        index.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = index.with_suffix(index.suffix + ".tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                for obj in entries.values():
+                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            tmp_file.replace(index)
+        except Exception as e:
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
+            print(f"重写会话元数据索引失败: {e}")
+            raise
+
+    def backfill_index(self) -> None:
+        """对账索引：目录内所有 jsonl 缺条目的补录；索引中 jsonl 已不存在的剔除。
+
+        - glob 全部 *.jsonl（含其他前缀，如 cron_），避免误删别家前缀的条目
+        - 老会话补录：title=null、created_at 取文件 mtime、status=active
         """
-        列出所有会话
+        entries = self.load_index()
+        changed = False
+        existing: set[str] = set()
+        for f in self.chat_history_dir.glob("*.jsonl"):
+            if f.name == self.index_file.name:
+                continue
+            existing.add(f.name)
+            if f.name in entries:
+                continue
+            num = self._num_from_stem(f.stem)
+            if num is None:
+                continue
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+            except OSError:
+                mtime = datetime.now()
+            ts = mtime.isoformat(timespec="seconds")
+            entries[f.name] = {
+                "num": num,
+                "file": f.name,
+                "title": None,
+                "title_source": "none",
+                "created_at": ts,
+                "updated_at": ts,
+                "status": "active",
+                "trashed_at": None,
+                "project": DEFAULT_PROJECT_SLUG,
+            }
+            changed = True
+        for key in [k for k in entries if k not in existing]:
+            entries.pop(key)
+            changed = True
+        if changed:
+            self.save_index(entries)
+
+    def ensure_index_entry(self, num: int) -> None:
+        """新建会话时写入初始元数据条目（已存在则跳过）。"""
+        entries = self.load_index()
+        key = self.get_session_file(num).name
+        if key in entries:
+            return
+        now = _now_iso()
+        entries[key] = {
+            "num": num,
+            "file": key,
+            "title": None,
+            "title_source": "none",
+            "created_at": now,
+            "updated_at": now,
+            "status": "active",
+            "trashed_at": None,
+            "project": DEFAULT_PROJECT_SLUG,
+        }
+        self.save_index(entries)
+
+    def _update_entry(self, num: int, mutate) -> dict:
+        """加载索引 → 定位条目 → mutate(entry) → 刷新 updated_at → 原子写回。
+
+        条目不存在（老会话未补录）时先现场补录再更新。
+
+        Raises:
+            FileNotFoundError: 会话 jsonl 不存在
+        """
+        session_file = self.get_session_file(num)
+        if not session_file.exists():
+            raise FileNotFoundError(f"会话 {session_file.name} 不存在")
+        key = session_file.name
+        with self._index_lock:
+            entries = self.load_index()
+            entry = entries.get(key)
+            if entry is None:
+                try:
+                    mtime = datetime.fromtimestamp(session_file.stat().st_mtime)
+                except OSError:
+                    mtime = datetime.now()
+                ts = mtime.isoformat(timespec="seconds")
+                entry = {
+                    "num": num,
+                    "file": key,
+                    "title": None,
+                    "title_source": "none",
+                    "created_at": ts,
+                    "updated_at": ts,
+                    "status": "active",
+                    "trashed_at": None,
+                    "project": DEFAULT_PROJECT_SLUG,
+                }
+                entries[key] = entry
+            mutate(entry)
+            entry["updated_at"] = _now_iso()
+            self.save_index(entries)
+        return entry
+
+    def rename_session(self, num: int, title: str) -> dict:
+        """重命名会话（title_source=user，自动生成不再覆盖）。"""
+        title = title.strip()
+        if not title:
+            raise ValueError("标题不能为空")
+        return self._update_entry(
+            num, lambda e: e.update({"title": title[:60], "title_source": "user"})
+        )
+
+    def set_auto_title(self, num: int, title: str, source: str = "auto") -> None:
+        """写入自动生成的标题；用户手动改名（title_source=user）不覆盖。"""
+        def mutate(e):
+            if e.get("title_source") == "user":
+                return
+            e.update({"title": title[:60], "title_source": source})
+        try:
+            self._update_entry(num, mutate)
+        except FileNotFoundError:
+            pass
+
+    def trash_session(self, num: int) -> dict:
+        """软删除：标记 status=trashed，jsonl/todo 原样保留。"""
+        return self._update_entry(
+            num, lambda e: e.update({"status": "trashed", "trashed_at": _now_iso()})
+        )
+
+    def restore_session(self, num: int) -> dict:
+        """从回收站还原：status=active，清空 trashed_at。"""
+        return self._update_entry(
+            num, lambda e: e.update({"status": "active", "trashed_at": None})
+        )
+
+    def delete_session_permanent(self, num: int) -> bool:
+        """永久删除会话：jsonl + 绑定的 todo 文件 + 索引行。"""
+        session_file = self.get_session_file(num)
+        if not session_file.exists():
+            return False
+        try:
+            session_file.unlink()
+        except OSError as e:
+            print(f"删除会话文件失败: {e}")
+            return False
+        # todo 与 chat history 同生共死（tools.set_todo_manager 创建的路径）
+        try:
+            todo_file = todo_file_for_session(num)
+            if todo_file.exists():
+                todo_file.unlink()
+        except OSError:
+            pass
+        entries = self.load_index()
+        entries.pop(session_file.name, None)
+        self.save_index(entries)
+        return True
+
+    def list_sessions(self, status: str = "active") -> list[dict]:
+        """
+        列出会话（含元数据）
+
+        Args:
+            status: "active"（默认，任务树）或 "trashed"（回收站）
 
         Returns:
-            [(会话编号, 会话文件路径, 消息数量), ...]
+            [{num, title, title_source, status, created_at, updated_at,
+              trashed_at, message_count, file}, ...] 按 num 降序（新会话在前）
         """
+        self.backfill_index()
+        entries = self.load_index()
         sessions = []
-        session_files = list(self.chat_history_dir.glob(f"{self.session_prefix}*.jsonl"))
-
-        for f in session_files:
+        for f in self.chat_history_dir.glob(f"{self.session_prefix}*.jsonl"):
+            num = self._num_from_stem(f.stem)
+            if num is None:
+                continue
             try:
-                num = int(f.stem.replace(self.session_prefix, ""))
                 with open(f, "r", encoding="utf-8") as file:
                     msg_count = sum(1 for line in file if line.strip())
-                sessions.append((num, f, msg_count))
             except (ValueError, IOError):
                 continue
-
-        return sorted(sessions, key=lambda x: x[0])
+            meta = entries.get(f.name) or {}
+            sessions.append({
+                "num": num,
+                "title": meta.get("title"),
+                "title_source": meta.get("title_source", "none"),
+                "status": meta.get("status", "active"),
+                "created_at": meta.get("created_at"),
+                "updated_at": meta.get("updated_at"),
+                "trashed_at": meta.get("trashed_at"),
+                "message_count": msg_count,
+                "file": f.name,
+            })
+        sessions = [s for s in sessions if s.get("status") == status]
+        return sorted(sessions, key=lambda x: x["num"], reverse=True)
 
     def clear_session(self, session_file: Path) -> int:
         """

@@ -3,6 +3,11 @@ export interface AgentApi {
   switchSession: (num: number) => Promise<{ num: number; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>
+  renameSession: (num: number, title: string) => Promise<unknown>
+  trashSession: (num: number) => Promise<unknown>
+  restoreSession: (num: number) => Promise<unknown>
+  deleteSessions: (nums: number[]) => Promise<unknown>
+  listTrash: () => Promise<unknown[]>
   goalStatus: () => Promise<string>
   tasks: () => Promise<string>
   skills: () => Promise<string>

@@ -124,6 +124,64 @@
   font-size: var(--fs-sm);
 }
 
+/* 会话项三点按钮：默认透明，hover 节点时浮现 */
+.tree-more {
+  opacity: 0;
+  flex: none;
+  transition: opacity 0.12s;
+}
+.tree-node:hover .tree-more,
+.tree-node.active .tree-more {
+  opacity: 1;
+}
+
+/* 行内重命名输入框：贴合树节点高度 */
+.tree-rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+/* 会话弹出菜单（三点按钮 / 右键菜单共用） */
+.session-menu {
+  position: fixed;
+  z-index: 950;
+  min-width: 132px;
+  padding: var(--sp-1);
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.2));
+}
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-2);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.session-menu-item:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+.session-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.session-menu-item.danger:hover:not(:disabled) {
+  color: var(--color-danger);
+}
+
 /* 用户卡 */
 .usercard {
   flex: none;

@@ -639,3 +639,105 @@
   color: var(--color-accent);
   background: var(--color-bg-active);
 }
+/* ── 回收站 ── */
+.trash-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-height: 100%;
+}
+.trash-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.trash-check-all {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.trash-check-all input,
+.trash-row > input[type='checkbox'] {
+  accent-color: var(--color-accent);
+  flex: none;
+}
+
+/* 彻底删除按钮：普通态描边，二次确认态红底警示 */
+.trash-delete-btn {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+}
+.trash-delete-btn:hover:not(:disabled) {
+  background: rgba(224, 83, 61, 0.08);
+}
+.trash-delete-btn:disabled {
+  color: var(--color-text-secondary);
+  border-color: var(--color-border);
+}
+.trash-delete-btn.confirm {
+  background: var(--color-danger);
+  border-color: transparent;
+  color: #fff;
+}
+
+.trash-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--fs-sm);
+}
+.trash-row:last-child {
+  border-bottom: none;
+}
+.trash-row:hover {
+  background: var(--color-bg-hover);
+}
+.trash-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--color-text-primary);
+}
+.trash-meta {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.trash-restore-btn {
+  flex: none;
+}
+.trash-row-delete-btn {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+.trash-row-delete-btn:hover {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+  background: rgba(224, 83, 61, 0.08);
+}
+.trash-row-delete-btn.confirm {
+  background: var(--color-danger);
+  border-color: transparent;
+  color: #fff;
+}
+
+.trash-empty {
+  padding: var(--sp-5);
+  text-align: center;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-md);
+}
