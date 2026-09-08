@@ -19,8 +19,8 @@
   }
 }
 .settings {
-  width: 720px;
-  height: 520px;
+  width: 900px;
+  height: 640px;
   max-width: calc(100vw - 80px);
   max-height: calc(100vh - 80px);
   background: var(--color-bg-main);
@@ -217,7 +217,12 @@
   gap: var(--sp-1);
   font-weight: 600;
 }
+.model-name-text {
+  white-space: nowrap; /* 不折行、不省略，完整显示（长名称撑开列宽） */
+}
 .model-active-tag {
+  flex: none;
+  white-space: nowrap;
   font-size: var(--fs-xs);
   color: var(--color-accent);
   background: var(--color-bg-active);
@@ -227,6 +232,7 @@
 .model-model-id {
   color: var(--color-text-secondary);
   font-size: var(--fs-xs);
+  white-space: nowrap;
 }
 .model-empty {
   color: var(--color-text-secondary);
@@ -307,7 +313,7 @@
   animation: settings-fade 0.15s ease;
 }
 .addmodel {
-  width: 480px;
+  width: 560px;
   max-width: calc(100vw - 60px);
   max-height: calc(100vh - 80px);
   background: var(--color-bg-main);
@@ -438,10 +444,185 @@
   background: linear-gradient(135deg, #7c6cff, #4f8ef7);
 }
 
-.chip-row {
+/* ── 模型下拉（ModelSelect） ── */
+.model-select-dd {
+  position: relative;
+}
+.select-trigger {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  text-align: left;
+  cursor: pointer;
+  padding-right: var(--sp-3);
+}
+.select-trigger.open {
+  border-color: var(--color-accent);
+}
+.select-placeholder {
+  color: var(--color-text-secondary);
+}
+.select-caret {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  transition: transform 0.15s;
+  flex: none;
+}
+.select-caret.open {
+  transform: rotate(180deg);
+}
+.select-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.select-option {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-md);
+  text-align: left;
+  color: var(--color-text-primary);
+}
+.select-option:hover {
+  background: var(--color-bg-hover);
+}
+.select-option.active {
+  background: var(--color-bg-active);
+}
+.select-option-id {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select-option-tags {
+  display: inline-flex;
   gap: var(--sp-1);
+  flex: none;
+}
+.select-check {
+  color: var(--color-accent);
+  font-size: var(--fs-sm);
+  flex: none;
+}
+.model-tag {
+  font-size: var(--fs-xs);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-pill);
+  padding: 0 var(--sp-2);
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* ── 高级配置（可折叠，全部可选项） ── */
+.adv-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  padding: 0;
+}
+.adv-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  flex: none;
+}
+.adv-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-sidebar);
+}
+.adv-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.adv-group-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.adv-opt {
+  color: var(--color-text-secondary);
+  font-weight: 400;
+}
+.adv-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.adv-row-label {
+  flex: none;
+  width: 88px;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.adv-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.quick-chips {
+  display: inline-flex;
+  gap: var(--sp-1);
+  flex: none;
+}
+.adv-radio-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+.adv-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.adv-radio input {
+  accent-color: var(--color-accent);
+}
+.adv-clear {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  text-decoration: underline;
+}
+.adv-clear:hover {
+  color: var(--color-text-primary);
+}
+.adv-sample-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.adv-sample-row .input {
+  flex: 1;
+  min-width: 0;
 }
 .chip {
   padding: 2px var(--sp-2);

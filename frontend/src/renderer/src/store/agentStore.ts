@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, SessionMeta, UiEvent, LlmConfig } from '@protocols/agentProtocol'
+import type { AgentEvent, HistoryMessage, SessionMeta, UiEvent, LlmConfig } from '@protocols/agentProtocol'
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
@@ -64,6 +64,19 @@ const pendingAssistantId = (): string | null => {
   return last && last.role === 'assistant' && last.streaming ? last.id : null
 }
 
+/** Toast 自动消失计时器：重复触发时重置，避免旧计时器提前清掉新提示 */
+let toastTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 显示 Toast 并自动消失（info 默认 3s，error 默认 4s）。函数声明提升，运行时 useAgentStore 已初始化 */
+export function showToast(msg: string, type: 'info' | 'error' = 'info', ms = 3000): void {
+  if (toastTimer) clearTimeout(toastTimer)
+  useAgentStore.setState({ toast: msg, toastType: type })
+  toastTimer = setTimeout(() => {
+    toastTimer = null
+    useAgentStore.getState().clearToast()
+  }, ms)
+}
+
 export const useAgentStore = create<AgentState>((set, get) => ({
   connection: 'disconnected',
   python: 'stopped',
@@ -84,6 +97,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   send: (text) => {
     const t = text.trim()
     if (!t || get().isSending) return
+    // 惰性会话：无激活会话（新建任务后的首条消息）带 fresh 标记，由后端创建 jsonl
+    const fresh = get().activeSession === null
     set((s) => ({
       messages: [
         ...s.messages,
@@ -92,7 +107,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       ],
       isSending: true
     }))
-    window.agent.send(t).catch(() => set({ isSending: false }))
+    window.agent.send(t, fresh).catch(() => set({ isSending: false }))
   },
 
   stop: () =>
@@ -114,13 +129,38 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         const raw = Array.isArray(payload) ? payload : payload?.sessions
         // 后端异常/未就绪时可能下发非数组，忽略而不是让渲染树崩溃
         if (!Array.isArray(raw)) break
-        const list = raw as SessionMeta[]
-        set((s) => ({ sessions: list, activeSession: s.activeSession ?? list[0]?.num ?? null }))
+        // 只更新列表，不自动激活：activeSession 仅由用户切换/新建消息触发，
+        // 否则启动时会被 list[0] 占位，与后端"惰性会话"状态不一致
+        set({ sessions: raw as SessionMeta[] })
         break
       }
       case 'session': {
         const num = (ev.payload as { num?: number })?.num
         if (typeof num === 'number') set({ activeSession: num })
+        break
+      }
+      case 'session_history': {
+        // 切换会话：后端回放该会话历史消息，整体替换当前消息流
+        const payload = ev.payload as { num?: number; messages?: HistoryMessage[] } | null
+        if (typeof payload?.num !== 'number' || !Array.isArray(payload.messages)) break
+        set({
+          activeSession: payload.num,
+          messages: payload.messages.map((m, i) => ({
+            id: `h${payload.num}_${i}`,
+            role: m.role,
+            content: m.content ?? '',
+            thinking: m.thinking ?? '',
+            toolCalls: (m.toolCalls ?? []).map((t, j) => ({
+              id: `h${payload.num}_${i}_${j}`,
+              name: t.name,
+              args: t.args,
+              status: 'done' as const
+            })),
+            activeToolId: null,
+            streaming: false,
+            usage: {}
+          }))
+        })
         break
       }
       case 'goal_status':
@@ -131,13 +171,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       case 'llm_config': {
         const payload = ev.payload as { config?: LlmConfig; applied?: boolean; msg?: string }
         if (payload?.config) set({ llmConfig: payload.config })
-        if (payload?.msg) set({ toast: payload.msg, toastType: 'info' })
+        if (payload?.msg) showToast(payload.msg, 'info')
         break
       }
       case 'error': {
         const msg = (ev.payload as { msg?: string })?.msg ?? '未知错误'
-        set({ toast: msg, toastType: 'error' })
-        setTimeout(() => get().clearToast(), 4000)
+        showToast(msg, 'error', 4000)
         break
       }
     }
@@ -149,18 +188,20 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 后端未就绪时主进程会返回 { error: 'backend timeout' } 等非数组值，
       // 不校验会把对象当数组存入，导致 TaskTree 里 sessions.map 崩溃白屏
       if (!Array.isArray(list)) return
-      set((s) => ({ sessions: list, activeSession: s.activeSession ?? list[0]?.num ?? null }))
+      set({ sessions: list })
     } catch {
       /* 忽略 */
     }
   },
 
-  newSession: async () => {
-    await window.agent.newSession()
-    get().refreshSessions()
+  /** 新建任务：纯前端行为——清空消息流、回到欢迎空态；jsonl 由首条消息发送时惰性创建 */
+  newSession: () => {
+    set({ messages: [], activeSession: null })
+    return Promise.resolve()
   },
   switchSession: async (num) => {
-    set({ activeSession: num })
+    // 立即高亮并清空消息流，历史消息等后端 session_history 事件回放
+    set({ activeSession: num, messages: [] })
     await window.agent.switchSession(num)
   },
   clearSession: async () => {
@@ -191,10 +232,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         msg?: string
       } | null
       if (res?.config) set({ llmConfig: res.config })
-      if (res?.msg) set({ toast: res.msg, toastType: 'info' })
+      if (res?.msg) showToast(res.msg, 'info')
       return res?.applied ?? false
     } catch {
-      set({ toast: '保存模型配置失败', toastType: 'error' })
+      showToast('保存模型配置失败', 'error', 4000)
       return false
     } finally {
       set({ llmSaving: false })

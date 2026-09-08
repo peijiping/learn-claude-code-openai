@@ -140,9 +140,14 @@ class Agent:
 
         # LLM 客户端 + S11 错误恢复控制器
         self.llm_client = LLMClient().llm
+        # 高级设置「输出上下文窗口」→ 默认 max_tokens（未配置走 error_recovery 默认值）
+        out_tokens = os.environ.get("OPENAI_MAX_OUTPUT_TOKENS")
         self.recovery = ErrorRecovery(
-            primary_model=self.model, fallback_model=self.fallback_model
+            primary_model=self.model, fallback_model=self.fallback_model,
+            **({"default_max_tokens": int(out_tokens)} if out_tokens else {}),
         )
+        # 高级设置「工具调用轮数」→ agent 循环上限（未配置走类默认 MAX_AGENT_ITERATIONS）
+        self.max_agent_iterations = self._read_tool_iterations()
 
         # 工作流运行时（s16）：复用本实例的 LLM 客户端与模型跑工作流子智能体，
         # 挂到本实例 tools 的 holder 上（实例级），并注册内置示例工作流
@@ -183,16 +188,25 @@ class Agent:
         - 自身 model / fallback_model / llm_client / recovery
         - workflow_manager、goal_controller 评估器、subagent_runner、teammate_manager
         """
-        self.model = os.environ.get("OPENAI_MODEL_ID", "")
-        self.fallback_model = os.environ.get("FALLBACK_MODEL_ID", "")
+        new_model = os.environ.get("OPENAI_MODEL_ID", "")
+        new_fallback = os.environ.get("FALLBACK_MODEL_ID", "")
         if not os.environ.get("OPENAI_API_KEY"):
             return {"applied": False, "reason": "未配置 API Key"}
+        if not new_model:
+            # 模型被删光/全停用：env 绑定已清空，保持现状不重建（保留可用客户端）
+            return {"applied": False, "reason": "无启用模型，LLM 绑定未切换"}
+        self.model = new_model
+        self.fallback_model = new_fallback
         # 重建 OpenAI 客户端（持有新的 api_key / base_url）
         self.llm_client = LLMClient().llm
-        # 错误恢复状态机绑定新主/备模型
+        # 错误恢复状态机绑定新主/备模型（高级设置「输出上下文」→ 默认 max_tokens）
+        out_tokens = os.environ.get("OPENAI_MAX_OUTPUT_TOKENS")
         self.recovery = ErrorRecovery(
-            primary_model=self.model, fallback_model=self.fallback_model
+            primary_model=self.model, fallback_model=self.fallback_model,
+            **({"default_max_tokens": int(out_tokens)} if out_tokens else {}),
         )
+        # 高级设置「工具调用轮数」→ agent 循环上限
+        self.max_agent_iterations = self._read_tool_iterations()
         # 各协作对象就地换绑定（复用既有 set_llm 接缝）
         self.workflow_manager.set_llm(self.llm_client, self.model)
         self.goal_controller.set_llm(
@@ -202,6 +216,57 @@ class Agent:
         self.subagent_runner.set_llm(self.llm_client, self.model)
         self.teammate_manager.set_llm(self.llm_client, self.model)
         return {"applied": True, "primary": self.model, "fallback": self.fallback_model}
+
+    @staticmethod
+    def _read_tool_iterations() -> int:
+        """高级设置「工具调用轮数」→ agent 循环上限；未配置/非法走类默认。"""
+        raw = os.environ.get("OPENAI_TOOL_ITERATIONS", "")
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return Agent.MAX_AGENT_ITERATIONS
+        return val if val > 0 else Agent.MAX_AGENT_ITERATIONS
+
+    @staticmethod
+    def _advanced_llm_kwargs() -> dict:
+        """高级设置 → LLM 调用参数（chat.completions.create 的 kwargs）。
+
+        llmconfig.json 中主模型的高级配置经 apply_to_env() 映射进 env，
+        这里读取并合成调用参数；未配置的项走原默认
+        （temperature=0.5、思考开启 reasoning_effort=high）。
+        """
+        kwargs: dict = {}
+        temp = os.environ.get("OPENAI_TEMPERATURE", "").strip()
+        if temp:
+            try:
+                kwargs["temperature"] = max(0.0, min(2.0, float(temp)))
+            except ValueError:
+                pass
+        top_p = os.environ.get("OPENAI_TOP_P", "").strip()
+        if top_p:
+            try:
+                kwargs["top_p"] = max(0.0, min(1.0, float(top_p)))
+            except ValueError:
+                pass
+        extra_body: dict = {}
+        top_k = os.environ.get("OPENAI_TOP_K", "").strip()
+        if top_k:
+            try:
+                extra_body["top_k"] = int(float(top_k))
+            except ValueError:
+                pass
+        # 思考模式：default/enabled → 思考开启（原默认行为）；disabled → 显式关闭
+        mode = os.environ.get("OPENAI_THINKING_MODE", "default")
+        if mode == "disabled":
+            extra_body["thinking"] = {"type": "disabled"}
+        else:
+            kwargs["reasoning_effort"] = "high"
+            extra_body["thinking"] = {"type": "enabled"}
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if "temperature" not in kwargs:
+            kwargs["temperature"] = 0.5
+        return kwargs
 
     # ── silent 打印辅助 ──────────────────────────────────────────
     def _print(self, *args, **kwargs):
@@ -480,9 +545,9 @@ class Agent:
 
         while True:
             iteration += 1
-            if iteration > self.MAX_AGENT_ITERATIONS:
+            if iteration > self.max_agent_iterations:
                 self._print(
-                    f"\033[31m[警告] 智能体循环达到最大迭代次数 ({self.MAX_AGENT_ITERATIONS})，强制结束\033[0m"
+                    f"\033[31m[警告] 智能体循环达到最大迭代次数 ({self.max_agent_iterations})，强制结束\033[0m"
                 )
                 break
 
@@ -510,9 +575,7 @@ class Agent:
                         tools=self.tools.build_agent_tools(team_mode=self.team_mode),
                         tool_choice="auto",  # 工具选择，值域 none、auto、required，默认 auto
                         parallel_tool_calls=True,  # 是否并行执行工具调用，默认 False
-                        temperature=0.5,
-                        reasoning_effort="high",  # 思考强度，DeepSeek只有 high、max 两个选项
-                        extra_body={"thinking": {"type": "enabled"}},  # 思考模式开关
+                        **self._advanced_llm_kwargs(),  # 高级设置：temperature/top_p/top_k/思考模式（未配置走默认）
                     )
                 )
                 response_msg, finish_reason, usage = llm_response

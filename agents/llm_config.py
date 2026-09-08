@@ -9,7 +9,10 @@ api_key，权限 0600）。支持维护多个厂家的多个模型。
 - 文件不存在 → load_llm_config() 直接返回空，不碰环境变量，LLM 走原有
   config.json / credentials.json / .env 兜底。
 - 文件存在   → 把「启用且（激活或被选中）的模型」映射进
-  OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_ID / FALLBACK_MODEL_ID。
+  OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_ID / FALLBACK_MODEL_ID，
+  以及该模型的高级设置（OPENAI_TEMPERATURE / OPENAI_TOP_P / OPENAI_TOP_K /
+  OPENAI_MAX_OUTPUT_TOKENS / OPENAI_TOOL_ITERATIONS / OPENAI_THINKING_MODE /
+  OPENAI_CONTEXT_WINDOW_IN / OPENAI_IMAGE_INPUT，均可选，未配置即清位走默认）。
   因为是「用户显式配置的大模型」，直接赋值（不 setdefault），保证相对
   .env / config.json 是权威来源。
 
@@ -32,13 +35,18 @@ LLM_CONFIG_FILE = AIGENT_HOME / "llmconfig.json"
 
 # ── 预置服务商（本期仅 DeepSeek 与 硅基流动，后续扩展） ──────────────
 # base_url 为 OpenAI 兼容端点；models 是给「选择模型」下拉的候选，允许自定义输入。
+# tags 为模型能力/上下文标签（前端下拉里展示，如 1M / 图片），仅作展示不参与运行逻辑。
 PROVIDERS: dict[str, dict] = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
         "models": [
-            {"id": "deepseek-chat", "display_name": "DeepSeek-V4-Flash"},
-            {"id": "deepseek-reasoner", "display_name": "DeepSeek-V4-Pro"},
+            {"id": "deepseek-v4-flash", "display_name": "deepseek-v4-flash",
+             "tags": ["1M"]},
+            {"id": "deepseek-v4-pro", "display_name": "deepseek-v4-pro",
+             "tags": ["1M"]},
+            {"id": "deepseek-v4-flash-vision-exp", "display_name": "deepseek-v4-flash-vision-exp",
+             "tags": ["1M", "图片"]},
         ],
     },
     "siliconflow": {
@@ -55,6 +63,26 @@ PROVIDERS: dict[str, dict] = {
 
 def _empty_config() -> dict:
     return {"active_model_id": None, "models": []}
+
+
+def _parse_tokens(raw) -> int | None:
+    """把 '1M' / '128k' / '8000' 这类窗口值解析成 token 数（k=1000、M=1000_000）。
+    纯数字直接取整；空串/非法返回 None（表示「未配置，走默认」）。"""
+    s = str(raw or "").strip().upper()
+    if not s:
+        return None
+    mult = 1
+    if s.endswith("K"):
+        mult, s = 1_000, s[:-1]
+    elif s.endswith("M"):
+        mult, s = 1_000_000, s[:-1]
+    try:
+        val = float(s)
+    except ValueError:
+        return None
+    if val <= 0:
+        return None
+    return int(val * mult)
 
 
 def get_config() -> dict:
@@ -74,13 +102,15 @@ def get_config() -> dict:
 
 def save_config(data: dict) -> dict:
     """持久化模型配置到 llmconfig.json（权限 0600）。
-    返回规范化后的配置；异常（JSON 非法/无有效模型）抛 ValueError。"""
+    返回规范化后的配置；异常（JSON 非法）抛 ValueError。
+    允许删光所有模型（models 为空 → active_model_id 置 None），运行时走未配置态。"""
     models = [m for m in data.get("models", []) if m and isinstance(m, dict)]
-    if not models:
-        raise ValueError("至少保留一个模型配置")
     active_id = data.get("active_model_id")
-    if active_id and not any(m.get("id") == active_id for m in models):
-        active_id = models[0].get("id")
+    if models:
+        if active_id and not any(m.get("id") == active_id for m in models):
+            active_id = models[0].get("id")
+    else:
+        active_id = None
     payload = {"active_model_id": active_id, "models": models}
     LLM_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     LLM_CONFIG_FILE.write_text(
@@ -95,7 +125,12 @@ def apply_to_env(data: dict) -> dict:
     直接赋值，作为用户显式模型配置的权威来源。返回生效摘要。"""
     models = [m for m in data.get("models", []) if m.get("enabled")]
     if not models:
-        return {"applied": False, "primary": None, "fallback": None}
+        # 全部删除/停用时清掉模型绑定 env，避免已删除的模型继续在运行期生效
+        # （key/base_url 保留：密钥与端点不随删模型丢失）
+        os.environ.pop("OPENAI_MODEL_ID", None)
+        os.environ.pop("FALLBACK_MODEL_ID", None)
+        return {"applied": False, "primary": None, "fallback": None,
+                "reason": "无启用模型，LLM 绑定已清空"}
     active_id = data.get("active_model_id")
     primary = next((m for m in models if m.get("id") == active_id), models[0])
     fallback = next((m for m in models if m.get("id") != primary.get("id")), None)
@@ -114,6 +149,36 @@ def apply_to_env(data: dict) -> dict:
         )
     else:
         os.environ.pop("FALLBACK_MODEL_ID", None)
+
+    # ── 高级设置（可选）→ env，供 Agent 实例合成调用参数 ──────────────
+    # 先全部清除旧值再按需写入：切换主模型时避免上一个模型的高级配置残留
+    for key in ("OPENAI_TEMPERATURE", "OPENAI_TOP_P", "OPENAI_TOP_K",
+                "OPENAI_MAX_OUTPUT_TOKENS", "OPENAI_TOOL_ITERATIONS",
+                "OPENAI_THINKING_MODE", "OPENAI_CONTEXT_WINDOW_IN",
+                "OPENAI_IMAGE_INPUT"):
+        os.environ.pop(key, None)
+    adv = primary.get("advanced") or {}
+    if isinstance(adv, dict):
+        if str(adv.get("temperature") or "").strip():
+            os.environ["OPENAI_TEMPERATURE"] = str(adv["temperature"]).strip()
+        if str(adv.get("top_p") or "").strip():
+            os.environ["OPENAI_TOP_P"] = str(adv["top_p"]).strip()
+        if str(adv.get("top_k") or "").strip():
+            os.environ["OPENAI_TOP_K"] = str(adv["top_k"]).strip()
+        out_tokens = _parse_tokens(adv.get("context_out"))
+        if out_tokens:
+            os.environ["OPENAI_MAX_OUTPUT_TOKENS"] = str(out_tokens)
+        in_tokens = _parse_tokens(adv.get("context_in"))
+        if in_tokens:
+            os.environ["OPENAI_CONTEXT_WINDOW_IN"] = str(in_tokens)
+        if str(adv.get("tool_rounds") or "").strip():
+            os.environ["OPENAI_TOOL_ITERATIONS"] = str(adv["tool_rounds"]).strip()
+        thinking = str(adv.get("thinking") or "").strip()
+        if thinking in ("default", "enabled", "disabled"):
+            os.environ["OPENAI_THINKING_MODE"] = thinking
+        image_input = str(adv.get("image_input") or "").strip()
+        if image_input in ("yes", "no"):
+            os.environ["OPENAI_IMAGE_INPUT"] = "1" if image_input == "yes" else "0"
 
     return {
         "applied": True,

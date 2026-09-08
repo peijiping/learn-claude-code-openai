@@ -31,17 +31,44 @@ export type UiEvent =
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { num: number; message_count: number } }
+  | { kind: 'session_history'; payload: { num: number; messages: HistoryMessage[] } }
   | { kind: 'llm_config'; payload: LlmConfigResult }
+
+/** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
+export interface HistoryMessage {
+  role: 'user' | 'assistant'
+  content: string
+  thinking?: string
+  toolCalls?: { name: string; args: string }[]
+}
 
 /** 大模型配置（来自后端 llmconfig.json，服务商预置数据由 providers 字段下发） */
 export interface LlmProviderModel {
   id: string
   display_name: string
+  /** 能力/上下文标签（如 1M、图片），仅作下拉展示 */
+  tags?: string[]
 }
 export interface LlmProvider {
   name: string
   base_url: string
   models: LlmProviderModel[]
+}
+/** 模型高级设置（全部可选项；留空/缺省 = 走程序默认，不写入配置文件） */
+export interface LlmAdvanced {
+  /** 上下文窗口-输入（如 "1M" / "128k" / "8000"） */
+  context_in?: string
+  /** 上下文窗口-输出 → max_tokens 默认值 */
+  context_out?: string
+  /** 工具调用轮数 → agent 循环上限 */
+  tool_rounds?: string
+  /** 支持图片输入：yes/no，空 = 未设置 */
+  image_input?: 'yes' | 'no' | ''
+  /** 思考模式：跟随模型默认配置/开启/关闭 */
+  thinking?: 'default' | 'enabled' | 'disabled' | ''
+  temperature?: string
+  top_p?: string
+  top_k?: string
 }
 export interface LlmModel {
   id: string
@@ -52,6 +79,8 @@ export interface LlmModel {
   base_url: string
   api_key: string
   enabled: boolean
+  /** 高级设置（可选，未配置时不落盘） */
+  advanced?: LlmAdvanced
 }
 export interface LlmConfig {
   active_model_id: string | null
@@ -70,10 +99,9 @@ export interface SessionMeta {
   file?: string
 }
 
-/** 前端 → 后端命令信封 */
+/** 前端 → 后端命令信封（session_new 已移除：新建任务是纯前端态，会话由首条 chat 惰性创建） */
 export type ControlKind =
   | 'chat'
-  | 'session_new'
   | 'session_switch'
   | 'session_clear'
   | 'sessions_list'

@@ -180,7 +180,8 @@
   border-radius: var(--radii-btn);
   background: var(--color-bg-main);
   box-shadow: var(--shadow-md);
-  overflow: hidden;
+  /* 不能用 overflow: hidden 裁剪圆角——会把向上弹出的模型下拉菜单 (.model-menu) 一并裁掉；
+     圆角裁剪改由带背景色的子元素 (.composer-context) 自行承担 */
 }
 .composer-input {
   width: 100%;
@@ -228,7 +229,8 @@
 .tool-btn.model {
   border: 1px solid var(--color-border);
 }
-.model-name {
+/* 仅作用于输入区工具栏的模型按钮，避免污染设置页同名类 */
+.tool-btn.model .model-name {
   max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -271,6 +273,8 @@
 .model-menu-item {
   display: flex;
   align-items: center;
+  /* button 元素 UA 默认 justify-content:center 会把内容居中，显式覆盖为居左 */
+  justify-content: flex-start;
   gap: var(--sp-2);
   width: 100%;
   padding: var(--sp-2) var(--sp-3);
@@ -299,6 +303,8 @@
 }
 .model-menu-name {
   flex: 1;
+  /* button 的 UA 默认 text-align:center 会继承进来，导致名称在 flex:1 的 span 内居中 */
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -318,6 +324,8 @@
   padding: var(--sp-2) var(--sp-3);
   border-top: 1px solid var(--color-border);
   background: var(--color-bg-sidebar);
+  /* 补偿 .composer 去掉 overflow:hidden 后的圆角裁剪：仅底部圆角需要自己裁 */
+  border-radius: 0 0 var(--radii-btn) var(--radii-btn);
 }
 .ctx-chip {
   display: inline-flex;

@@ -1,5 +1,5 @@
 import { Icon } from '@components/common/Icon'
-import { useAgentStore } from '@store/agentStore'
+import { showToast, useAgentStore } from '@store/agentStore'
 
 const items = [
   { key: 'new', label: '新建任务', icon: 'plus', shortcut: '⌘^N' },
@@ -15,7 +15,7 @@ export default function QuickActions(): JSX.Element {
   const onClick = (key: string): void => {
     if (key === 'new') void newSession()
     else {
-      useAgentStore.setState({ toast: `${key === 'plugin' ? '插件市场' : key === 'template' ? '模板库' : key === 'automation' ? '自动化' : '办公助理'}：后续增量` })
+      showToast(`${key === 'plugin' ? '插件市场' : key === 'template' ? '模板库' : key === 'automation' ? '自动化' : '办公助理'}：后续增量`)
     }
   }
 

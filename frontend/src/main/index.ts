@@ -88,16 +88,11 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string }) => {
+  ipcMain.handle('agent:send', (e, payload: { text?: string; fresh?: boolean }) => {
     if (!isTrustedSender(e) || !payload?.text) return
-    ws.send(JSON.stringify({ kind: 'chat', payload: { text: payload.text } }))
+    ws.send(JSON.stringify({ kind: 'chat', payload: { text: payload.text, fresh: !!payload.fresh } }))
   })
 
-  ipcMain.handle('agent:newSession', (e) => {
-    if (!isTrustedSender(e)) return
-    ws.send(JSON.stringify({ kind: 'session_new' }))
-    return { ok: true }
-  })
   ipcMain.handle('agent:switchSession', (e, payload: { num?: number }) => {
     if (!isTrustedSender(e) || typeof payload?.num !== 'number') return
     ws.send(JSON.stringify({ kind: 'session_switch', payload: { num: payload.num } }))

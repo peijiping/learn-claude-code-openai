@@ -1,6 +1,5 @@
 export interface AgentApi {
-  send: (text: string) => Promise<void>
-  newSession: () => Promise<{ num: number; prompt: string }>
+  send: (text: string, fresh?: boolean) => Promise<void>
   switchSession: (num: number) => Promise<{ num: number; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>

@@ -52,10 +52,10 @@
   background: var(--color-text-secondary);
 }
 
-/* Toast */
+/* Toast（顶部居中） */
 .toast {
   position: fixed;
-  bottom: calc(var(--statusbar-height) + var(--sp-4));
+  top: var(--sp-4);
   left: 50%;
   transform: translateX(-50%);
   background: #1f1f1f;

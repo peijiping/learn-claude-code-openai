@@ -5,12 +5,11 @@ import { contextBridge, ipcRenderer } from 'electron'
  * 只暴露白名单 API（不透出原始 ipcRenderer），contextIsolation 开启下安全。
  */
 const agent = {
-  /** 发起一次对话 */
-  send: (text: string): Promise<void> => ipcRenderer.invoke('agent:send', { text }),
+  /** 发起一次对话；fresh=true 表示当前无激活会话（新建任务后的首条消息），后端据此惰性建会话 */
+  send: (text: string, fresh = false): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, fresh }),
 
-  /** 会话操作 */
-  newSession: (): Promise<{ num: number; prompt: string }> =>
-    ipcRenderer.invoke('agent:newSession'),
+  /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (num: number): Promise<{ num: number; message_count: number }> =>
     ipcRenderer.invoke('agent:switchSession', { num }),
   clearSession: (): Promise<{ deleted: number }> =>

@@ -24,11 +24,11 @@ export default function TaskTree(): JSX.Element {
       <div className="tasktree-project">{'{ learn-claude-code-main }'}</div>
 
       <div className="tasktree-list">
-        {sessions.length === 0 && <div className="tasktree-empty">暂无任务（后端未连接）</div>}
-        {sessions.map((s, i) => (
+        {sessions.length === 0 && <div className="tasktree-empty">暂无任务</div>}
+        {sessions.map((s) => (
           <button
             key={s.num}
-            className={`tree-node ${s.num === activeSession ? 'active' : ''} ${i === sessions.length - 1 ? 'muted' : ''}`}
+            className={`tree-node ${s.num === activeSession ? 'active' : ''}`}
             onClick={() => void switchSession(s.num)}
           >
             <Icon name="chevronRight" size={12} className="tree-chevron" />

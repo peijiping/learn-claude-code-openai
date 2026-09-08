@@ -16,6 +16,8 @@ import websockets
 from agent_full_v2 import Agent
 from config import load as load_config
 from llm_config import get_config, load_llm_config, save_config
+from paths import CHAT_HISTORY_DIR
+from session_manage import SessionManager
 from streaming_client import WSSink
 
 # 启动即自举配置（Electron spawn 的 cwd 为仓库根，config.py 按 cwd 解析项目级配置）
@@ -25,9 +27,10 @@ load_llm_config()
 
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
 
-# 全局单 Agent（桌面端同一后端实例），静音避免打印干扰 UI
+# 全局单 Agent（桌面端同一后端实例），静音避免打印干扰 UI。
+# 惰性会话：启动不建会话（避免每次打开窗口都多一个空 jsonl），
+# 首条 chat 消息或用户切换会话时才产生/加载会话。
 agent = Agent(silent=True)
-agent.init_session(resume=False)
 
 
 def _envelope(kind: str, payload: dict) -> str:
@@ -38,6 +41,57 @@ def _session_meta(item):
     """session_manager.list_sessions() 的条目：tuple[int, Path, int]"""
     num, path, msg_count = item
     return {"num": num, "message_count": msg_count, "file": path.name}
+
+
+def _ensure_session_manager():
+    """惰性会话下 session_manager 可能为 None（尚未 init/switch），
+    列会话等只读操作前先兜底构建（构建后 init_session 也会复用）。"""
+    if agent.session_manager is None:
+        agent.session_manager = SessionManager(
+            CHAT_HISTORY_DIR, agent.system_prompt.build_system_prompt(),
+            session_prefix=agent.session_prefix,
+        )
+    return agent.session_manager
+
+
+def _text_of(content) -> str:
+    """历史消息 content 兼容转换：str 直接返回，list（多模态 blocks）拼接 text。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def _history_to_ui(messages: list) -> list[dict]:
+    """session 历史 → 前端可渲染消息列表。
+
+    - 跳过 system / tool 消息（前者无展示价值，后者已聚合进 assistant 工具条）
+    - 跳过系统注入的 user 消息（<system-reminder> 开头的 todo reminder 等）
+    - assistant 保留 reasoning_content → thinking、tool_calls → 工具条
+    """
+    ui = []
+    for m in messages:
+        role = m.get("role")
+        if role == "user":
+            content = _text_of(m.get("content"))
+            if content.startswith("<system-reminder>"):
+                continue
+            ui.append({"role": "user", "content": content})
+        elif role == "assistant":
+            ui.append({
+                "role": "assistant",
+                "content": _text_of(m.get("content")),
+                "thinking": m.get("reasoning_content") or "",
+                "toolCalls": [
+                    {
+                        "name": (tc.get("function") or {}).get("name", ""),
+                        "args": (tc.get("function") or {}).get("arguments", ""),
+                    }
+                    for tc in (m.get("tool_calls") or [])
+                ],
+            })
+    return ui
 
 
 async def handle(ws):
@@ -71,12 +125,19 @@ async def handle(ws):
             payload = msg.get("payload") or {}
 
             if kind == "chat":
-                # run_turn 是阻塞的（agent_loop 同步 LLM 调用）→ 丢到线程池，
-                # 让事件循环继续运行，writer 才能把流式事件发出去。
+                # 惰性会话：前端"新建任务"只是前端态（activeSession=null），
+                # 首条消息带 fresh=true；后端无激活会话时也强制新建。
+                # 先建会话并回发 session 信封（前端尽早拿到新会话号），
+                # 再跑 run_turn（阻塞调用丢线程池，让 writer 持续吐流式事件）。
+                if payload.get("fresh") or agent.session_num is None:
+                    await asyncio.to_thread(agent.init_session, resume=False)
+                    await ws.send(_envelope("session", {
+                        "num": agent.session_num,
+                        "message_count": 0,
+                    }))
+                    await _reply_sessions(ws)
                 await asyncio.to_thread(agent.run_turn, payload.get("text", ""))
-
-            elif kind == "session_new":
-                await asyncio.to_thread(agent.new_session)
+                # 一轮结束后回发列表，让新会话/计数即时可见
                 await _reply_sessions(ws)
 
             elif kind == "session_switch":
@@ -85,13 +146,17 @@ async def handle(ws):
                 except FileNotFoundError:
                     await ws.send(_envelope("error", {"msg": f"session {payload.get('num')} not found"}))
                 else:
-                    await ws.send(_envelope("session", {
+                    # 切换成功：把该会话历史消息回放给前端渲染（会话列表同刷）
+                    await ws.send(_envelope("session_history", {
                         "num": agent.session_num,
-                        "message_count": len(agent.history_messages),
+                        "messages": _history_to_ui(agent.history_messages),
                     }))
                     await _reply_sessions(ws)
 
             elif kind == "session_clear":
+                if agent.session_num is None:
+                    await ws.send(_envelope("error", {"msg": "当前无激活会话"}))
+                    continue
                 deleted = await asyncio.to_thread(agent.clear_session)
                 await ws.send(_envelope("session", {
                     "num": agent.session_num,
@@ -108,6 +173,10 @@ async def handle(ws):
                 await ws.send(_envelope("goal_status", {"text": text}))
 
             elif kind == "tasks":
+                # 惰性会话下可能尚未绑定 todo manager，无激活会话时给占位文本
+                if agent.session_num is None:
+                    await ws.send(_envelope("tasks", {"text": "(当前会话暂无待办)"}))
+                    continue
                 text = await asyncio.to_thread(agent.show_tasks)
                 if not text.strip():
                     text = "(当前会话暂无待办)"
@@ -145,7 +214,8 @@ async def handle(ws):
 
 
 async def _reply_sessions(ws):
-    items = await asyncio.to_thread(agent.session_manager.list_sessions)
+    sm = await asyncio.to_thread(_ensure_session_manager)
+    items = await asyncio.to_thread(sm.list_sessions)
     sessions = [_session_meta(i) for i in items]
     await ws.send(_envelope("sessions", {"sessions": sessions}))
 
