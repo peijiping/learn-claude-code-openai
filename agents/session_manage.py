@@ -15,12 +15,13 @@ session_manage.py - 会话管理模块
 """
 
 import json
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from context_compact import ContextCompact
+from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
 from paths import DEFAULT_PROJECT_SLUG, todo_file_for_session
 
 
@@ -58,6 +59,32 @@ class SessionManager:
     def format_context_label(self, messages: list) -> str:
         """格式化当前上下文窗口显示信息。"""
         return self.compact_manager.format_context_label(messages)
+
+    def set_max_context(self, max_context: str | None) -> None:
+        """设置会话级上下文窗口覆盖（如 "1M" / "128k"）。
+
+        空串/None 时恢复为环境变量/默认值。同步影响 ContextCompact 的
+        压缩阈值与前端展示的上下文上限。
+        """
+        if max_context and str(max_context).strip():
+            parsed = self.compact_manager.parse_max_context_tokens(
+                str(max_context).strip(), DEFAULT_MAX_CONTEXT_TOKENS
+            )
+            self.compact_manager.max_context_tokens = parsed
+        else:
+            self.compact_manager.max_context_tokens = self.compact_manager.parse_max_context_tokens(
+                os.environ.get("MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT_TOKENS
+            )
+
+    def context_stats_dict(self, messages: list) -> dict:
+        """计算当前消息的上下文统计 dict（供前端 context_stats 事件）。"""
+        s = self.compact_manager.context_stats(messages)
+        return {
+            "used_tokens": s.used_tokens,
+            "max_tokens": s.max_tokens,
+            "used_percent": round(s.used_percent, 1),
+            "max_label": s.max_label,
+        }
     def get_latest_session(self) -> tuple[int, Optional[Path]]:
         """
         获取最新的会话编号和文件路径
@@ -532,6 +559,56 @@ class SessionManager:
         """会话元数据索引文件（与 chat history 同目录）。"""
         return self.chat_history_dir / "index.jsonl"
 
+    def meta_file(self, num: int) -> Path:
+        """新会话独立元数据路径：{chat_history_dir}/session_{num}.meta.json。"""
+        return self.chat_history_dir / f"{self.session_prefix}{num}.meta.json"
+
+    def load_meta(self, num: int) -> Optional[dict]:
+        """读取单个会话的独立元数据；文件不存在返回 None。O(1)。"""
+        p = self.meta_file(num)
+        if not p.exists():
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def save_meta(self, meta: dict) -> None:
+        """原子写单个 meta 文件（tmp + replace，复用 save_index 的写入模式）。O(1)。"""
+        meta_path = self.meta_file(int(meta.get("num", 0)))
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = meta_path.with_suffix(meta_path.suffix + ".tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            tmp_file.replace(meta_path)
+        except Exception as e:
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
+            print(f"写入会话元数据失败: {e}")
+            raise
+
+    def _new_entry(self, num: int, file_name: str) -> dict:
+        """构造新会话的默认元数据条目（与旧 ensure_index_entry 字段一致）。"""
+        now = _now_iso()
+        return {
+            "num": num,
+            "file": file_name,
+            "title": None,
+            "title_source": "none",
+            "created_at": now,
+            "updated_at": now,
+            "status": "active",
+            "trashed_at": None,
+            "project": DEFAULT_PROJECT_SLUG,
+            "model_id": None,
+            "overrides": None,
+        }
+
     def _num_from_stem(self, stem: str) -> Optional[int]:
         """从文件 stem 解析会话编号（"session_3"/"cron_12" → 3/12）。"""
         try:
@@ -583,19 +660,25 @@ class SessionManager:
         """对账索引：目录内所有 jsonl 缺条目的补录；索引中 jsonl 已不存在的剔除。
 
         - glob 全部 *.jsonl（含其他前缀，如 cron_），避免误删别家前缀的条目
+        - 已有独立 meta 文件的会话（新方案）跳过，不写入 index.jsonl
         - 老会话补录：title=null、created_at 取文件 mtime、status=active
         """
         entries = self.load_index()
         changed = False
         existing: set[str] = set()
+        metas: set[str] = set()
         for f in self.chat_history_dir.glob("*.jsonl"):
             if f.name == self.index_file.name:
                 continue
-            existing.add(f.name)
-            if f.name in entries:
-                continue
             num = self._num_from_stem(f.stem)
             if num is None:
+                continue
+            existing.add(f.name)
+            if self.meta_file(num).exists():
+                # 新方案会话：元数据独立维护，index.jsonl 不再承载；跳过并在清理时保留
+                metas.add(f.name)
+                continue
+            if f.name in entries:
                 continue
             try:
                 mtime = datetime.fromtimestamp(f.stat().st_mtime)
@@ -614,36 +697,24 @@ class SessionManager:
                 "project": DEFAULT_PROJECT_SLUG,
             }
             changed = True
-        for key in [k for k in entries if k not in existing]:
+        for key in [k for k in entries if k not in existing and k not in metas]:
             entries.pop(key)
             changed = True
         if changed:
             self.save_index(entries)
 
     def ensure_index_entry(self, num: int) -> None:
-        """新建会话时写入初始元数据条目（已存在则跳过）。"""
-        entries = self.load_index()
-        key = self.get_session_file(num).name
-        if key in entries:
+        """新建会话时写入独立元数据文件（已存在则跳过）。O(1)。"""
+        if self.load_meta(num):
             return
-        now = _now_iso()
-        entries[key] = {
-            "num": num,
-            "file": key,
-            "title": None,
-            "title_source": "none",
-            "created_at": now,
-            "updated_at": now,
-            "status": "active",
-            "trashed_at": None,
-            "project": DEFAULT_PROJECT_SLUG,
-        }
-        self.save_index(entries)
+        key = self.get_session_file(num).name
+        self.save_meta(self._new_entry(num, key))
 
     def _update_entry(self, num: int, mutate) -> dict:
-        """加载索引 → 定位条目 → mutate(entry) → 刷新 updated_at → 原子写回。
+        """定位条目 → mutate(entry) → 刷新 updated_at → 原子写回。
 
-        条目不存在（老会话未补录）时先现场补录再更新。
+        新方案会话（存在独立 meta 文件）直接读写单文件 O(1)；
+        存量会话回退 index.jsonl 全量路径，作为兜底。
 
         Raises:
             FileNotFoundError: 会话 jsonl 不存在
@@ -653,29 +724,27 @@ class SessionManager:
             raise FileNotFoundError(f"会话 {session_file.name} 不存在")
         key = session_file.name
         with self._index_lock:
-            entries = self.load_index()
-            entry = entries.get(key)
-            if entry is None:
-                try:
-                    mtime = datetime.fromtimestamp(session_file.stat().st_mtime)
-                except OSError:
-                    mtime = datetime.now()
-                ts = mtime.isoformat(timespec="seconds")
-                entry = {
-                    "num": num,
-                    "file": key,
-                    "title": None,
-                    "title_source": "none",
-                    "created_at": ts,
-                    "updated_at": ts,
-                    "status": "active",
-                    "trashed_at": None,
-                    "project": DEFAULT_PROJECT_SLUG,
-                }
-                entries[key] = entry
-            mutate(entry)
-            entry["updated_at"] = _now_iso()
-            self.save_index(entries)
+            if self.meta_file(num).exists():
+                entry = self.load_meta(num) or self._new_entry(num, key)
+                mutate(entry)
+                entry["updated_at"] = _now_iso()
+                self.save_meta(entry)
+            else:
+                # 存量会话：走 index.jsonl 全量路径
+                entries = self.load_index()
+                entry = entries.get(key)
+                if entry is None:
+                    try:
+                        mtime = datetime.fromtimestamp(session_file.stat().st_mtime)
+                    except OSError:
+                        mtime = datetime.now()
+                    ts = mtime.isoformat(timespec="seconds")
+                    entry = self._new_entry(num, key)
+                    entry["created_at"] = entry["updated_at"] = ts
+                    entries[key] = entry
+                mutate(entry)
+                entry["updated_at"] = _now_iso()
+                self.save_index(entries)
         return entry
 
     def rename_session(self, num: int, title: str) -> dict:
@@ -698,6 +767,21 @@ class SessionManager:
         except FileNotFoundError:
             pass
 
+    def set_session_model(self, num: int, model_id: str | None = None,
+                          overrides: dict | None = None) -> dict:
+        """记录会话最后选择的模型与其参数（写入元数据，兼容新 meta 文件/存量 index）。
+
+        model_id: 该会话绑定的模型 id；None 表示不修改该项。
+        overrides: 按模型 id 分别保存的 UI 级参数覆盖
+                   { [model_id]: {thinking_strength?, max_context_option?} }；None 表示不修改。
+        """
+        def mutate(e):
+            if model_id is not None:
+                e["model_id"] = model_id
+            if overrides is not None:
+                e["overrides"] = overrides
+        return self._update_entry(num, mutate)
+
     def trash_session(self, num: int) -> dict:
         """软删除：标记 status=trashed，jsonl/todo 原样保留。"""
         return self._update_entry(
@@ -711,7 +795,11 @@ class SessionManager:
         )
 
     def delete_session_permanent(self, num: int) -> bool:
-        """永久删除会话：jsonl + 绑定的 todo 文件 + 索引行。"""
+        """永久删除会话：jsonl + 绑定的 todo 文件 + 元数据。
+
+        新方案会话（存在独立 meta 文件）删除单文件 O(1)；
+        存量会话回退移除 index.jsonl 中对应条目。
+        """
         session_file = self.get_session_file(num)
         if not session_file.exists():
             return False
@@ -727,9 +815,17 @@ class SessionManager:
                 todo_file.unlink()
         except OSError:
             pass
-        entries = self.load_index()
-        entries.pop(session_file.name, None)
-        self.save_index(entries)
+        with self._index_lock:
+            if self.meta_file(num).exists():
+                try:
+                    self.meta_file(num).unlink()
+                except OSError as e:
+                    print(f"删除会话元数据失败: {e}")
+            else:
+                # 存量会话：从 index.jsonl 移除对应条目
+                entries = self.load_index()
+                entries.pop(session_file.name, None)
+                self.save_index(entries)
         return True
 
     def list_sessions(self, status: str = "active") -> list[dict]:
@@ -755,7 +851,8 @@ class SessionManager:
                     msg_count = sum(1 for line in file if line.strip())
             except (ValueError, IOError):
                 continue
-            meta = entries.get(f.name) or {}
+            # 优先独立 meta 文件（新方案会话），否则回退 index.jsonl（存量会话）
+            meta = self.load_meta(num) or entries.get(f.name) or {}
             sessions.append({
                 "num": num,
                 "title": meta.get("title"),
@@ -766,6 +863,7 @@ class SessionManager:
                 "trashed_at": meta.get("trashed_at"),
                 "message_count": msg_count,
                 "file": f.name,
+                "model_id": meta.get("model_id"),
             })
         sessions = [s for s in sessions if s.get("status") == status]
         return sorted(sessions, key=lambda x: x["num"], reverse=True)

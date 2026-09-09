@@ -22,7 +22,7 @@ from config import load as load_config
 from llm_config import get_config, load_llm_config, save_config
 from paths import CHAT_HISTORY_DIR
 from session_manage import SessionManager
-from streaming_client import WSSink
+from session_runtime import SessionRuntimeRegistry
 
 # 启动即自举配置（Electron spawn 的 cwd 为仓库根，config.py 按 cwd 解析项目级配置）
 load_config()
@@ -31,9 +31,11 @@ load_llm_config()
 
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
 
-# 全局单 Agent（桌面端同一后端实例），静音避免打印干扰 UI。
+# 全局 Agent 仅用于：大模型配置热切换（reload_llm_bindings）、会话标题生成、
+# 以及 goal/tasks/skills 等查询；"跑对话"不再走它——并发会话各自持有一个
+# 独立 Agent（见 session_runtime.SessionRuntime），事件按 session_num 路由。
 # 惰性会话：启动不建会话（避免每次打开窗口都多一个空 jsonl），
-# 首条 chat 消息或用户切换会话时才产生/加载会话。
+# 会话号由 ws_bridge 在事件循环内确定性分配。
 agent = Agent(silent=True)
 
 
@@ -218,18 +220,25 @@ def _history_to_ui(messages: list) -> list[dict]:
 
 
 async def handle(ws):
+    loop = asyncio.get_running_loop()
     line_q: asyncio.Queue = asyncio.Queue()
 
-    # WSSink 的 send_func 是同步回调：往 asyncio 队列塞，writer 协程异步发送。
-    # 这样 agent.run_turn 跑在别的线程时，事件仍能被事件循环逐条 flush。
-    def send_func(line: str):
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            payload = {"type": "unknown", "text": line}
-        line_q.put_nowait(_envelope("event", payload))
+    # deliver(kind, payload)：把信封从任意线程（run_turn 工作线程 / 本协程）投递回
+    # 事件循环队列，writer 协程逐条 flush 到前端。必须经 loop.call_soon_threadsafe，
+    # 否则 asyncio.Queue 的 put_nowait 不会唤醒事件循环，增量会积压到 turn 结束才
+    # 一次性刷出（流式失效）。
+    def deliver(kind: str, payload: dict) -> None:
+        loop.call_soon_threadsafe(line_q.put_nowait, _envelope(kind, payload))
 
-    agent.stream_sink = WSSink(send_func=send_func)
+    async def reply_sessions() -> None:
+        await _reply_sessions(ws)
+
+    # 并发会话运行时注册表：每个会话独立 Agent + 会话级事件路由 + 独立停止。
+    # load_meta 供每会话按元数据独立绑定模型。
+    registry = SessionRuntimeRegistry(
+        deliver, reply_sessions,
+        load_meta=lambda num: (_ensure_session_manager().load_meta(num)),
+    )
 
     async def writer():
         while True:
@@ -248,56 +257,144 @@ async def handle(ws):
             payload = msg.get("payload") or {}
 
             if kind == "chat":
-                # 惰性会话：前端"新建任务"只是前端态（activeSession=null），
-                # 首条消息带 fresh=true；后端无激活会话时也强制新建。
-                # 先建会话并回发 session 信封（前端尽早拿到新会话号），
-                # 再跑 run_turn（阻塞调用丢线程池，让 writer 持续吐流式事件）。
-                fresh_created = False
-                if payload.get("fresh") or agent.session_num is None:
-                    await asyncio.to_thread(agent.init_session, resume=False)
-                    fresh_created = True
-                    await ws.send(_envelope("session", {
-                        "num": agent.session_num,
-                        "message_count": 0,
-                    }))
+                # 并发会话：每个会话由注册表里的 SessionRuntime 独立跑 run_turn，
+                # 事件按 session_num 路由到前端对应缓冲。本循环不做 await run_turn，
+                # 派发后立即继续读命令 → 任意会话可后台执行、切换不断流。
+                sm = _ensure_session_manager()
+                num = payload.get("num")
+                text = payload.get("text", "")
+                # 全新会话（前端无激活会话 / 未带 num）：事件循环内确定性领号 +
+                # 写入初始 system 消息（create_new_session 读文件取 max，必须在这个
+                # 单线程事件循环里执行，避免并发线程 race 到同一编号）。
+                if num is None:
+                    new_num, new_file = sm.create_new_session()
+                    for m in sm._build_initial_messages():
+                        sm.append_message_to_session(new_file, m)
+                    num = new_num
+                    await ws.send(_envelope("session", {"num": num, "message_count": 0}))
+                    # 新建会话首批：把前端选择的模型持久化进该会话元数据。
+                    #（参数覆盖由前端在收到 session 信封后按 UI 形状 map 写入，此处只记模型；
+                    #  chat 透传的 overrides 是已换算的单轮 resolved 形状，不宜直接落元数据。）
+                    await asyncio.to_thread(
+                        sm.set_session_model, new_num,
+                        model_id=payload.get("model_id"),
+                    )
                     await _reply_sessions(ws)
-                # 标题生成判定：新建会话、或当前会话此前没有任何真实 user 消息（首轮）
-                # 独立 daemon 线程立即启动，且先于 run_turn 提交——标题请求最先到达
-                # 服务端，不受主对话流式请求排队影响；turn 进行中即可见标题。
-                first_user_text = payload.get("text", "")
-                needs_title = fresh_created or not _has_real_user_turn(agent.history_messages)
-                if needs_title and agent.session_num is not None:
-                    _start_title_thread(ws, agent.session_num, first_user_text)
-                # run_turn 阻塞调用丢线程池，让 writer 持续吐流式事件；
-                # 标题线程与此完全解耦，无需在 turn 结束后等待
-                await asyncio.to_thread(agent.run_turn, first_user_text)
-                # 一轮结束后回发列表，让新会话/计数/标题即时可见
-                await _reply_sessions(ws)
+                rt = registry.get_or_create(num)
+                if rt.busy:
+                    # 同会话并发 turn 拒绝：避免两线程同时写同一会话 jsonl
+                    await ws.send(_envelope("error", {
+                        "msg": f"该会话 (session_{num}) 正在执行，请先用停止按钮结束后再发送",
+                    }))
+                    continue
+                # 标题：全新会话，或该会话此前从无真实 user 消息（旧会话首轮）
+                history = await asyncio.to_thread(
+                    sm.load_session_history, sm.get_session_file(num)
+                )
+                if not _has_real_user_turn(history):
+                    _start_title_thread(ws, num, text)
+                # 会话级请求覆盖：思考强度 / 更大上下文（本轮生效，内存态，不写配置）。
+                # 前端下拉悬浮面板改动后随 chat 命令带上来。
+                ov = payload.get("overrides") or {}
+                reasoning_effort = ov.get("thinking_strength") or None
+                max_context_raw = ov.get("max_context") or None
+                # 前端发送的是叠加态（standard/extended 二选一），这里已由前端换算成
+                # 具体窗口字符串；若前端仅传开关位则回落到 None（走全局）。跳过空串。
+                max_context = str(max_context_raw) if max_context_raw else None
+                # 后台线程跑 turn；事件循环继续处理其它命令（切换 / 其它会话 / stop）
+                asyncio.create_task(
+                    rt.start_turn(text, reasoning_effort=reasoning_effort,
+                                  max_context=max_context)
+                )
+
+            elif kind == "stop":
+                # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响
+                num = int(payload.get("num", 0))
+                rt = registry.get(num)
+                if rt is not None:
+                    rt.request_stop()
 
             elif kind == "session_switch":
-                try:
-                    await asyncio.to_thread(agent.switch_session, int(payload.get("num", 0)))
-                except FileNotFoundError:
-                    await ws.send(_envelope("error", {"msg": f"session {payload.get('num')} not found"}))
-                else:
-                    # 切换成功：把该会话历史消息回放给前端渲染（会话列表同刷）
+                sm = _ensure_session_manager()
+                num = int(payload.get("num", 0))
+                # 运行中的会话不读磁盘回放：turn 在途时 jsonl 可能处于
+                # "assistant(tool_calls) 已落盘、tool 响应未落盘" 的中间态，
+                # load_session_history 的孤儿清理会把它当坏数据重写文件，
+                # 截断在途消息。前端对运行中会话本就以实时缓冲为准
+                # （session_history 的 hasLive 守卫），此处回放空消息即可。
+                if registry.is_busy(num):
+                    # 消息回放跳过（以实时缓冲为准），但模型与参数仍按元数据恢复，
+                    # 保证切到运行中会话时其参数覆盖也能正确加载。
+                    meta = (await asyncio.to_thread(sm.load_meta, num)) or {}
                     await ws.send(_envelope("session_history", {
-                        "num": agent.session_num,
-                        "messages": _history_to_ui(agent.history_messages),
+                        "num": num, "messages": [],
+                        "model_id": meta.get("model_id"),
+                        "overrides": meta.get("overrides") or {},
                     }))
                     await _reply_sessions(ws)
-
-            elif kind == "session_clear":
-                if agent.session_num is None:
-                    await ws.send(_envelope("error", {"msg": "当前无激活会话"}))
                     continue
-                deleted = await asyncio.to_thread(agent.clear_session)
-                await ws.send(_envelope("session", {
-                    "num": agent.session_num,
-                    "message_count": len(agent.history_messages),
+                try:
+                    _, _, history = await asyncio.to_thread(sm.switch_session, num)
+                except FileNotFoundError:
+                    await ws.send(_envelope("error", {"msg": f"session {num} not found"}))
+                else:
+                    # 切换只是"按号读取该会话历史回放"（并刷新列表），
+                    # 不改变任何运行中会话的执行状态 → 切换不断流。
+                    # 顺带读取该会话记录的模型与参数，供前端按元数据恢复选中。
+                    meta = (await asyncio.to_thread(sm.load_meta, num)) or {}
+                    await ws.send(_envelope("session_history", {
+                        "num": num,
+                        "messages": _history_to_ui(history),
+                        "model_id": meta.get("model_id"),
+                        "overrides": meta.get("overrides") or {},
+                    }))
+                    # 切换会话后推送该会话的上下文统计（供前端圆圈指示器按会话展示）
+                    try:
+                        stats = await asyncio.to_thread(sm.context_stats_dict, history)
+                        await ws.send(_envelope("context_stats", {"num": num, **stats}))
+                    except Exception:
+                        pass
+                    await _reply_sessions(ws)
+
+            elif kind == "session_model":
+                # 记录会话最后选择的模型 + 参数到会话元数据（会话级独立绑定）；
+                # 无 num（新建任务预设态）由 chat 首条统一持久化，此处仅处理已建会话。
+                sm = _ensure_session_manager()
+                num = int(payload.get("num", 0) or 0)
+                if num <= 0:
+                    continue
+                if not sm.get_session_file(num).exists():
+                    await ws.send(_envelope("error", {"msg": f"session {num} not found"}))
+                    continue
+                model_id = payload.get("model_id")
+                overrides = payload.get("overrides") or None
+                await asyncio.to_thread(
+                    sm.set_session_model, num,
+                    model_id=model_id if model_id is not None else None,
+                    overrides=overrides if isinstance(overrides, dict) else None,
+                )
+                await ws.send(_envelope("session_model", {
+                    "num": num, "model_id": model_id, "overrides": overrides,
                 }))
                 await _reply_sessions(ws)
-                await ws.send(_envelope("error", {"msg": f"cleared {deleted} messages"}))
+
+            elif kind == "session_clear":
+                sm = _ensure_session_manager()
+                num = int(payload.get("num", 0) or 0)
+                if num <= 0:
+                    await ws.send(_envelope("error", {"msg": "当前无激活会话"}))
+                    continue
+                if registry.is_busy(num):
+                    await ws.send(_envelope("error", {
+                        "msg": f"该会话 (session_{num}) 正在执行，暂不能清空",
+                    }))
+                    continue
+                if not sm.get_session_file(num).exists():
+                    await ws.send(_envelope("error", {"msg": f"session {num} not found"}))
+                    continue
+                await asyncio.to_thread(sm.clear_session, sm.get_session_file(num))
+                await ws.send(_envelope("session", {"num": num, "message_count": 0}))
+                await _reply_sessions(ws)
 
             elif kind == "sessions_list":
                 await _reply_sessions(ws)
@@ -319,17 +416,18 @@ async def handle(ws):
             elif kind == "session_trash":
                 sm = _ensure_session_manager()
                 num = int(payload.get("num", 0))
+                # 运行中的会话禁止进回收站（后台还在写文件 / 流式输出）
+                if registry.is_busy(num):
+                    await ws.send(_envelope("error", {
+                        "msg": f"该会话 (session_{num}) 正在执行，请先停止后再删除",
+                    }))
+                    continue
                 try:
                     await asyncio.to_thread(sm.trash_session, num)
                 except (FileNotFoundError, ValueError):
                     await ws.send(_envelope("error", {"msg": f"session {num} not found"}))
                 else:
-                    # 删除的是当前激活会话：置空 agent 会话态
-                    # （惰性会话机制下，下条 chat 会自动新建）
-                    if agent.session_num == num:
-                        agent.session_num = None
-                        agent.session_file = None
-                        agent.history_messages = []
+                    registry.remove(num)
                     await _reply_sessions(ws)
 
             elif kind == "session_restore":
@@ -342,24 +440,33 @@ async def handle(ws):
                     await _reply_sessions(ws)
 
             elif kind == "session_delete":
-                # 批量永久删除：逐个执行，单条失败不断整批
+                # 批量永久删除：逐条执行，单条失败不断整批；
+                # 运行中的会话拒绝删除（后台还在写文件）
                 sm = _ensure_session_manager()
                 nums = payload.get("nums") or []
                 deleted, failed = [], []
                 for n in nums:
                     try:
                         num = int(n)
+                    except (TypeError, ValueError):
+                        continue
+                    if registry.is_busy(num):
+                        failed.append(num)
+                        continue
+                    try:
                         ok = await asyncio.to_thread(sm.delete_session_permanent, num)
                     except (TypeError, ValueError):
                         continue
                     if ok:
                         deleted.append(num)
+                        registry.remove(num)
                     else:
                         failed.append(num)
+                # 结果回发后不再全量广播 sessions：前端以 deleted[] 本地增量移除，
+                # 避免删除完成后重建整个会话列表（逐个重数 message_count）造成的刷新延迟。
                 await ws.send(_envelope("session_delete_result", {
                     "deleted": deleted, "failed": failed,
                 }))
-                await _reply_sessions(ws)
 
             elif kind == "trash_list":
                 sm = _ensure_session_manager()
@@ -399,6 +506,8 @@ async def handle(ws):
                 except ValueError as exc:
                     await ws.send(_envelope("error", {"msg": f"保存失败：{exc}"}))
                 else:
+                    # 同步所有已构造的运行时会话 Agent 的新绑定（并发后台会话也立即生效）
+                    await asyncio.to_thread(registry.reload_llm_bindings)
                     ok = result.get("applied", False)
                     await ws.send(_envelope("llm_config", {
                         "config": get_config(),

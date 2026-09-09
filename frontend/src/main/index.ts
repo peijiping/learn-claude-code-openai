@@ -88,9 +88,36 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string; fresh?: boolean }) => {
+  ipcMain.handle('agent:send', (e, payload: { text?: string; num?: number | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null }) => {
     if (!isTrustedSender(e) || !payload?.text) return
-    ws.send(JSON.stringify({ kind: 'chat', payload: { text: payload.text, fresh: !!payload.fresh } }))
+    // num 缺省/null = 新建任务（后端惰性领号建会话）；否则定位到目标会话
+    const num = typeof payload.num === 'number' ? payload.num : undefined
+    ws.send(JSON.stringify({
+      kind: 'chat',
+      payload: {
+        text: payload.text,
+        ...(num !== undefined ? { num } : {}),
+        ...(payload.overrides ? { overrides: payload.overrides } : {}),
+        ...(payload.model_id ? { model_id: payload.model_id } : {})
+      }
+    }))
+  })
+
+  ipcMain.handle('agent:setSessionModel', (e, payload: { num?: number; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => {
+    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return
+    ws.send(JSON.stringify({
+      kind: 'session_model',
+      payload: {
+        num: payload.num,
+        ...(payload.model_id ? { model_id: payload.model_id } : {}),
+        ...(payload.overrides ? { overrides: payload.overrides } : {})
+      }
+    }))
+  })
+
+  ipcMain.handle('agent:stop', (e, payload: { num?: number }) => {
+    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return
+    ws.send(JSON.stringify({ kind: 'stop', payload: { num: payload.num } }))
   })
 
   ipcMain.handle('agent:switchSession', (e, payload: { num?: number }) => {

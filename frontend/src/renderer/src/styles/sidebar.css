@@ -107,6 +107,32 @@
 .tree-chevron {
   transition: transform 0.15s;
 }
+/* 会话状态点：运行中青色脉冲 / 后台完成绿色未读，flex-none 防止挤压标题 */
+.tree-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.tree-dot.running {
+  background: var(--color-accent, #4facfe);
+  box-shadow: 0 0 0 0 rgba(79, 172, 254, 0.5);
+  animation: tree-dot-pulse 1.2s ease-out infinite;
+}
+.tree-dot.done {
+  background: #34c759;
+}
+@keyframes tree-dot-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(79, 172, 254, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(79, 172, 254, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(79, 172, 254, 0);
+  }
+}
 .tree-label {
   flex: 1;
   text-align: left;
@@ -143,7 +169,7 @@
   padding: 0 var(--sp-1);
   border: 1px solid var(--color-accent);
   border-radius: var(--radius-sm);
-  background: var(--color-bg-primary);
+  background: var(--color-bg-main);
   color: var(--color-text-primary);
   font-size: var(--fs-sm);
   outline: none;
@@ -155,7 +181,7 @@
   z-index: 950;
   min-width: 132px;
   padding: var(--sp-1);
-  background: var(--color-bg-primary);
+  background: var(--color-bg-main);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.2));

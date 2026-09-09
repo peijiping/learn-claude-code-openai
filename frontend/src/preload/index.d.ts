@@ -1,5 +1,7 @@
 export interface AgentApi {
-  send: (text: string, fresh?: boolean) => Promise<void>
+  send: (text: string, num?: number | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null) => Promise<void>
+  setSessionModel: (payload: { num?: number | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
+  stop: (num: number) => Promise<void>
   switchSession: (num: number) => Promise<{ num: number; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>

@@ -27,6 +27,13 @@ from types import SimpleNamespace
 from typing import Callable, Iterator, List, Optional
 
 
+class TurnStopped(Exception):
+    """协作式停止信号：should_stop 触发时在流式迭代中抛出，让 agent_loop 干净收尾。
+
+    与正式错误区分，调用方捕获后不得走重试/升级判定（不写入错误消息）。
+    """
+
+
 # ── 事件模型 ──────────────────────────────────────────────────
 
 class StreamEvent:
@@ -187,8 +194,12 @@ class StreamedMessage:
 
 # ── 流式消费与统一入口 ─────────────────────────────────────────
 
-def consume_stream(response, sinks: Optional[List[EventSink]] = None):
+def consume_stream(response, sinks: Optional[List[EventSink]] = None,
+                   should_stop: Optional[Callable[[], bool]] = None):
     """迭代流式响应：把增量事件分发给 sinks，同时聚合出完整消息。
+
+    should_stop: 每收到一个 chunk 前检查的可选回调；返回 True 时抛出
+    TurnStopped 提前中断迭代（协作式停止，交由调用方收尾，不补发 turn_end）。
 
     返回 (message, finish_reason, usage)：
     - message: StreamedMessage（.content / .reasoning_content / .tool_calls / model_dump）
@@ -203,6 +214,8 @@ def consume_stream(response, sinks: Optional[List[EventSink]] = None):
     usage: dict = {}
 
     for chunk in response:
+        if should_stop and should_stop():
+            raise TurnStopped()
         # include_usage 时 usage 在最后的尾包上（choices 为空）
         u = getattr(chunk, "usage", None)
         if u is not None:
@@ -296,11 +309,14 @@ def consume_stream(response, sinks: Optional[List[EventSink]] = None):
     return message, finish_reason, usage
 
 
-def streamed_create(llm, sinks: Optional[List[EventSink]] = None, **kwargs):
+def streamed_create(llm, sinks: Optional[List[EventSink]] = None,
+                    should_stop: Optional[Callable[[], bool]] = None,
+                    **kwargs):
     """统一流式入口：等价 `llm.chat.completions.create(...)` 但走流式。
 
     - llm: OpenAI SDK 实例（LLMClient().llm 或子智能体的客户端）
     - sinks: 增量事件消费者（None 表示仅内部聚合，不上任何 UI）
+    - should_stop: 协作式停止回调，见 consume_stream
     - kwargs: create() 的原生参数（model/messages/tools/max_tokens/...）
     返回 (message, finish_reason, usage)。
     """
@@ -309,4 +325,4 @@ def streamed_create(llm, sinks: Optional[List[EventSink]] = None, **kwargs):
         stream_options={"include_usage": True},
         **kwargs,
     )
-    return consume_stream(response, sinks)
+    return consume_stream(response, sinks, should_stop=should_stop)

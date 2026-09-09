@@ -26,6 +26,7 @@ config.py 不 import 本模块（避免循环依赖），由各入口点调用 l
 
 import json
 import os
+import threading
 from pathlib import Path
 
 from config import AIGENT_HOME, CREDENTIALS_FILE
@@ -41,21 +42,42 @@ PROVIDERS: dict[str, dict] = {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
         "models": [
+            # 思考强度档位：low=轻 / high=高 / very_high=极高（映射到 OpenAI 的
+            # reasoning_effort: low/high/max）；max_context 为标准上下文窗口，
+            # max_context_extended 为开启「更大上下文」后的窗口，均可被前端展示。
             {"id": "deepseek-v4-flash", "display_name": "deepseek-v4-flash",
-             "tags": ["1M"]},
+             "tags": ["1M"],
+             "max_context": "128k", "max_context_extended": "1M",
+             "thinking_strengths": ["low", "high", "very_high"],
+             "default_thinking": "high"},
             {"id": "deepseek-v4-pro", "display_name": "deepseek-v4-pro",
-             "tags": ["1M"]},
+             "tags": ["1M"],
+             "max_context": "128k", "max_context_extended": "1M",
+             "thinking_strengths": ["low", "high", "very_high"],
+             "default_thinking": "high"},
             {"id": "deepseek-v4-flash-vision-exp", "display_name": "deepseek-v4-flash-vision-exp",
-             "tags": ["1M", "图片"]},
+             "tags": ["1M", "图片"],
+             "max_context": "128k", "max_context_extended": "1M",
+             "thinking_strengths": ["low", "high", "very_high"],
+             "default_thinking": "high"},
         ],
     },
     "siliconflow": {
         "name": "硅基流动",
         "base_url": "https://api.siliconflow.cn/v1",
         "models": [
-            {"id": "deepseek-ai/DeepSeek-V3", "display_name": "DeepSeek-V3"},
-            {"id": "deepseek-ai/DeepSeek-R1", "display_name": "DeepSeek-R1"},
-            {"id": "Qwen/Qwen2.5-72B-Instruct", "display_name": "Qwen2.5-72B-Instruct"},
+            {"id": "deepseek-ai/DeepSeek-V3", "display_name": "DeepSeek-V3",
+             "max_context": "128k", "max_context_extended": "1M",
+             "thinking_strengths": ["high", "very_high"],
+             "default_thinking": "high"},
+            {"id": "deepseek-ai/DeepSeek-R1", "display_name": "DeepSeek-R1",
+             "max_context": "128k", "max_context_extended": "1M",
+             "thinking_strengths": ["high", "very_high"],
+             "default_thinking": "high"},
+            {"id": "Qwen/Qwen2.5-72B-Instruct", "display_name": "Qwen2.5-72B-Instruct",
+             "max_context": "128k",
+             "thinking_strengths": ["low", "high"],
+             "default_thinking": "high"},
         ],
     },
 }
@@ -214,3 +236,59 @@ def hint_if_missing_key() -> None:
             f"[llm_config] 未配置 API Key：请在 {CREDENTIALS_FILE} 填入 OPENAI_API_KEY，"
             "或在设置中添加模型，或设置同名环境变量"
         )
+
+
+# ── 每会话独立绑定模型：env 换绑临界区 ────────────────────────────────
+# LLMClient 在 __init__ 一次性捕获 api_key/base_url（llm_manage.create_llm），
+# run_turn 走已固化的实例、不再读 env。因此只需对「swap 会话模型 env →
+# 构造/重载 Agent」这段加全局锁，并事后恢复为全局快照，即可让每个会话
+# 独立绑定自己的模型，且不污染其它并发线程的全局 env。
+ENV_LLM_LOCK = threading.Lock()
+
+# apply_to_env() 会写入的 LLM 相关 env 键集合（快照/恢复范围与此一致）
+_LLM_ENV_KEYS = (
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL_ID",
+    "FALLBACK_MODEL_ID", "OPENAI_TEMPERATURE", "OPENAI_TOP_P",
+    "OPENAI_TOP_K", "OPENAI_MAX_OUTPUT_TOKENS", "OPENAI_TOOL_ITERATIONS",
+    "OPENAI_THINKING_MODE", "OPENAI_CONTEXT_WINDOW_IN", "OPENAI_IMAGE_INPUT",
+)
+
+
+def snapshot_llm_env() -> dict:
+    """捕获当前 LLM env 键现值，供 build_agent 换绑后恢复。"""
+    return {k: os.environ.get(k) for k in _LLM_ENV_KEYS}
+
+
+def restore_llm_env(snap: dict) -> None:
+    """按快照恢复 LLM env；快照中不存在的键则剔除。"""
+    for k in _LLM_ENV_KEYS:
+        val = snap.get(k)
+        if val is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = val
+
+
+def apply_model_to_env(model_id: str | None) -> bool:
+    """把指定模型（llmconfig.json 中某个条目）临时映射进 env。
+
+    返回 True 表示 env 已被该模型的配置覆盖（含高级设置）；返回 False 表示
+    未改动 env（model_id 为空 / 文件缺失或损坏 / 未找到该模型），此时调用方
+    应沿用当前全局 env 构造 Agent。必须配合 snapshot/restore 在临界区内使用。
+    """
+    if not model_id:
+        return False
+    try:
+        data = json.loads(LLM_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    models = [m for m in data.get("models", []) if m and isinstance(m, dict)]
+    if not any(m.get("id") == model_id for m in models):
+        return False
+    # 临时数据：克隆全部模型并启用，使 apply_to_env 能选中目标模型、推导 fallback
+    ephemeral = {
+        "active_model_id": model_id,
+        "models": [dict(m, enabled=True) for m in models],
+    }
+    apply_to_env(ephemeral)
+    return True

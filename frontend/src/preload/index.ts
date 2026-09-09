@@ -5,9 +5,19 @@ import { contextBridge, ipcRenderer } from 'electron'
  * 只暴露白名单 API（不透出原始 ipcRenderer），contextIsolation 开启下安全。
  */
 const agent = {
-  /** 发起一次对话；fresh=true 表示当前无激活会话（新建任务后的首条消息），后端据此惰性建会话 */
-  send: (text: string, fresh = false): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, fresh }),
+  /** 发起一次对话；num=目标会话号（新建任务时传 null/缺省，后端惰性领号建会话）。
+   * overrides=当前会话请求级覆盖（思考强度/更大上下文），随本轮请求带上。
+   * modelId=当前会话绑定模型，新建任务随首条消息持久化。 */
+  send: (text: string, num?: number | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, num, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}) }),
+
+  /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
+   * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
+  setSessionModel: (payload: { num?: number | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }): Promise<void> =>
+    ipcRenderer.invoke('agent:setSessionModel', payload),
+
+  /** 停止指定会话正在执行的那一轮（其它后台会话不受影响） */
+  stop: (num: number): Promise<void> => ipcRenderer.invoke('agent:stop', { num }),
 
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (num: number): Promise<{ num: number; message_count: number }> =>

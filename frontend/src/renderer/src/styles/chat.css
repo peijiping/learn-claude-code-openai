@@ -281,6 +281,8 @@
   border-radius: var(--radius-sm);
   font-size: var(--fs-sm);
   color: var(--color-text-primary);
+  /* 现在是 div（非 button），需显式加手型；div 无 UA 边框/背景 */
+  cursor: pointer;
 }
 .model-menu-item:hover {
   background: var(--color-bg-hover);
@@ -308,6 +310,122 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 模型悬浮配置面板：思考强度 + 更大上下文。
+   定位交给由 createPortal 渲染到 body 顶层的包装层（fixed + JS 计算坐标 + z-index），
+   本类只负责视觉样式；用 overflow:visible 保证内容不被裁剪 */
+.model-hover-panel {
+  min-width: 200px;
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop);
+  padding: var(--sp-3);
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.mhp-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.mhp-title {
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.mhp-strengths {
+  display: flex;
+  gap: var(--sp-1);
+}
+.mhp-chip {
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.mhp-chip:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.mhp-chip.active {
+  background: linear-gradient(135deg, var(--color-action-left), var(--color-action-right));
+  border-color: transparent;
+  color: #fff;
+}
+.mhp-switch {
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--color-border);
+  border: none;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.2s;
+}
+.mhp-switch.on {
+  background: var(--color-accent);
+}
+.mhp-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.2s;
+}
+.mhp-switch.on .mhp-switch-knob {
+  transform: translateX(16px);
+}
+.mhp-hint {
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+/* 上下文使用量圆圈指示器 */
+.context-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  cursor: default;
+  position: relative;
+}
+.context-circle {
+  width: 24px;
+  height: 24px;
+}
+.context-bg {
+  stroke: var(--color-bg-hover);
+}
+.context-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-pop);
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  z-index: 950;
+  pointer-events: none;
 }
 .send-btn:disabled {
   opacity: 0.5;

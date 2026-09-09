@@ -69,6 +69,14 @@ class SystemPromptBuilder:
         workspace_block = f"\n{workspace_section}\n" if workspace_section else ""
         return f"""你是一个专业的编程助手，工作目录是 {self.workdir}，所有操作仅限在该目录下进行。
 {workspace_block}
+# 回复输出格式（Markdown）
+你的回复展示在桌面客户端的 Markdown 渲染界面中，**所有回复必须使用 Markdown 格式**：
+- 标题用 `#`/`##`/`###` 分级，列表用 `-` 或 `1.`，强调用 `**粗体**`/`*斜体*`
+- 代码、命令、文件名、路径一律用行内代码（反引号）或代码块（```lang ... ```）包裹，代码块必须标注语言
+- 结构化内容（多字段、多方案对比、参数说明等）优先用表格呈现
+- 引用文件路径或代码位置时使用 Markdown 链接（`[文件名](file:///绝对路径#L行号)`）格式
+- 段落之间保留空行；不要输出纯文本大段堆砌，也不要用 Markdown 之外的标记（如 HTML 标签）排版
+
 # 上下文保护规则（最高优先级）
 上下文窗口有限，每次工具调用都消耗它。
 - **禁止**对二进制文件（PDF、图片、压缩包）使用 strings / cat / hexdump

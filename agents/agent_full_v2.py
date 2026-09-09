@@ -17,6 +17,7 @@ agent_full_v2.py - 主智能体引擎（Agent 类）
 
 import json
 import os
+import threading
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -41,7 +42,7 @@ from system_prompt import SystemPromptBuilder
 from error_recovery import ErrorRecovery, RecoveryAction
 from hooks import HookSystem
 from utils import truncate_chars
-from streaming_client import PrintSink, streamed_create
+from streaming_client import PrintSink, StreamEvent, streamed_create, TurnStopped
 
 
 # 加载环境变量
@@ -84,6 +85,13 @@ class Agent:
         self.silent = silent
         # 主循环的 CLI 增量输出 sink（流式 thinking/content 逐字打印）
         self.stream_sink = PrintSink(silent=self.silent)
+
+        # ── 会话级请求覆盖（仅本会话生效，不写 llmconfig.json，不影响其它会话）──
+        # 由 ws_bridge 在发新请求前设置；None = 用全局 env 配置。
+        self._request_overrides: dict[str, str | None] = {
+            "reasoning_effort": None,  # low/high/very_high（思考强度）
+            "max_context": None,       # 字符串如 "1M" / "128k"（更大上下文）
+        }
 
         # ── 依赖（默认惰性构造；允许外部注入，多实例可共享/自定义） ──
         self.skills = skills if skills is not None else SkillLoader(SKILLS_DIR)
@@ -179,6 +187,13 @@ class Agent:
         self.session_file: Path | None = None
         self.history_messages: list = []
 
+        # ── 协作式停止：request_stop() 置位，run_turn/agent_loop 轮询并干净收尾 ──
+        self._stop_evt = threading.Event()
+
+    def request_stop(self) -> None:
+        """请求停止当前 turn（线程安全）。只影响本会话的这次执行。"""
+        self._stop_evt.set()
+
     def reload_llm_bindings(self) -> dict:
         """
         配置热切换：进程内就地重建全部 LLM 绑定，无需重启。
@@ -228,12 +243,33 @@ class Agent:
         return val if val > 0 else Agent.MAX_AGENT_ITERATIONS
 
     @staticmethod
-    def _advanced_llm_kwargs() -> dict:
+    def _map_reasoning_effort(strength: str | None) -> str:
+        """思考强度档位 → reasoning_effort 取值。
+
+        low=轻 → low；high=高 → high；very_high=极高 → max（DeepSeek API 取值）。
+        无法识别时返回 None，走默认。
+        """
+        return {"low": "low", "high": "high", "very_high": "max"}.get(strength)
+
+    def set_request_overrides(self, reasoning_effort: str | None = None,
+                              max_context: str | None = None) -> None:
+        """设置当前会话的请求级覆盖（仅本会话生效，不写配置文件）。
+
+        reasoning_effort: low/high/very_high 思考强度档位，None 表示用全局配置。
+        max_context: 字符串如 "1M" / "128k"，None 表示用全局配置。
+        """
+        self._request_overrides["reasoning_effort"] = reasoning_effort
+        self._request_overrides["max_context"] = max_context
+
+    def _advanced_llm_kwargs(self) -> dict:
         """高级设置 → LLM 调用参数（chat.completions.create 的 kwargs）。
 
         llmconfig.json 中主模型的高级配置经 apply_to_env() 映射进 env，
         这里读取并合成调用参数；未配置的项走原默认
         （temperature=0.5、思考开启 reasoning_effort=high）。
+
+        会话级覆盖（self._request_overrides）优先于全局 env 配置，
+        用于「当前会话新一轮请求直接生效」的思考强度/更大上下文。
         """
         kwargs: dict = {}
         temp = os.environ.get("OPENAI_TEMPERATURE", "").strip()
@@ -255,9 +291,14 @@ class Agent:
                 extra_body["top_k"] = int(float(top_k))
             except ValueError:
                 pass
-        # 思考模式：default/enabled → 思考开启（原默认行为）；disabled → 显式关闭
+        # 思考档位：会话覆盖 > 全局思考模式 env（default/enabled → 思考开启，disabled → 关闭）
+        strength = self._request_overrides.get("reasoning_effort")
+        effort = self._map_reasoning_effort(strength) if strength else None
         mode = os.environ.get("OPENAI_THINKING_MODE", "default")
-        if mode == "disabled":
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+            extra_body["thinking"] = {"type": "enabled"}
+        elif mode == "disabled":
             extra_body["thinking"] = {"type": "disabled"}
         else:
             kwargs["reasoning_effort"] = "high"
@@ -311,6 +352,7 @@ class Agent:
         """
         # 目标循环（s17）：每轮查询（用户输入 / cron 触发）都是全新过程，
         # 重置连续 block 计数，避免上一轮的 block 累计误判触发 limit
+        self._stop_evt.clear()  # 新一轮开始，清掉可能遗留的停止信号
         self.goal_controller.begin_query()
         self.hook_system.trigger("UserPromptSubmit", user_query)
         self.history_messages.append({"role": "user", "content": user_query})
@@ -340,6 +382,13 @@ class Agent:
         切换到指定会话，绑定对应 todo 并注入 reminder。
         返回 (会话编号, 消息数)；会话不存在时抛 FileNotFoundError。
         """
+        # 惰性构建（同 init_session）：桌面端 SessionRuntime.build_agent 会直接
+        # 对全新 Agent 实例调 switch_session，此时 session_manager 尚为 None
+        if self.session_manager is None:
+            self.session_manager = SessionManager(
+                CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
+                session_prefix=self.session_prefix,
+            )
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.switch_session(target_num)
         self.tools.set_todo_manager(self.session_num)
@@ -544,6 +593,12 @@ class Agent:
         # 这样可以保证记忆、工具、skill的实时更新，但会影响缓存未命中率。
 
         while True:
+            # 协作式停止：请求停止后，在进入下一轮（再次调 LLM/工具）前提前收尾
+            if self._stop_evt.is_set():
+                self.stream_sink.emit(StreamEvent(type="turn_end", finish_reason="stop"))
+                self._stop_evt.clear()
+                break
+
             iteration += 1
             if iteration > self.max_agent_iterations:
                 self._print(
@@ -569,6 +624,7 @@ class Agent:
                     streamed_create(
                         self.llm_client,
                         sinks=[self.stream_sink],
+                        should_stop=self._stop_evt.is_set,
                         model=mdl,
                         messages=self.history_messages,
                         max_tokens=mt,
@@ -587,6 +643,13 @@ class Agent:
                 if usage:
                     self.total_tokens += int(usage.get("prompt_tokens", 0) or 0) \
                         + int(usage.get("completion_tokens", 0) or 0)
+
+            except TurnStopped:
+                # 协作式停止：中途打断流式，不写入错误消息、不重试，
+                # 补发 turn_end 让前端把流式标记复位后干净收尾本轮。
+                self.stream_sink.emit(StreamEvent(type="turn_end", finish_reason="stop"))
+                self._stop_evt.clear()
+                return
 
             except Exception as e:
                 # 外层异常处理：内层 with_retry 主动 raise 出来的"非临时错误"会到这一层。

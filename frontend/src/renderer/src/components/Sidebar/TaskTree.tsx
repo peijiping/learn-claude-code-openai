@@ -10,6 +10,9 @@ export default function TaskTree(): JSX.Element {
   const sessions = useAgentStore((s) => s.sessions)
   const activeSession = useAgentStore((s) => s.activeSession)
   const isSending = useAgentStore((s) => s.isSending)
+  const runningSessions = useAgentStore((s) => s.runningSessions)
+  const bgSessions = useAgentStore((s) => s.bgSessions)
+  const completedBg = useAgentStore((s) => s.completedBg)
   const switchSession = useAgentStore((s) => s.switchSession)
   const newSession = useAgentStore((s) => s.newSession)
   const renameSession = useAgentStore((s) => s.renameSession)
@@ -70,6 +73,13 @@ export default function TaskTree(): JSX.Element {
             onContextMenu={(e) => openMenu(e, s)}
           >
             <Icon name="chevronRight" size={12} className="tree-chevron" />
+            {runningSessions.includes(s.num) ? (
+              <span className="tree-dot running" title="执行中" />
+            ) : bgSessions.includes(s.num) ? (
+              <span className="tree-dot running" title="后台任务执行中" />
+            ) : completedBg.includes(s.num) ? (
+              <span className="tree-dot done" title="已完成，点击查看" />
+            ) : null}
             {renaming === s.num ? (
               <input
                 className="tree-rename-input"
