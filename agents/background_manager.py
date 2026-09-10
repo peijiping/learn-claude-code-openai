@@ -11,6 +11,7 @@ BackgroundManager —— 适配 OpenAI SDK 的后台任务管理器
    background_manager 只负责"启动线程 + 收集通知"两件事。
 """
 import threading
+import time
 from typing import Callable
 
 
@@ -83,6 +84,7 @@ class BackgroundManager:
         )
 
         def worker():
+            started = time.monotonic()
             try:
                 result = executor()
                 if not isinstance(result, str):
@@ -92,6 +94,10 @@ class BackgroundManager:
             with self.background_lock:
                 self.background_tasks[bg_id]["status"] = "completed"
                 self.background_results[bg_id] = result
+            # 完成即打点（含耗时）：区分"任务真完成"与"结果尚未注入主循环"
+            elapsed = time.monotonic() - started
+            print(f"  \033[33m[background] completed {bg_id} ({elapsed:.1f}s): "
+                  f"{cmd[:40]}\033[0m")
 
         with self.background_lock:
             self.background_tasks[bg_id] = {
@@ -148,6 +154,18 @@ class BackgroundManager:
         with self.background_lock:
             return any(
                 t["status"] == "running"
+                for t in self.background_tasks.values()
+            )
+
+    # 是否有"已完成但尚未注入通知"的后台结果（auto-followup 用途）：
+    # 完成后台任务的 watch 结束、但结果还没被主智能体消费过（collect
+    # 才会把 completed → notified）时返回 True，供会话运行时决定是否
+    # 自动续一轮 turn，让主智能体拿到 task_notification 并给出最终总结。
+    def has_completed_pending(self) -> bool:
+        """Return True if any finished background result is not yet consumed."""
+        with self.background_lock:
+            return any(
+                t["status"] == "completed"
                 for t in self.background_tasks.values()
             )
 

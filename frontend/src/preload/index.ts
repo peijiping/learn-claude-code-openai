@@ -42,11 +42,22 @@ const agent = {
   tasks: (): Promise<string> => ipcRenderer.invoke('agent:tasks'),
   skills: (): Promise<string> => ipcRenderer.invoke('agent:skills'),
   getConnectionStatus: (): Promise<string> => ipcRenderer.invoke('agent:connectionStatus'),
+  /** 拉取后端仍在运行会话的执行状态（重放 session_status），恢复前端运行指示 */
+  queryStatus: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('agent:queryStatus'),
 
   /** 大模型配置（llmconfig.json）：读 / 保存（保存即热切换生效） */
   llmConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:llmConfigGet'),
   llmConfigSave: (config: unknown): Promise<unknown> =>
     ipcRenderer.invoke('agent:llmConfigSave', { config }),
+
+  /** 刷新某连接的可用模型列表（GET {base_url}/models）；api_key 留空时后端回退已保存密钥 */
+  llmModelsFetch: (payload: {
+    base_url?: string
+    api_key?: string
+    connection_id?: string
+    api_format?: string
+    models_path?: string
+  }): Promise<unknown> => ipcRenderer.invoke('agent:llmModelsFetch', payload),
 
   /** 订阅后端事件与连接状态变化（返回取消订阅函数） */
   onEvent: (cb: (e: unknown) => void): (() => void) => {

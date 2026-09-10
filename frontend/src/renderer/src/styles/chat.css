@@ -111,6 +111,46 @@
   font-size: var(--fs-sm);
   color: var(--color-text-secondary);
 }
+
+/* 子智能体执行块：机器人头标识，内容折叠在块下 */
+.subagent-box {
+  margin-bottom: var(--sp-2);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.subagent-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-3);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.subagent-header:hover {
+  background: var(--color-bg-hover);
+}
+.subagent-header .rot {
+  transform: rotate(90deg);
+}
+.subagent-icon {
+  display: flex;
+  color: #7c6cff;
+}
+.subagent-name {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.subagent-content {
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--color-border);
+}
 .toolbar-icon {
   color: #c78a2c;
   display: flex;

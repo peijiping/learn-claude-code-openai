@@ -14,8 +14,18 @@ export interface AgentApi {
   tasks: () => Promise<string>
   skills: () => Promise<string>
   getConnectionStatus: () => Promise<string>
+  /** 拉取后端仍在运行会话的执行状态（重放 session_status），恢复前端运行指示 */
+  queryStatus: () => Promise<{ ok: boolean }>
   llmConfigGet: () => Promise<unknown>
   llmConfigSave: (config: unknown) => Promise<unknown>
+  /** 刷新某连接可用模型列表（GET {base_url}/models；api_key 留空回退已保存密钥） */
+  llmModelsFetch: (payload: {
+    base_url?: string
+    api_key?: string
+    connection_id?: string
+    api_format?: string
+    models_path?: string
+  }) => Promise<unknown>
   onEvent: (cb: (e: unknown) => void) => () => void
   onStatus: (cb: (status: string) => void) => () => void
   onPythonStatus: (cb: (status: string) => void) => () => void

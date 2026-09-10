@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, UiEvent, LlmConfig, LlmModel } from '@protocols/agentProtocol'
+import type { AgentEvent, ContextStats, HistoryMessage, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, UiEvent, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -58,21 +58,33 @@ export function resolveOverridesPayload(
   return hasOverride ? payload : undefined
 }
 
-/** 解析某模型的服务商预置元数据（通过 provider + model id 在 providers 里查找）。 */
+/** 解析某模型的元数据（窗口 / 思考档位）：
+ * 模型自身字段优先（后端归一化时已从预置目录继承过来，自定义模型则来自手动填写），
+ * 回落预置目录（~/.aigent/providers.json）。都拿不到时返回 null（不渲染悬浮面板）。 */
 export function resolveModelMeta(
   llmConfig: LlmConfig | null,
-  model: LlmModel | null | undefined
+  model: (LlmModel | LlmConnectionModel) | null | undefined
 ): { max_context?: string; max_context_extended?: string; thinking_strengths?: string[]; default_thinking?: string } | null {
-  if (!llmConfig || !model) return null
-  const provider = llmConfig.providers?.[model.provider]
-  const preset = provider?.models?.find((p) => p.id === (model.model || model.id))
-  if (!preset) return null
-  return {
-    max_context: preset.max_context,
-    max_context_extended: preset.max_context_extended,
-    thinking_strengths: preset.thinking_strengths,
-    default_thinking: preset.default_thinking,
+  if (!model) return null
+  const providerKey = (model as LlmModel).provider
+  const preset = providerKey
+    ? llmConfig?.providers?.[providerKey]?.models?.find((p) => p.id === (model.model || model.id))
+    : undefined
+  const meta = {
+    max_context: model.max_context ?? preset?.max_context,
+    max_context_extended: model.max_context_extended ?? preset?.max_context_extended,
+    thinking_strengths: model.thinking_strengths ?? preset?.thinking_strengths,
+    default_thinking: model.default_thinking ?? preset?.default_thinking,
   }
+  if (!meta.max_context && !meta.max_context_extended && !meta.thinking_strengths) return null
+  return meta
+}
+
+/** 厂商小圆点样式类：预置厂商用专属配色，自定义厂商留空（走中性样式）。 */
+export function providerDot(provider: string | undefined | null): string {
+  if (provider === 'deepseek') return 'dp'
+  if (provider === 'siliconflow') return 'sf'
+  return ''
 }
 
 /** SessionOverridesMap（UI 形状，按模型 id）→ 后端元数据存储形状（按模型 id 的 thinking_strength / max_context_option） */
@@ -112,12 +124,25 @@ export interface ToolCallMsg {
   status: 'running' | 'done'
 }
 
+/** 子智能体执行块：挂在 assistant 消息下，展示其思考过程与工具执行（可折叠） */
+export interface SubAgentMsg {
+  /** 后端下发的子任务 id（事件按此路由） */
+  id: string
+  name: string
+  thinking: string
+  toolCalls: ToolCallMsg[]
+  activeToolId: string | null
+  streaming: boolean
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
   thinking: string
   toolCalls: ToolCallMsg[]
+  /** 本消息内调用过的子智能体执行块（按后端 subagent_id 累积） */
+  subagents: SubAgentMsg[]
   activeToolId: string | null
   streaming: boolean
   usage: Record<string, number>
@@ -175,7 +200,15 @@ interface AgentState {
   openSettings: (tab?: SettingsTab) => void
   closeSettings: () => void
   loadLlConfig: () => Promise<void>
-  saveLlConfig: (config: LlmConfig) => Promise<boolean>
+  saveLlConfig: (config: LlmConfigPayload) => Promise<boolean>
+  /** 刷新某连接可用模型列表（GET {base_url}{models_path}），返回模型 id 列表（失败返回空） */
+  fetchModels: (payload: {
+    base_url?: string
+    api_key?: string
+    connection_id?: string
+    api_format?: string
+    models_path?: string
+  }) => Promise<string[]>
   setActiveModel: (id: string) => Promise<void>
   setSessionModel: (id: string) => void
   setSessionOverrides: (overrides: SessionOverrides | null, modelId: string) => void
@@ -191,21 +224,64 @@ function addUnique(arr: number[], n: number): number[] {
 }
 
 function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
-  return hist.map((m, i) => ({
-    id: `h${num}_${i}`,
-    role: m.role,
-    content: m.content ?? '',
-    thinking: m.thinking ?? '',
-    toolCalls: (m.toolCalls ?? []).map((t, j) => ({
-      id: `h${num}_${i}_${j}`,
-      name: t.name,
-      args: t.args,
-      status: 'done' as const
-    })),
-    activeToolId: null,
-    streaming: false,
-    usage: {}
-  }))
+  return hist.map((m, i) => {
+    // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
+    // 数据未落盘），则从主 toolCalls 里的 sub_agent 调用派生一张基础卡片，
+    // 保证回放时 sub_agent 永远以卡片形式展示（与流式执行一致），绝不以普通工具条出现。
+    const backendSubs = (m.subagents ?? []).map((s, k) => ({
+      id: s.id,
+      name: s.name,
+      thinking: s.thinking ?? '',
+      toolCalls: (s.toolCalls ?? []).map((t, l) => ({
+        id: `h${num}_${i}_s${k}_${l}`,
+        name: t.name,
+        args: t.args,
+        status: t.status === 'running' ? ('running' as const) : ('done' as const)
+      })),
+      activeToolId: null,
+      streaming: false
+    }))
+    // 主 toolCalls 里的 sub_agent 调用 → 从中派生兜底卡片（含 prompt 作为名称），并从 toolCalls 剥离
+    const subCalls = (m.toolCalls ?? []).filter((t) => t.name === 'sub_agent')
+    const derivedSubs = subCalls.map((call, k) => ({
+      id: `h${num}_${i}_submain_${k}`,
+      name: subAgentNameFromArgs(call.args),
+      thinking: '',
+      toolCalls: [],
+      activeToolId: null,
+      streaming: false
+    }))
+    const subagents = backendSubs.length ? backendSubs : derivedSubs
+    const normalCalls = (m.toolCalls ?? []).filter((t) => t.name !== 'sub_agent')
+    return {
+      id: `h${num}_${i}`,
+      role: m.role,
+      content: m.content ?? '',
+      thinking: m.thinking ?? '',
+      toolCalls: normalCalls.map((t, j) => ({
+        id: `h${num}_${i}_${j}`,
+        name: t.name,
+        args: t.args,
+        status: t.status === 'running' ? ('running' as const) : ('done' as const)
+      })),
+      activeToolId: null,
+      streaming: false,
+      subagents,
+      usage: {}
+    }
+  })
+}
+
+/** 从 sub_agent 工具调用参数中提取可读名称作为卡片标题（无参数解析失败时回退到「子智能体」） */
+function subAgentNameFromArgs(args: string): string {
+  try {
+    const parsed = JSON.parse(args || '{}')
+    const prompt = (parsed.prompt || parsed.task || '').trim()
+    if (prompt) return prompt.length > 48 ? prompt.slice(0, 48) + '…' : prompt
+  } catch {
+    /* 参数非 JSON，走回退名 */
+  }
+  return '子智能体'
 }
 
 /** Toast 自动消失计时器：重复触发时重置，避免旧计时器提前清掉新提示 */
@@ -221,9 +297,16 @@ export function showToast(msg: string, type: 'info' | 'error' = 'info', ms = 300
   }, ms)
 }
 
-/** 把一条会话内流式增量事件合并进「指定会话」的缓冲（纯函数，增量 append 形成打字机效果） */
+/** 把一条会话内流式增量事件合并进「指定会话」的缓冲（纯函数，增量 append 形成打字机效果）。
+ * 带 subagent_id 的事件（子智能体发出）路由到 applySubagentEvent，折叠进子智能体块；
+ * 其余按主消息原逻辑处理。 */
 function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
   let msgs = buffer
+
+  // 子智能体事件单独分流（思考/工具/生命周期都进对应子智能体块）
+  if (ev.subagent_id) {
+    return applySubagentEvent(msgs, ev)
+  }
 
   const ensureAssistant = (): string => {
     const last = msgs[msgs.length - 1]
@@ -231,7 +314,7 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', toolCalls: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
     ]
     return id
   }
@@ -253,6 +336,9 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     }
     case 'tool_call_start': {
       const id = ensureAssistant()
+      // sub_agent 调用不进主工具条：子智能体展示统一由 SubAgentBlock 卡片承载
+      //（sub_agent_start 事件创建），避免普通工具条与卡片并存/重复。
+      if (ev.tool_name === 'sub_agent') return msgs
       msgs = msgs.map((m) => {
         if (m.id !== id) return m
         const hasRunning = m.toolCalls.some((t) => t.status === 'running')
@@ -298,6 +384,127 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
   return msgs
 }
 
+/** 子智能体事件：路由进「最后一条 assistant 消息」的子智能体块（与主消息互不干扰）。
+ * 块不存在时先创建（sub_agent_start / 首个 thinking / 首个工具事件都能触发）。 */
+function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
+  const subId = ev.subagent_id ?? ''
+  if (!subId) return msgs
+
+  const ensureAssistant = (): string => {
+    const last = msgs[msgs.length - 1]
+    if (last && last.role === 'assistant' && last.streaming) return last.id
+    const id = mid()
+    msgs = [
+      ...msgs,
+      { id, role: 'assistant', content: '', thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+    ]
+    return id
+  }
+  const ensureSubagent = (msgId: string, name: string): [Message[], SubAgentMsg] => {
+    const m = msgs.find((x) => x.id === msgId) as Message
+    const existing = m.subagents.find((s) => s.id === subId)
+    if (existing) return [msgs, existing]
+    const block: SubAgentMsg = { id: subId, name, thinking: '', toolCalls: [], activeToolId: null, streaming: true }
+    msgs = msgs.map((x) => (x.id === msgId ? { ...x, subagents: [...x.subagents, block] } : x))
+    return [msgs, block]
+  }
+  const patchSub = (msgId: string, patch: Partial<SubAgentMsg>): Message[] =>
+    msgs.map((m) =>
+      m.id === msgId
+        ? { ...m, subagents: m.subagents.map((s) => (s.id === subId ? { ...s, ...patch } : s)) }
+        : m
+    )
+
+  switch (ev.type) {
+    case 'sub_agent_start': {
+      const id = ensureAssistant()
+      msgs = ensureSubagent(id, ev.text || '子智能体')[0]
+      break
+    }
+    case 'thinking_delta': {
+      const id = ensureAssistant()
+      const block = ensureSubagent(id, '子智能体')[1]
+      msgs = patchSub(id, { thinking: block.thinking + (ev.text ?? '') })
+      break
+    }
+    case 'tool_call_start': {
+      const id = ensureAssistant()
+      const block = ensureSubagent(id, '子智能体')[1]
+      const hasRunning = block.toolCalls.some((t) => t.status === 'running')
+      if (!hasRunning) {
+        const toolCalls = [
+          ...block.toolCalls,
+          { id: ev.tool_id || `t${Date.now()}`, name: ev.tool_name ?? '', args: ev.args ?? '', status: 'running' as const }
+        ]
+        msgs = patchSub(id, { toolCalls, activeToolId: toolCalls[toolCalls.length - 1].id })
+      }
+      break
+    }
+    case 'tool_call_delta': {
+      const id = ensureAssistant()
+      msgs = msgs.map((m) =>
+        m.id === id
+          ? {
+              ...m,
+              subagents: m.subagents.map((s) =>
+                s.id === subId && s.activeToolId
+                  ? {
+                      ...s,
+                      toolCalls: s.toolCalls.map((t) =>
+                        t.id === s.activeToolId && t.status === 'running'
+                          ? { ...t, args: t.args + (ev.args ?? '') }
+                          : t
+                      )
+                    }
+                  : s
+              )
+            }
+          : m
+      )
+      break
+    }
+    case 'tool_call': {
+      const id = ensureAssistant()
+      msgs = msgs.map((m) =>
+        m.id === id
+          ? {
+              ...m,
+              subagents: m.subagents.map((s) =>
+                s.id === subId
+                  ? {
+                      ...s,
+                      toolCalls: s.toolCalls.map((t) =>
+                        t.id === (ev.tool_id || '')
+                          ? { ...t, args: ev.args || t.args, name: ev.tool_name || t.name, status: 'done' as const }
+                          : t
+                      ),
+                      activeToolId: null
+                    }
+                  : s
+              )
+            }
+          : m
+      )
+      break
+    }
+    case 'sub_agent_end': {
+      const id = ensureAssistant()
+      msgs = msgs.map((m) => {
+        if (m.id !== id) return m
+        const subagents = m.subagents.map((s) => (s.id === subId ? { ...s, streaming: false } : s))
+        // 后台子智能体场景：消息可能仅为装载子智能体块而建（无正文/思考/工具），
+        // 全部块结束后同步收起其流式态，避免留下永久光标。
+        // 前台场景该消息必有主层 tool_calls/正文，不受影响（由主 turn_end 收尾）。
+        const blockOnly = !m.content && !m.thinking && m.toolCalls.length === 0
+        const allDone = subagents.every((s) => !s.streaming)
+        return { ...m, subagents, streaming: blockOnly && allDone ? false : m.streaming }
+      })
+      break
+    }
+  }
+  return msgs
+}
+
 function mapMsg(msgs: Message[], id: string, patch: Partial<Message>): Message[] {
   return msgs.map((m) => (m.id === id ? { ...m, ...patch } : m))
 }
@@ -327,7 +534,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   toast: null,
   toastType: 'info',
 
-  setConnection: (c) => set({ connection: c }),
+  setConnection: (c) =>
+    set((s) => {
+      if (c === s.connection) return s
+      // 断线重连（→ connected）：清空陈旧运行态。后端会在新连接上重放
+      // 仍在运行会话的 session_status（running/background），重新点亮真实
+      // 运行指示；清空防止断连期间的状态残留（如永远转圈的僵尸会话）。
+      if (c === 'connected' && s.connection !== 'connected') {
+        return { ...s, connection: c, runningSessions: [], bgSessions: [], isSending: false }
+      }
+      return { ...s, connection: c }
+    }),
   setPython: (p) => set({ python: p }),
 
   send: (text) => {
@@ -337,10 +554,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const modelId = get().sessionModelId
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
     const userMsg: Message = {
-      id: mid(), role: 'user', content: t, thinking: '', toolCalls: [], activeToolId: null, streaming: false, usage: {}
+      id: mid(), role: 'user', content: t, thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: {}
     }
     const assMsg: Message = {
-      id: mid(), role: 'assistant', content: '', thinking: '', toolCalls: [], activeToolId: null, streaming: true, usage: {}
+      id: mid(), role: 'assistant', content: '', thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {}
     }
     set((s) => {
       // 新建任务（尚无会话号）：首条消息进临时草稿缓冲，等后端 session 信封迁移
@@ -694,10 +911,27 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set({ llmSaving: false })
     }
   },
+  fetchModels: async (payload) => {
+    try {
+      const res = (await window.agent.llmModelsFetch(payload)) as LlmModelsResult | null
+      if (!res) {
+        showToast('获取模型列表超时', 'error', 4000)
+        return []
+      }
+      if (!res.ok) {
+        showToast(res.error || '获取模型列表失败', 'error', 5000)
+        return []
+      }
+      return (res.models ?? []).map((m) => m.id).filter(Boolean)
+    } catch {
+      showToast('获取模型列表失败', 'error', 4000)
+      return []
+    }
+  },
   setActiveModel: async (id) => {
     const cfg = get().llmConfig
     if (!cfg) return
-    await get().saveLlConfig({ active_model_id: id, models: cfg.models })
+    await get().saveLlConfig({ active_model_id: id, connections: cfg.connections ?? [] })
   },
   setSessionModel: (id) => {
     set({ sessionModelId: id, lastSessionModelId: id })

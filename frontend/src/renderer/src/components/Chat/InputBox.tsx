@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '@components/common/Icon'
-import { useAgentStore, resolveModelMeta } from '@store/agentStore'
+import { useAgentStore, resolveModelMeta, providerDot } from '@store/agentStore'
 
 interface InputBoxProps {
   value: string
@@ -154,7 +154,7 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
                           if (m.id !== active?.id) setSessionModel(m.id)
                         }}
                       >
-                        <span className={`model-dot ${m.provider === 'deepseek' ? 'dp' : 'sf'}`} />
+                        <span className={`model-dot ${providerDot(m.provider)}`} />
                         <span className="model-menu-name">{m.display_name || m.id}</span>
                         {m.id === active?.id && <Icon name="check" size={13} />}
                       </div>

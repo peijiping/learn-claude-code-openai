@@ -39,10 +39,13 @@ class TurnStopped(Exception):
 class StreamEvent:
     """一次流式增量事件。type 取值：
     thinking_delta / content_delta / tool_call_start / tool_call_delta /
-    tool_call / turn_end
+    tool_call / turn_end / sub_agent_start / sub_agent_end
+
+    subagent_id：事件来源标识。子智能体转发事件时打上本次子任务 id，
+    前端据此把思考/工具事件折叠到对应子智能体块下；空串 = 主智能体事件。
     """
     def __init__(self, type, text="", tool_id="", tool_name="", args="",
-                 finish_reason="", usage=None):
+                 finish_reason="", usage=None, subagent_id=""):
         self.type = type
         self.text = text
         self.tool_id = tool_id
@@ -50,6 +53,7 @@ class StreamEvent:
         self.args = args
         self.finish_reason = finish_reason
         self.usage = usage or {}
+        self.subagent_id = subagent_id
 
     def to_dict(self) -> dict:
         """P4 线协议：把事件完整序列化成 dict（前端可直接渲染）。"""
@@ -61,6 +65,7 @@ class StreamEvent:
             "args": self.args,
             "finish_reason": self.finish_reason,
             "usage": self.usage,
+            "subagent_id": self.subagent_id,
         }
 
     def to_json(self) -> str:
@@ -131,15 +136,40 @@ class PrintSink(EventSink):
 
 
 class FilterSink(EventSink):
-    """只把指定事件类型转发给内层 sinks（subagent 把工具类事件转给 UI）。"""
-    def __init__(self, sinks: List[EventSink], types):
+    """只把指定事件类型转发给内层 sinks（subagent 把思考/工具类事件转给 UI）。
+
+    subagent_id：给转发的每个事件打上子智能体来源标识（空串 = 透传不打标）。
+    转发时复制事件再打标，不改动原始事件（其它 sink 仍拿到干净事件）。
+    """
+    def __init__(self, sinks: List[EventSink], types, subagent_id: str = ""):
         self.sinks = sinks
         self.types = set(types)
+        self.subagent_id = subagent_id
 
     def emit(self, ev: StreamEvent):
-        if ev.type in self.types:
-            for s in self.sinks:
-                s.emit(ev)
+        if ev.type not in self.types:
+            return
+        out = ev
+        if self.subagent_id:
+            out = StreamEvent(type=ev.type, text=ev.text, tool_id=ev.tool_id,
+                              tool_name=ev.tool_name, args=ev.args,
+                              finish_reason=ev.finish_reason, usage=ev.usage,
+                              subagent_id=self.subagent_id)
+        for s in self.sinks:
+            s.emit(out)
+
+
+class CallbackSink(EventSink):
+    """旁路收集 sink：把每个事件原样转交给注入的回调。
+
+    用于子智能体收集 transcript（与 FilterSink 串联时只收到过滤后的
+    转发事件，含 subagent_id 打标），不改变事件本身。
+    """
+    def __init__(self, fn: Callable[[StreamEvent], None]):
+        self.fn = fn
+
+    def emit(self, ev: StreamEvent):
+        self.fn(ev)
 
 
 class WSSink(EventSink):

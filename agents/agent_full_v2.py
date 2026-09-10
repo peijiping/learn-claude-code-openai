@@ -187,6 +187,15 @@ class Agent:
         self.session_file: Path | None = None
         self.history_messages: list = []
 
+        # ── 子智能体执行过程（边通道，只进 jsonl，绝不进模型上下文） ──
+        # _run_subagent 把 spawn_subagent 返回的 transcript 按 tool_call_id 暂存，
+        # 并在拿到后立刻落盘为 role=subagent 行（后台路径由 worker 线程完成，
+        # 立即写盘保证"turn 结束后才完成的后台子智能体"也能被历史回放展示）；
+        # history_messages 只接收摘要（工具结果），保持主上下文纯净。
+        self._subagent_transcripts: dict[str, dict] = {}  # tool_call_id → transcript
+        self._subagent_persisted: set[str] = set()        # 已落盘的 tool_call_id
+        self._subagent_lock = threading.Lock()            # 落盘状态跨线程保护
+
         # ── 协作式停止：request_stop() 置位，run_turn/agent_loop 轮询并干净收尾 ──
         self._stop_evt = threading.Event()
 
@@ -319,6 +328,16 @@ class Agent:
     #  会话生命周期（CLI / cron / TUI 共用接缝）
     # ═══════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _strip_subagent_rows(messages: list) -> list:
+        """从会话历史中剔除 role=subagent 行。
+
+        子智能体执行记录只进 jsonl / 前端回放展示，绝不进入模型上下文。
+        load_session_history 保留它们（供 ws_bridge 回放），此处是
+        Agent 侧的统一过滤点（init / switch / clear 都会经过）。
+        """
+        return [m for m in messages if m.get("role") != "subagent"]
+
     def init_session(self, resume: bool = True) -> int:
         """
         创建/恢复会话：构建 SessionManager → 初始化 → 绑定 todo → 注入 reminder。
@@ -336,6 +355,7 @@ class Agent:
         else:
             self.session_num, self.session_file, self.history_messages = \
                 self.session_manager.create_initialized_session()
+        self.history_messages = self._strip_subagent_rows(self.history_messages)
         # todo 与 session 绑定：每次切会话都要重新指向对应的 todo 文件
         self.tools.set_todo_manager(self.session_num)
         # task 与 session 绑定：任务板限定在本会话作用域（"session_N"/"cron_N"）
@@ -368,10 +388,33 @@ class Agent:
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         return str(last)
 
+    def run_background_followup(self) -> str:
+        """后台任务全部完成后的自动续轮：让主智能体拿到结果并给出最终总结。
+
+        与 run_turn 的区别（桌面端后台子智能体 / 后台 bash 完成后自动续一轮，
+        避免"子智能体跑完了主智能体却停在'稍等片刻'不回总结"）：
+        - 不伪造用户消息：不 append user 行、不触发 UserPromptSubmit，
+          由 agent_loop 起点的 collect_background_results 预热注入
+          <task_notification>（同一结果只注入一次）；
+        - 其余行为与 run_turn 一致（流式输出、工具循环、停止协作等）。
+        返回本轮最终回复文本；无新内容时返回空串。
+        """
+        self._stop_evt.clear()
+        self.goal_controller.begin_query()
+        # 仅当确有未消费的后台结果才续轮，避免空转发出无意义的一轮
+        if not self.background_manager.has_completed_pending():
+            return ""
+        self.agent_loop()
+        last = self.history_messages[-1].get("content", "")
+        if isinstance(last, list):
+            return "".join(b.get("text", "") for b in last if isinstance(b, dict))
+        return str(last)
+
     def new_session(self) -> tuple[int, str]:
         """创建新会话并绑定 todo，返回 (新会话编号, 提示语)。"""
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.create_initialized_session()
+        self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 新会话的 todo 文件尚不存在，set_todo_manager 会建出空列表；reminder 不会注入
         self.tools.set_todo_manager(self.session_num)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
@@ -391,6 +434,7 @@ class Agent:
             )
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.switch_session(target_num)
+        self.history_messages = self._strip_subagent_rows(self.history_messages)
         self.tools.set_todo_manager(self.session_num)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
         self._inject_todo_reminder()
@@ -401,8 +445,8 @@ class Agent:
         deleted_count = self.session_manager.clear_session(self.session_file)
         # todo 与 chat history 同生共死：清空 chat 的同时把当前 session 的 todo 也重置为空
         self.tools.get_todo_manager().update([], fresh_start=False)
-        self.history_messages = self.session_manager.load_session_history(
-            self.session_file
+        self.history_messages = self._strip_subagent_rows(
+            self.session_manager.load_session_history(self.session_file)
         )
         return deleted_count
 
@@ -481,7 +525,7 @@ class Agent:
             self.session_file, self.history_messages[-1]
         )
 
-    def _make_executor(self, tool_name: str, tool_args: dict):
+    def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = ""):
         """
         把"执行一个工具调用"包成无参闭包，供 background_manager 在后台线程调用。
 
@@ -490,14 +534,19 @@ class Agent:
         变量导致所有闭包都引用最后一次迭代值的经典坑。
         """
         if tool_name == "sub_agent":
-            return lambda: self._run_subagent(tool_args)
+            return lambda: self._run_subagent(tool_args, tool_call_id)
         elif self.tools.resolve_handler(tool_name) is not None:
             return lambda: self.tools.execute(tool_name, **tool_args)
         else:
             return lambda: f"Error: Unknown tool {tool_name}"
 
-    def _run_subagent(self, tool_args: dict) -> str:
-        """派发 sub_agent。若传了 workdir（worktree 名称），解析为路径并注入。"""
+    def _run_subagent(self, tool_args: dict, tool_call_id: str = "") -> str:
+        """派发 sub_agent。若传了 workdir（worktree 名称），解析为路径并注入。
+
+        子智能体返回 (摘要, transcript)：摘要作为工具结果回传主上下文；
+        transcript（思考 + 工具执行过程）经边通道按 tool_call_id 暂存，
+        由 _persist_pending_subagent_rows 落盘为 role=subagent 行，绝不进 history_messages。
+        """
         prompt = tool_args.get("prompt", "")
         workdir_name = tool_args.get("workdir")
         if workdir_name:
@@ -505,15 +554,55 @@ class Agent:
             if not wt.exists():
                 return (f"Worktree '{workdir_name}' not found. "
                         "Create it first via create_worktree.")
-            return self.subagent_runner.spawn_subagent(
+            summary, transcript = self.subagent_runner.spawn_subagent(
                 prompt,
                 allowed_tools=tool_args.get("allowed_tools"),
                 workdir=wt,
             )
-        return self.subagent_runner.spawn_subagent(
-            prompt,
-            allowed_tools=tool_args.get("allowed_tools"),
-        )
+        else:
+            summary, transcript = self.subagent_runner.spawn_subagent(
+                prompt,
+                allowed_tools=tool_args.get("allowed_tools"),
+            )
+        if tool_call_id:
+            # 边通道暂存（供 _persist_pending_subagent_rows 兜底去重）
+            # tool_call_id 一并记入 transcript，供回放时把执行记录挂回
+            # 发起它的 assistant 消息下（而非最近的末条 assistant）。
+            transcript = {**transcript, "tool_call_id": tool_call_id}
+            self._subagent_transcripts[tool_call_id] = transcript
+            # 立即落盘 role=subagent 行：同步路径在主线程写，后台路径由
+            # worker 线程写（append_subagent_to_session 内部持锁，不会与
+            # agent_loop 的写入交错）。立即写盘保证后台子智能体即使在
+            # turn 结束后才完成，历史里也有完整执行记录可供回放展示。
+            self._persist_one_subagent_row(tool_call_id)
+        return summary
+
+    def _persist_one_subagent_row(self, tool_call_id: str) -> None:
+        """按 tool_call_id 立即落盘一条子智能体 transcript（幂等，可跨线程调用）。"""
+        with self._subagent_lock:
+            if tool_call_id in self._subagent_persisted:
+                return
+            transcript = self._subagent_transcripts.get(tool_call_id)
+            if transcript is None:
+                return
+            self.session_manager.append_subagent_to_session(
+                self.session_file, transcript
+            )
+            self._subagent_persisted.add(tool_call_id)
+
+    def _persist_pending_subagent_rows(self) -> None:
+        """把边通道里未落盘的子智能体 transcript 写入会话文件（role=subagent 行）。
+
+        仅在主线程调用（工具回放循环后 / 后台通知注入后 / turn 起点预热后）；
+        写入只进 jsonl，不进 history_messages，模型上下文保持纯净。
+        """
+        with self._subagent_lock:
+            pending_ids = [
+                tid for tid in self._subagent_transcripts
+                if tid not in self._subagent_persisted
+            ]
+        for tid in pending_ids:
+            self._persist_one_subagent_row(tid)
 
     def _execute_tool_call(self, tool_call) -> dict:
         """
@@ -533,7 +622,7 @@ class Agent:
 
         # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式
         if self.background_manager.should_run_background(tool_name, tool_args):
-            executor = self._make_executor(tool_name, tool_args)
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
             bg_id = self.background_manager.start_background_task(
                 tool_name, tool_args, tool_id, executor
             )
@@ -550,7 +639,7 @@ class Agent:
             self._print(f">> {tool_name} 后台分发: {bg_id}")
         else:
             # 同步路径：直接走原逻辑
-            executor = self._make_executor(tool_name, tool_args)
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
             tool_output = executor()
 
         return {
@@ -585,6 +674,8 @@ class Agent:
             self._print(
                 f"  \033[32m[inject pre-loop] {len(pre_notifs)} background notification(s)\033[0m"
             )
+        # 预热注入后，把上一 turn 结束时仍在跑、此刻已完成的后台子智能体记录落盘
+        self._persist_pending_subagent_rows()
 
         iteration = 0  # 循环迭代计数
         rounds_since_todo = 0  # 记录距离上次调用 todo 工具的轮数，用于 nag reminder
@@ -840,6 +931,9 @@ class Agent:
                     self.session_file, tool_msg
                 )
 
+            # 工具回放完成后落盘子智能体执行记录（role=subagent 行，不进 history_messages）
+            self._persist_pending_subagent_rows()
+
             # 后台任务通知注入：本轮（或更早轮次）已完成的后台任务，
             # 把它们的输出整理成 <task_notification> 文本块作为 user 消息追加。
             # 与 s13 教程的"每轮都收集"语义一致：
@@ -860,6 +954,9 @@ class Agent:
                 self._print(
                     f"  \033[32m[inject] {len(bg_notifications)} background notification(s)\033[0m"
                 )
+
+            # 后台结果注入后，把已完成后台子智能体的执行记录一并落盘
+            self._persist_pending_subagent_rows()
 
             # todo 更新追踪: 本轮用了 todo 就清零, 否则累加;
             # 连续 3 轮未更新且仍有 open items 时, 注入提醒作为本轮最后一条消息, 并清零避免重复打扰

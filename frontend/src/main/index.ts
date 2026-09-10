@@ -30,7 +30,8 @@ function broadcastStatus(status: string): void {
 function request(
   outKind: string,
   matchKind: string = outKind,
-  payload?: Record<string, unknown>
+  payload?: Record<string, unknown>,
+  timeoutMs = 5000
 ): Promise<unknown> {
   ws.send(JSON.stringify({ kind: outKind, ...(payload ? { payload } : {}) }))
   return new Promise((resolve) => {
@@ -41,7 +42,7 @@ function request(
       const i = pending.findIndex((p) => p.kind === matchKind && p.timer === timer)
       if (i >= 0) pending.splice(i, 1)
       resolve(null)
-    }, 5000)
+    }, timeoutMs)
     const handleResult = (v: unknown): void => {
       if (settled) return
       settled = true
@@ -169,9 +170,45 @@ function createWindow(): void {
     if (!isTrustedSender(e) || payload?.config === undefined) return null
     return request('llm_config_save', 'llm_config', { config: payload.config })
   })
+  // 「刷新模型列表」：远端 GET /models 可能较慢，超时放宽到 30s
+  ipcMain.handle(
+    'agent:llmModelsFetch',
+    (
+      e,
+      payload?: {
+        base_url?: string
+        api_key?: string
+        connection_id?: string
+        api_format?: string
+        models_path?: string
+      }
+    ) => {
+      if (!isTrustedSender(e)) return null
+      return request(
+        'llm_models_fetch',
+        'llm_models',
+        {
+          base_url: payload?.base_url ?? '',
+          api_key: payload?.api_key ?? '',
+          connection_id: payload?.connection_id ?? '',
+          api_format: payload?.api_format ?? '',
+          models_path: payload?.models_path ?? '/models'
+        },
+        30000
+      )
+    }
+  )
   ipcMain.handle('agent:connectionStatus', (e) => {
     if (!isTrustedSender(e)) return 'disconnected'
     return ws.currentStatus
+  })
+  // 前端主动拉取运行状态：渲染进程刷新/HMR 不重建主进程 WS 连接，
+  // 后端"新连接重放"覆盖不到该场景，由前端就绪后发 status_query 补偿，
+  // 后端把仍在运行会话的 session_status（running/background）重放回来。
+  ipcMain.handle('agent:queryStatus', (e) => {
+    if (!isTrustedSender(e)) return { ok: false }
+    ws.send(JSON.stringify({ kind: 'status_query' }))
+    return { ok: true }
   })
 
   // dev 模式加载 Vite dev server，生产加载构建产物

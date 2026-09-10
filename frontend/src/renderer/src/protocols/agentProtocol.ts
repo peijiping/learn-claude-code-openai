@@ -10,6 +10,8 @@ export type StreamEventType =
   | 'tool_call_delta'
   | 'tool_call'
   | 'turn_end'
+  | 'sub_agent_start'
+  | 'sub_agent_end'
 
 export interface ContextStats {
   /** 当前会话已用 token（启发式估算） */
@@ -32,6 +34,8 @@ export interface AgentEvent {
   args?: string
   finish_reason?: string
   usage?: Record<string, number>
+  /** 子智能体来源标识：非空表示该事件由某次子智能体任务发出（前端折叠到子智能体块下） */
+  subagent_id?: string
 }
 
 /** 会话执行状态（后端 → 前端）：驱动侧边栏运行指示 / 完成绿点 / 停止按钮。
@@ -58,14 +62,36 @@ export type UiEvent =
   | { kind: 'context_stats'; payload: { num: number } & ContextStats }
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
+export interface HistoryToolCall {
+  name: string
+  args: string
+  /** 工具执行状态（子智能体回放行携带；缺省按已完成处理） */
+  status?: string
+}
+
+export interface HistorySubAgent {
+  id: string
+  name: string
+  thinking: string
+  toolCalls: HistoryToolCall[]
+}
+
 export interface HistoryMessage {
   role: 'user' | 'assistant'
   content: string
   thinking?: string
-  toolCalls?: { name: string; args: string }[]
+  toolCalls?: HistoryToolCall[]
+  /** 本 assistant 消息下调用过的子智能体执行块（后端由 role=subagent 行挂载，回放展示用） */
+  subagents?: HistorySubAgent[]
 }
 
-/** 大模型配置（来自后端 llmconfig.json，服务商预置数据由 providers 字段下发） */
+/** 模型能力声明（输入/输出模态：text / image / video / pdf） */
+export interface LlmCapabilities {
+  input: string[]
+  output: string[]
+}
+
+/** 大模型配置（来自后端 llmconfig.json v2，以「连接」为中心；providers 为预置目录） */
 export interface LlmProviderModel {
   id: string
   display_name: string
@@ -79,11 +105,24 @@ export interface LlmProviderModel {
   thinking_strengths?: string[]
   /** 默认思考强度档位 */
   default_thinking?: string
+  /** 能力声明（输入/输出模态） */
+  capabilities?: LlmCapabilities
 }
 export interface LlmProvider {
   name: string
   base_url: string
   models: LlmProviderModel[]
+  /** 默认 API 格式（如 chat_completions） */
+  api_format?: string
+  /** 密钥来源环境变量名（如 DEEPSEEK_API_KEY） */
+  api_key_env?: string
+  /** 获取密钥的文档地址 */
+  docs_url?: string
+}
+/** API 格式选项（后端下发，供下拉渲染） */
+export interface LlmApiFormat {
+  id: string
+  label: string
 }
 /** 模型高级设置（全部可选项；留空/缺省 = 走程序默认，不写入配置文件） */
 export interface LlmAdvanced {
@@ -101,27 +140,84 @@ export interface LlmAdvanced {
   top_p?: string
   top_k?: string
 }
-export interface LlmModel {
+/** 连接内的模型条目（v2：模型不再自带 base_url/api_key，继承所在连接） */
+export interface LlmConnectionModel {
   id: string
-  provider: string
-  display_name: string
   /** 实际提交给 API 的模型 id */
   model: string
-  base_url: string
-  api_key: string
+  display_name: string
   enabled: boolean
+  /** 能力/上下文标签（如 1M、图片） */
+  tags?: string[]
+  /** 上下文窗口-输入（如 "1M" / "128000"），空 = 继承 */
+  context_in?: string
+  /** 输出上限（Token），空 = 继承 */
+  context_out?: string
+  capabilities?: LlmCapabilities
+  /** 能力来源：auto 自动识别 / manual 手动覆盖 */
+  capability_source?: 'auto' | 'manual'
+  max_context?: string
+  max_context_extended?: string
+  thinking_strengths?: string[]
+  default_thinking?: string
   /** 高级设置（可选，未配置时不落盘） */
   advanced?: LlmAdvanced
 }
+
+/** 连接（= 一个「模型服务」/供应商账号）：承载端点与密钥，下挂多个模型 */
+export interface LlmConnection {
+  id: string
+  /** 预置 catalog key（如 deepseek），或 "custom:<slug>" */
+  provider: string
+  /** 展示名（可改） */
+  name: string
+  base_url: string
+  api_format: string
+  api_key: string
+  models: LlmConnectionModel[]
+  /** 兼容设置（通常不用改） */
+  compat?: Record<string, unknown>
+  /** 是否为自定义供应商（非预置 catalog） */
+  custom?: boolean
+}
+
+/** 扁平模型视图（v2 兼容层：输入区下拉 / 会话绑定 / resolveModelMeta 读取） */
+export interface LlmModel extends LlmConnectionModel {
+  provider: string
+  base_url: string
+  api_key: string
+  connection_id: string
+  connection_name?: string
+}
+
 export interface LlmConfig {
+  version?: number
   active_model_id: string | null
+  /** 连接列表（新 UI 的主数据） */
+  connections: LlmConnection[]
+  /** 扁平模型视图（兼容既有链路） */
   models: LlmModel[]
+  /** 预置厂商目录（~/.aigent/providers.json） */
   providers?: Record<string, LlmProvider>
+  /** API 格式选项 */
+  api_formats?: LlmApiFormat[]
 }
 export interface LlmConfigResult {
   config: LlmConfig
   applied?: boolean
   msg?: string
+}
+/** 保存入参（后端 save_config 只消费 active_model_id + connections） */
+export interface LlmConfigPayload {
+  active_model_id: string | null
+  connections: LlmConnection[]
+}
+/** 「刷新模型列表」结果（GET {base_url}/models） */
+export interface LlmModelsResult {
+  ok: boolean
+  models: { id: string }[]
+  base_url?: string
+  error?: string
 }
 
 /** 会话元数据（来自后端 index.jsonl + 会话文件统计） */
@@ -170,6 +266,7 @@ export type ControlKind =
   | 'stop'
   | 'llm_config_get'
   | 'llm_config_save'
+  | 'llm_models_fetch'
 
 export interface WsOutbound {
   kind: ControlKind | 'ping'
@@ -206,6 +303,8 @@ export function isKnownAgentEvent(ev: AgentEvent): boolean {
     'tool_call_start',
     'tool_call_delta',
     'tool_call',
-    'turn_end'
+    'turn_end',
+    'sub_agent_start',
+    'sub_agent_end'
   ].includes(ev.type)
 }

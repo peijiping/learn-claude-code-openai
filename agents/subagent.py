@@ -8,11 +8,13 @@ subagent.py - 通用型子智能体模块
 """
 import os
 import json
+import time
+import uuid
 
 from paths import WORKDIR
 from hooks import HookSystem
 from llm_manage import LLMClient
-from streaming_client import FilterSink, streamed_create
+from streaming_client import CallbackSink, FilterSink, StreamEvent, streamed_create
 
 class SubAgent:
     """
@@ -66,6 +68,14 @@ class SubAgent:
         self.sub_llm_client = llm_client
         self.model = model
 
+    def _emit_sub_agent(self, ev_type: str, subagent_id: str, text: str = "") -> None:
+        """直接向父级 sinks 发子智能体生命周期事件（start/end，不经过 FilterSink 的类型过滤）。"""
+        if not self.sinks:
+            return
+        ev = StreamEvent(type=ev_type, text=text, subagent_id=subagent_id)
+        for s in self.sinks:
+            s.emit(ev)
+
     @staticmethod
     def _extract_content(response) -> str:
         """
@@ -99,7 +109,7 @@ class SubAgent:
         system_prompt: str | None = None,
         allowed_tools: list[str] | None = None,
         workdir=None,
-    ) -> str:
+    ) -> tuple[str, dict]:
         """
         执行一次子智能体任务。
 
@@ -109,7 +119,8 @@ class SubAgent:
         3. 可通过 system_prompt 自定义角色和行为约束
         4. 可通过 allowed_tools 限制可用工具范围
         5. 循环调用工具直到完成或达到安全限制（MAX_ITERATIONS 轮）
-        6. 只返回最终的任务摘要，而非完整执行过程
+        6. 只把最终的任务摘要返回给父智能体，执行过程（思考/工具）以
+           transcript 形式返回，由父智能体决定是否持久化展示（不进父上下文）
 
         参数:
             prompt: 需要子智能体执行的任务描述
@@ -121,7 +132,9 @@ class SubAgent:
                      系统提示追加工作目录提醒。
 
         返回:
-            str: 任务执行结果的摘要文本，如果无结果则返回 "(no summary)"
+            (str, dict): (任务执行结果的摘要文本, 子智能体执行过程 transcript)。
+                         transcript 结构：{subagent_id, name, thinking, toolCalls, error}，
+                         失败时 error 非空、thinking/toolCalls 可能为空。
         """
         if allowed_tools is not None:
             sub_tools = [t for t in self.base_tools if t.get("function").get("name") in allowed_tools]
@@ -146,77 +159,128 @@ class SubAgent:
         tools_label = f"{len(sub_tools)} tools" if allowed_tools else "all child tools"
         print(f"\033[2;91m  [subagent] 开始执行任务 ({tools_label}): {prompt[:80]}...\033[0m")
 
-        # 子智能体的工具调用事件上行给父级 sinks（CLI 的 stream_sink / 未来 UI）：
-        # 转发 tool_call_start / tool_call_delta / tool_call（预测式 + 完成态），
-        # 不转发 thinking/content（避免刷屏）；无父级 sinks 时仅内部聚合。
-        sub_sinks = [FilterSink(self.sinks, types={"tool_call", "tool_call_start", "tool_call_delta"})] if self.sinks else None
+        # 子智能体执行过程上行给父级 sinks（CLI 的 stream_sink / 桌面端 WSSink）：
+        # 转发 thinking_delta（思考过程）+ tool_call_start/delta/tool_call（预测式 + 完成态），
+        # 全部打上本次子任务 id，供前端把内容折叠到对应子智能体块下；不转发
+        # content_delta（最终摘要由主智能体写入正文，避免重复）。
+        # 同时用 CallbackSink 旁路收集同一批事件，作为 transcript 的持久化依据。
+        subagent_id = f"sub_{uuid.uuid4().hex[:8]}"
+        collected: list[StreamEvent] = []
+        self._emit_sub_agent("sub_agent_start", subagent_id, prompt[:120])
+        sub_sinks = [FilterSink([*(self.sinks or []), CallbackSink(collected.append)],
+                                types={"thinking_delta", "tool_call", "tool_call_start", "tool_call_delta"},
+                                subagent_id=subagent_id)]
+
+        # transcript 名称取任务 prompt 前 80 字，便于回放时辨认
+        name = (prompt[:80] + "…") if len(prompt) > 80 else (prompt or "子智能体")
 
         sub_msg = None
-        for iteration in range(self.MAX_ITERATIONS):
-            try:
-                # 统一流式入口：内部聚合出完整消息，sub_msg 接口兼容 OpenAI message
-                sub_msg, _finish, _usage = streamed_create(
-                    self.sub_llm_client,
-                    sinks=sub_sinks,
-                    model=self.model,
-                    messages=sub_messages,
-                    tools=sub_tools,
-                    max_tokens=int(os.environ.get("SUBAGENT_MAX_TOKENS") or 8000),
-                    temperature=0.5,
-                    reasoning_effort="high", #思考强度，DeepSeek只有 high、max 两个选项
-                    extra_body={"thinking":{"type":"enabled"}} #思考模式开关，值范围 disabled、enabled，默认 enabled
-                )
-            except Exception as e:
-                error_msg = f"子智能体 API 调用失败 (第 {iteration + 1} 轮): {type(e).__name__}: {e}"
-                print(f"  [subagent] {error_msg}")
-                return error_msg
-            sub_messages.append(sub_msg.model_dump())
+        _t0 = time.monotonic()
+        try:
+            for iteration in range(self.MAX_ITERATIONS):
+                try:
+                    # 统一流式入口：内部聚合出完整消息，sub_msg 接口兼容 OpenAI message
+                    sub_msg, _finish, _usage = streamed_create(
+                        self.sub_llm_client,
+                        sinks=sub_sinks,
+                        model=self.model,
+                        messages=sub_messages,
+                        tools=sub_tools,
+                        max_tokens=int(os.environ.get("SUBAGENT_MAX_TOKENS") or 8000),
+                        temperature=0.5,
+                        reasoning_effort="high", #思考强度，DeepSeek只有 high、max 两个选项
+                        extra_body={"thinking":{"type":"enabled"}} #思考模式开关，值范围 disabled、enabled，默认 enabled
+                    )
+                except Exception as e:
+                    error_msg = f"子智能体 API 调用失败 (第 {iteration + 1} 轮): {type(e).__name__}: {e}"
+                    print(f"  [subagent] {error_msg}")
+                    return error_msg, self._build_transcript(subagent_id, name, collected, error=error_msg)
+                sub_messages.append(sub_msg.model_dump())
 
-            if not sub_msg.tool_calls:
-                content = self._extract_content(sub_msg.model_dump())
-                return content or "(no summary)"
+                if not sub_msg.tool_calls:
+                    content = self._extract_content(sub_msg.model_dump())
+                    return content or "(no summary)", self._build_transcript(subagent_id, name, collected)
 
-            for tool_call in sub_msg.tool_calls:
-                tool_id = tool_call.id
-                tool_name = tool_call.function.name
-                # OpenAI SDK 返回的 function.arguments 是 JSON 字符串,需解析为 dict 才能 ** 解包
-                raw_args = tool_call.function.arguments
-                tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                for tool_call in sub_msg.tool_calls:
+                    tool_id = tool_call.id
+                    tool_name = tool_call.function.name
+                    # OpenAI SDK 返回的 function.arguments 是 JSON 字符串,需解析为 dict 才能 ** 解包
+                    raw_args = tool_call.function.arguments
+                    tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
-                if tool_name:
-                    # hooks: PreToolUse
-                    blocked = self.hook_system.trigger("PreToolUse", tool_call)
-                    if blocked:
-                        sub_messages.append({"role": "tool", "tool_use_id": tool_id,
-                                             "content": str(blocked)})
-                        continue
-                    handler = sub_handlers.get(tool_name)
-                    if handler:
-                        try:
-                            output = handler(**tool_args)
-                        except Exception as e:
-                            output = f"Error executing {tool_name}: {e}"
-                        # hooks: PostToolUse
-                        self.hook_system.trigger("PostToolUse", tool_call, output)
+                    if tool_name:
+                        # hooks: PreToolUse
+                        blocked = self.hook_system.trigger("PreToolUse", tool_call)
+                        if blocked:
+                            sub_messages.append({"role": "tool", "tool_use_id": tool_id,
+                                                 "content": str(blocked)})
+                            continue
+                        handler = sub_handlers.get(tool_name)
+                        if handler:
+                            try:
+                                output = handler(**tool_args)
+                            except Exception as e:
+                                output = f"Error executing {tool_name}: {e}"
+                            # hooks: PostToolUse
+                            self.hook_system.trigger("PostToolUse", tool_call, output)
+                        else:
+                            output = f"Unknown tool: {tool_name}"
+                        result = {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": str(output),
+                        }
                     else:
-                        output = f"Unknown tool: {tool_name}"
-                    result = {
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "content": str(output),
-                    }
-                else:
-                    result = {
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "content": "Error: tool call missing name",
-                    }
-                sub_messages.append(result)
+                        result = {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": "Error: tool call missing name",
+                        }
+                    sub_messages.append(result)
 
-            # print(f"  [subagent] 第 {iteration + 1} 轮，执行了 {len(sub_msg.tool_calls)} 个工具调用")
+                # print(f"  [subagent] 第 {iteration + 1} 轮，执行了 {len(sub_msg.tool_calls)} 个工具调用")
 
-        # 达到最大轮次，尝试从最后一轮响应中提取内容返回
-        content = self._extract_content(sub_msg.model_dump()) if sub_msg else ""
-        if content:
-            return f"[达到最大轮次限制，返回最后一轮摘要]\n{content}"
-        return "(no summary: 达到最大轮次限制且最后一轮无内容)"
+            # 达到最大轮次，尝试从最后一轮响应中提取内容返回
+            content = self._extract_content(sub_msg.model_dump()) if sub_msg else ""
+            if content:
+                return f"[达到最大轮次限制，返回最后一轮摘要]\n{content}", self._build_transcript(subagent_id, name, collected)
+            return "(no summary: 达到最大轮次限制且最后一轮无内容)", self._build_transcript(subagent_id, name, collected)
+        finally:
+            # 无论正常完成还是异常返回，都通知前端子智能体执行结束（收折叠态/停转圈）
+            self._emit_sub_agent("sub_agent_end", subagent_id)
+            # 完成打点（含耗时）：排查"前端状态断了"时对照后端是否真的结束
+            print(f"  [subagent] 结束 ({time.monotonic() - _t0:.1f}s): "
+                  f"{(name or prompt)[:50]}")
+
+    def _build_transcript(self, subagent_id: str, name: str,
+                          events: list, error: str = "") -> dict:
+        """把旁路收集的子智能体事件聚合为可持久化的 transcript。
+
+        结构对齐前端 SubAgentMsg：{subagent_id, name, thinking, toolCalls, error}。
+        toolCalls 由 start（建）→ delta（续 args）→ call（闭合，置 done）聚合。
+        """
+        thinking = "".join(e.text for e in events if e.type == "thinking_delta")
+        tool_calls: list[dict] = []
+        for ev in events:
+            if ev.type == "tool_call_start":
+                tool_calls.append({
+                    "name": ev.tool_name or "",
+                    "args": ev.args or "",
+                    "status": "running",
+                })
+            elif ev.type == "tool_call_delta" and tool_calls:
+                tool_calls[-1]["args"] += ev.args or ""
+            elif ev.type == "tool_call" and tool_calls:
+                t = tool_calls[-1]
+                if ev.args:
+                    t["args"] = ev.args
+                if ev.tool_name:
+                    t["name"] = ev.tool_name
+                t["status"] = "done"
+        return {
+            "subagent_id": subagent_id,
+            "name": name,
+            "thinking": thinking,
+            "toolCalls": tool_calls,
+            "error": error,
+        }

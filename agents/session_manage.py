@@ -55,6 +55,13 @@ class SessionManager:
         # 索引读-改-写互斥锁：标题生成等后台线程与 UI 管理操作并发更新索引时，
         # 防止两个 RMW 交错导致丢更新（JSONL 原子替换只保证单次写不损坏）
         self._index_lock = threading.Lock()
+        # 追加写互斥锁：主循环（agent_loop）与后台 sub_agent 完成线程都会
+        # append 会话文件（role=subagent 行即时落盘），持锁保证写入不交错。
+        self._append_lock = threading.Lock()
+        # 子智能体执行记录（role=subagent 行）进程内缓存：key = 会话文件路径。
+        # 由 load_session_history / append_subagent_to_session 维护，
+        # save_session_history 重写后据此回写，保证 compact / 自愈重写不丢记录。
+        self.subagent_rows: dict[Path, list[dict]] = {}
 
     def format_context_label(self, messages: list) -> str:
         """格式化当前上下文窗口显示信息。"""
@@ -172,6 +179,9 @@ class SessionManager:
             print(f"加载会话历史失败: {e}")
 
         # 把 dict 形式的 row 转成 load_session_history 期望的消息结构
+        # 重置该文件的 subagent 缓存：以本次磁盘内容为准重新填充
+        # （避免 load 多次调用时把旧缓存再叠加一遍，导致重写回写出重复行）
+        self.subagent_rows.pop(session_file, None)
         normalized = []
         for msg_data in messages:
             if not isinstance(msg_data, dict):
@@ -195,6 +205,20 @@ class SessionManager:
                     "content": content,
                     "tool_call_id": msg_data.get("tool_call_id", ""),
                 })
+            elif msg_role == "subagent":
+                # 子智能体执行记录：原样保留（只服务回放展示，不进模型上下文；
+                # Agent 侧加载后统一过滤）。同时进缓存，供重写后回写。
+                row = {
+                    "role": "subagent",
+                    "subagent_id": msg_data.get("subagent_id", ""),
+                    "name": msg_data.get("name", ""),
+                    "thinking": msg_data.get("thinking", ""),
+                    "toolCalls": msg_data.get("toolCalls", []),
+                }
+                if msg_data.get("tool_call_id"):
+                    row["tool_call_id"] = msg_data["tool_call_id"]
+                normalized.append(row)
+                self.subagent_rows.setdefault(session_file, []).append(row)
             else:
                 # 兜底：未知 role 仍按 user 处理，避免丢消息
                 normalized.append({"role": "user", "content": str(content)})
@@ -348,6 +372,18 @@ class SessionManager:
                 "content": message.get("content", ""),
                 "tool_call_id": message.get("tool_call_id", ""),
             }
+        elif role == "subagent":
+            # 子智能体执行记录：独立行，只服务回放展示，不进模型上下文
+            row = {
+                "role": "subagent",
+                "subagent_id": message.get("subagent_id", ""),
+                "name": message.get("name", ""),
+                "thinking": message.get("thinking", ""),
+                "toolCalls": message.get("toolCalls", []),
+            }
+            if message.get("tool_call_id"):
+                row["tool_call_id"] = message["tool_call_id"]
+            return row
         else:
             return {"role": "unknown", "content": str(message.get("content", ""))}
 
@@ -368,23 +404,100 @@ class SessionManager:
             message: 消息对象 (SystemMessage/HumanMessage/AIMessage/ToolMessage)
         """
         try:
-            with open(session_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
+            with self._append_lock:
+                with open(session_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
         except Exception as e:
             print(f"写入会话历史失败: {e}")
+
+    def append_subagent_to_session(self, session_file: Path, transcript: dict) -> None:
+        """
+        把子智能体执行过程写入会话文件（role=subagent 独立行）并进缓存。
+
+        transcript 结构：{subagent_id, name, thinking, toolCalls}，可选 tool_call_id
+        （发起方主智能体 tool_call 的 id，回放时据此把记录挂回对应 assistant 消息下）。
+        该行只服务前端回放展示，不属于模型上下文（Agent 加载时过滤，
+        重写时由 save_session_history 按缓存回写）。
+        """
+        row = {
+            "role": "subagent",
+            "subagent_id": transcript.get("subagent_id", ""),
+            "name": transcript.get("name", ""),
+            "thinking": transcript.get("thinking", ""),
+            "toolCalls": transcript.get("toolCalls", []),
+        }
+        if transcript.get("tool_call_id"):
+            row["tool_call_id"] = transcript["tool_call_id"]
+        try:
+            with self._append_lock:
+                with open(session_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                # 缓存与写盘在同一把锁内更新，避免与 save_session_history 重写竞争
+                self.subagent_rows.setdefault(session_file, []).append(row)
+        except Exception as e:
+            print(f"写入子智能体执行记录失败: {e}")
+
+    def _read_subagent_rows(self, session_file: Path) -> list:
+        """
+        读取会话文件中全部 role=subagent 行（缓存优先，缺失时读磁盘并回填缓存）。
+
+        缓存与磁盘保持一致：load_session_history / append_subagent_to_session
+        维护缓存，save_session_history 重写后同步缓存。
+        """
+        cached = self.subagent_rows.get(session_file)
+        if cached is not None:
+            return cached
+        rows = []
+        if session_file.exists():
+            try:
+                with open(session_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict) and obj.get("role") == "subagent":
+                            rows.append(obj)
+            except OSError:
+                return rows
+        self.subagent_rows[session_file] = rows
+        return rows
 
     def save_session_history(self, session_file: Path, messages: list) -> None:
         """
         原子重写完整会话历史，保证磁盘 jsonl 与内存 messages 一致。
+
+        子智能体执行记录（role=subagent 行）不属于 messages（模型上下文）：
+        重写前从缓存/旧文件提取，重写后原样回写（与 messages 中已有的
+        按 subagent_id 去重），保证 compact / 自愈重写不丢子智能体记录。
         """
         session_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = session_file.with_suffix(session_file.suffix + ".tmp")
 
         try:
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                for message in messages:
-                    f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
-            tmp_file.replace(session_file)
+            with self._append_lock:
+                # 读缓存与写盘同锁：后台 sub_agent 完成线程可能在重写期间
+                # append 新行，加锁避免读到一半被并发修改/写盘错过新行。
+                old_subagent_rows = self._read_subagent_rows(session_file)
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    for message in messages:
+                        f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
+                tmp_file.replace(session_file)
+                # 重写后回写 subagent 行
+                if old_subagent_rows:
+                    covered = {
+                        m.get("subagent_id") for m in messages
+                        if isinstance(m, dict) and m.get("role") == "subagent"
+                    }
+                    with open(session_file, "a", encoding="utf-8") as f:
+                        for row in old_subagent_rows:
+                            if row.get("subagent_id") not in covered:
+                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            # 缓存与磁盘保持一致（重写后旧行已全部回写）
+            self.subagent_rows[session_file] = old_subagent_rows
         except Exception as e:
             if tmp_file.exists():
                 try:
@@ -894,6 +1007,9 @@ class SessionManager:
 
             for message in self._build_initial_messages():
                 self.append_message_to_session(session_file, message)
+
+            # 子智能体执行记录随会话内容一起清空（缓存同步失效）
+            self.subagent_rows.pop(session_file, None)
 
             return max(0, deleted_count - 1)  # 减去保留的系统提示词
         except Exception as e:

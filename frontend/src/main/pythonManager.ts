@@ -88,11 +88,12 @@ export class PythonManager {
     child.stdout?.on('data', (d: Buffer) => this.opts.onLog?.(d.toString()))
     child.stderr?.on('data', (d: Buffer) => this.opts.onLog?.(d.toString()))
 
-    // 简单探测：桥起来后会打印 "WS server on ..."，据此标记 running
+    // 简单探测：桥起来后会打印 "WS server on ..."，据此标记 running。
+    // 注意：stdout 已有统一的 onLog 监听器负责打印，此处只做探测，
+    // 不能再调 onLog（历史 bug：双监听器各打印一次，"WS server listening"
+    // 出现两行，排查时误判为拉起了两个 Python 进程）。
     const readyProbe = (d: Buffer): void => {
-      const text = d.toString()
-      this.opts.onLog?.(text)
-      if (text.includes('WS server') || text.includes('listening')) {
+      if (d.toString().includes('WS server') || d.toString().includes('listening')) {
         this.setStatus('running')
         child.stdout?.removeListener('data', readyProbe)
       }

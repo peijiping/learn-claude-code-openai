@@ -46,7 +46,7 @@ export default function SettingsModal(): JSX.Element {
               <Icon name="close" size={16} />
             </button>
           </div>
-          <div className="settings-body">
+          <div className={`settings-body ${tab === 'model' ? 'flush' : ''}`}>
             {tab === 'model' && <ModelSettings />}
             {tab === 'trash' && <TrashSettings />}
             {tab === 'general' && <GeneralSettings />}

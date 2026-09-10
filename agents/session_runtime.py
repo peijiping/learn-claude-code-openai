@@ -22,6 +22,7 @@ SessionRuntime，由 SessionRuntimeRegistry 按会话号维护。仅作为 ws_br
 import asyncio
 import json
 import threading
+import time
 from typing import Awaitable, Callable, Dict, Optional
 
 from agent_full_v2 import Agent
@@ -29,6 +30,10 @@ from llm_config import (
     ENV_LLM_LOCK, apply_model_to_env, restore_llm_env, snapshot_llm_env,
 )
 from streaming_client import WSSink
+
+# 后台任务完成后的自动续轮上限：正常场景（派后台子智能体 → 自动总结）只续一轮；
+# 上限防御"续轮又派后台 → 再续轮"的极端连环派发，避免后台守望无限循环。
+MAX_BG_FOLLOWUPS = 10
 
 # deliver(kind, payload) -> 把信封投递回事件循环队列（线程安全，由 ws_bridge 提供）
 Deliver = Callable[[str, dict], None]
@@ -71,6 +76,7 @@ class SessionRuntime:
         self._reply_sessions = reply_sessions
         self._load_meta: LoadMeta = load_meta
         self._bound_model: str | None = None  # 当前 agent 实际绑定的会话模型 id
+        self._turn_started: float = 0.0  # 当前 turn 开始时间（耗时统计用）
 
     # ── 事件路由：把会话内事件打上 session_num ──────────────────
     def _bind_sink(self, agent: Agent) -> None:
@@ -87,6 +93,13 @@ class SessionRuntime:
         # 只打印到后端 stdout，永远到不了前端 UI。
         agent.subagent_runner.sinks = [agent.stream_sink]
 
+    def _push_status(self, status: str) -> None:
+        """会话执行状态的唯一出口：关键节点打日志 + 广播到前端。
+        running=turn 执行中；background=turn 结束但后台任务仍在跑；
+        done/stopped=全部结束。排查"前端执行状态断了"先看这串日志。"""
+        print(f"[session {self.num}] status -> {status}")
+        self._deliver("session_status", {"num": self.num, "status": status})
+
     def build_agent(self) -> Agent:
         """按需构造本会话的 Agent，并按其元数据记录的模型独立绑定（在工作线程里调用）。
 
@@ -101,9 +114,12 @@ class SessionRuntime:
             self._bound_model = model_id
             self._bind_sink(self.agent)
             self.agent.switch_session(self.num)
+            print(f"[session {self.num}] agent built (model={model_id or 'global-default'})")
             return self.agent
         model_id = (self._load_meta(self.num) or {}).get("model_id") or None
         if model_id != self._bound_model:
+            print(f"[session {self.num}] rebinding model "
+                  f"{self._bound_model or 'global-default'} -> {model_id or 'global-default'}")
             _bind_agent_env(self._load_meta, self.num, self.agent, rebuild=True)
             self._bound_model = model_id
         return self.agent
@@ -114,37 +130,63 @@ class SessionRuntime:
         if self.agent is not None:
             self.agent.request_stop()
 
+    def current_status(self) -> Optional[str]:
+        """新连接状态重放用（ws_bridge.handle）：
+        running=turn 执行中；background=turn 已结束但后台任务仍在跑；None=空闲。"""
+        if self.busy:
+            return "running"
+        if self.agent is not None and self.agent.background_manager.has_running():
+            return "background"
+        return None
+
     async def start_turn(self, text: str,
                          reasoning_effort: Optional[str] = None,
                          max_context: Optional[str] = None) -> None:
         """派发一轮对话：后台线程跑 run_turn，事件循环保持可读。
 
-        先发 running，结束后发 done/stopped 并刷新会话列表；
-        若 turn 结束时仍有后台任务（如后台子智能体）在跑，改发 background
-        并守望其完成后再回 done——让前端在整个执行期间都能看到执行状态。
+        先发 running，结束后按终态发**一条**状态：
+        - stopped：用户主动停止；
+        - background：turn 结束但后台任务（如后台子智能体）仍在跑，
+          守望其完成后再回 done；
+        - done：全部结束。
+        （历史缺陷：结束路径先发 done 再发 background，两条之间隔着
+          reply_sessions 的磁盘 IO，前端运行指示会"消失又出现"闪烁。）
         """
         # 新 turn 开始：取消上一轮遗留的后台守望（避免旧守望把运行中的 turn 误报 done）
-        self._pending_overrides = (reasoning_effort, max_context)
         if self._bg_watch_task is not None:
+            print(f"[session {self.num}] bg watch cancelled (new turn)")
             self._bg_watch_task.cancel()
             self._bg_watch_task = None
+        self._pending_overrides = (reasoning_effort, max_context)
         self.busy = True
-        self._deliver("session_status", {"num": self.num, "status": "running"})
+        self._turn_started = time.monotonic()
+        self._push_status("running")
         stopped = False
         try:
             await asyncio.to_thread(self._run_turn_worker, text)
             stopped = self.stop_evt.is_set()
-        except Exception:
+        except Exception as e:
             # run 线程内任何未捕获异常都不应压垮事件循环：
             # 状态按 done 回，让前端侧边栏复位；真实错误已由 agent 内部处理。
+            print(f"[session {self.num}] turn worker crashed: "
+                  f"{type(e).__name__}: {e}")
             stopped = False
         finally:
             self.busy = False
             self.stop_evt.clear()
-            self._deliver("session_status", {
-                "num": self.num,
-                "status": "stopped" if stopped else "done",
-            })
+            elapsed = time.monotonic() - self._turn_started
+            bg_running = (
+                self.agent is not None
+                and self.agent.background_manager.has_running()
+            )
+            # 终态只发一条：有后台任务直接进 background，避免 done→background
+            # 闪烁；无后台任务发 done/stopped 一步到位。
+            self._push_status(
+                "stopped" if stopped else ("background" if bg_running else "done")
+            )
+            print(f"[session {self.num}] turn end ({elapsed:.1f}s, "
+                  f"{'stopped' if stopped else 'done'}, "
+                  f"bg_running={bg_running})")
             # 本轮结束：推送该会话最新的上下文统计（供前端圆圈指示器刷新）
             try:
                 if self.agent is not None and self.agent.session_manager is not None:
@@ -158,21 +200,70 @@ class SessionRuntime:
                 pass  # 统计失败不阻断本轮收尾
             await self._reply_sessions()
             # turn 已结束但后台任务仍在跑：进入 background 态并守望完成
-            if self.agent is not None and self.agent.background_manager.has_running():
-                self._deliver("session_status", {
-                    "num": self.num, "status": "background",
-                })
-                self._bg_watch_task = asyncio.create_task(self._watch_background())
+            if bg_running:
+                self._bg_watch_task = asyncio.create_task(self._watch_background(elapsed))
 
-    async def _watch_background(self) -> None:
-        """守望后台任务直到全部完成（事件循环内轮询），完成后回 done。"""
+    async def _watch_background(self, turn_elapsed: float = 0.0) -> None:
+        """守望后台任务直到全部完成（事件循环内轮询），完成后回 done。
+
+        若后台任务完成后尚有未消费的执行结果（如后台子智能体刚跑完、
+        结果还没注入主智能体上下文），自动续一轮 turn（run_background_followup）
+        让主智能体拿到 task_notification 并给出最终总结；否则主智能体会
+        停在"后台任务已派发"的占位回复上，用户永远等不到最后总结。
+        续轮本身也可能再派后台任务 → 循环守望；MAX_BG_FOLLOWUPS 兜底。
+        """
+        started = time.monotonic()
+        print(f"[session {self.num}] bg watch start")
+        followups = 0
         try:
-            while self.agent is not None and self.agent.background_manager.has_running():
-                await asyncio.sleep(1.0)
-            self._deliver("session_status", {"num": self.num, "status": "done"})
+            while True:
+                while self.agent is not None and self.agent.background_manager.has_running():
+                    await asyncio.sleep(1.0)
+                # 用户中途点了停止：不再自动续轮，直接收尾
+                if self.stop_evt.is_set():
+                    break
+                # 无待消费结果或达续轮上限：收尾回 done
+                if (self.agent is None
+                        or not self.agent.background_manager.has_completed_pending()
+                        or followups >= MAX_BG_FOLLOWUPS):
+                    break
+                followups += 1
+                print(f"[session {self.num}] bg followup turn #{followups}")
+                self.busy = True
+                self._push_status("running")
+                try:
+                    await asyncio.to_thread(self._run_followup_worker)
+                except Exception as e:
+                    print(f"[session {self.num}] bg followup crashed: "
+                          f"{type(e).__name__}: {e}")
+                finally:
+                    self.busy = False
+                # 续轮结束后：若用户在这期间点了停止，保留停止信号并退出循环；
+                # 否则清掉信号进入下一轮判断（避免把停止误当正常信号吞掉）
+                if self.stop_evt.is_set():
+                    break
+                self.stop_evt.clear()
+            total = turn_elapsed + (time.monotonic() - started)
+            print(f"[session {self.num}] bg watch done ({total:.1f}s total)")
+            self._push_status("done")
             await self._reply_sessions()
         except asyncio.CancelledError:
-            pass  # 新 turn 已开始，状态由 start_turn 接管
+            print(f"[session {self.num}] bg watch cancelled")
+            raise  # 新 turn 已开始，状态由 start_turn 接管
+
+    def _run_followup_worker(self) -> None:
+        """后台完成后的自动续轮 worker（非用户输入，复用会话模型与参数覆盖）。"""
+        agent = self.build_agent()
+        reasoning_effort, max_context = self._pending_overrides
+        agent.set_request_overrides(
+            reasoning_effort=reasoning_effort, max_context=max_context
+        )
+        try:
+            if agent.session_manager is not None:
+                agent.session_manager.set_max_context(max_context)
+        except Exception:
+            pass
+        agent.run_background_followup()
 
     def _run_turn_worker(self, text: str) -> None:
         agent = self.build_agent()
@@ -201,6 +292,10 @@ class SessionRuntimeRegistry:
 
     def get(self, num: int) -> Optional[SessionRuntime]:
         return self._sessions.get(num)
+
+    def all_runtimes(self) -> list["SessionRuntime"]:
+        """所有已注册的会话运行时（新连接状态重放用）。"""
+        return list(self._sessions.values())
 
     def get_or_create(self, num: int) -> SessionRuntime:
         rt = self._sessions.get(num)

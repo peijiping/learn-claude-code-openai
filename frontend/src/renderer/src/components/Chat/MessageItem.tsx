@@ -2,7 +2,7 @@ import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
-import type { Message, ToolCallMsg } from '@store/agentStore'
+import type { Message, SubAgentMsg, ToolCallMsg } from '@store/agentStore'
 
 function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
   return (
@@ -30,9 +30,41 @@ function ThinkingBox({ text, open }: { text: string; open: boolean }): JSX.Eleme
     <div className="thinking-box">
       <button className="thinking-toggle" onClick={() => setExpanded((v) => !v)}>
         <Icon name="chevronRight" size={12} className={expanded ? 'rot' : ''} />
+        <Icon name="brain" size={13} />
         <span>思考过程</span>
       </button>
       {expanded && <details open className="thinking-content">{text}</details>}
+    </div>
+  )
+}
+
+/** 子智能体执行块：机器人头图标标识，思考过程与工具执行折叠在块下（可展开/收起） */
+function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
+  const [expanded, setExpanded] = useState(true)
+  return (
+    <div className="subagent-box">
+      <button className="subagent-header" onClick={() => setExpanded((v) => !v)}>
+        <span className="subagent-icon">
+          <Icon name="bot" size={14} />
+        </span>
+        <span className="subagent-name">{block.name || '子智能体'}</span>
+        {block.streaming ? (
+          <span className="toolbar-status spinner" />
+        ) : (
+          <span className="toolbar-status done">
+            <Icon name="check" size={12} />
+          </span>
+        )}
+        <Icon name="chevronRight" size={12} className={expanded ? 'rot' : ''} />
+      </button>
+      {expanded && (
+        <div className="subagent-content">
+          <ThinkingBox text={block.thinking} open={false} />
+          {block.toolCalls.map((t) => (
+            <ToolCallBar key={t.id} tool={t} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -61,6 +93,9 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
         <ThinkingBox text={msg.thinking} open={false} />
         {msg.toolCalls.map((t) => (
           <ToolCallBar key={t.id} tool={t} />
+        ))}
+        {msg.subagents.map((s) => (
+          <SubAgentBlock key={s.id} block={s} />
         ))}
         <div className="markdown-body">
           {msg.content ? (

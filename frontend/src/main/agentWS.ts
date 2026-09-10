@@ -17,6 +17,8 @@ export class AgentWS {
   private opts: AgentWSOptions
   private manualClose = false
   private queue: string[] = []
+  /** 是否成功连上过：区分"后端尚未就绪的首连失败（正常等待）"与"运行中断开（异常）" */
+  private everConnected = false
 
   constructor(opts: AgentWSOptions) {
     this.opts = opts
@@ -38,12 +40,19 @@ export class AgentWS {
   }
 
   connect(): void {
+    // 重入守卫：已有 socket（OPEN/CONNECTING）时不重复建连。
+    // 历史 bug：scheduleReconnect 的 setTimeout 与 send() 的兜底 connect()
+    // 竞争并发调用时 this.ws 被覆盖、旧 socket 不关闭 → 产生僵尸 ESTABLISHED
+    // 连接，其 onmessage 事件被静默丢弃（表现为"已连接但事件断流"）。
+    if (this.ws) return
     this.manualClose = false
     this.setStatus('connecting')
     const ws = new WebSocket(this.url)
     this.ws = ws
 
     ws.onopen = (): void => {
+      this.everConnected = true
+      console.log(`[agentWS] connected -> ${this.url}`)
       this.setStatus('connected')
       this.retryMs = 1000
       // 连接建立后补发排队中的命令
@@ -61,17 +70,25 @@ export class AgentWS {
       }
     }
 
-    ws.onclose = (): void => {
-      if (this.ws === ws) this.ws = null
-      if (this.manualClose) {
-        this.setStatus('disconnected')
-        return
-      }
+    ws.onclose = (ev: CloseEvent): void => {
+      // 诊断日志：code/reason 直接暴露客户端侧断连的触发原因。
+      // 首连失败（Python 还在 import、端口未 listen）是启动期正常现象，
+      // 单独标注，避免每次 dev 启动都出现误导性的 1006 报错。
+      const notReady = !this.everConnected
+      console.log(
+        `[agentWS] onclose: code=${ev.code} reason=${ev.reason || '(empty)'} wasClean=${ev.wasClean}` +
+          (notReady ? ' (python bridge not ready yet, will retry)' : '')
+      )
+      // 迟到的旧 socket 关闭事件：已被新连接替换，忽略（防止误置状态/触发多余重连）
+      if (this.ws !== ws) return
+      this.ws = null
       this.setStatus('disconnected')
+      if (this.manualClose) return
       this.scheduleReconnect()
     }
 
-    ws.onerror = (): void => {
+    ws.onerror = (ev: Event): void => {
+      console.log(`[agentWS] onerror: ${(ev as ErrorEvent).message || ev.type}`)
       // onclose 会随后触发，交给 onclose 统一处理
       try {
         ws.close()
@@ -84,7 +101,6 @@ export class AgentWS {
   private scheduleReconnect(): void {
     const delay = this.retryMs
     this.retryMs = Math.min(this.retryMs * 2, 30_000)
-    this.opts.onStatus('disconnected')
     setTimeout(() => {
       if (!this.manualClose) this.connect()
     }, delay)
