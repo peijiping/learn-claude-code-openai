@@ -46,6 +46,10 @@ import threading
 from pathlib import Path
 
 from config import AIGENT_HOME, CREDENTIALS_FILE
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("llm_config")
 
 # ~/.aigent/llmconfig.json（含 api_key，权限收紧到 0600）
 LLM_CONFIG_FILE = AIGENT_HOME / "llmconfig.json"
@@ -222,15 +226,15 @@ def load_provider_catalog() -> dict:
             # 使文件始终等于「生效中的目录」，便于用户直接查看与编辑。
             if (stored.get("providers") or {}) != providers:
                 save_provider_catalog(providers)
-                print(f"[llm_config] 已更新预置厂商目录 {PROVIDER_CATALOG_FILE}")
+                log.info("已更新预置厂商目录 %s", PROVIDER_CATALOG_FILE)
         except (json.JSONDecodeError, OSError):
-            print(f"[llm_config] {PROVIDER_CATALOG_FILE} 解析失败，回退内置预置厂商目录")
+            log.error("%s 解析失败，回退内置预置厂商目录", PROVIDER_CATALOG_FILE)
     else:
         try:
             save_provider_catalog(providers)
-            print(f"[llm_config] 已物化预置厂商目录到 {PROVIDER_CATALOG_FILE}")
+            log.info("已物化预置厂商目录到 %s", PROVIDER_CATALOG_FILE)
         except OSError as exc:
-            print(f"[llm_config] 写出预置厂商目录失败：{exc}")
+            log.error("写出预置厂商目录失败：%s", exc)
 
     return {"version": CATALOG_VERSION, "providers": providers}
 
@@ -541,7 +545,7 @@ def load_llm_config() -> dict:
         return {}
     raw = _read_raw()
     if not raw:
-        print(f"[llm_config] {LLM_CONFIG_FILE} 解析失败，跳过模型加载")
+        log.error("%s 解析失败，跳过模型加载", LLM_CONFIG_FILE)
         return {}
     data = get_config()
     # v1 → v2 就地升级：写回迁移结果，后续读写都走新结构
@@ -549,23 +553,22 @@ def load_llm_config() -> dict:
         try:
             save_config({"active_model_id": raw.get("active_model_id"),
                          "connections": data["connections"]})
-            print(f"[llm_config] 已把 v1 模型配置迁移为 v2（{len(data['connections'])} 个连接）")
+            log.info("已把 v1 模型配置迁移为 v2（%d 个连接）",
+                     len(data["connections"]))
         except OSError as exc:
-            print(f"[llm_config] v1→v2 迁移写回失败（内存内仍可用）：{exc}")
+            log.error("v1→v2 迁移写回失败（内存内仍可用）：%s", exc)
     apply_to_env(data)
-    print(
-        f"[llm_config] 已加载模型配置 {LLM_CONFIG_FILE}："
-        f"{os.environ.get('OPENAI_MODEL_ID', '')}"
-    )
+    log.info("已加载模型配置 %s：%s",
+             LLM_CONFIG_FILE, os.environ.get("OPENAI_MODEL_ID", ""))
     return data
 
 
 def hint_if_missing_key() -> None:
     """密钥缺失时的引导提示（复用 credentials 的报错文案习惯）。"""
     if not os.environ.get("OPENAI_API_KEY"):
-        print(
-            f"[llm_config] 未配置 API Key：请在 {CREDENTIALS_FILE} 填入 OPENAI_API_KEY，"
-            "或在设置中添加模型，或设置同名环境变量"
+        log.info(
+            "未配置 API Key：请在 %s 填入 OPENAI_API_KEY，"
+            "或在设置中添加模型，或设置同名环境变量", CREDENTIALS_FILE
         )
 
 

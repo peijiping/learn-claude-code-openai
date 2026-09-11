@@ -26,9 +26,12 @@ if Path.cwd() != _PROJECT_ROOT:
 from agent_full_v2 import Agent
 from config import load as load_config
 from llm_config import load_llm_config
+from logger import get_logger, install_excepthooks
 from cron_scheduler import CronScheduler
 from goal import CLEAR_ALIASES, GoalError
 from paths import CHAT_HISTORY_DIR, DURABLE_PATH
+
+log = get_logger("cli")
 
 # readline 中文输入配置（从原 agent_full_v2.py 顶部迁移过来）
 try:
@@ -46,6 +49,9 @@ def main() -> None:
     load_config()
     # 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
     load_llm_config()
+    install_excepthooks()
+    log.info("agent_cli 启动 (pid=%s, model=%s)",
+             os.getpid(), os.environ.get("OPENAI_MODEL_ID", "(none)"))
 
     # ── s14：启动 CronScheduler（定时任务调度器）──
     cron_scheduler = CronScheduler(CHAT_HISTORY_DIR, DURABLE_PATH)

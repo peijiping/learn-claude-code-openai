@@ -42,6 +42,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("subagent")
+
 # 旁路文件后缀：session_6.jsonl → session_6.subagents.jsonl
 SIDECAR_SUFFIX = ".subagents.jsonl"
 
@@ -184,7 +189,7 @@ class SubagentStore:
             if path.exists():
                 path.unlink()
         except OSError as e:  # pragma: no cover - 文件占用等极端情况
-            print(f"删除子智能体记录文件失败: {e}")
+            log.error("删除子智能体记录文件失败: %s", e)
 
     # ── 旧数据迁移 ─────────────────────────────────────────────
     def migrate(self, session_file: Path) -> int:
@@ -216,7 +221,7 @@ class SubagentStore:
                     encoding="utf-8",
                 )
         except OSError as e:  # pragma: no cover
-            print(f"写入会话备份失败（继续迁移）: {e}")
+            log.error("写入会话备份失败（继续迁移）: %s", e)
 
         # 旧行写入旁路（已存在同 id 记录则跳过：sidecar 视为主源，数据更新）
         existing_ids = {r.get("subagent_id") for r in self.load(session_file)}
@@ -267,8 +272,8 @@ class SubagentStore:
                     tmp.unlink()
                 except OSError:
                     pass
-            print(f"迁移子智能体记录失败（主文件保持原样）: {e}")
+            log.error("迁移子智能体记录失败（主文件保持原样）: %s", e)
             return 0
-        print(f"\033[33m[子智能体记录迁移] {session_file.name}: "
-              f"抽出 {len(legacy)} 行到旁路文件（主文件已净化为纯标准消息）\033[0m")
+        log.warning("[子智能体记录迁移] %s: 抽出 %d 行到旁路文件（主文件已净化为纯标准消息）",
+                    session_file.name, len(legacy))
         return len(legacy)

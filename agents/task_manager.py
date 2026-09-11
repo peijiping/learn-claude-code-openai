@@ -12,6 +12,10 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 
 from paths import TASKS_DIR
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("task")
 
 
 @dataclass
@@ -169,7 +173,7 @@ class TaskManager:
         task.owner = owner
         task.status = "in_progress"
         self._save_task(task)
-        print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
+        log.info("[claim] %s → in_progress (owner: %s)", task.subject, owner)
         return f"Claimed {task.id} ({task.subject})"
 
 
@@ -191,11 +195,11 @@ class TaskManager:
         # 找出所有因为本次完成而新解锁的待办任务
         unblocked = [t.subject for t in self._list_tasks()
                     if t.status == "pending" and t.blockedBy and self._can_start(t.id)]
-        print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+        log.info("[complete] %s ✓", task.subject)
         msg = f"Completed {task.id} ({task.subject})"
         if unblocked:
             msg += f"\nUnblocked: {', '.join(unblocked)}"
-            print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
+            log.warning("[unblocked] %s", ", ".join(unblocked))
         # 会话内任务板：若本会话任务已全部完成，自动清理该会话的任务文件
         self._gc_scoped_tasks()
         return msg
@@ -219,7 +223,8 @@ class TaskManager:
             return 0
         for p in files:
             p.unlink(missing_ok=True)
-        print(f"  \033[33m[gc] session '{self.scope}' 任务已全部完成，清理 {len(files)} 个任务文件\033[0m")
+        log.warning("[gc] session '%s' 任务已全部完成，清理 %d 个任务文件",
+                    self.scope, len(files))
         return len(files)
 
     # ── Task tools (面向模型工具调用的薄包装层) ──
@@ -236,7 +241,7 @@ class TaskManager:
         """
         task = self._create_task(subject, description, blockedBy)
         deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-        print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+        log.info("[create] %s%s", task.subject, deps)
         return f"Created {task.id}: {task.subject}{deps}"
 
 

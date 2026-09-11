@@ -66,6 +66,9 @@ TRANSCRIPT_DIRNAME = DATA_ROOT / ".transcripts"
 # L3 落盘大 tool_result 的目录名
 TOOL_RESULTS_DIRNAME = DATA_ROOT / ".task_outputs/tool-results"
 
+# 日志目录（按日期分文件，见 agents/logger.py）
+LOG_DIR = AIGENT_HOME / "logs"
+
 # 记忆目录
 MEMORY_DIR = DATA_ROOT / ".memory"
 
@@ -93,6 +96,7 @@ def ensure_dirs() -> None:
     migrate_legacy(ROOT_DIR / "WorkSpace" / "HomeDir")
     migrate_workspace_data()
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     TODO_DIR.mkdir(parents=True, exist_ok=True)
     TASKS_DIR.mkdir(parents=True, exist_ok=True)

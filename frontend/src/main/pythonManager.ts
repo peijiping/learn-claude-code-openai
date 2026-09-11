@@ -1,5 +1,6 @@
 import { spawn, ChildProcess, execFileSync } from 'child_process'
 import path from 'path'
+import { flog } from './logger'
 
 export type PythonStatus = 'starting' | 'running' | 'crashed' | 'stopped'
 
@@ -84,6 +85,7 @@ export class PythonManager {
       stdio: ['ignore', 'pipe', 'pipe']
     })
     this.child = child
+    flog.info('python', `拉起后端: ${python} ${script} (port=${port}, pid=${child.pid})`)
 
     child.stdout?.on('data', (d: Buffer) => this.opts.onLog?.(d.toString()))
     child.stderr?.on('data', (d: Buffer) => this.opts.onLog?.(d.toString()))
@@ -103,6 +105,7 @@ export class PythonManager {
     child.on('exit', (code) => {
       this.child = null
       this.opts.onLog?.(`[python] 退出 code=${code}`)
+      flog[code === 0 ? 'info' : 'error']('python', `后端进程退出 code=${code}`)
       this.setStatus(code === 0 ? 'stopped' : 'crashed')
     })
   }

@@ -26,6 +26,10 @@ from llm_manage import LLMClient
 from paths import INBOX_DIR
 from tools import ToolRegistry
 from streaming_client import streamed_create
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("teammate")
 
 # ── 可调参数（遵循 .env 约定，见 AGENTS.md）──
 IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_INTERVAL", "5"))   # 空闲等待的兜底周期（秒），配合 Event 即时唤醒
@@ -169,22 +173,21 @@ class TeammateManager:
         """通过 request_id 将响应与原始请求关联起来。"""
         state = self.pending_requests.get(request_id)
         if not state:
-            print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
+            log.error("[protocol] unknown request_id: %s", request_id)
             return
         # 校验响应类型与请求类型是否匹配
         if state.type == "shutdown" and response_type != "shutdown_response":
-            print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
-                  f"got {response_type}\033[0m")
+            log.error("[protocol] type mismatch: expected shutdown_response, "
+                      "got %s", response_type)
             return
         if state.type == "plan_approval" and response_type != "plan_approval_response":
-            print(f"  \033[31m[protocol] type mismatch: expected plan_approval_response, "
-                  f"got {response_type}\033[0m")
+            log.error("[protocol] type mismatch: expected plan_approval_response, "
+                      "got %s", response_type)
             return
         state.status = "approved" if approve else "rejected"
         icon = "✓" if approve else "✗"
-        color = "32" if approve else "31"
-        print(f"  \033[{color}m[protocol] {state.type} {icon} "
-              f"({request_id}: {state.status})\033[0m")
+        log.info("[protocol] %s %s (%s: %s)",
+                 state.type, icon, request_id, state.status)
 
     # ═══════════════════════════════════════════════════════════
     #  自主队友：任务板扫描 + 空闲轮询（来自 s17）
@@ -223,14 +226,14 @@ class TeammateManager:
                         self._send(name, "lead", "Shutting down gracefully.",
                                       "shutdown_response",
                                       {"request_id": req_id, "approve": True})
-                        print(f"  \033[35m[protocol] {name} approved shutdown "
-                              f"in idle ({req_id})\033[0m")
+                        log.info("[protocol] %s approved shutdown in idle (%s)",
+                                 name, req_id)
                         return "shutdown"
 
                 # 非协议消息：注入对话上下文，恢复工作
                 messages.append({"role": "user",
                     "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
-                print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
+                log.info("[idle] %s found inbox messages", name)
                 return "work"
 
             # 第二步：扫描任务板，自动认领未分配的任务
@@ -242,13 +245,11 @@ class TeammateManager:
                     messages.append({"role": "user",
                         "content": f"<auto-claimed>Task {task.id}: "
                                    f"{task.subject}</auto-claimed>"})
-                    print(f"  \033[32m[idle] {name} auto-claimed: "
-                          f"{task.subject}\033[0m")
+                    log.info("[idle] %s auto-claimed: %s", name, task.subject)
                     return "work"
-                print(f"  \033[33m[idle] {name} claim failed: "
-                      f"{result}\033[0m")
+                log.warning("[idle] %s claim failed: %s", name, result)
 
-        print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
+        log.error("[idle] %s timeout (%ds)", name, IDLE_TIMEOUT)
         return "timeout"
 
     # ═══════════════════════════════════════════════════════════
@@ -295,7 +296,7 @@ class TeammateManager:
         )
         self.threads[name] = thread
         thread.start()
-        print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
+        log.info("[teammate] %s spawned as %s", name, role)
         return f"Teammate '{name}' spawned as {role} (autonomous)"
 
     def _handle_inbox_message(self, name: str, msg: dict, messages: list) -> bool:
@@ -308,8 +309,7 @@ class TeammateManager:
             self._send(name, "lead", "Shutting down gracefully.",
                           "shutdown_response",
                           {"request_id": req_id, "approve": True})
-            print(f"  \033[35m[protocol] {name} approved shutdown "
-                  f"({req_id})\033[0m")
+            log.info("[protocol] %s approved shutdown (%s)", name, req_id)
             return True  # 返回 True 表示需要关闭
 
         if msg_type == "plan_approval_response":
@@ -377,7 +377,7 @@ class TeammateManager:
                         max_tokens=TEAM_MAX_TOKENS,
                     )
                 except Exception as e:
-                    print(f"  \033[31m[teammate] {name} LLM error: {e}\033[0m")
+                    log.error("[teammate] %s LLM error: %s", name, e)
                     break
 
                 tool_calls = response_msg.tool_calls or []
@@ -427,7 +427,7 @@ class TeammateManager:
         self._update_member_status(name, "shutdown" if should_shutdown else "idle")
         self.active_teammates.pop(name, None)
         self.wake_events.pop(name, None)
-        print(f"  \033[32m[teammate] {name} finished\033[0m")
+        log.info("[teammate] %s finished", name)
 
     # ═══════════════════════════════════════════════════════════
     #  队友工具：定义（OpenAI function calling 格式）+ 执行分发
@@ -547,8 +547,7 @@ class TeammateManager:
         self._send("lead", teammate, "Please shut down gracefully.",
                       "shutdown_request",
                       {"request_id": req_id})
-        print(f"  \033[35m[protocol] shutdown_request → {teammate} "
-              f"({req_id})\033[0m")
+        log.info("[protocol] shutdown_request → %s (%s)", teammate, req_id)
         return f"Shutdown request sent to {teammate} (req: {req_id})"
 
     def request_plan(self, teammate: str, task: str) -> str:
@@ -571,7 +570,7 @@ class TeammateManager:
                       "plan_approval_response",
                       {"request_id": request_id, "approve": approve})
         icon = "✓" if approve else "✗"
-        print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
+        log.info("[protocol] plan %s (%s)", icon, request_id)
         return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
     # ═══════════════════════════════════════════════════════════

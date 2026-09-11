@@ -32,6 +32,10 @@ from llm_manage import LLMClient
 from streaming_client import streamed_create
 
 from paths import TRANSCRIPT_DIRNAME, TOOL_RESULTS_DIRNAME
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("compact")
 
 
 # ── 1. 配置常量（运行时可由 .env 覆盖） ──────────────────────────────
@@ -482,7 +486,7 @@ class ContextCompact:
             return messages
 
         summary = self.summarize_history(to_summarize, summarizer=summarizer)
-        print(f"[transcript saved: {transcript_path}]")
+        log.info("[transcript saved: %s]", transcript_path)
         return [
             *messages[:prefix_end],
             HumanMessage(content=f"<context_summary>\n{summary}\n</context_summary>"),

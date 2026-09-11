@@ -23,6 +23,10 @@ from typing import Optional
 
 from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
 from paths import DEFAULT_PROJECT_SLUG, todo_file_for_session
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("session")
 
 
 def _now_iso() -> str:
@@ -163,7 +167,8 @@ class SessionManager:
             try:
                 self.subagent_store.migrate(session_file)
             except Exception as exc:  # noqa: BLE001 - 迁移失败不阻断加载
-                print(f"\033[33m[子智能体记录迁移] 跳过（{type(exc).__name__}: {exc}）\033[0m")
+                log.warning("[子智能体记录迁移] 跳过（%s: %s）",
+                            type(exc).__name__, exc)
 
         repaired = False  # 是否检测到拼行/坏行
         try:
@@ -191,7 +196,7 @@ class SessionManager:
                 messages.append(obj)
                 idx = next_idx
         except Exception as e:
-            print(f"加载会话历史失败: {e}")
+            log.error("加载会话历史失败: %s", e)
 
         # 把 dict 形式的 row 转成 load_session_history 期望的消息结构
         # 重置该文件的 subagent 缓存：以本次磁盘内容为准重新填充
@@ -257,11 +262,11 @@ class SessionManager:
                 self._snapshot_before_rewrite(session_file)
                 self.save_session_history(session_file, messages)
                 if repaired:
-                    print("\033[33m[会话修复] 检测到历史文件存在拼行，已自动重写为标准 JSONL\033[0m")
+                    log.warning("[会话修复] 检测到历史文件存在拼行，已自动重写为标准 JSONL")
                 else:
-                    print(f"\033[33m[会话修复] 已修复 {repairs} 处块结构问题并写回历史文件\033[0m")
+                    log.warning("[会话修复] 已修复 %d 处块结构问题并写回历史文件", repairs)
             except Exception as e:
-                print(f"\033[33m[会话修复] 重写历史文件失败: {e}\033[0m")
+                log.error("[会话修复] 重写历史文件失败: %s", e)
 
         return messages
 
@@ -389,17 +394,17 @@ class SessionManager:
                                 "content": "Error: missing tool result (recovered)",
                             })
                     repairs += 1
-                    print(
-                        f"\033[33m[会话修复] 补齐缺失的工具响应 "
-                        f"（{sorted(missing)}，占位写入而非丢弃该轮对话）\033[0m"
+                    log.warning(
+                        "[会话修复] 补齐缺失的工具响应 "
+                        "（%s，占位写入而非丢弃该轮对话）", sorted(missing)
                     )
                 if subagent_rows:
                     # 子智能体记录移到块后，恢复合法结构
                     sanitized.extend(subagent_rows)
                     repairs += 1
-                    print(
-                        f"\033[33m[会话修复] 归位 {len(subagent_rows)} 条子智能体记录行 "
-                        f"（移出 assistant/tool 块中间）\033[0m"
+                    log.warning(
+                        "[会话修复] 归位 %d 条子智能体记录行 "
+                        "（移出 assistant/tool 块中间）", len(subagent_rows)
                     )
                 i = j
                 continue
@@ -418,10 +423,10 @@ class SessionManager:
                 )
                 if not valid_prev:
                     repairs += 1
-                    print(
-                        f"\033[33m[会话修复] 丢弃孤儿 tool 消息 "
-                        f"（缺少匹配的 assistant.tool_calls，"
-                        f"tool_call_id={msg.get('tool_call_id')!r}）\033[0m"
+                    log.warning(
+                        "[会话修复] 丢弃孤儿 tool 消息 "
+                        "（缺少匹配的 assistant.tool_calls，"
+                        "tool_call_id=%r）", msg.get("tool_call_id")
                     )
                     i += 1
                     continue
@@ -441,9 +446,9 @@ class SessionManager:
             return
         try:
             backup.write_bytes(session_file.read_bytes())
-            print(f"\033[33m[会话修复] 已留备份快照 {backup.name}（重写前）\033[0m")
+            log.warning("[会话修复] 已留备份快照 %s（重写前）", backup.name)
         except OSError as e:
-            print(f"\033[33m[会话修复] 备份失败（继续重写）: {e}\033[0m")
+            log.error("[会话修复] 备份失败（继续重写）: %s", e)
 
     def _message_to_json_row(self, message) -> dict:
         """将 OpenAI JSON 格式消息转换为 jsonl 行（与 load_session_history 读取结构保持一致）。"""
@@ -501,7 +506,7 @@ class SessionManager:
                 with open(session_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
         except Exception as e:
-            print(f"写入会话历史失败: {e}")
+            log.error("写入会话历史失败: %s", e)
 
     def append_subagent_to_session(self, session_file: Path, transcript: dict) -> None:
         """
@@ -522,7 +527,7 @@ class SessionManager:
             try:
                 self.subagent_store.append(session_file, transcript)
             except Exception as e:
-                print(f"写入子智能体执行记录失败: {e}")
+                log.error("写入子智能体执行记录失败: %s", e)
             return
         row = {
             "role": "subagent",
@@ -540,7 +545,7 @@ class SessionManager:
                 # 缓存与写盘在同一把锁内更新，避免与 save_session_history 重写竞争
                 self.subagent_rows.setdefault(session_file, []).append(row)
         except Exception as e:
-            print(f"写入子智能体执行记录失败: {e}")
+            log.error("写入子智能体执行记录失败: %s", e)
 
     def begin_subagent(self, session_file: Path, subagent_id: str,
                        tool_call_id: str = "", name: str = "",
@@ -558,7 +563,7 @@ class SessionManager:
                 name=name, prompt=prompt, source=source,
             )
         except Exception as e:
-            print(f"写入子智能体启动占位记录失败: {e}")
+            log.error("写入子智能体启动占位记录失败: %s", e)
 
     def load_subagent_records(self, session_file: Path) -> list:
         """读取某会话的子智能体执行记录（供桌面端回放挂载）。
@@ -570,7 +575,7 @@ class SessionManager:
             try:
                 return self.subagent_store.load(session_file)
             except Exception as e:
-                print(f"读取子智能体执行记录失败: {e}")
+                log.error("读取子智能体执行记录失败: %s", e)
                 return []
         return [dict(r) for r in self._read_subagent_rows(session_file)]
 
@@ -648,7 +653,7 @@ class SessionManager:
                     tmp_file.unlink()
                 except OSError:
                     pass
-            print(f"重写会话历史失败: {e}")
+            log.error("重写会话历史失败: %s", e)
             raise
 
     def maybe_compact_context(
@@ -666,9 +671,9 @@ class SessionManager:
         if not manual and stats.used_percent < 95:
             return
 
-        print(
-            f"\033[33m[上下文压缩] 正在检查上下文：当前 {stats.used_tokens}/{stats.max_label} tokens，"
-            f"剩余 {int(stats.remaining_percent)}%\033[0m"
+        log.warning(
+            "[上下文压缩] 正在检查上下文：当前 %s/%s tokens，剩余 %d%%",
+            stats.used_tokens, stats.max_label, int(stats.remaining_percent)
         )
         self.compact_messages_if_needed(
             history_messages,
@@ -707,9 +712,10 @@ class SessionManager:
 
         if not result.changed:
             reason = "未达到 L4 摘要阈值（已跑 L1/L2/L3 内部检查均无需处理）" if not force else "没有可压缩的历史消息"
-            print(
-                f"\033[33m[上下文压缩] {reason}：当前 {before.used_tokens}/{before.max_label} tokens，"
-                f"剩余 {int(before.remaining_percent)}%\033[0m"
+            log.warning(
+                "[上下文压缩] %s：当前 %s/%s tokens，剩余 %d%%",
+                reason, before.used_tokens, before.max_label,
+                int(before.remaining_percent)
             )
             return
 
@@ -727,7 +733,7 @@ class SessionManager:
             parts.append("触发 reactive 兜底压缩")
         summary = "；".join(parts) if parts else "已整理上下文"
         after_text = f"{after.used_tokens}/{after.max_label} tokens，剩余 {int(after.remaining_percent)}%" if after else "未知"
-        print(f"\033[33m[上下文压缩完成] {summary}；压缩后 {after_text}\033[0m")
+        log.warning("[上下文压缩完成] %s；压缩后 %s", summary, after_text)
 
     def _build_initial_messages(self) -> list:
         """
@@ -778,11 +784,12 @@ class SessionManager:
         if session_file and session_file.exists():
             messages = self.load_session_history(session_file)
             if messages:
-                print(f"已加载会话: session_{max_num}.jsonl ({len(messages)} 条消息)")
+                log.info("已加载会话: session_%d.jsonl (%d 条消息)",
+                         max_num, len(messages))
                 return max_num, session_file, messages
 
         new_num, new_file, messages = self.create_initialized_session()
-        print(f"已创建新会话: session_{new_num}.jsonl")
+        log.info("已创建新会话: session_%d.jsonl", new_num)
         return new_num, new_file, messages
 
     def switch_session(self, target_num: int) -> tuple[int, Path, list]:
@@ -846,7 +853,7 @@ class SessionManager:
                     tmp_file.unlink()
                 except OSError:
                     pass
-            print(f"写入会话元数据失败: {e}")
+            log.error("写入会话元数据失败: %s", e)
             raise
 
     def _new_entry(self, num: int, file_name: str) -> dict:
@@ -891,7 +898,7 @@ class SessionManager:
                     if isinstance(obj, dict) and obj.get("file"):
                         entries[str(obj["file"])] = obj
         except OSError as e:
-            print(f"读取会话元数据索引失败: {e}")
+            log.error("读取会话元数据索引失败: %s", e)
         return entries
 
     def save_index(self, entries: dict[str, dict]) -> None:
@@ -910,7 +917,7 @@ class SessionManager:
                     tmp_file.unlink()
                 except OSError:
                     pass
-            print(f"重写会话元数据索引失败: {e}")
+            log.error("重写会话元数据索引失败: %s", e)
             raise
 
     def backfill_index(self) -> None:
@@ -1063,7 +1070,7 @@ class SessionManager:
         try:
             session_file.unlink()
         except OSError as e:
-            print(f"删除会话文件失败: {e}")
+            log.error("删除会话文件失败: %s", e)
             return False
         # 子智能体旁路记录与主文件同生共死（不残留、不串台）
         if self.subagent_store is not None:
@@ -1080,7 +1087,7 @@ class SessionManager:
                 try:
                     self.meta_file(num).unlink()
                 except OSError as e:
-                    print(f"删除会话元数据失败: {e}")
+                    log.error("删除会话元数据失败: %s", e)
             else:
                 # 存量会话：从 index.jsonl 移除对应条目
                 entries = self.load_index()
@@ -1162,5 +1169,5 @@ class SessionManager:
 
             return max(0, deleted_count - 1)  # 减去保留的系统提示词
         except Exception as e:
-            print(f"清空会话失败: {e}")
+            log.error("清空会话失败: %s", e)
             return 0

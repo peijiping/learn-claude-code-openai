@@ -21,6 +21,7 @@ from openai import OpenAI
 from agent_full_v2 import Agent
 from config import load as load_config
 from llm_config import fetch_remote_models, get_config, load_llm_config, save_config
+from logger import get_logger, install_excepthooks
 from paths import CHAT_HISTORY_DIR
 from session_manage import SessionManager
 from session_runtime import SessionRuntimeRegistry
@@ -30,6 +31,9 @@ from subagent_store import SubagentStore
 load_config()
 # 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
 load_llm_config()
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("ws_bridge")
 
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
 
@@ -96,7 +100,7 @@ async def safe_send(ws, line: str) -> None:
     try:
         await ws.send(line)
     except Exception as e:
-        print(f"[ws] send failed: {type(e).__name__}: {e}")
+        log.warning("回包发送失败: %s: %s", type(e).__name__, e)
 
 
 async def reply_sessions() -> None:
@@ -357,16 +361,14 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
 
 async def handle(ws):
     line_q = hub.register(ws)
-    print(f"[ws] connection opened: {ws.remote_address} "
-          f"(active={len(hub._conns)})")
+    log.info("WS 连接建立: %s (active=%d)", ws.remote_address, len(hub._conns))
     # 状态重放：新连接（含断线重连）立即得知仍在运行的会话，
     # 前端据此恢复运行指示（转圈/后台脉冲点）。
     # 渲染进程刷新（HMR/Cmd+R）不重建此连接，那种场景由前端主动发
     # status_query 命令拉取（走同一快照函数）。
     replay = _status_snapshot_lines()
     if replay:
-        print(f"[ws] replay {len(replay)} running session status(es) "
-              f"to new connection")
+        log.info("WS 状态重放: %d 个运行中会话", len(replay))
     for line in replay:
         line_q.put_nowait(line)
 
@@ -379,8 +381,8 @@ async def handle(ws):
             try:
                 await ws.send(line)
             except Exception as e:
-                print(f"[ws] writer died ({ws.remote_address}): "
-                      f"{type(e).__name__}: {e}")
+                log.error("WS writer 异常退出 (%s): %s: %s",
+                          ws.remote_address, type(e).__name__, e)
                 hub.unregister(ws)
                 return
 
@@ -410,7 +412,8 @@ async def handle(ws):
                     for m in sm._build_initial_messages():
                         sm.append_message_to_session(new_file, m)
                     num = new_num
-                    print(f"[ws_bridge] new session -> session_{num}")
+                    log.info("新会话创建: session_%d (model=%s)",
+                             num, payload.get("model_id") or "global-default")
                     await safe_send(ws, _envelope("session", {"num": num, "message_count": 0}))
                     # 新建会话首批：把前端选择的模型持久化进该会话元数据。
                     #（参数覆盖由前端在收到 session 信封后按 UI 形状 map 写入，此处只记模型；
@@ -442,7 +445,7 @@ async def handle(ws):
                 # 具体窗口字符串；若前端仅传开关位则回落到 None（走全局）。跳过空串。
                 max_context = str(max_context_raw) if max_context_raw else None
                 # 后台线程跑 turn；事件循环继续处理其它命令（切换 / 其它会话 / stop）
-                print(f"[ws_bridge] chat -> session_{num}: {text[:60]!r}")
+                log.info("chat 派发: session_%s text=%r", num, text[:80])
                 asyncio.create_task(
                     rt.start_turn(text, reasoning_effort=reasoning_effort,
                                   max_context=max_context)
@@ -451,7 +454,7 @@ async def handle(ws):
             elif kind == "stop":
                 # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响
                 num = int(payload.get("num", 0))
-                print(f"[ws_bridge] stop -> session_{num}")
+                log.info("停止请求: session_%d", num)
                 rt = registry.get(num)
                 if rt is not None:
                     rt.request_stop()
@@ -461,13 +464,14 @@ async def handle(ws):
                 # 连接建立时的重放覆盖不到该场景）。回包走本连接的 writer
                 # 队列，与其它事件同管道保序；无运行会话时回空（前端自然复位）。
                 lines = _status_snapshot_lines()
-                print(f"[ws] status_query -> {len(lines)} running session(s)")
+                log.info("status_query: %d 个运行中会话", len(lines))
                 for line in lines:
                     line_q.put_nowait(line)
 
             elif kind == "session_switch":
                 sm = _ensure_session_manager()
                 num = int(payload.get("num", 0))
+                log.info("会话切换请求: session_%d", num)
                 # 运行中的会话不读磁盘回放：turn 在途时 jsonl 可能处于
                 # "assistant(tool_calls) 已落盘、tool 响应未落盘" 的中间态，
                 # load_session_history 的孤儿清理会把它当坏数据重写文件，
@@ -548,6 +552,7 @@ async def handle(ws):
                     await safe_send(ws, _envelope("error", {"msg": f"session {num} not found"}))
                     continue
                 await asyncio.to_thread(sm.clear_session, sm.get_session_file(num))
+                log.info("会话清空: session_%d", num)
                 await safe_send(ws, _envelope("session", {"num": num, "message_count": 0}))
                 await reply_sessions()
 
@@ -566,6 +571,8 @@ async def handle(ws):
                 except ValueError as exc:
                     await safe_send(ws, _envelope("error", {"msg": f"重命名失败：{exc}"}))
                 else:
+                    log.info("会话重命名: session_%s -> %r",
+                             payload.get("num"), payload.get("title"))
                     await reply_sessions()
 
             elif kind == "session_trash":
@@ -582,6 +589,7 @@ async def handle(ws):
                 except (FileNotFoundError, ValueError):
                     await safe_send(ws, _envelope("error", {"msg": f"session {num} not found"}))
                 else:
+                    log.info("会话进回收站: session_%d", num)
                     registry.remove(num)
                     await reply_sessions()
 
@@ -592,6 +600,7 @@ async def handle(ws):
                 except (FileNotFoundError, ValueError):
                     await safe_send(ws, _envelope("error", {"msg": f"session {payload.get('num')} not found"}))
                 else:
+                    log.info("会话从回收站还原: session_%s", payload.get("num"))
                     await reply_sessions()
 
             elif kind == "session_delete":
@@ -619,6 +628,7 @@ async def handle(ws):
                         failed.append(num)
                 # 结果回发后不再全量广播 sessions：前端以 deleted[] 本地增量移除，
                 # 避免删除完成后重建整个会话列表（逐个重数 message_count）造成的刷新延迟。
+                log.info("会话批量永久删除: deleted=%s failed=%s", deleted, failed)
                 await safe_send(ws, _envelope("session_delete_result", {
                     "deleted": deleted, "failed": failed,
                 }))
@@ -653,17 +663,24 @@ async def handle(ws):
 
             elif kind == "llm_config_save":
                 config = payload.get("config") or {}
+                old_primary = os.environ.get("OPENAI_MODEL_ID", "")
                 try:
                     saved = await asyncio.to_thread(save_config, config)
                     # 重新映射进 env 并就地热切换 LLM 绑定，立即生效（无需重启）
                     await asyncio.to_thread(load_llm_config)
                     result = await asyncio.to_thread(agent.reload_llm_bindings)
                 except ValueError as exc:
+                    log.warning("模型配置保存失败: %s", exc)
                     await safe_send(ws, _envelope("error", {"msg": f"保存失败：{exc}"}))
                 else:
                     # 同步所有已构造的运行时会话 Agent 的新绑定（并发后台会话也立即生效）
                     await asyncio.to_thread(registry.reload_llm_bindings)
                     ok = result.get("applied", False)
+                    if ok:
+                        log.info("模型配置切换生效: %s -> %s", old_primary or "(none)",
+                                 result.get("primary"))
+                    else:
+                        log.warning("模型配置保存但未生效: %s", result.get("reason", ""))
                     await safe_send(ws, _envelope("llm_config", {
                         "config": get_config(),
                         "applied": ok,
@@ -697,8 +714,8 @@ async def handle(ws):
         hub.unregister(ws)
         writer_task.cancel()
         code = getattr(ws, "close_code", None)
-        print(f"[ws] connection closed: {ws.remote_address} (code={code}, "
-              f"active={len(hub._conns)})")
+        log.info("WS 连接断开: %s (code=%s, active=%d)",
+                 ws.remote_address, code, len(hub._conns))
 
 
 def _watch_parent():
@@ -708,7 +725,7 @@ def _watch_parent():
     while True:
         time.sleep(1)
         if os.getppid() == 1:
-            print("[ws_bridge] 检测到父进程已退出，随退避免残留占用端口")
+            log.warning("父进程(Electron)已退出，ws_bridge 随退避免残留占用端口")
             os._exit(0)
 
 
@@ -721,10 +738,13 @@ async def main():
         return _ensure_session_manager().load_meta(num)
     registry = SessionRuntimeRegistry(deliver, reply_sessions, _load_meta)
     async with websockets.serve(handle, "127.0.0.1", PORT):
-        print(f"[ws_bridge] WS server listening on 127.0.0.1:{PORT}")
+        log.info("ws_bridge 后端启动: WS server listening on 127.0.0.1:%d "
+                 "(pid=%s, model=%s)", PORT, os.getpid(),
+                 os.environ.get("OPENAI_MODEL_ID", "(none)"))
         await asyncio.Future()
 
 
 if __name__ == "__main__":
+    install_excepthooks()
     threading.Thread(target=_watch_parent, daemon=True).start()
     asyncio.run(main())

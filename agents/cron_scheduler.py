@@ -23,6 +23,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("cron")
+
 
 # ── CronJob 数据结构（与教程一致）──────────────────────────────────
 
@@ -185,12 +190,12 @@ class CronScheduler:
                 job = CronJob(**j)
                 err = self.validate_cron(job.cron)
                 if err:
-                    print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
+                    log.error("[cron] skipping invalid job %s: %s", job.id, err)
                     continue
                 self.scheduled_jobs[job.id] = job
             valid = [j for j in jobs if j["id"] in self.scheduled_jobs]
             if valid:
-                print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
+                log.info("[cron] loaded %d durable job(s)", len(valid))
         except Exception:
             pass
 
@@ -215,7 +220,7 @@ class CronScheduler:
             self._last_fired[job.id] = datetime.now().strftime("%Y-%m-%d %H:%M")
         if durable:
             self._save_durable_jobs()
-        print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
+        log.info("[cron register] %s '%s' → %s", job.id, cron, prompt[:40])
         return job
 
     def cancel_job(self, job_id: str) -> str:
@@ -226,7 +231,7 @@ class CronScheduler:
             return f"Job {job_id} not found"
         if job.durable:
             self._save_durable_jobs()
-        print(f"  \033[31m[cron cancel] {job_id}\033[0m")
+        log.error("[cron cancel] %s", job_id)
         return f"Cancelled {job_id}"
 
     def list_jobs(self) -> list[CronJob]:
@@ -288,7 +293,7 @@ class CronScheduler:
                                 if job.durable:
                                     self._save_durable_jobs()
                     except Exception as e:
-                        print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
+                        log.error("[cron error] %s: %s", job.id, e)
 
     # ═══════════════════════════════════════════════════════════
     #  队列处理器（变化点：创建独立 Agent 实例执行）
@@ -322,7 +327,7 @@ class CronScheduler:
             #       f"cron_{agent.session_num}\033[0m")
             result = agent.run_turn(f"[Scheduled] {job.prompt}")
         except Exception as e:
-            print(f"  \033[31m[cron execute error] {job.id}: {e}\033[0m")
+            log.error("[cron execute error] %s: %s", job.id, e)
 
     def _queue_processor_loop(self):
         """队列处理器（独立 daemon 线程）。
@@ -351,7 +356,7 @@ class CronScheduler:
         self._running = True
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
         threading.Thread(target=self._queue_processor_loop, daemon=True).start()
-        print("  \033[35m[cron] scheduler + queue processor started\033[0m")
+        log.info("[cron] scheduler + queue processor started")
 
     def stop(self):
         """停止调度器（线程为 daemon，进程退出时自动结束；此方法仅设标志位）。"""

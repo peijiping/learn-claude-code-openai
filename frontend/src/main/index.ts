@@ -2,13 +2,16 @@ import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { PythonManager, PythonStatus } from './pythonManager'
 import { AgentWS, ConnStatus } from './agentWS'
+import { flog } from './logger'
 
 const WS_PORT = Number(process.env.AGENT_WS_PORT || '8765')
 
 let mainWindow: BrowserWindow | null = null
 const python = new PythonManager({
-  onStatus: (s: PythonStatus) =>
-    mainWindow?.webContents.send('python:status', s),
+  onStatus: (s: PythonStatus) => {
+    flog.info('python', `后端状态: ${s}`)
+    mainWindow?.webContents.send('python:status', s)
+  },
   onLog: (line: string) => console.log(line)
 })
 const ws = new AgentWS({
@@ -17,7 +20,10 @@ const ws = new AgentWS({
     mainWindow?.webContents.send('agent:event', envelope)
     resolvePending(envelope)
   },
-  onStatus: (s: ConnStatus) => mainWindow?.webContents.send('agent:status', s)
+  onStatus: (s: ConnStatus) => {
+    flog.info('ws', `WS 连接状态: ${s}`)
+    mainWindow?.webContents.send('agent:status', s)
+  }
 })
 
 type Pending = { kind: string; resolve: (v: unknown) => void; timer: NodeJS.Timeout }
@@ -220,6 +226,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  flog.info('app', `Electron 主进程启动 (electron=${process.versions.electron}, node=${process.versions.node}, pid=${process.pid})`)
   createWindow()
   // 拉起后端并连接
   python.start()
@@ -231,12 +238,14 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  flog.info('app', '所有窗口关闭，退出应用')
   python.stop()
   ws.close()
   if (process.platform !== 'darwin') app.quit()
 })
 
 app.on('before-quit', () => {
+  flog.info('app', '应用退出清理（before-quit）')
   python.stop()
   ws.close()
 })

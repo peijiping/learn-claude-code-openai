@@ -1,3 +1,5 @@
+import { flog } from './logger'
+
 export type ConnStatus = 'connecting' | 'connected' | 'disconnected'
 
 export interface AgentWSOptions {
@@ -53,6 +55,7 @@ export class AgentWS {
     ws.onopen = (): void => {
       this.everConnected = true
       console.log(`[agentWS] connected -> ${this.url}`)
+      flog.info('ws', `已连接后端 ${this.url}`)
       this.setStatus('connected')
       this.retryMs = 1000
       // 连接建立后补发排队中的命令
@@ -78,6 +81,11 @@ export class AgentWS {
       console.log(
         `[agentWS] onclose: code=${ev.code} reason=${ev.reason || '(empty)'} wasClean=${ev.wasClean}` +
           (notReady ? ' (python bridge not ready yet, will retry)' : '')
+      )
+      flog[notReady ? 'info' : 'warn'](
+        'ws',
+        `连接断开: code=${ev.code} reason=${ev.reason || '(empty)'} wasClean=${ev.wasClean}` +
+          (notReady ? ' (后端尚未就绪，将重试)' : ' (运行中断开，将重连)')
       )
       // 迟到的旧 socket 关闭事件：已被新连接替换，忽略（防止误置状态/触发多余重连）
       if (this.ws !== ws) return
