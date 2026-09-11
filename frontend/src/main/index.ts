@@ -225,11 +225,14 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   flog.info('app', `Electron 主进程启动 (electron=${process.versions.electron}, node=${process.versions.node}, pid=${process.pid})`)
-  createWindow()
-  // 拉起后端并连接
+  // 方案A：先拉起后端并就绪，再建窗 + 连 WS。
+  // 原顺序是"先建窗再起后端"，首连 WS 时后端仍在 import，导致状态栏短暂"连接中"。
+  // 现在等 python.whenReady()（后端 listening 或崩溃/超时兜底）后才建窗，WS 首次即连上。
   python.start()
+  await python.whenReady()
+  createWindow()
   ws.connect()
 
   app.on('activate', () => {
