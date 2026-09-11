@@ -129,10 +129,19 @@ export interface SubAgentMsg {
   /** 后端下发的子任务 id（事件按此路由） */
   id: string
   name: string
+  /** 思考过程内容（thinking_delta 流式累积） */
   thinking: string
+  /** 思考过程是否正在流式输出：thinking_delta 期间 true，转入工具调用/块结束（sub_agent_end）后 false */
+  thinkingActive: boolean
   toolCalls: ToolCallMsg[]
   activeToolId: string | null
   streaming: boolean
+  /** 终态：running / done / error / aborted（进程被强杀只剩占位记录时为 running） */
+  status?: 'running' | 'done' | 'error' | 'aborted'
+  /** 执行耗时（毫秒；实时为 null，回放由后端记录补上） */
+  durationMs?: number | null
+  /** 失败原因（status=error 时非空） */
+  error?: string
 }
 
 export interface Message {
@@ -140,9 +149,14 @@ export interface Message {
   role: 'user' | 'assistant'
   content: string
   thinking: string
+  /** 思考过程是否正在流式输出：thinking_delta 期间 true，正文/工具调用/turn_end 后 false */
+  thinkingActive: boolean
   toolCalls: ToolCallMsg[]
   /** 本消息内调用过的子智能体执行块（按后端 subagent_id 累积） */
   subagents: SubAgentMsg[]
+  /** 本消息内发起过的 sub_agent 工具调用 id（实时锚点：子智能体事件据此
+   *  挂回"发起它的那条 assistant 消息"，与回放规则一致，切会话不跳位） */
+  subAgentToolIds?: string[]
   activeToolId: string | null
   streaming: boolean
   usage: Record<string, number>
@@ -232,14 +246,20 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
       id: s.id,
       name: s.name,
       thinking: s.thinking ?? '',
+      thinkingActive: false,
+      // 工具 id 优先用后端给出的 tool_id（实时/回放同一 id，便于按 id 归位）
       toolCalls: (s.toolCalls ?? []).map((t, l) => ({
-        id: `h${num}_${i}_s${k}_${l}`,
+        id: t.tool_id || `h${num}_${i}_s${k}_${l}`,
         name: t.name,
         args: t.args,
         status: t.status === 'running' ? ('running' as const) : ('done' as const)
       })),
       activeToolId: null,
-      streaming: false
+      streaming: false,
+      // 终态与耗时来自旁路记录；旧数据缺字段时按"已完成"处理
+      status: (s.status as SubAgentMsg['status']) ?? (s.error ? 'error' : 'done'),
+      durationMs: s.durationMs ?? null,
+      error: s.error ?? ''
     }))
     // 主 toolCalls 里的 sub_agent 调用 → 从中派生兜底卡片（含 prompt 作为名称），并从 toolCalls 剥离
     const subCalls = (m.toolCalls ?? []).filter((t) => t.name === 'sub_agent')
@@ -247,6 +267,7 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
       id: `h${num}_${i}_submain_${k}`,
       name: subAgentNameFromArgs(call.args),
       thinking: '',
+      thinkingActive: false,
       toolCalls: [],
       activeToolId: null,
       streaming: false
@@ -258,6 +279,7 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
       role: m.role,
       content: m.content ?? '',
       thinking: m.thinking ?? '',
+      thinkingActive: false,
       toolCalls: normalCalls.map((t, j) => ({
         id: `h${num}_${i}_${j}`,
         name: t.name,
@@ -314,7 +336,7 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
     ]
     return id
   }
@@ -325,29 +347,38 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     case 'thinking_delta': {
       const id = ensureAssistant()
       const m = current(id)
-      msgs = mapMsg(msgs, id, { thinking: m.thinking + (ev.text ?? '') })
+      msgs = mapMsg(msgs, id, { thinking: m.thinking + (ev.text ?? ''), thinkingActive: true })
       break
     }
     case 'content_delta': {
       const id = ensureAssistant()
       const m = current(id)
-      msgs = mapMsg(msgs, id, { content: m.content + (ev.text ?? '') })
+      msgs = mapMsg(msgs, id, { content: m.content + (ev.text ?? ''), thinkingActive: false })
       break
     }
     case 'tool_call_start': {
       const id = ensureAssistant()
-      // sub_agent 调用不进主工具条：子智能体展示统一由 SubAgentBlock 卡片承载
-      //（sub_agent_start 事件创建），避免普通工具条与卡片并存/重复。
-      if (ev.tool_name === 'sub_agent') return msgs
+      // sub_agent 调用不进主工具条：子智能体展示统一由 SubAgentBlock 卡片承载，
+      // 避免普通工具条与卡片并存/重复。但要**记录锚点**（本消息发起过该
+      // tool_call_id）——子智能体事件到达时据此把卡片挂回这条 assistant
+      //（唯一锚点规则），与回放挂载一致 → 切换会话前后卡片位置不跳变。
+      if (ev.tool_name === 'sub_agent') {
+        const tcid = ev.tool_id || ''
+        if (!tcid) return msgs
+        msgs = msgs.map((m) =>
+          m.id === id ? { ...m, subAgentToolIds: [...(m.subAgentToolIds ?? []), tcid] } : m
+        )
+        return msgs
+      }
       msgs = msgs.map((m) => {
         if (m.id !== id) return m
         const hasRunning = m.toolCalls.some((t) => t.status === 'running')
-        if (hasRunning) return m
+        if (hasRunning) return { ...m, thinkingActive: false }
         const toolCalls = [
           ...m.toolCalls,
           { id: ev.tool_id || `t${Date.now()}`, name: ev.tool_name ?? '', args: ev.args ?? '', status: 'running' as const }
         ]
-        return { ...m, toolCalls, activeToolId: toolCalls[toolCalls.length - 1].id }
+        return { ...m, toolCalls, activeToolId: toolCalls[toolCalls.length - 1].id, thinkingActive: false }
       })
       break
     }
@@ -370,13 +401,14 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
             ? { ...t, args: ev.args || t.args, name: ev.tool_name || t.name, status: 'done' as const }
             : t
         ),
-        activeToolId: null
+        activeToolId: null,
+        thinkingActive: false
       }))
       break
     case 'turn_end':
       msgs = msgs.map((m) =>
         m.role === 'assistant' && m.streaming
-          ? { ...m, streaming: false, usage: ev.usage ?? {}, activeToolId: null }
+          ? { ...m, streaming: false, usage: ev.usage ?? {}, activeToolId: null, thinkingActive: false }
           : m
       )
       break
@@ -384,19 +416,37 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
   return msgs
 }
 
-/** 子智能体事件：路由进「最后一条 assistant 消息」的子智能体块（与主消息互不干扰）。
+/** 子智能体事件：路由进「发起它的那条 assistant 消息」的子智能体块（与主消息互不干扰）。
  * 块不存在时先创建（sub_agent_start / 首个 thinking / 首个工具事件都能触发）。 */
 function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
   const subId = ev.subagent_id ?? ''
   if (!subId) return msgs
 
+  // 唯一锚点规则：卡片挂在发起它的那条 assistant 下，实时与回放共用同一规则。
+  //   1) 该 subagent_id 的块已存在 → 沿用其所属消息（最高优先级：同一子智能体的
+  //      所有事件必须永远落在同一条 assistant 下。子智能体后续的 thinking/tool
+  //      事件不带发起方 tool_call_id，只有靠这一步才不会在主智能体进入下一轮后
+  //      被挂到别的 assistant 上）；
+  //   2) 首次创建：按发起方 tool_call_id（sub_agent_start 携带）定位所属 assistant；
+  //   3) 回退：末尾一条 assistant（含已结束的——后台子智能体完成时主 turn 往往
+  //      已结束，此时不该新建空气泡）；
+  //   4) 兜底：新建气泡（仅在会话缓冲被回放整体替换、锚点丢失时）。
   const ensureAssistant = (): string => {
+    const owner = msgs.find((m) => m.subagents.some((s) => s.id === subId))
+    if (owner) return owner.id
+    const tcid = ev.tool_id || ''
+    if (tcid) {
+      const byTcid = msgs.find(
+        (m) => m.role === 'assistant' && (m.subAgentToolIds ?? []).includes(tcid)
+      )
+      if (byTcid) return byTcid.id
+    }
     const last = msgs[msgs.length - 1]
-    if (last && last.role === 'assistant' && last.streaming) return last.id
+    if (last && last.role === 'assistant') return last.id
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
     ]
     return id
   }
@@ -404,7 +454,7 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
     const m = msgs.find((x) => x.id === msgId) as Message
     const existing = m.subagents.find((s) => s.id === subId)
     if (existing) return [msgs, existing]
-    const block: SubAgentMsg = { id: subId, name, thinking: '', toolCalls: [], activeToolId: null, streaming: true }
+    const block: SubAgentMsg = { id: subId, name, thinking: '', thinkingActive: false, toolCalls: [], activeToolId: null, streaming: true, status: 'running' }
     msgs = msgs.map((x) => (x.id === msgId ? { ...x, subagents: [...x.subagents, block] } : x))
     return [msgs, block]
   }
@@ -424,34 +474,40 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
     case 'thinking_delta': {
       const id = ensureAssistant()
       const block = ensureSubagent(id, '子智能体')[1]
-      msgs = patchSub(id, { thinking: block.thinking + (ev.text ?? '') })
+      msgs = patchSub(id, { thinking: block.thinking + (ev.text ?? ''), thinkingActive: true })
       break
     }
     case 'tool_call_start': {
       const id = ensureAssistant()
       const block = ensureSubagent(id, '子智能体')[1]
-      const hasRunning = block.toolCalls.some((t) => t.status === 'running')
-      if (!hasRunning) {
-        const toolCalls = [
-          ...block.toolCalls,
-          { id: ev.tool_id || `t${Date.now()}`, name: ev.tool_name ?? '', args: ev.args ?? '', status: 'running' as const }
-        ]
-        msgs = patchSub(id, { toolCalls, activeToolId: toolCalls[toolCalls.length - 1].id })
+      const tid = ev.tool_id || ''
+      // 按 tool_id 归位：同一工具只建一行，并行工具调用各自成行
+      //（旧实现用"是否已有 running"守卫，并行时会漏建/错位）
+      if (tid && block.toolCalls.some((t) => t.id === tid)) {
+        msgs = patchSub(id, { thinkingActive: false })
+        break
       }
+      const toolCalls = [
+        ...block.toolCalls,
+        { id: tid || `t${Date.now()}`, name: ev.tool_name ?? '', args: ev.args ?? '', status: 'running' as const }
+      ]
+      msgs = patchSub(id, { toolCalls, activeToolId: toolCalls[toolCalls.length - 1].id, thinkingActive: false })
       break
     }
     case 'tool_call_delta': {
       const id = ensureAssistant()
+      const tid = ev.tool_id || ''
+      // 按 tool_id 归位（而非"当前 active 的那条"），并行工具调用才不会串台
       msgs = msgs.map((m) =>
         m.id === id
           ? {
               ...m,
               subagents: m.subagents.map((s) =>
-                s.id === subId && s.activeToolId
+                s.id === subId
                   ? {
                       ...s,
                       toolCalls: s.toolCalls.map((t) =>
-                        t.id === s.activeToolId && t.status === 'running'
+                        t.id === tid && t.status === 'running'
                           ? { ...t, args: t.args + (ev.args ?? '') }
                           : t
                       )
@@ -478,7 +534,8 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
                           ? { ...t, args: ev.args || t.args, name: ev.tool_name || t.name, status: 'done' as const }
                           : t
                       ),
-                      activeToolId: null
+                      activeToolId: null,
+                      thinkingActive: false
                     }
                   : s
               )
@@ -491,7 +548,11 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
       const id = ensureAssistant()
       msgs = msgs.map((m) => {
         if (m.id !== id) return m
-        const subagents = m.subagents.map((s) => (s.id === subId ? { ...s, streaming: false } : s))
+        const subagents = m.subagents.map((s) =>
+          s.id === subId
+            ? { ...s, streaming: false, thinkingActive: false, status: s.error ? s.status : ('done' as const) }
+            : s
+        )
         // 后台子智能体场景：消息可能仅为装载子智能体块而建（无正文/思考/工具），
         // 全部块结束后同步收起其流式态，避免留下永久光标。
         // 前台场景该消息必有主层 tool_calls/正文，不受影响（由主 turn_end 收尾）。
@@ -554,10 +615,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const modelId = get().sessionModelId
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
     const userMsg: Message = {
-      id: mid(), role: 'user', content: t, thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: {}
+      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: {}
     }
     const assMsg: Message = {
-      id: mid(), role: 'assistant', content: '', thinking: '', toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {}
+      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {}
     }
     set((s) => {
       // 新建任务（尚无会话号）：首条消息进临时草稿缓冲，等后端 session 信封迁移

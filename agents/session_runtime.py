@@ -29,7 +29,10 @@ from agent_full_v2 import Agent
 from llm_config import (
     ENV_LLM_LOCK, apply_model_to_env, restore_llm_env, snapshot_llm_env,
 )
+from paths import CHAT_HISTORY_DIR
+from session_manage import SessionManager
 from streaming_client import WSSink
+from subagent_store import SubagentStore
 
 # 后台任务完成后的自动续轮上限：正常场景（派后台子智能体 → 自动总结）只续一轮；
 # 上限防御"续轮又派后台 → 再续轮"的极端连环派发，避免后台守望无限循环。
@@ -43,12 +46,17 @@ ReplySessions = Callable[[], Awaitable[None]]
 LoadMeta = Callable[[int], Optional[dict]]
 
 
-def _bind_agent_env(load_meta: LoadMeta, num: int, agent: Agent,
+def _bind_agent_env(load_meta: LoadMeta, num: int, agent_or_factory,
                     rebuild: bool) -> tuple[Agent, str | None]:
     """在全局锁内把会话记录模型换绑到 env，构造/重载 Agent 后再恢复全局 env。
 
-    rebuild=False 时为首次构造前的「准备 env」；rebuild=True 时按会话模型
-    就地 reload_llm_bindings()。
+    rebuild=False（首建）：传入 **Agent 工厂**（可调用对象），函数在锁内先换绑
+    会话模型 env，再调用工厂构造 Agent —— 保证首轮起就按会话绑定模型生效。
+    历史 bug：曾把已构造好的 Agent(silent=True) 作为参数传入，参数求值发生在
+    函数体换绑 env 之前，导致首建永远捕获全局默认模型；首次 rebuild(True) 时
+    _bound_model 又与元数据对齐，切换模型后比较失效、表现为"切换不生效"。
+    rebuild=True（重载）：传入既有 Agent 实例，按会话模型就地
+    reload_llm_bindings()。
     """
     meta = load_meta(num) or {}
     model_id = meta.get("model_id") or None
@@ -57,10 +65,12 @@ def _bind_agent_env(load_meta: LoadMeta, num: int, agent: Agent,
         try:
             apply_model_to_env(model_id)
             if rebuild:
-                agent.reload_llm_bindings()
+                agent_or_factory.reload_llm_bindings()
+            else:
+                agent_or_factory = agent_or_factory()
         finally:
             restore_llm_env(snap)
-    return agent, model_id
+    return agent_or_factory, model_id
 
 
 class SessionRuntime:
@@ -86,12 +96,42 @@ class SessionRuntime:
             except (json.JSONDecodeError, TypeError):
                 ev = {"type": "unknown", "text": line}
             ev["session_num"] = self.num
+            # 子智能体启动：立刻落一条 running 占位记录。进程被强杀（无终态）
+            # 时历史里仍留痕迹，回放显示"运行中/已中断"；终态记录由 Agent 在
+            # 拿到 transcript 后写入（同 subagent_id，后写覆盖先写）。
+            if ev.get("type") == "sub_agent_start" and ev.get("subagent_id"):
+                sm = agent.session_manager
+                if sm is not None and agent.session_file is not None:
+                    sm.begin_subagent(
+                        agent.session_file,
+                        subagent_id=ev["subagent_id"],
+                        tool_call_id=ev.get("tool_id", ""),
+                        name=(ev.get("text") or "子智能体")[:80],
+                        prompt=ev.get("text") or "",
+                    )
             self._deliver("event", ev)
         agent.stream_sink = WSSink(send_func=send_func)
         # 子智能体在 Agent.__init__ 阶段捕获了当时的 sinks（PrintSink），
         # 此处必须同步重绑，否则子智能体（含后台子任务）的 tool_call 事件
         # 只打印到后端 stdout，永远到不了前端 UI。
         agent.subagent_runner.sinks = [agent.stream_sink]
+
+    def _bind_subagent_store(self, agent: Agent) -> None:
+        """把子智能体旁路记录存储绑给本会话 Agent 的 SessionManager。
+
+        Agent 内部惰性构造 SessionManager（init_session / switch_session 里
+        `if self.session_manager is None`），所以在 switch_session 之前先把
+        带 store 的实例建好即可；已存在则直接改属性。绑定后子智能体执行过程
+        写到 `session_N.subagents.jsonl`，主会话文件只保留标准消息。
+        """
+        store = SubagentStore(CHAT_HISTORY_DIR)
+        if agent.session_manager is None:
+            agent.session_manager = SessionManager(
+                CHAT_HISTORY_DIR, agent.system_prompt.build_system_prompt(),
+                session_prefix=agent.session_prefix, subagent_store=store,
+            )
+        else:
+            agent.session_manager.subagent_store = store
 
     def _push_status(self, status: str) -> None:
         """会话执行状态的唯一出口：关键节点打日志 + 广播到前端。
@@ -103,16 +143,18 @@ class SessionRuntime:
     def build_agent(self) -> Agent:
         """按需构造本会话的 Agent，并按其元数据记录的模型独立绑定（在工作线程里调用）。
 
-        首次构造：在锁内换绑会话模型 env 后 Agent(silent=True)；
+        首次构造：在锁内换绑会话模型 env 后用工厂构造 Agent（首轮即按会话绑定模型）；
         之后：若会话记录的模型与已绑定的不同，则原地 reload_llm_bindings()。
         """
         if self.agent is None:
             agent, model_id = _bind_agent_env(
-                self._load_meta, self.num, Agent(silent=True), rebuild=False
+                self._load_meta, self.num, lambda: Agent(silent=True), rebuild=False
             )
             self.agent = agent
             self._bound_model = model_id
             self._bind_sink(self.agent)
+            # 必须在 switch_session 之前绑 store（后者会惰性构造 SessionManager）
+            self._bind_subagent_store(self.agent)
             self.agent.switch_session(self.num)
             print(f"[session {self.num}] agent built (model={model_id or 'global-default'})")
             return self.agent

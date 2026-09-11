@@ -90,8 +90,12 @@ export default function ModelSettings(): JSX.Element {
   const checkAll = (checked: boolean): void =>
     patchModels((conn?.models ?? []).map((m) => ({ ...m, enabled: checked })))
 
-  const setActive = (id: string): void => {
-    setActiveId((cur) => (cur === id ? null : id))
+  // 「模型参数」弹窗内设为默认模型：写入草稿 activeId（不切换），保存更改后生效；
+  // 仅启用（enabled）的模型可设为默认
+  const setDefaultModel = (id: string): void => {
+    const target = draft.flatMap((c) => c.models).find((m) => m.id === id)
+    if (!target?.enabled) return
+    setActiveId(id)
     setDirty(true)
   }
 
@@ -346,7 +350,6 @@ export default function ModelSettings(): JSX.Element {
                 knownIds={knownIds}
                 onCheckAll={checkAll}
                 activeId={activeId}
-                onSetActive={setActive}
                 emptyText="没有匹配的模型"
               />
 
@@ -411,9 +414,13 @@ export default function ModelSettings(): JSX.Element {
           initial={modelModal.model}
           providerPreset={providerPreset}
           saving={llmSaving}
+          isDefault={!!modelModal.model && activeId === modelModal.model.id}
           onCancel={() => setModelModal(null)}
           onSubmit={submitModel}
           onDelete={removeModel}
+          onSetDefault={
+            modelModal.model ? () => setDefaultModel(modelModal.model!.id) : undefined
+          }
         />
       )}
     </div>

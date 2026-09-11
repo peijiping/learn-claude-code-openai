@@ -558,11 +558,13 @@ class Agent:
                 prompt,
                 allowed_tools=tool_args.get("allowed_tools"),
                 workdir=wt,
+                tool_call_id=tool_call_id,
             )
         else:
             summary, transcript = self.subagent_runner.spawn_subagent(
                 prompt,
                 allowed_tools=tool_args.get("allowed_tools"),
+                tool_call_id=tool_call_id,
             )
         if tool_call_id:
             # 边通道暂存（供 _persist_pending_subagent_rows 兜底去重）

@@ -88,6 +88,13 @@
 .thinking-toggle .rot {
   transform: rotate(90deg);
 }
+/* 思考过程中的转圈指示：thinking_delta 流式输出期间显示（提示模型正在思考），完成后消失 */
+.thinking-toggle .spinner {
+  width: 11px;
+  height: 11px;
+  border-width: 2px;
+  margin-left: var(--sp-1);
+}
 .thinking-content {
   margin-top: var(--sp-2);
   padding: var(--sp-2) var(--sp-3);
@@ -150,6 +157,59 @@
 .subagent-content {
   padding: var(--sp-2) var(--sp-3);
   border-top: 1px solid var(--color-border);
+}
+/* 标题行：任务名占满剩余宽度，状态徽标 / 耗时 / 状态图标靠右 */
+.subagent-header .subagent-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-badge {
+  flex: none;
+  font-size: var(--fs-xs);
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+.subagent-badge.running {
+  color: #7c6cff;
+  background: rgba(124, 108, 255, 0.12);
+}
+.subagent-badge.error {
+  color: #d9534f;
+  background: rgba(217, 83, 79, 0.12);
+}
+.subagent-badge.aborted {
+  color: #c78a2c;
+  background: rgba(199, 138, 44, 0.12);
+}
+.subagent-duration {
+  flex: none;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.subagent-status {
+  flex: none;
+  display: flex;
+  color: var(--color-text-secondary);
+}
+/* 终态边框着色：失败 / 已中断一眼可辨 */
+.subagent-box.error {
+  border-color: rgba(217, 83, 79, 0.5);
+}
+.subagent-box.aborted {
+  border-color: rgba(199, 138, 44, 0.5);
+}
+.subagent-error {
+  margin-bottom: var(--sp-2);
+  color: #d9534f;
+  font-size: var(--fs-sm);
+  word-break: break-word;
+}
+.subagent-empty {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
 }
 .toolbar-icon {
   color: #c78a2c;

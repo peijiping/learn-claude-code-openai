@@ -29,6 +29,9 @@ export interface AgentEvent {
   /** 事件所属会话号；多会话并发时据此路由到对应消息缓冲 */
   session_num?: number
   text?: string
+  /** 工具调用 id。子智能体生命周期事件（sub_agent_start / sub_agent_end）里
+   *  表示**发起该子任务的主智能体 tool_call_id** —— 前端据此执行"唯一锚点
+   *  规则"（卡片挂在发起它的那条 assistant 消息下，实时与回放一致）。 */
   tool_id?: string
   tool_name?: string
   args?: string
@@ -65,6 +68,8 @@ export type UiEvent =
 export interface HistoryToolCall {
   name: string
   args: string
+  /** 子智能体回放行携带：该次工具调用在子智能体内的 id（实时按同 id 归位） */
+  tool_id?: string
   /** 工具执行状态（子智能体回放行携带；缺省按已完成处理） */
   status?: string
 }
@@ -74,6 +79,12 @@ export interface HistorySubAgent {
   name: string
   thinking: string
   toolCalls: HistoryToolCall[]
+  /** 终态：running（执行中；进程被强杀时只剩占位行）/ done / error / aborted */
+  status?: string
+  /** 执行耗时（毫秒） */
+  durationMs?: number | null
+  /** 失败原因（status=error 时非空） */
+  error?: string
 }
 
 export interface HistoryMessage {

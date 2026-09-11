@@ -24,6 +24,7 @@ from llm_config import fetch_remote_models, get_config, load_llm_config, save_co
 from paths import CHAT_HISTORY_DIR
 from session_manage import SessionManager
 from session_runtime import SessionRuntimeRegistry
+from subagent_store import SubagentStore
 
 # 启动即自举配置（Electron spawn 的 cwd 为仓库根，config.py 按 cwd 解析项目级配置）
 load_config()
@@ -233,11 +234,16 @@ def _has_real_user_turn(messages: list) -> bool:
 
 def _ensure_session_manager():
     """惰性会话下 session_manager 可能为 None（尚未 init/switch），
-    列会话等只读操作前先兜底构建（构建后 init_session 也会复用）。"""
+    列会话等只读操作前先兜底构建（构建后 init_session 也会复用）。
+
+    注入 SubagentStore：子智能体执行过程写到 `session_N.subagents.jsonl`，
+    主会话文件只保留标准消息（并在首次加载时把历史遗留的 in-file 行迁出）。
+    """
     if agent.session_manager is None:
         agent.session_manager = SessionManager(
             CHAT_HISTORY_DIR, agent.system_prompt.build_system_prompt(),
             session_prefix=agent.session_prefix,
+            subagent_store=SubagentStore(CHAT_HISTORY_DIR),
         )
     return agent.session_manager
 
@@ -263,14 +269,54 @@ def _status_snapshot_lines() -> list[str]:
     return lines
 
 
-def _history_to_ui(messages: list) -> list[dict]:
+def _attach_subagent(ui: list[dict], rec: dict) -> None:
+    """把一条子智能体记录挂到「发起它的那条 assistant 消息」下（唯一锚点规则）。
+
+    优先按 `tool_call_id`（= 发起 sub_agent 的主工具调用 id）定位；找不到时
+    回退到最近一条 assistant 消息（compaction 后原归属若被摘要替代，会降级
+    挂到摘要消息，属可接受行为）；再找不到则跳过。
+
+    实时挂载（前端 subCallAnchors）与回放挂载共用同一规则，保证切换会话
+    前后卡片位置不跳变。
+    """
+    tcid = rec.get("tool_call_id", "") or ""
+    target = None
+    if tcid:
+        for ui_msg in reversed(ui):
+            if (ui_msg.get("role") == "assistant"
+                    and tcid in (ui_msg.get("_tc_ids") or [])):
+                target = ui_msg
+                break
+    if target is None:
+        for ui_msg in reversed(ui):
+            if ui_msg.get("role") == "assistant":
+                target = ui_msg
+                break
+    if target is None:
+        return
+    target.setdefault("subagents", []).append({
+        "id": rec.get("subagent_id", ""),
+        "name": rec.get("name", ""),
+        "thinking": rec.get("thinking", ""),
+        "toolCalls": rec.get("toolCalls", []),
+        "status": rec.get("status", "done"),
+        "durationMs": rec.get("duration_ms"),
+        "error": rec.get("error", ""),
+    })
+
+
+def _history_to_ui(messages: list, subagent_records: list | None = None) -> list[dict]:
     """session 历史 → 前端可渲染消息列表。
 
     - 跳过 system / tool 消息（前者无展示价值，后者已聚合进 assistant 工具条）
     - 跳过系统注入的 user 消息（<system-reminder> 开头的 todo reminder 等）
     - assistant 保留 reasoning_content → thinking、tool_calls → 工具条
+    - 子智能体执行过程：主源为**旁路记录**（`session_N.subagents.jsonl`，
+      经 subagent_records 传入）；messages 里若仍残留 `role=subagent` 行
+      （尚未迁移的旧数据）一并挂载，按 subagent_id 去重、旁路记录优先。
     """
-    ui = []
+    ui: list[dict] = []
+    legacy_rows: list[dict] = []
     for m in messages:
         role = m.get("role")
         if role == "user":
@@ -295,30 +341,17 @@ def _history_to_ui(messages: list) -> list[dict]:
                 "toolCalls": tool_calls,
             })
         elif role == "subagent":
-            # 子智能体执行记录行：优先挂到发起它的 assistant 消息下
-            # （transcript 记录了触发它的 tool_call_id），找不到时回退到
-            # 最近一条 assistant 消息（compaction 后原归属若被摘要替代会
-            # 降级挂到摘要消息，属可接受行为）
-            trigger_tcid = m.get("tool_call_id", "")
-            target = None
-            if trigger_tcid:
-                for ui_msg in reversed(ui):
-                    if (ui_msg["role"] == "assistant"
-                            and trigger_tcid in (ui_msg.get("_tc_ids") or [])):
-                        target = ui_msg
-                        break
-            if target is None:
-                for ui_msg in reversed(ui):
-                    if ui_msg["role"] == "assistant":
-                        target = ui_msg
-                        break
-            if target is not None:
-                target.setdefault("subagents", []).append({
-                    "id": m.get("subagent_id", ""),
-                    "name": m.get("name", ""),
-                    "thinking": m.get("thinking", ""),
-                    "toolCalls": m.get("toolCalls", []),
-                })
+            # 旧数据残留的 in-file 记录行（正常已由迁移搬到旁路文件）
+            legacy_rows.append(m)
+
+    records: list[dict] = list(subagent_records or [])
+    seen = {r.get("subagent_id") for r in records}
+    for row in legacy_rows:
+        if row.get("subagent_id") not in seen:
+            records.append(row)
+            seen.add(row.get("subagent_id"))
+    for rec in records:
+        _attach_subagent(ui, rec)
     return ui
 
 
@@ -452,7 +485,7 @@ async def handle(ws):
                     await reply_sessions()
                     continue
                 try:
-                    _, _, history = await asyncio.to_thread(sm.switch_session, num)
+                    _, sess_file, history = await asyncio.to_thread(sm.switch_session, num)
                 except FileNotFoundError:
                     await safe_send(ws, _envelope("error", {"msg": f"session {num} not found"}))
                 else:
@@ -460,9 +493,13 @@ async def handle(ws):
                     # 不改变任何运行中会话的执行状态 → 切换不断流。
                     # 顺带读取该会话记录的模型与参数，供前端按元数据恢复选中。
                     meta = (await asyncio.to_thread(sm.load_meta, num)) or {}
+                    # 子智能体执行过程来自旁路文件（与主 jsonl 物理隔离），
+                    # 按 tool_call_id 挂到发起它的 assistant 消息下（与实时一致）
+                    records = await asyncio.to_thread(
+                        sm.load_subagent_records, sess_file)
                     await safe_send(ws, _envelope("session_history", {
                         "num": num,
-                        "messages": _history_to_ui(history),
+                        "messages": _history_to_ui(history, records),
                         "model_id": meta.get("model_id"),
                         "overrides": meta.get("overrides") or {},
                     }))

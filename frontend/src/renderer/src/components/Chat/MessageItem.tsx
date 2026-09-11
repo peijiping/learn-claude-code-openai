@@ -23,7 +23,10 @@ function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
   )
 }
 
-function ThinkingBox({ text, open }: { text: string; open: boolean }): JSX.Element {
+/** 思考过程折叠块：默认收起，点击展开灰色思考正文。
+ * active 为 true（thinking_delta 正在流式输出）时在「思考过程」右侧显示转圈图标，
+ * 提示模型正在思考；思考完成（正文/工具调用/turn_end）后由 store 置 false 即消失。 */
+function ThinkingBox({ text, open, active }: { text: string; open: boolean; active?: boolean }): JSX.Element {
   const [expanded, setExpanded] = useState(open)
   if (!text) return <></>
   return (
@@ -32,37 +35,64 @@ function ThinkingBox({ text, open }: { text: string; open: boolean }): JSX.Eleme
         <Icon name="chevronRight" size={12} className={expanded ? 'rot' : ''} />
         <Icon name="brain" size={13} />
         <span>思考过程</span>
+        {active && <span className="toolbar-status spinner" />}
       </button>
       {expanded && <details open className="thinking-content">{text}</details>}
     </div>
   )
 }
 
-/** 子智能体执行块：机器人头图标标识，思考过程与工具执行折叠在块下（可展开/收起） */
+/** 子智能体执行块：机器人头图标标识，思考过程与工具执行折叠在块下（可展开/收起）。
+ * 状态：执行中（转圈）/ 已完成（对勾 + 耗时）/ 失败（红叉 + 原因）/ 已中断
+ *（进程被强杀，仅剩启动占位记录）。子智能体返回给主智能体的正文不在此展示
+ * ——那是给主智能体的结果，不是给用户的。 */
 function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
   const [expanded, setExpanded] = useState(true)
+  const state: 'running' | 'done' | 'error' | 'aborted' = block.error
+    ? 'error'
+    : block.status === 'aborted'
+      ? 'aborted'
+      : block.streaming || block.status === 'running'
+        ? 'running'
+        : block.status ?? 'done'
+  const seconds =
+    typeof block.durationMs === 'number' ? Math.max(1, Math.round(block.durationMs / 1000)) : null
   return (
-    <div className="subagent-box">
+    <div className={`subagent-box ${state}`}>
       <button className="subagent-header" onClick={() => setExpanded((v) => !v)}>
         <span className="subagent-icon">
           <Icon name="bot" size={14} />
         </span>
         <span className="subagent-name">{block.name || '子智能体'}</span>
-        {block.streaming ? (
-          <span className="toolbar-status spinner" />
-        ) : (
-          <span className="toolbar-status done">
-            <Icon name="check" size={12} />
-          </span>
+        {state === 'running' && <span className="subagent-badge running">执行中</span>}
+        {state === 'error' && <span className="subagent-badge error">失败</span>}
+        {state === 'aborted' && <span className="subagent-badge aborted">已中断</span>}
+        {seconds !== null && state !== 'running' && (
+          <span className="subagent-duration">{seconds}s</span>
         )}
+        <span className="subagent-status">
+          {state === 'running' ? (
+            <span className="toolbar-status spinner" />
+          ) : state === 'error' ? (
+            <Icon name="close" size={12} />
+          ) : state === 'aborted' ? (
+            <Icon name="stop" size={12} />
+          ) : (
+            <Icon name="check" size={12} />
+          )}
+        </span>
         <Icon name="chevronRight" size={12} className={expanded ? 'rot' : ''} />
       </button>
       {expanded && (
         <div className="subagent-content">
-          <ThinkingBox text={block.thinking} open={false} />
+          {block.error && <div className="subagent-error">{block.error}</div>}
+          <ThinkingBox text={block.thinking} open={false} active={block.thinkingActive} />
           {block.toolCalls.map((t) => (
             <ToolCallBar key={t.id} tool={t} />
           ))}
+          {state === 'running' && !block.thinking && block.toolCalls.length === 0 && (
+            <div className="subagent-empty">子智能体正在准备…</div>
+          )}
         </div>
       )}
     </div>
@@ -90,7 +120,7 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
         <Icon name="terminal" size={15} />
       </div>
       <div className="assistant-body">
-        <ThinkingBox text={msg.thinking} open={false} />
+        <ThinkingBox text={msg.thinking} open={false} active={msg.thinkingActive} />
         {msg.toolCalls.map((t) => (
           <ToolCallBar key={t.id} tool={t} />
         ))}

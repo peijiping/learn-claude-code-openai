@@ -10,6 +10,7 @@ import os
 import json
 import time
 import uuid
+from datetime import datetime
 
 from paths import WORKDIR
 from hooks import HookSystem
@@ -68,11 +69,18 @@ class SubAgent:
         self.sub_llm_client = llm_client
         self.model = model
 
-    def _emit_sub_agent(self, ev_type: str, subagent_id: str, text: str = "") -> None:
-        """直接向父级 sinks 发子智能体生命周期事件（start/end，不经过 FilterSink 的类型过滤）。"""
+    def _emit_sub_agent(self, ev_type: str, subagent_id: str, text: str = "",
+                        tool_id: str = "") -> None:
+        """直接向父级 sinks 发子智能体生命周期事件（start/end，不经过 FilterSink 的类型过滤）。
+
+        tool_id：**发起本次子任务的主智能体 tool_call_id**（不是子智能体内部工具的
+        id）。前端据此把子智能体卡片挂到"发起 sub_agent 的那条 assistant 消息"下，
+        避免实时挂载点与回放挂载点不一致（切会话后卡片位置跳变）。
+        """
         if not self.sinks:
             return
-        ev = StreamEvent(type=ev_type, text=text, subagent_id=subagent_id)
+        ev = StreamEvent(type=ev_type, text=text, subagent_id=subagent_id,
+                         tool_id=tool_id)
         for s in self.sinks:
             s.emit(ev)
 
@@ -109,6 +117,7 @@ class SubAgent:
         system_prompt: str | None = None,
         allowed_tools: list[str] | None = None,
         workdir=None,
+        tool_call_id: str = "",
     ) -> tuple[str, dict]:
         """
         执行一次子智能体任务。
@@ -130,11 +139,16 @@ class SubAgent:
             workdir: 可选，工作目录（Path 或 worktree 目录）。给定时本子任务的文件
                      操作工具（bash/read/write/edit/glob/pdf）以该目录为工作根，
                      系统提示追加工作目录提醒。
+            tool_call_id: 发起本次子任务的主智能体 tool_call id。会写进 transcript
+                     并随 sub_agent_start 事件上行，供前端/回放把执行记录挂到
+                     "发起 sub_agent 的那条 assistant 消息"下（唯一锚点规则）。
 
         返回:
             (str, dict): (任务执行结果的摘要文本, 子智能体执行过程 transcript)。
-                         transcript 结构：{subagent_id, name, thinking, toolCalls, error}，
-                         失败时 error 非空、thinking/toolCalls 可能为空。
+                         transcript 结构：
+                         {subagent_id, tool_call_id, name, status, prompt, thinking,
+                          text, toolCalls, error, started_at, duration_ms}；
+                         失败时 status=error、error 非空、thinking/toolCalls 可能为空。
         """
         if allowed_tools is not None:
             sub_tools = [t for t in self.base_tools if t.get("function").get("name") in allowed_tools]
@@ -161,12 +175,16 @@ class SubAgent:
 
         # 子智能体执行过程上行给父级 sinks（CLI 的 stream_sink / 桌面端 WSSink）：
         # 转发 thinking_delta（思考过程）+ tool_call_start/delta/tool_call（预测式 + 完成态），
-        # 全部打上本次子任务 id，供前端把内容折叠到对应子智能体块下；不转发
-        # content_delta（最终摘要由主智能体写入正文，避免重复）。
+        # 全部打上本次子任务 id，供前端把内容折叠到对应子智能体块下。
+        # **不转发 content_delta**：子智能体的答复正文是给主智能体的（最终由主智能体
+        # 复述进正文），不需要流式给用户看，也不进卡片（避免与主正文重复）。
         # 同时用 CallbackSink 旁路收集同一批事件，作为 transcript 的持久化依据。
         subagent_id = f"sub_{uuid.uuid4().hex[:8]}"
         collected: list[StreamEvent] = []
-        self._emit_sub_agent("sub_agent_start", subagent_id, prompt[:120])
+        _started_at = datetime.now().isoformat(timespec="seconds")
+        _t0 = time.monotonic()
+        self._emit_sub_agent("sub_agent_start", subagent_id, prompt[:120],
+                             tool_id=tool_call_id)
         sub_sinks = [FilterSink([*(self.sinks or []), CallbackSink(collected.append)],
                                 types={"thinking_delta", "tool_call", "tool_call_start", "tool_call_delta"},
                                 subagent_id=subagent_id)]
@@ -174,13 +192,28 @@ class SubAgent:
         # transcript 名称取任务 prompt 前 80 字，便于回放时辨认
         name = (prompt[:80] + "…") if len(prompt) > 80 else (prompt or "子智能体")
 
+        def _finish(summary: str, err: str = "") -> tuple[str, dict]:
+            """收束为 (回传主智能体的摘要, transcript)：统一补齐状态/正文/耗时。"""
+            return summary, self._build_transcript(
+                subagent_id, name, collected,
+                error=err,
+                text="" if err else summary,
+                prompt=prompt,
+                tool_call_id=tool_call_id,
+                started_at=_started_at,
+                duration_ms=int((time.monotonic() - _t0) * 1000),
+            )
+
         sub_msg = None
-        _t0 = time.monotonic()
         try:
             for iteration in range(self.MAX_ITERATIONS):
                 try:
-                    # 统一流式入口：内部聚合出完整消息，sub_msg 接口兼容 OpenAI message
-                    sub_msg, _finish, _usage = streamed_create(
+                    # 统一流式入口：内部聚合出完整消息，sub_msg 接口兼容 OpenAI message。
+                    # 注意：streamed_create 返回 (message, finish_reason, usage)，
+                    # 第二个值必须叫 finish_reason —— 早期误写成 `_finish`，把上面
+                    # 定义的 _finish() 闭包覆盖成了字符串，导致后续 `_finish(...)`
+                    # 抛 "TypeError: 'str' object is not callable"（子智能体跑完即崩）。
+                    sub_msg, finish_reason, _usage = streamed_create(
                         self.sub_llm_client,
                         sinks=sub_sinks,
                         model=self.model,
@@ -194,12 +227,12 @@ class SubAgent:
                 except Exception as e:
                     error_msg = f"子智能体 API 调用失败 (第 {iteration + 1} 轮): {type(e).__name__}: {e}"
                     print(f"  [subagent] {error_msg}")
-                    return error_msg, self._build_transcript(subagent_id, name, collected, error=error_msg)
+                    return _finish(error_msg, err=error_msg)
                 sub_messages.append(sub_msg.model_dump())
 
                 if not sub_msg.tool_calls:
                     content = self._extract_content(sub_msg.model_dump())
-                    return content or "(no summary)", self._build_transcript(subagent_id, name, collected)
+                    return _finish(content or "(no summary)")
 
                 for tool_call in sub_msg.tool_calls:
                     tool_id = tool_call.id
@@ -243,44 +276,91 @@ class SubAgent:
             # 达到最大轮次，尝试从最后一轮响应中提取内容返回
             content = self._extract_content(sub_msg.model_dump()) if sub_msg else ""
             if content:
-                return f"[达到最大轮次限制，返回最后一轮摘要]\n{content}", self._build_transcript(subagent_id, name, collected)
-            return "(no summary: 达到最大轮次限制且最后一轮无内容)", self._build_transcript(subagent_id, name, collected)
+                return _finish(f"[达到最大轮次限制，返回最后一轮摘要]\n{content}")
+            return _finish("(no summary: 达到最大轮次限制且最后一轮无内容)")
+        except Exception as e:
+            # 采集完整性兜底：子智能体内部任何**未预期**异常都必须自己收束成
+            # error transcript 正常返回，绝不让异常逃逸出本方法。逃逸的后果
+            # 是三重的：(1) 主智能体这一轮 turn 直接崩掉（工具结果拿不到）；
+            # (2) 调用方拿不到 transcript → 旁路记录永远停在 `running` 占位行，
+            #     前端卡片永久转圈；(3) 后台路径下表现为 "bg followup crashed"。
+            # 注意：这里只兜 BaseException 之外的普通异常，ESC/KeyboardInterrupt
+            # 仍按正常中断语义向上传播。
+            error_msg = (f"子智能体执行异常 ({type(e).__name__}): {e}")
+            print(f"  [subagent] {error_msg}")
+            return _finish(error_msg, err=error_msg)
         finally:
             # 无论正常完成还是异常返回，都通知前端子智能体执行结束（收折叠态/停转圈）
-            self._emit_sub_agent("sub_agent_end", subagent_id)
+            self._emit_sub_agent("sub_agent_end", subagent_id, tool_id=tool_call_id)
             # 完成打点（含耗时）：排查"前端状态断了"时对照后端是否真的结束
             print(f"  [subagent] 结束 ({time.monotonic() - _t0:.1f}s): "
                   f"{(name or prompt)[:50]}")
 
-    def _build_transcript(self, subagent_id: str, name: str,
-                          events: list, error: str = "") -> dict:
-        """把旁路收集的子智能体事件聚合为可持久化的 transcript。
+    def _build_transcript(self, subagent_id: str, name: str, events: list,
+                          error: str = "", text: str = "", prompt: str = "",
+                          tool_call_id: str = "", started_at: str = "",
+                          duration_ms: int | None = None) -> dict:
+        """把旁路收集的子智能体事件聚合为可持久化的 transcript（旁路记录一条）。
 
-        结构对齐前端 SubAgentMsg：{subagent_id, name, thinking, toolCalls, error}。
-        toolCalls 由 start（建）→ delta（续 args）→ call（闭合，置 done）聚合。
+        字段与 `subagent_store` 的记录结构、前端 SubAgentMsg 的可视字段一致。
+
+        toolCalls 聚合规则（修工具状态配对 bug）：
+        - `tool_call_start(tool_id)` → 新建条目（status=running）
+        - `tool_call_delta(tool_id)` → 追加该条目的 args
+        - `tool_call(tool_id)`       → 按 **tool_id** 定位并置 done
+
+        旧实现按 `tool_calls[-1]`（最后一条）闭合：一次响应里模型并行发起 N 个
+        工具调用时，先来 N 个 start（追加 N 条），流结束后一次性来 N 个
+        tool_call（每次只标记最后一条）→ 前 N-1 条永久停在 running
+        （实测 session_6 为 6/7 running，卡片一直转圈）。
         """
         thinking = "".join(e.text for e in events if e.type == "thinking_delta")
         tool_calls: list[dict] = []
+        by_id: dict[str, dict] = {}
         for ev in events:
             if ev.type == "tool_call_start":
-                tool_calls.append({
+                item = {
+                    "tool_id": ev.tool_id or "",
                     "name": ev.tool_name or "",
                     "args": ev.args or "",
                     "status": "running",
-                })
-            elif ev.type == "tool_call_delta" and tool_calls:
-                tool_calls[-1]["args"] += ev.args or ""
-            elif ev.type == "tool_call" and tool_calls:
-                t = tool_calls[-1]
+                }
+                tool_calls.append(item)
+                if item["tool_id"]:
+                    by_id[item["tool_id"]] = item
+            elif ev.type == "tool_call_delta":
+                item = by_id.get(ev.tool_id or "")
+                if item is not None:
+                    item["args"] += ev.args or ""
+            elif ev.type == "tool_call":
+                item = by_id.get(ev.tool_id or "")
+                if item is None:
+                    # 兜底：没有对应的 start 事件（如中途接入）→ 补一条完整记录
+                    item = {
+                        "tool_id": ev.tool_id or "",
+                        "name": ev.tool_name or "",
+                        "args": ev.args or "",
+                        "status": "done",
+                    }
+                    tool_calls.append(item)
+                    if item["tool_id"]:
+                        by_id[item["tool_id"]] = item
+                    continue
                 if ev.args:
-                    t["args"] = ev.args
+                    item["args"] = ev.args
                 if ev.tool_name:
-                    t["name"] = ev.tool_name
-                t["status"] = "done"
+                    item["name"] = ev.tool_name
+                item["status"] = "done"
         return {
             "subagent_id": subagent_id,
+            "tool_call_id": tool_call_id,
             "name": name,
+            "status": "error" if error else "done",
+            "prompt": prompt,
             "thinking": thinking,
+            "text": text,
             "toolCalls": tool_calls,
             "error": error,
+            "started_at": started_at,
+            "duration_ms": duration_ms,
         }

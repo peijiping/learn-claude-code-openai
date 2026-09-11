@@ -21,10 +21,14 @@ interface AddModelModalProps {
   /** 所属连接的预置目录条目（用于「自动识别」预填能力与上下文） */
   providerPreset?: LlmProvider | null
   saving?: boolean
+  /** 编辑态：该模型是否已是默认模型（active_model_id） */
+  isDefault?: boolean
   onCancel: () => void
   onSubmit: (model: LlmConnectionModel) => void
   /** 编辑态提供删除入口 */
   onDelete?: (id: string) => void
+  /** 编辑态提供「设为默认模型」入口（写入全局 active_model_id 草稿） */
+  onSetDefault?: () => void
 }
 
 /** 「添加模型 / 模型参数」弹窗：模型 ID + 参数（上下文 / 输出上限）+ 模型能力 + 来源 + 进阶参数。
@@ -33,9 +37,11 @@ export default function AddModelModal({
   initial = null,
   providerPreset = null,
   saving = false,
+  isDefault = false,
   onCancel,
   onSubmit,
-  onDelete
+  onDelete,
+  onSetDefault
 }: AddModelModalProps): JSX.Element {
   const editing = !!initial
   const [modelId, setModelId] = useState(initial?.model ?? '')
@@ -386,6 +392,16 @@ export default function AddModelModal({
               }}
             >
               {confirmDelete ? '确认删除？' : '删除模型'}
+            </button>
+          )}
+          {editing && onSetDefault && (
+            <button
+              className="btn ammodal-default"
+              disabled={saving || isDefault || !initial?.enabled}
+              title={initial?.enabled ? undefined : '模型未启用，不能设为默认模型'}
+              onClick={onSetDefault}
+            >
+              {isDefault ? '默认模型 ✓' : '设为默认模型'}
             </button>
           )}
           <span className="addmodel-foot-hint">保存连接后生效</span>

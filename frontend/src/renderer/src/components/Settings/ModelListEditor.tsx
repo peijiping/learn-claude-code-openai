@@ -19,10 +19,8 @@ interface ModelListEditorProps {
   knownIds?: Set<string>
   /** 全部勾选 / 取消勾选（⋯ 菜单） */
   onCheckAll?: (checked: boolean) => void
-  /** 当前使用中的模型 id（在该行显示「当前」标签） */
+  /** 默认模型 id（在该行显示「默认」标签） */
   activeId?: string | null
-  /** 点击模型名设为当前使用模型（设置页主面板提供） */
-  onSetActive?: (id: string) => void
   emptyText?: string
 }
 
@@ -39,7 +37,6 @@ export default function ModelListEditor({
   knownIds,
   onCheckAll,
   activeId,
-  onSetActive,
   emptyText
 }: ModelListEditorProps): JSX.Element {
   const [moreOpen, setMoreOpen] = useState(false)
@@ -126,14 +123,10 @@ export default function ModelListEditor({
                 aria-label={`选择 ${m.display_name || m.model}`}
                 onChange={() => onToggle(m.id)}
               />
-              <span
-                className="mlist-name"
-                title={onSetActive ? `${m.model}（点击设为当前使用模型）` : m.model}
-                onClick={() => (onSetActive ? onSetActive(m.id) : onToggle(m.id))}
-              >
+              <span className="mlist-name" title={m.model}>
                 {m.display_name || m.model}
               </span>
-              {activeId && activeId === m.id && <span className="mlist-current">当前</span>}
+              {activeId && activeId === m.id && <span className="mlist-current">默认</span>}
               {!m.enabled && <span className="mlist-off">已停用</span>}
               {capChip && <span className="mlist-cap">{capChip}</span>}
               <span className="mlist-tags">

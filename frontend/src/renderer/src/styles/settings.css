@@ -963,6 +963,14 @@
   border-color: transparent;
   color: #fff;
 }
+.ammodal-default {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.ammodal-default:disabled {
+  opacity: 0.75;
+  cursor: default;
+}
 
 /* ── 添加供应商弹窗 ── */
 .addprovider {

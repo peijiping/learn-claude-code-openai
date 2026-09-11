@@ -34,7 +34,7 @@ class SessionManager:
     """会话管理器，负责对话历史的持久化和管理"""
 
     def __init__(self, chat_history_dir: Path, system_prompt: str,
-                 session_prefix: str = "session_"):
+                 session_prefix: str = "session_", subagent_store=None):
         """
         初始化会话管理器
 
@@ -43,10 +43,16 @@ class SessionManager:
             system_prompt: 系统提示词
             session_prefix: 会话文件名前缀，默认 "session_"；
                             cron 调度器传入 "cron_" 以独立编号
+            subagent_store: 可选的子智能体旁路记录存储（SubagentStore 实例）。
+                            传入时（桌面端）：子智能体执行过程写到独立的
+                            `session_N.subagents.jsonl`，主会话文件只保留标准
+                            消息（并在加载时把历史遗留的 in-file 行一次性迁出）。
+                            为 None 时（CLI 旧路径）：保持原行为。
         """
         self.chat_history_dir = chat_history_dir
         self.system_prompt = system_prompt
         self.session_prefix = session_prefix
+        self.subagent_store = subagent_store
         self.compact_manager = ContextCompact(
             transcript_dir=chat_history_dir.parent / ".transcripts",
             tool_results_dir=chat_history_dir.parent / ".task_outputs" / "tool-results",
@@ -150,6 +156,15 @@ class SessionManager:
         if not session_file.exists():
             return messages
 
+        # 旁路存储模式：先把历史遗留的 in-file `role=subagent` 行迁到
+        # `session_N.subagents.jsonl` 并净化主文件（幂等，首次迁移前留 .bak）。
+        # 迁移后主文件只含标准消息 → 下面的块结构自愈不会再被子智能体行打断。
+        if self.subagent_store is not None:
+            try:
+                self.subagent_store.migrate(session_file)
+            except Exception as exc:  # noqa: BLE001 - 迁移失败不阻断加载
+                print(f"\033[33m[子智能体记录迁移] 跳过（{type(exc).__name__}: {exc}）\033[0m")
+
         repaired = False  # 是否检测到拼行/坏行
         try:
             with open(session_file, "r", encoding="utf-8") as f:
@@ -231,18 +246,20 @@ class SessionManager:
         # 清理孤儿 AIMessage：上次进程在保存 AIMessage 后、ToolMessage 落盘前
         # 崩溃 / 被中断，导致 tool_calls 没有匹配的 tool 响应。重新加载整段历史
         # 直接回传 OpenAI 会触发 400 invalid_request_error。
-        messages, orphan_drops = self._sanitize_orphan_tool_calls(messages)
+        messages, repairs = self._sanitize_orphan_tool_calls(messages)
 
-        # 自愈：发现拼行/坏行，或丢弃了孤儿消息时，把清理后的列表写回文件，
-        # 避免每次启动都重复剔除同一批干消息。
-        needs_rewrite = repaired or orphan_drops > 0
+        # 自愈：发现拼行/坏行，或发生了块结构修复时，把清理后的列表写回文件，
+        # 避免每次启动都重复处理同一批问题数据。
+        # 重写不可逆（会丢弃历史坏数据）→ 先留 .bak 快照。
+        needs_rewrite = repaired or repairs > 0
         if needs_rewrite and messages:
             try:
+                self._snapshot_before_rewrite(session_file)
                 self.save_session_history(session_file, messages)
                 if repaired:
                     print("\033[33m[会话修复] 检测到历史文件存在拼行，已自动重写为标准 JSONL\033[0m")
                 else:
-                    print(f"\033[33m[会话修复] 已丢弃 {orphan_drops} 条孤儿消息并写回历史文件\033[0m")
+                    print(f"\033[33m[会话修复] 已修复 {repairs} 处块结构问题并写回历史文件\033[0m")
             except Exception as e:
                 print(f"\033[33m[会话修复] 重写历史文件失败: {e}\033[0m")
 
@@ -297,60 +314,136 @@ class SessionManager:
 
     def _sanitize_orphan_tool_calls(self, messages: list) -> tuple[list, int]:
         """
-        清理孤儿 assistant 消息：带 tool_calls 但其后没有匹配 tool 消息的情况。
+        保守修复 tool 块结构，**绝不静默删除整轮对话**。
 
-        当会话文件因进程崩溃 / Ctrl+C 在 assistant 消息落盘后、tool 消息落盘前被
-        中断时，加载整段历史直接回传 OpenAI 会触发：
-            BadRequestError: An assistant message with 'tool_calls' must be
-            followed by tool messages responding to each 'tool_call_id'.
-        本函数扫描消息列表，对每个带 tool_calls 的 assistant 消息，验证紧随其后
-        的 tool 消息是否覆盖了全部 tool_call_id；缺失则丢弃该 assistant 消息
-        以及它后面紧跟的任何错位 tool 消息。
+        背景（历史数据丢失 bug）：带 tool_calls 的 assistant 消息若其后没有匹配
+        tool 响应（进程在两者之间崩溃），直接回传 OpenAI 会触发 400：
+            An assistant message with 'tool_calls' must be followed by tool
+            messages responding to each 'tool_call_id'.
+        旧实现丢弃该 assistant 及其后续 tool 消息；一旦块结构被子智能体记录行
+        （role=subagent，曾与标准消息混写在同一 jsonl）打断，就会误判为孤儿并
+        **删除整轮对话 + 原子重写文件**（不可逆）。
+
+        新实现采取保守策略：
+        1. `role=subagent` 记录行不参与、也不打断 tool 块连续性判定（扫描时跳过
+           并暂存），它不属于模型消息；
+        2. 缺失的 tool 响应用占位 tool 消息补齐，而不是丢弃 assistant ——
+           宁可让模型看到一条"结果缺失"，也不让用户丢掉一整轮对话；
+        3. 暂存的 subagent 行统一移到该块之后，避免生成
+           `assistant → subagent → tool` 这种非法顺序（新数据走旁路文件后
+           不会再产生，此处仅兜底旧数据）；
+        4. 仅"孤立 tool 消息"（前面确无匹配 assistant.tool_calls）才丢弃 ——
+           这是 OpenAI 明确拒绝的结构，且无独立可恢复的信息。
 
         Returns:
-            (清理后的消息列表, 丢弃的孤儿 assistant 消息条数)
+            (修复后的消息列表, 修复动作条数)
         """
-        sanitized = []
-        drops = 0
+        sanitized: list = []
+        repairs = 0
         i = 0
-        while i < len(messages):
+        n = len(messages)
+        while i < n:
             msg = messages[i]
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                expected_ids = {
+                expected_ids = [
                     tc["id"] for tc in msg["tool_calls"]
-                    if isinstance(tc, dict) and "id" in tc
-                }
+                    if isinstance(tc, dict) and tc.get("id")
+                ]
                 if not expected_ids:
                     sanitized.append(msg)
                     i += 1
                     continue
+                expected = set(expected_ids)
 
+                # 向后扫描本块的 tool 响应；跳过（并暂存）subagent 记录行，
+                # 绝不允许它打断块连续性判定。
                 j = i + 1
                 found_ids: set[str] = set()
-                while j < len(messages) and messages[j].get("role") == "tool":
-                    if messages[j].get("tool_call_id") in expected_ids:
-                        found_ids.add(messages[j].get("tool_call_id"))
-                    j += 1
-                    if found_ids == expected_ids:
-                        break
+                block_tools: list = []
+                subagent_rows: list = []
+                while j < n:
+                    role = messages[j].get("role")
+                    if role == "tool":
+                        block_tools.append(messages[j])
+                        if messages[j].get("tool_call_id") in expected:
+                            found_ids.add(messages[j].get("tool_call_id"))
+                        j += 1
+                        if found_ids == expected:
+                            break
+                        continue
+                    if role == "subagent":
+                        subagent_rows.append(messages[j])
+                        j += 1
+                        continue
+                    break
 
-                if found_ids == expected_ids:
-                    sanitized.extend(messages[i:j])
-                    i = j
-                else:
-                    missing = expected_ids - found_ids
-                    dropped_tools = j - i - 1
-                    drops += 1
-                    print(
-                        f"\033[33m[会话修复] 丢弃孤儿 assistant 消息 "
-                        f"（缺失 tool 响应: {sorted(missing)}，"
-                        f"丢弃错位 tool 消息: {dropped_tools} 条）\033[0m"
-                    )
-                    i = j
-            else:
+                missing = expected - found_ids
                 sanitized.append(msg)
-                i += 1
-        return sanitized, drops
+                sanitized.extend(block_tools)
+                if missing:
+                    for tcid in expected_ids:
+                        if tcid in missing:
+                            sanitized.append({
+                                "role": "tool",
+                                "tool_call_id": tcid,
+                                "content": "Error: missing tool result (recovered)",
+                            })
+                    repairs += 1
+                    print(
+                        f"\033[33m[会话修复] 补齐缺失的工具响应 "
+                        f"（{sorted(missing)}，占位写入而非丢弃该轮对话）\033[0m"
+                    )
+                if subagent_rows:
+                    # 子智能体记录移到块后，恢复合法结构
+                    sanitized.extend(subagent_rows)
+                    repairs += 1
+                    print(
+                        f"\033[33m[会话修复] 归位 {len(subagent_rows)} 条子智能体记录行 "
+                        f"（移出 assistant/tool 块中间）\033[0m"
+                    )
+                i = j
+                continue
+
+            # 孤立 tool 消息：前面没有带匹配 tool_call_id 的 assistant(tool_calls)。
+            # 直接回传 OpenAI 会触发 400，且无独立可恢复信息 → 丢弃。
+            if msg.get("role") == "tool":
+                prev = sanitized[-1] if sanitized else None
+                valid_prev = (
+                    prev is not None
+                    and prev.get("role") == "assistant"
+                    and any(
+                        isinstance(tc, dict) and tc.get("id") == msg.get("tool_call_id")
+                        for tc in (prev.get("tool_calls") or [])
+                    )
+                )
+                if not valid_prev:
+                    repairs += 1
+                    print(
+                        f"\033[33m[会话修复] 丢弃孤儿 tool 消息 "
+                        f"（缺少匹配的 assistant.tool_calls，"
+                        f"tool_call_id={msg.get('tool_call_id')!r}）\033[0m"
+                    )
+                    i += 1
+                    continue
+
+            sanitized.append(msg)
+            i += 1
+        return sanitized, repairs
+
+    def _snapshot_before_rewrite(self, session_file: Path) -> None:
+        """自愈重写前留一份 `.bak` 快照（仅首次，不覆盖更早的备份）。
+
+        自愈重写是"丢弃历史坏数据"的不可逆操作；留快照让误判可人工回滚。
+        与旁路记录迁移使用同一快照名（谁先写谁生效，语义都是"最初形态快照"）。
+        """
+        backup = session_file.with_name(session_file.name + ".bak")
+        if backup.exists() or not session_file.exists():
+            return
+        try:
+            backup.write_bytes(session_file.read_bytes())
+            print(f"\033[33m[会话修复] 已留备份快照 {backup.name}（重写前）\033[0m")
+        except OSError as e:
+            print(f"\033[33m[会话修复] 备份失败（继续重写）: {e}\033[0m")
 
     def _message_to_json_row(self, message) -> dict:
         """将 OpenAI JSON 格式消息转换为 jsonl 行（与 load_session_history 读取结构保持一致）。"""
@@ -412,13 +505,25 @@ class SessionManager:
 
     def append_subagent_to_session(self, session_file: Path, transcript: dict) -> None:
         """
-        把子智能体执行过程写入会话文件（role=subagent 独立行）并进缓存。
+        把子智能体执行过程写入会话记录（终态行）。
 
-        transcript 结构：{subagent_id, name, thinking, toolCalls}，可选 tool_call_id
-        （发起方主智能体 tool_call 的 id，回放时据此把记录挂回对应 assistant 消息下）。
-        该行只服务前端回放展示，不属于模型上下文（Agent 加载时过滤，
-        重写时由 save_session_history 按缓存回写）。
+        **旁路存储模式（桌面端，注入 subagent_store）**：写到独立的
+        `session_N.subagents.jsonl`，主会话文件只保留标准消息。这是
+        「写入位置错误 → 整轮对话被自愈逻辑删除」（D1）的结构性修复：
+        两类数据物理隔离，append 顺序不再是隐式契约。
+
+        未注入 store（CLI 旧路径）：沿用 in-file `role=subagent` 行。
+
+        transcript 结构：{subagent_id, name, thinking, toolCalls}，可选
+        tool_call_id（发起方主智能体 tool_call 的 id，回放时据此把记录挂回
+        对应 assistant 消息下）、text / error / duration_ms / started_at。
         """
+        if self.subagent_store is not None:
+            try:
+                self.subagent_store.append(session_file, transcript)
+            except Exception as e:
+                print(f"写入子智能体执行记录失败: {e}")
+            return
         row = {
             "role": "subagent",
             "subagent_id": transcript.get("subagent_id", ""),
@@ -436,6 +541,38 @@ class SessionManager:
                 self.subagent_rows.setdefault(session_file, []).append(row)
         except Exception as e:
             print(f"写入子智能体执行记录失败: {e}")
+
+    def begin_subagent(self, session_file: Path, subagent_id: str,
+                       tool_call_id: str = "", name: str = "",
+                       prompt: str = "", source: str = "sync") -> None:
+        """子智能体启动时的占位记录（仅旁路存储模式生效）。
+
+        写一条 `status=running` 行：进程被强杀（无终态行）时历史里仍留有痕迹，
+        卡片显示"运行中/已中断"；同时让实时回放能立刻看到卡片。
+        """
+        if self.subagent_store is None:
+            return
+        try:
+            self.subagent_store.begin(
+                session_file, subagent_id=subagent_id, tool_call_id=tool_call_id,
+                name=name, prompt=prompt, source=source,
+            )
+        except Exception as e:
+            print(f"写入子智能体启动占位记录失败: {e}")
+
+    def load_subagent_records(self, session_file: Path) -> list:
+        """读取某会话的子智能体执行记录（供桌面端回放挂载）。
+
+        旁路存储模式读 `session_N.subagents.jsonl`（按 subagent_id 取末条）；
+        未注入 store 时回退读 in-file `role=subagent` 行（兼容旧路径）。
+        """
+        if self.subagent_store is not None:
+            try:
+                return self.subagent_store.load(session_file)
+            except Exception as e:
+                print(f"读取子智能体执行记录失败: {e}")
+                return []
+        return [dict(r) for r in self._read_subagent_rows(session_file)]
 
     def _read_subagent_rows(self, session_file: Path) -> list:
         """
@@ -473,6 +610,10 @@ class SessionManager:
         子智能体执行记录（role=subagent 行）不属于 messages（模型上下文）：
         重写前从缓存/旧文件提取，重写后原样回写（与 messages 中已有的
         按 subagent_id 去重），保证 compact / 自愈重写不丢子智能体记录。
+
+        旁路存储模式下主文件本就不含 subagent 行（记录在
+        `session_N.subagents.jsonl`），因此无需（也不得）回写 —— 压缩 /
+        自愈重写天然与子智能体记录互不影响。
         """
         session_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = session_file.with_suffix(session_file.suffix + ".tmp")
@@ -481,7 +622,10 @@ class SessionManager:
             with self._append_lock:
                 # 读缓存与写盘同锁：后台 sub_agent 完成线程可能在重写期间
                 # append 新行，加锁避免读到一半被并发修改/写盘错过新行。
-                old_subagent_rows = self._read_subagent_rows(session_file)
+                old_subagent_rows = (
+                    [] if self.subagent_store is not None
+                    else self._read_subagent_rows(session_file)
+                )
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     for message in messages:
                         f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
@@ -921,6 +1065,9 @@ class SessionManager:
         except OSError as e:
             print(f"删除会话文件失败: {e}")
             return False
+        # 子智能体旁路记录与主文件同生共死（不残留、不串台）
+        if self.subagent_store is not None:
+            self.subagent_store.delete(session_file)
         # todo 与 chat history 同生共死（tools.set_todo_manager 创建的路径）
         try:
             todo_file = todo_file_for_session(num)
@@ -1008,8 +1155,10 @@ class SessionManager:
             for message in self._build_initial_messages():
                 self.append_message_to_session(session_file, message)
 
-            # 子智能体执行记录随会话内容一起清空（缓存同步失效）
+            # 子智能体执行记录随会话内容一起清空（缓存同步失效 + 旁路文件删除）
             self.subagent_rows.pop(session_file, None)
+            if self.subagent_store is not None:
+                self.subagent_store.clear(session_file)
 
             return max(0, deleted_count - 1)  # 减去保留的系统提示词
         except Exception as e:

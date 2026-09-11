@@ -302,7 +302,7 @@ class ErrorRecovery:
                     {"type": "text",
                      "text": "[Error] Context too large, cannot continue."}
                 ],
-            }.model_dump()
+            }
             # 加入大模型回复到历史消息中
             history_messages.append(error_msg_dict)
             session_manager.append_message_to_session(session_file, error_msg_dict)
@@ -317,7 +317,7 @@ class ErrorRecovery:
             "content": [
                 {"type": "text", "text": f"[Error] {name}: {str(e)[:200]}"}
             ],
-        }.model_dump()
+        }
         # 加入大模型回复到历史消息中
         history_messages.append(error_msg_dict)
         session_manager.append_message_to_session(session_file, error_msg_dict)
