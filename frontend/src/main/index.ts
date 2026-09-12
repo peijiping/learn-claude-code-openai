@@ -1,10 +1,21 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, nativeImage } from 'electron'
 import { join } from 'path'
 import { PythonManager, PythonStatus } from './pythonManager'
 import { AgentWS, ConnStatus } from './agentWS'
 import { flog } from './logger'
 
 const WS_PORT = Number(process.env.AGENT_WS_PORT || '8765')
+
+// 应用图标：机器人头像（dev 下位于工程根 build/icon.jpg；打包后位于安装资源目录）
+const APP_ICON = join(app.getAppPath(), 'build/icon.jpg')
+
+// macOS Dock 图标：nativeImage 可直接用该路径加载（PNG/JPG 均可）
+function ensureAppIcon(): void {
+  if (process.platform === 'darwin' && app.dock) {
+    const icon = nativeImage.createFromPath(APP_ICON)
+    if (!icon.isEmpty()) app.dock.setIcon(icon)
+  }
+}
 
 let mainWindow: BrowserWindow | null = null
 const python = new PythonManager({
@@ -71,11 +82,12 @@ function resolvePending(envelope: unknown): void {
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1180,
+    width: 1380,
     height: 800,
     minWidth: 860,
     minHeight: 600,
     show: false,
+    icon: APP_ICON, // Windows/Linux 窗口与任务栏图标
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -227,6 +239,7 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   flog.info('app', `Electron 主进程启动 (electron=${process.versions.electron}, node=${process.versions.node}, pid=${process.pid})`)
+  ensureAppIcon() // macOS Dock 图标
   createWindow()
   // 方案B：先建窗显示界面；后端冷启动期间由渲染进程的"启动画面"遮罩覆盖
   //（见 02-界面功能设计.md 启动遮罩），直至 WS 首次 connected 后切主界面。
