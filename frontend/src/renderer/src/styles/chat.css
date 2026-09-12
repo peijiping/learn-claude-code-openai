@@ -28,12 +28,29 @@
   color: var(--color-text-primary);
 }
 
-/* 消息流 */
+/* 消息流：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
 .msglist {
   flex: 1;
   overflow-y: auto;
   padding: var(--sp-5) var(--sp-5) var(--sp-2);
   min-height: 0;
+  width: 100%;
+  max-width: 940px;
+  margin: 0 auto;
+}
+/* 对话区域隐藏滚动条但保留滚动：消息列表 / 深度思考框 / 输入框 */
+.msglist,
+.thinking-content,
+.composer-input {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.msglist::-webkit-scrollbar,
+.thinking-content::-webkit-scrollbar,
+.composer-input::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 .msg-row {
   margin-bottom: var(--sp-4);
@@ -50,6 +67,7 @@
   max-width: 70%;
   font-size: var(--fs-md);
   line-height: 1.6;
+  user-select: text;
 }
 
 /* assistant 消息 */
@@ -95,10 +113,17 @@
   border-width: 2px;
   margin-left: var(--sp-1);
 }
+/* 思考正文：max-height 自适应滚动框。上限 146px（约 20vh），窗口变矮时随视口比例缩小（下限 120px）；
+ * 文本不足上限时按实际内容高度显示；思考中（active）自动展开实时显示流式输出并滚到底；
+ * 思考结束自动折叠，点击标题重新展开为同款框，内容超出上限时框内上下滚动。 */
 .thinking-content {
   margin-top: var(--sp-2);
   padding: var(--sp-2) var(--sp-3);
-  border-left: 2px solid var(--color-border);
+  max-height: clamp(120px, 20vh, 146px);
+  overflow-y: auto;
+  background: var(--color-thinking-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
   color: var(--color-thinking);
   font-size: var(--fs-sm);
   white-space: pre-wrap;
@@ -270,10 +295,13 @@
   font-size: var(--fs-xs);
 }
 
-/* 输入区 */
+/* 输入区：宽度上限 940px（与消息列表一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
 .composer-wrap {
   padding: var(--sp-3) var(--sp-5) var(--sp-4);
   flex: none;
+  width: 100%;
+  max-width: 940px;
+  margin: 0 auto;
 }
 .composer {
   border: 1px solid var(--color-border);

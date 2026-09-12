@@ -199,6 +199,7 @@ cython_debug/
 .task_outputs/
 .tasks/
 .teams/
+.playwright-cli/
 
 # Ruff stuff:
 .ruff_cache/

@@ -14,6 +14,11 @@ import threading
 import time
 from typing import Callable
 
+from logger import get_logger
+
+# 统一日志：后台任务派发/完成打点（排查"后台子智能体期间前端状态断了"的对照源）
+log = get_logger("background")
+
 
 class BackgroundManager:
     """
@@ -98,6 +103,7 @@ class BackgroundManager:
             elapsed = time.monotonic() - started
             print(f"  \033[33m[background] completed {bg_id} ({elapsed:.1f}s): "
                   f"{cmd[:40]}\033[0m")
+            log.info("[background] %s completed (%.1fs): %r", bg_id, elapsed, cmd[:60])
 
         with self.background_lock:
             self.background_tasks[bg_id] = {
@@ -108,6 +114,7 @@ class BackgroundManager:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
         print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
+        log.info("[background] %s dispatched (tool=%s): %r", bg_id, tool_name, cmd[:60])
         return bg_id
 
     # 查询后台任务状态（不消费结果，可重复调用）。

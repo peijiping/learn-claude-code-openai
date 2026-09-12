@@ -15,7 +15,12 @@ from datetime import datetime
 from paths import WORKDIR
 from hooks import HookSystem
 from llm_manage import LLMClient
+from logger import get_logger
 from streaming_client import CallbackSink, FilterSink, StreamEvent, streamed_create
+
+# 统一日志（~/.aigent/logs/agent_日期.log）：排查"前端状态断了"时，
+# 对照后端工具执行打点与前端卡片更新时间即可定位断连窗口。
+log = get_logger("subagent")
 
 class SubAgent:
     """
@@ -70,17 +75,22 @@ class SubAgent:
         self.model = model
 
     def _emit_sub_agent(self, ev_type: str, subagent_id: str, text: str = "",
-                        tool_id: str = "") -> None:
+                        tool_id: str = "", tool_name: str = "", args: str = "") -> None:
         """直接向父级 sinks 发子智能体生命周期事件（start/end，不经过 FilterSink 的类型过滤）。
 
         tool_id：**发起本次子任务的主智能体 tool_call_id**（不是子智能体内部工具的
         id）。前端据此把子智能体卡片挂到"发起 sub_agent 的那条 assistant 消息"下，
         避免实时挂载点与回放挂载点不一致（切会话后卡片位置跳变）。
+
+        tool_name / args：子智能体**内部工具执行**生命周期事件（tool_exec_start /
+        tool_exec_end）携带，前端把卡片里对应的工具行从"流式聚合完成"拨回
+        "执行中"，执行结束后再闭合——否则工具执行阶段（往往最耗时）卡片零更新，
+        用户看到的是"执行状态断了"，直到主智能体续轮才"回来"（2026-09-12 修复）。
         """
         if not self.sinks:
             return
         ev = StreamEvent(type=ev_type, text=text, subagent_id=subagent_id,
-                         tool_id=tool_id)
+                         tool_id=tool_id, tool_name=tool_name, args=args)
         for s in self.sinks:
             s.emit(ev)
 
@@ -178,8 +188,12 @@ class SubAgent:
         # 全部打上本次子任务 id，供前端把内容折叠到对应子智能体块下。
         # **不转发 content_delta**：子智能体的答复正文是给主智能体的（最终由主智能体
         # 复述进正文），不需要流式给用户看，也不进卡片（避免与主正文重复）。
-        # 同时用 CallbackSink 旁路收集同一批事件，作为 transcript 的持久化依据。
+        # 工具执行生命周期（tool_exec_start/end）不走这里 —— 它们由下方执行循环经
+        # _emit_sub_agent 直达父级 sinks（事件自带 subagent_id，无需 FilterSink 打标）。
+        # 同时用 CallbackSink 旁路收集同一批流式事件，作为 transcript 的持久化依据。
         subagent_id = f"sub_{uuid.uuid4().hex[:8]}"
+        log.info("[subagent] %s 开始执行任务 (%s, tool_call_id=%s): %r",
+                 subagent_id, tools_label, tool_call_id or "-", prompt[:80])
         collected: list[StreamEvent] = []
         _started_at = datetime.now().isoformat(timespec="seconds")
         _t0 = time.monotonic()
@@ -250,10 +264,23 @@ class SubAgent:
                             continue
                         handler = sub_handlers.get(tool_name)
                         if handler:
+                            # 工具执行生命周期上行（修复"执行阶段卡片零更新"）：
+                            # 流式聚合完成时 tool_call 事件已把该工具标成 done，
+                            # 但真正的执行此刻才开始（往往最耗时）——不把状态拨回
+                            # "执行中"，前端卡片就会在整个执行窗口内完全冻结，
+                            # 用户看到"子智能体与前端的状态断了"，直到主智能体
+                            # 续轮输出时才"回来"（2026-09-12 实测复现）。
+                            self._emit_sub_agent("tool_exec_start", subagent_id,
+                                                 tool_id=tool_id, tool_name=tool_name)
+                            _exec_t0 = time.monotonic()
                             try:
                                 output = handler(**tool_args)
                             except Exception as e:
                                 output = f"Error executing {tool_name}: {e}"
+                            self._emit_sub_agent("tool_exec_end", subagent_id,
+                                                 tool_id=tool_id, tool_name=tool_name)
+                            log.info("[subagent] %s 工具 %s 执行完成 (%.2fs)",
+                                     subagent_id, tool_name, time.monotonic() - _exec_t0)
                             # hooks: PostToolUse
                             self.hook_system.trigger("PostToolUse", tool_call, output)
                         else:
@@ -293,8 +320,9 @@ class SubAgent:
             # 无论正常完成还是异常返回，都通知前端子智能体执行结束（收折叠态/停转圈）
             self._emit_sub_agent("sub_agent_end", subagent_id, tool_id=tool_call_id)
             # 完成打点（含耗时）：排查"前端状态断了"时对照后端是否真的结束
-            print(f"  [subagent] 结束 ({time.monotonic() - _t0:.1f}s): "
-                  f"{(name or prompt)[:50]}")
+            _elapsed = time.monotonic() - _t0
+            print(f"  [subagent] 结束 ({_elapsed:.1f}s): {(name or prompt)[:50]}")
+            log.info("[subagent] %s 结束 (%.1fs): %r", subagent_id, _elapsed, (name or prompt)[:50])
 
     def _build_transcript(self, subagent_id: str, name: str, events: list,
                           error: str = "", text: str = "", prompt: str = "",

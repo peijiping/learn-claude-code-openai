@@ -20,8 +20,10 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = ROOT / "agents"
@@ -473,6 +475,59 @@ class TestSpawnSubagentContract(unittest.TestCase):
             sub.sinks = [CallbackSink(seen.append)]
             sub.spawn_subagent("任务", tool_call_id="call_3")
             self.assertIn("sub_agent_end", [e.type for e in seen])
+
+    def test_tool_execution_emits_exec_lifecycle_events(self):
+        """回归（2026-09-12）：子智能体工具「执行阶段」必须发 tool_exec_start/end。
+
+        根因：流聚合完成（tool_call）≠ 执行开始。此前执行阶段（往往最耗时）
+        零事件上行，前端卡片在整个执行窗口内完全冻结 —— 后台子智能体场景下
+        用户看到"与前端的状态断了"，直到主智能体续轮才"回来"。
+        """
+        self._stub(StubMessage(content="收尾"), "stop")
+        sub = _offline_subagent()
+        # 带一个工具调用：第一轮 LLM 响应携带 run_read_pdf 调用，handler 慢速执行
+        seen = []
+        sub.sinks = [CallbackSink(seen.append)]
+        sub.base_tools = []
+        sub.tool_handlers = {"run_read_pdf": lambda **kw: (time.sleep(0.05), "内容")[1]}
+
+        call_seq = {"n": 0}
+
+        def scripted(llm, sinks=None, should_stop=None, **kwargs):
+            call_seq["n"] += 1
+            if call_seq["n"] == 1:
+                tc = SimpleNamespace(id="call_T1", type="function",
+                                     function=SimpleNamespace(name="run_read_pdf",
+                                                              arguments='{"path":"a.pdf"}'))
+                # 模拟真实 consume_stream：流式阶段发预测式 start + 聚合完成 tool_call
+                for s in (sinks or []):
+                    s.emit(StreamEvent(type="tool_call_start", tool_id="call_T1",
+                                       tool_name="run_read_pdf", args='{"path":"a.pdf"}'))
+                    s.emit(StreamEvent(type="tool_call", tool_id="call_T1",
+                                       tool_name="run_read_pdf", args='{"path":"a.pdf"}'))
+                return StubMessage(content=None, tool_calls=[tc]), "tool_calls", {}
+            return StubMessage(content="完成"), "stop", {}
+
+        subagent.streamed_create = scripted
+        summary, transcript = sub.spawn_subagent("读pdf", tool_call_id="call_main")
+
+        types = [e.type for e in seen]
+        self.assertIn("tool_exec_start", types, "执行开始必须上行 tool_exec_start")
+        self.assertIn("tool_exec_end", types, "执行结束必须上行 tool_exec_end")
+        # 次序约束：exec_start 在 exec_end 之前，且都夹在 sub_agent_start/end 之间
+        self.assertLess(types.index("sub_agent_start"), types.index("tool_exec_start"))
+        self.assertLess(types.index("tool_exec_start"), types.index("tool_exec_end"))
+        self.assertLess(types.index("tool_exec_end"), types.index("sub_agent_end"))
+        # 事件必须携带子智能体内部工具 id/name（前端按 id 把工具行拨回"执行中"）
+        start_ev = seen[types.index("tool_exec_start")]
+        end_ev = seen[types.index("tool_exec_end")]
+        self.assertEqual(start_ev.tool_id, "call_T1")
+        self.assertEqual(start_ev.tool_name, "run_read_pdf")
+        self.assertEqual(start_ev.subagent_id, transcript["subagent_id"])
+        self.assertEqual(end_ev.tool_id, "call_T1")
+        # 旁路 transcript 不受新事件影响（未知类型忽略，工具仍闭合为 done）
+        self.assertEqual(transcript["toolCalls"][0]["status"], "done")
+        self.assertEqual(transcript["toolCalls"][0]["tool_id"], "call_T1")
 
 
 if __name__ == "__main__":

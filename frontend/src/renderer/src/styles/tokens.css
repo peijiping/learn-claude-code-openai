@@ -13,6 +13,7 @@
   --color-action-right: #4f8ef7;     /* 渐变终点(蓝) */
   --color-badge: #7c6cff;            /* Lite badge 紫 */
   --color-thinking: #9a9a9a;         /* thinking 灰 */
+  --color-thinking-bg: #f0f7ff;      /* thinking 框底色（浅蓝） */
   --color-danger: #e0533d;
   --color-ok: #34a853;
 

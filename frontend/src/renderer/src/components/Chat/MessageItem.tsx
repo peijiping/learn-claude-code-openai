@@ -1,14 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
 import type { Message, SubAgentMsg, ToolCallMsg } from '@store/agentStore'
+import MessageMenu from './MessageMenu'
 
 function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
   return (
     <div className={`toolbar-call ${tool.status}`}>
       <span className="toolbar-icon">
-        <Icon name="gear" size={13} />
+        <Icon name="terminal" size={13} />
       </span>
       <span className="toolbar-name">{tool.name || '(工具)'}</span>
       <span className="toolbar-args">({tool.args.slice(0, 120)}{tool.args.length > 120 ? '…' : ''})</span>
@@ -23,21 +24,32 @@ function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
   )
 }
 
-/** 思考过程折叠块：默认收起，点击展开灰色思考正文。
- * active 为 true（thinking_delta 正在流式输出）时在「思考过程」右侧显示转圈图标，
- * 提示模型正在思考；思考完成（正文/工具调用/turn_end）后由 store 置 false 即消失。 */
+/** 思考过程折叠块：思考中（active=true）自动展开，用固定高度框实时展示流式思考输出；
+ * 思考结束后自动折叠回标题行；点击标题可重新展开为同款固定高度可滚动框。 */
 function ThinkingBox({ text, open, active }: { text: string; open: boolean; active?: boolean }): JSX.Element {
   const [expanded, setExpanded] = useState(open)
+  const contentRef = useRef<HTMLDivElement>(null)
+  // 流式输出期间固定高度框自动滚到底，保证最新思考内容可见
+  useEffect(() => {
+    if (active && contentRef.current) {
+      contentRef.current.scrollTop = contentRef.current.scrollHeight
+    }
+  }, [text, active])
+  const showContent = active || expanded
   if (!text) return <></>
   return (
     <div className="thinking-box">
       <button className="thinking-toggle" onClick={() => setExpanded((v) => !v)}>
-        <Icon name="chevronRight" size={12} className={expanded ? 'rot' : ''} />
         <Icon name="brain" size={13} />
-        <span>思考过程</span>
+        <span>深度思考</span>
         {active && <span className="toolbar-status spinner" />}
+        <Icon name="chevronRight" size={12} className={active || expanded ? 'rot' : ''} />
       </button>
-      {expanded && <details open className="thinking-content">{text}</details>}
+      {showContent && (
+        <div className="thinking-content" ref={contentRef}>
+          {text}
+        </div>
+      )}
     </div>
   )
 }
@@ -100,11 +112,27 @@ function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
 }
 
 export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+
+  /** 右键打开消息菜单 */
+  const openMenu = (e: ReactMouseEvent): void => {
+    e.preventDefault()
+    setMenu({ x: e.clientX, y: e.clientY })
+  }
+
+  /** 复制消息正文（原始纯文本） */
+  const copyContent = (): void => {
+    void navigator.clipboard.writeText(msg.content || '')
+  }
+
   if (msg.role === 'user') {
     return (
-      <div className="msg-row user">
-        <div className="msg-bubble user">{msg.content}</div>
-      </div>
+      <>
+        <div className="msg-row user" onContextMenu={openMenu}>
+          <div className="msg-bubble user">{msg.content}</div>
+        </div>
+        {menu && <MessageMenu x={menu.x} y={menu.y} onCopy={copyContent} onClose={() => setMenu(null)} />}
+      </>
     )
   }
 
@@ -115,28 +143,28 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
   ) : null
 
   return (
-    <div className="msg-row assistant">
-      <div className="assistant-avatar">
-        <Icon name="terminal" size={15} />
-      </div>
-      <div className="assistant-body">
-        <ThinkingBox text={msg.thinking} open={false} active={msg.thinkingActive} />
-        {msg.toolCalls.map((t) => (
-          <ToolCallBar key={t.id} tool={t} />
-        ))}
-        {msg.subagents.map((s) => (
-          <SubAgentBlock key={s.id} block={s} />
-        ))}
-        <div className="markdown-body">
-          {msg.content ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-          ) : (
-            msg.streaming && <span className="cursor" />
-          )}
-          {msg.streaming && msg.content && <span className="cursor" />}
+    <>
+      <div className="msg-row assistant" onContextMenu={openMenu}>
+        <div className="assistant-body">
+          <ThinkingBox text={msg.thinking} open={false} active={msg.thinkingActive} />
+          {msg.toolCalls.map((t) => (
+            <ToolCallBar key={t.id} tool={t} />
+          ))}
+          {msg.subagents.map((s) => (
+            <SubAgentBlock key={s.id} block={s} />
+          ))}
+          <div className="markdown-body">
+            {msg.content ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+            ) : (
+              msg.streaming && <span className="cursor" />
+            )}
+            {msg.streaming && msg.content && <span className="cursor" />}
+          </div>
+          {!msg.streaming && usage}
         </div>
-        {!msg.streaming && usage}
       </div>
-    </div>
+      {menu && <MessageMenu x={menu.x} y={menu.y} onCopy={copyContent} onClose={() => setMenu(null)} />}
+    </>
   )
 }

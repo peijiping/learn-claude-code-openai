@@ -12,6 +12,11 @@ export type StreamEventType =
   | 'turn_end'
   | 'sub_agent_start'
   | 'sub_agent_end'
+  /** 子智能体内部工具「开始真正执行」：流聚合完成（tool_call）≠ 执行开始，
+   *  执行阶段（往往最耗时）据此把卡片里对应工具行拨回"执行中"，
+   *  修复后台子智能体执行期间卡片零更新的断连观感（2026-09-12）。 */
+  | 'tool_exec_start'
+  | 'tool_exec_end'
 
 export interface ContextStats {
   /** 当前会话已用 token（启发式估算） */
@@ -316,6 +321,8 @@ export function isKnownAgentEvent(ev: AgentEvent): boolean {
     'tool_call',
     'turn_end',
     'sub_agent_start',
-    'sub_agent_end'
+    'sub_agent_end',
+    'tool_exec_start',
+    'tool_exec_end'
   ].includes(ev.type)
 }

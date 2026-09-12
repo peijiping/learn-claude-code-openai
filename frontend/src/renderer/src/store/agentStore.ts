@@ -544,6 +544,42 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
       )
       break
     }
+    case 'tool_exec_start':
+    case 'tool_exec_end': {
+      // 工具「真正执行」的生命周期：tool_call（流聚合完成）把工具标 done 后，
+      // 实际执行此刻才开始 —— 执行开始拨回 running，执行结束再标 done。
+      // 缺了这两个事件，执行阶段（往往最耗时）卡片会完全冻结（2026-09-12 修复）。
+      const id = ensureAssistant()
+      const tid = ev.tool_id || ''
+      if (!tid) break
+      const running = ev.type === 'tool_exec_start'
+      msgs = msgs.map((m) => {
+        if (m.id !== id) return m
+        return {
+          ...m,
+          subagents: m.subagents.map((s) => {
+            if (s.id !== subId) return s
+            const exists = s.toolCalls.some((t) => t.id === tid)
+            const toolCalls = exists
+              ? s.toolCalls.map((t) =>
+                  t.id === tid
+                    ? {
+                        ...t,
+                        status: (running ? 'running' : 'done') as ToolCallMsg['status'],
+                        name: ev.tool_name || t.name
+                      }
+                    : t
+                )
+              : [
+                  ...s.toolCalls,
+                  { id: tid, name: ev.tool_name ?? '', args: ev.args ?? '', status: (running ? 'running' : 'done') as ToolCallMsg['status'] }
+                ]
+            return { ...s, toolCalls, activeToolId: running ? tid : s.activeToolId }
+          })
+        }
+      })
+      break
+    }
     case 'sub_agent_end': {
       const id = ensureAssistant()
       msgs = msgs.map((m) => {
