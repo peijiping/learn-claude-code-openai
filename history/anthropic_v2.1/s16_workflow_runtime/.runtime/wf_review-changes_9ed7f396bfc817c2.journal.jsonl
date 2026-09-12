@@ -1,0 +1,11 @@
+{"key": "agent-4165874729", "value": {"findings": [{"title": "audit:correctness #1", "severity": "low"}]}}
+{"key": "agent-6350648910", "value": {"findings": [{"title": "audit:security #1", "severity": "low"}, {"title": "audit:security #2", "severity": "low"}]}}
+{"key": "agent-9592688132", "value": {"findings": [{"title": "audit:performance #1", "severity": "medium"}, {"title": "audit:performance #2", "severity": "medium"}]}}
+{"key": "agent-6470996330", "value": {"findings": [{"title": "audit:style #1", "severity": "medium"}, {"title": "audit:style #2", "severity": "medium"}]}}
+{"key": "agent-0285516561", "value": {"isReal": false, "reason": "could not reproduce"}}
+{"key": "agent-4713569769", "value": {"isReal": true, "reason": "reproduced"}}
+{"key": "agent-3907395517", "value": {"isReal": true, "reason": "reproduced"}}
+{"key": "agent-9037414677", "value": {"isReal": true, "reason": "reproduced"}}
+{"key": "agent-7674383663", "value": {"isReal": true, "reason": "reproduced"}}
+{"key": "agent-4426315398", "value": {"isReal": true, "reason": "reproduced"}}
+{"key": "agent-2945860836", "value": {"isReal": true, "reason": "reproduced"}}

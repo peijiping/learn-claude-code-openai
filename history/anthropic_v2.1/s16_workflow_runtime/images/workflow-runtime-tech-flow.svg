@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 812" width="100%" height="auto" role="img" font-family="SF Pro Text, PingFang SC, system-ui, sans-serif">
+  <style>
+    .card { }
+    .th { fill: #171717; font: 500 14px/20px "SF Pro Text","PingFang SC",system-ui,sans-serif; }
+    .ts { fill: #52525B; font: 400 12px/18px "SF Pro Text","PingFang SC",system-ui,sans-serif; }
+    .gl { fill: #52525B; font: 500 12px/18px "SF Pro Text","PingFang SC",system-ui,sans-serif; letter-spacing: .02em; }
+    .arr { stroke: #9AA0A6; stroke-width: 1.5; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .arr-brand { stroke: #4B3FE3; stroke-width: 1.5; fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 4 4; }
+    g.grp > rect { fill: #EFEFF2; stroke: #17171726; stroke-dasharray: 6 4; }
+    g.nd > rect { fill: #F7F7F8; stroke: #1717171F; }
+    g.nd-brand > rect { fill: #F2F7FF; stroke: #4B3FE3; }
+    g.nd-brand text.th { fill: #1A1759; }
+    g.nd-brand text.ts { fill: #4B3FE3; }
+  </style>
+  <defs>
+    <marker id="arw1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M1 1 L7 4 L1 7 Z" style="fill: #9AA0A6;"/>
+    </marker>
+    <marker id="arwb1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M1 1 L7 4 L1 7 Z" style="fill: #4B3FE3;"/>
+    </marker>
+  </defs>
+
+  <g class="grp"><rect x="48" y="56" width="624" height="160" rx="12"/></g>
+  <text class="gl" x="68" y="78">① 工具入口层</text>
+  <g class="nd">
+    <rect x="186" y="90" width="348" height="44" rx="8"/>
+    <text class="th" x="360" y="108" text-anchor="middle">模型调用 run_workflow 工具</text>
+    <text class="ts" x="360" y="126" text-anchor="middle">只给名字和参数，代码由人预先注册</text>
+  </g>
+  <path class="arr" d="M360,134 L360,148" marker-end="url(#arw1)"/>
+  <g class="nd">
+    <rect x="186" y="150" width="348" height="44" rx="8"/>
+    <text class="th" x="360" y="168" text-anchor="middle">run_sync() 同步桥</text>
+    <text class="ts" x="360" y="186" text-anchor="middle">asyncio.run() 桥接异步运行时</text>
+  </g>
+
+  <path class="arr" d="M360,194 L360,270" marker-end="url(#arw1)"/>
+
+  <g class="grp"><rect x="48" y="240" width="624" height="180" rx="12"/></g>
+  <text class="gl" x="68" y="262">② WorkflowManager 运行器</text>
+  <g class="nd">
+    <rect x="136" y="274" width="448" height="48" rx="8"/>
+    <text class="th" x="360" y="292" text-anchor="middle">校验 → 原子占坑 runId → 双重锁</text>
+    <text class="ts" x="360" y="310" text-anchor="middle">O_EXCL 占位 · 线程锁 + fcntl 文件锁互斥</text>
+  </g>
+  <path class="arr" d="M360,322 L360,336" marker-end="url(#arw1)"/>
+  <g class="nd">
+    <rect x="136" y="338" width="448" height="48" rx="8"/>
+    <text class="th" x="360" y="356" text-anchor="middle">组装 ExecutionState (ctx)</text>
+    <text class="ts" x="360" y="374" text-anchor="middle">注入 Journal · Budget · Runner · Limits</text>
+  </g>
+
+  <path class="arr" d="M360,386 L360,482" marker-end="url(#arw1)"/>
+
+  <g class="grp"><rect x="48" y="452" width="624" height="252" rx="12"/></g>
+  <text class="gl" x="68" y="474">③ 执行层</text>
+  <g class="nd">
+    <rect x="136" y="486" width="448" height="48" rx="8"/>
+    <text class="th" x="360" y="504" text-anchor="middle">执行编排脚本 script_fn(ctx, args)</text>
+    <text class="ts" x="360" y="522" text-anchor="middle">计划即代码：pipeline / parallel / agent</text>
+  </g>
+  <path class="arr" d="M360,534 C360,558 200,550 135,562" marker-end="url(#arw1)"/>
+
+  <g class="nd"><rect x="71" y="564" width="128" height="56" rx="8"/>
+    <text class="th" x="135" y="588" text-anchor="middle">查 journal 缓存</text>
+    <text class="ts" x="135" y="606" text-anchor="middle">语义键稳定哈希</text></g>
+  <g class="nd"><rect x="221" y="564" width="128" height="56" rx="8"/>
+    <text class="th" x="285" y="588" text-anchor="middle">并发调 LLM</text>
+    <text class="ts" x="285" y="606" text-anchor="middle">信号量 + 线程池</text></g>
+  <g class="nd"><rect x="371" y="564" width="128" height="56" rx="8"/>
+    <text class="th" x="435" y="588" text-anchor="middle">schema 校验</text>
+    <text class="ts" x="435" y="606" text-anchor="middle">失败重试一次</text></g>
+  <g class="nd"><rect x="521" y="564" width="128" height="56" rx="8"/>
+    <text class="th" x="585" y="588" text-anchor="middle">记账落盘</text>
+    <text class="ts" x="585" y="606" text-anchor="middle">Budget + Journal</text></g>
+
+  <path class="arr" d="M199,592 L215,592" marker-end="url(#arw1)"/>
+  <path class="arr" d="M349,592 L365,592" marker-end="url(#arw1)"/>
+  <path class="arr" d="M499,592 L515,592" marker-end="url(#arw1)"/>
+
+  <path class="arr-brand" d="M135,620 L135,638" marker-end="url(#arwb1)"/>
+  <text class="ts" x="143" y="634" style="fill: #4B3FE3;">命中</text>
+  <g class="nd-brand">
+    <rect x="71" y="642" width="278" height="44" rx="8"/>
+    <text class="th" x="210" y="660" text-anchor="middle">缓存命中 → 直接重放结果</text>
+    <text class="ts" x="210" y="678" text-anchor="middle">resume 时不再调用模型</text>
+  </g>
+
+  <path class="arr" d="M360,704 L360,720" marker-end="url(#arw1)"/>
+  <g class="nd">
+    <rect x="136" y="724" width="448" height="48" rx="8"/>
+    <text class="th" x="360" y="742" text-anchor="middle">收尾：output.json + 快照 + last_run</text>
+    <text class="ts" x="360" y="760" text-anchor="middle">已完成步骤留在 journal，可 resume 续跑</text>
+  </g>
+</svg>

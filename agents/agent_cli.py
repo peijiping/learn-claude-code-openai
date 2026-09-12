@@ -23,10 +23,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if Path.cwd() != _PROJECT_ROOT:
     os.chdir(_PROJECT_ROOT)
 
-from dotenv import load_dotenv
 from agent_full_v2 import Agent
+from config import load as load_config
+from llm_config import load_llm_config
+from logger import get_logger, install_excepthooks
 from cron_scheduler import CronScheduler
+from goal import CLEAR_ALIASES, GoalError
 from paths import CHAT_HISTORY_DIR, DURABLE_PATH
+
+log = get_logger("cli")
 
 # readline 中文输入配置（从原 agent_full_v2.py 顶部迁移过来）
 try:
@@ -40,7 +45,13 @@ except ImportError:
 
 
 def main() -> None:
-    load_dotenv(override=True)
+    # 自举配置：真实环境变量 > 项目级 .aigent/config.json > ~/.aigent/config.json > .env > 默认值
+    load_config()
+    # 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
+    load_llm_config()
+    install_excepthooks()
+    log.info("agent_cli 启动 (pid=%s, model=%s)",
+             os.getpid(), os.environ.get("OPENAI_MODEL_ID", "(none)"))
 
     # ── s14：启动 CronScheduler（定时任务调度器）──
     cron_scheduler = CronScheduler(CHAT_HISTORY_DIR, DURABLE_PATH)
@@ -70,6 +81,7 @@ def main() -> None:
                 ("/skills", "查看当前可用的技能"),
                 ("/teams", "进入团队模式（s17 队友协作）"),
                 ("/subagent", "退出团队模式，回到默认子智能体模式"),
+                ("/goal [condition|clear]", "查看/设置/清除会话级目标（s17 目标循环）"),
             ]
             print("可用命令：")
             for name, desc in help_lines:
@@ -103,6 +115,32 @@ def main() -> None:
             continue
         if cmd == "/skills":
             print(f"当前可用技能:\n{agent.show_skills()}")
+            continue
+        # /goal：目标循环（s17）的 REPL 入口，三种用法：
+        #   /goal                → 打印当前目标状态（时长/评估次数/花费/最近判定）
+        #   /goal clear|stop|... → 清除目标（CLEAR_ALIASES 同义别名，与教程一致）
+        #   /goal <condition>    → 设置目标并立即以目标文字跑一轮（教程行为：
+        #                          目标作为首条用户消息喂给 Worker，马上开始
+        #                          朝目标干活；之后的回环由 agent_loop 的
+        #                          停止边界自动驱动，无需用户反复输入）
+        # 仅 set_goal 阶段捕获 GoalError（空目标/超长目标的用法错误）；
+        # run_turn 内部的错误由 agent_loop 的 recovery / goal error 态处理。
+        if cmd == "/goal" or cmd.startswith("/goal "):
+            argument = query.strip()[5:].strip()
+            if not argument:
+                print(agent.goal_status())
+                continue
+            if argument.lower() in CLEAR_ALIASES:
+                print(f"\033[33m{agent.clear_goal()}\033[0m")
+                continue
+            try:
+                print(f"\033[33m{agent.set_goal(argument)}\033[0m")
+            except GoalError as e:
+                print(f"\033[31m{e}\033[0m")
+                continue
+            reply = agent.run_turn(argument)
+            print(reply)
+            print()
             continue
         # /teams 与 /subagent：只要在输入中被空格独立隔开（前后为空白或行界）即生效，
         # 无需单独成行。如 `帮我 /teams 一下`、`请 /subagent 吧` 均会触发。

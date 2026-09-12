@@ -1,0 +1,72 @@
+/* ── App 整体布局：侧边栏 + 中央聊天 + 底状态条 ── */
+.app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-main);
+}
+
+.app-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* 状态条 */
+.statusbar {
+  height: var(--statusbar-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--sp-3);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-sidebar);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  flex: none;
+}
+.statusbar-left,
+.statusbar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.statusbar-link {
+  color: var(--color-accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot-ok {
+  background: var(--color-ok);
+}
+.dot-warn {
+  background: #f5a623;
+}
+.dot-off {
+  background: var(--color-text-secondary);
+}
+
+/* Toast（顶部居中） */
+.toast {
+  position: fixed;
+  top: var(--sp-4);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1f1f1f;
+  color: #fff;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  box-shadow: var(--shadow-pop);
+  z-index: 2000;
+  max-width: 70vw;
+}
+.toast-error {
+  background: var(--color-danger);
+}

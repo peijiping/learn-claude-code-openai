@@ -10,7 +10,7 @@ echo_server.py - 本地示例 MCP server（验证用，离线）
 
 运行方式：
   stdio: python -m mcp_servers.echo_server stdio
-  http : python -m mcp_servers.echo_server http     # 127.0.0.1:8765/mcp
+  http : python -m mcp_servers.echo_server http     # 127.0.0.1:8766/mcp（8765 已被 ws_bridge 占用）
 """
 
 import sys
@@ -19,7 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 
-mcp = FastMCP("echo", host="127.0.0.1", port=8765)
+mcp = FastMCP("echo", host="127.0.0.1", port=8766)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))

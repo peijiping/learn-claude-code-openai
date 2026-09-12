@@ -83,6 +83,7 @@ class ToolRegistry:
         self._teammate_manager = teammate_manager  # 团队成员管理器（holder，s17）
         self._worktree_manager = None  # worktree 管理器（holder，s18）
         self._mcp_manager = None  # MCP 管理器（holder，s19）
+        self._workflow_manager = None  # 工作流运行时管理器（holder，s16）
 
         # ── 懒加载缓存 ──
         self._handlers_cache = None
@@ -144,6 +145,19 @@ class ToolRegistry:
         if mgr is None:
             raise RuntimeError(
                 "MCPManager 未初始化。请先调用 set_mcp_manager(...)。"
+            )
+        return mgr
+
+    def set_workflow_manager(self, wm) -> None:
+        """由 agent_full_v2.py 在启动时调用一次，挂上 WorkflowManager 实例（s16）。"""
+        self._workflow_manager = wm
+
+    def get_workflow_manager(self):
+        """获取 WorkflowManager 实例；未初始化时抛错，提示调用方先 set_workflow_manager。"""
+        mgr = self._workflow_manager
+        if mgr is None:
+            raise RuntimeError(
+                "WorkflowManager 未初始化。请先调用 set_workflow_manager(...)。"
             )
         return mgr
 
@@ -528,6 +542,13 @@ class ToolRegistry:
                 "Available MCP servers:\n" + self._mcp_manager.catalog_text()
                 if self._mcp_manager else "Error: MCP not available"
             ),
+            # ── 工作流工具（s16）──
+            # workflow_manager 为 None 时返回占位错误（与 cron/mcp holder 语义一致）。
+            # run_sync 内部把 WorkflowInputError 转成 "Error: ..." 文本回给模型。
+            "run_workflow": lambda **kw: (
+                self.get_workflow_manager().run_sync(
+                    kw["name"], kw.get("args"), kw.get("resume_from_run_id"))
+            ),
         }
 
     @property
@@ -804,6 +825,31 @@ class ToolRegistry:
                 # MCP 发现工具（s19）：connect_mcp（name 枚举可用服务器）+ list_mcp（查目录），
                 # 连上后其 mcp__* 工具由 build_agent_tools() 动态追加（见 _mcp_tool_defs）
                 *self._mcp_discovery_tool_defs(),
+                # 工作流工具（s16）：按名运行已保存的编排脚本（计划即代码）
+                {"type": "function", "function": {
+                    "name": "run_workflow",
+                    "description": "Run a saved workflow by name. A workflow is a "
+                                   "pre-registered deterministic orchestration script "
+                                   "(multi-subagent plan as code): it spawns focused "
+                                   "single-step subagents, with journal-based resume "
+                                   "support. Pass input in args; pass resume_from_run_id "
+                                   "to resume a previous run (unchanged steps replay "
+                                   "from cache). Available names are limited to the "
+                                   "host registry (e.g. 'review-changes': review "
+                                   "changed code across dimensions and adversarially "
+                                   "verify each finding).",
+                    "parameters": {"type": "object",
+                                   "properties": {
+                                       "name": {"type": "string",
+                                           "description": "注册表中工作流的名字，如 'review-changes'"},
+                                       "args": {"type": "object",
+                                           "description": "工作流入参（可选）。review-changes 的入参："
+                                                          "changes（变更代码文本）、budget（token 上限，null 不限）"},
+                                       "resume_from_run_id": {"type": "string",
+                                           "description": "可选，上次运行的 runId（wf_* 格式）。"
+                                                          "传入后续跑：未变化的步骤直接命中缓存重放。"}},
+                                   "required": ["name"]}
+                }},
             ]
         return self._tools_cache
 

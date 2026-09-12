@@ -11,7 +11,13 @@ BackgroundManager —— 适配 OpenAI SDK 的后台任务管理器
    background_manager 只负责"启动线程 + 收集通知"两件事。
 """
 import threading
+import time
 from typing import Callable
+
+from logger import get_logger
+
+# 统一日志：后台任务派发/完成打点（排查"后台子智能体期间前端状态断了"的对照源）
+log = get_logger("background")
 
 
 class BackgroundManager:
@@ -83,6 +89,7 @@ class BackgroundManager:
         )
 
         def worker():
+            started = time.monotonic()
             try:
                 result = executor()
                 if not isinstance(result, str):
@@ -92,6 +99,11 @@ class BackgroundManager:
             with self.background_lock:
                 self.background_tasks[bg_id]["status"] = "completed"
                 self.background_results[bg_id] = result
+            # 完成即打点（含耗时）：区分"任务真完成"与"结果尚未注入主循环"
+            elapsed = time.monotonic() - started
+            print(f"  \033[33m[background] completed {bg_id} ({elapsed:.1f}s): "
+                  f"{cmd[:40]}\033[0m")
+            log.info("[background] %s completed (%.1fs): %r", bg_id, elapsed, cmd[:60])
 
         with self.background_lock:
             self.background_tasks[bg_id] = {
@@ -102,6 +114,7 @@ class BackgroundManager:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
         print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
+        log.info("[background] %s dispatched (tool=%s): %r", bg_id, tool_name, cmd[:60])
         return bg_id
 
     # 查询后台任务状态（不消费结果，可重复调用）。
@@ -141,18 +154,42 @@ class BackgroundManager:
                 )
             return f"[{task_id} still {t['status']}] {t['command'][:60]}"
 
-    # 收集所有已完成的后台任务，生成 <task_notification> 通知列表。
+    # 是否仍有后台任务在运行（goal Stop 钩子的 defer 分支用）：
+    # 有任务处于 running 状态时，goal 评估"是否达成"不可靠，应暂缓判定。
+    def has_running(self) -> bool:
+        """Return True if any background task is still running."""
+        with self.background_lock:
+            return any(
+                t["status"] == "running"
+                for t in self.background_tasks.values()
+            )
+
+    # 是否有"已完成但尚未注入通知"的后台结果（auto-followup 用途）：
+    # 完成后台任务的 watch 结束、但结果还没被主智能体消费过（collect
+    # 才会把 completed → notified）时返回 True，供会话运行时决定是否
+    # 自动续一轮 turn，让主智能体拿到 task_notification 并给出最终总结。
+    def has_completed_pending(self) -> bool:
+        """Return True if any finished background result is not yet consumed."""
+        with self.background_lock:
+            return any(
+                t["status"] == "completed"
+                for t in self.background_tasks.values()
+            )
+
+    # 收集所有已完成的后台任务，生成 task_notification 通知列表。
     # 设计要点（与教程版不同）：
     # - 通知里同时给 <summary>（200 字符预览）+ <full_output>（完整结果）：
     #   模型既能快速预览，也能直接读到全文，无需再查 check_background。
     # - 状态从 completed 改为 notified（不 pop 数据）：同一结果只注入一次，
     #   避免下轮重复出现；但 background_tasks / background_results 里的数据
     #   完整保留，check_background 仍能查到完整结果。
-    # - <task_notification> 是独立消息格式（普通 text 块），而非复用 tool_result——
+    # - task_notification 是独立消息格式（普通 text 块），而非复用 tool_result——
     #   因为 tool_result 必须对应具体 tool_call_id，而后台任务的结果与原始
     #   tool_use 早已"分离"了。
+    # - 整段用 <system-reminder> 包裹：这是"只给模型看、不下发前端"的判定依据
+    #   （ws_bridge._history_to_ui 按 startswith 过滤），详见下方实现处注释。
     def collect_background_results(self) -> list[str]:
-        """Collect completed background results as task_notification messages."""
+        """收集已完成的后台任务，产出 <system-reminder> 包裹的 task_notification 消息。"""
         with self.background_lock:
             ready_ids = [bid for bid, task in self.background_tasks.items()
                          if task["status"] == "completed"]
@@ -164,14 +201,20 @@ class BackgroundManager:
                 # 标记为已通知而不是 pop：同一结果只注入一次，但数据保留
                 self.background_tasks[bg_id]["status"] = "notified"
             summary = output[:200] if len(output) > 200 else output
+            # 必须用 <system-reminder> 包裹：ws_bridge._history_to_ui 只按
+            # startswith("<system-reminder>") 判定"系统注入消息"并跳过，否则这段
+            # 通知会以**用户气泡**的形式漏到聊天界面（看着像用户自己说的话）。
+            # 后台任务的用户可见性已由子智能体卡片 / 工具条承担，这里只给模型看。
             notifications.append(
+                f"<system-reminder>\n"
                 f"<task_notification>\n"
                 f"  <task_id>{bg_id}</task_id>\n"
                 f"  <status>completed</status>\n"
                 f"  <command>{task['command']}</command>\n"
                 f"  <summary>{summary}</summary>\n"
                 f"  <full_output>{output}</full_output>\n"
-                f"</task_notification>")
+                f"</task_notification>\n"
+                f"</system-reminder>")
             print(f"  \033[32m[background done] {bg_id}: "
                   f"{task['command'][:40]} ({len(output)} chars)\033[0m")
         return notifications

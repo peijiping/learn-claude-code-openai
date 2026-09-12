@@ -25,10 +25,16 @@ from session_manage import SessionManager
 from subagent import SubAgent
 from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
-from paths import WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR, WORKTREE_DIR, MCP_CONFIG
+from paths import WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR, WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR
 from tools import ToolRegistry
 from worktree import WorktreeManager
 from mcp_manager import MCPManager
+from workflow import WorkflowManager, register_default_workflows
+from goal import (
+    GoalController,
+    PromptGoalEvaluator,
+    DEFAULT_STOP_HOOK_BLOCK_CAP,
+)
 from skills import SkillLoader
 from llm_manage import LLMClient
 from system_prompt import SystemPromptBuilder
@@ -133,6 +139,30 @@ class Agent:
             primary_model=self.model, fallback_model=self.fallback_model
         )
 
+        # 工作流运行时（s16）：复用本实例的 LLM 客户端与模型跑工作流子智能体，
+        # 挂到本实例 tools 的 holder 上（实例级），并注册内置示例工作流
+        self.workflow_manager = WorkflowManager(WORKFLOW_DIR, self.llm_client, self.model)
+        register_default_workflows(self.workflow_manager)
+        self.tools.set_workflow_manager(self.workflow_manager)
+
+        # 目标循环（s17 Goal Loop）：goal 功能在主类的接入点（详见 goal.py 模块注释）
+        #   - PromptGoalEvaluator：独立评估器（无工具的 LLM 调用），读完整对话判定
+        #     目标是否达成；复用宿主 self.llm_client，不新建连接
+        #   - evaluator_model：评估器可单独配模（.env 的 GOAL_EVALUATOR_MODEL_ID，
+        #     留空则与 Worker 同模型）；goal_block_cap：连续判"未完成"的次数上限
+        #   - GoalController 只负责状态与裁决，"拦截动作"发生在 agent_loop 的
+        #     停止边界（无 tool_call 分支），见下方 agent_loop 内的注释
+        evaluator_model = os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model
+        goal_block_cap = int(
+            os.environ.get("GOAL_STOP_HOOK_BLOCK_CAP") or DEFAULT_STOP_HOOK_BLOCK_CAP
+        )
+        self.goal_controller = GoalController(
+            PromptGoalEvaluator(self.llm_client, evaluator_model),
+            block_cap=goal_block_cap,
+        )
+        # 累计 token 消耗：agent_loop 每次响应后累加（goal 状态展示"目标期间花费"用）
+        self.total_tokens = 0
+
         # ── 会话状态（由 init_session / new_session / switch_session 填充） ──
         self.session_manager: SessionManager | None = None
         self.session_num: int | None = None
@@ -180,6 +210,9 @@ class Agent:
         agent_loop 内部仍会打印 thinking / 本轮回复（保持现状 UX）；
         本方法额外返回历史最后一条消息的文本，供调用方打印。
         """
+        # 目标循环（s17）：每轮查询（用户输入 / cron 触发）都是全新过程，
+        # 重置连续 block 计数，避免上一轮的 block 累计误判触发 limit
+        self.goal_controller.begin_query()
         self.hook_system.trigger("UserPromptSubmit", user_query)
         self.history_messages.append({"role": "user", "content": user_query})
         self.session_manager.append_message_to_session(
@@ -228,6 +261,36 @@ class Agent:
     def show_tasks(self) -> str:
         """返回当前会话待办看板文本。"""
         return self.tools.get_todo_manager().render()
+
+    # ═══════════════════════════════════════════════════════════
+    #  目标循环（s17 goal loop，CLI 斜杠命令共用接缝）
+    # ═══════════════════════════════════════════════════════════
+
+    def set_goal(self, condition: str) -> str:
+        """设置会话级目标（对应 CLI 的 /goal <condition>），返回确认文本。
+
+        记录此刻的累计 token（tokens_at_start），供 /goal 状态统计
+        "目标期间花费"；若已有激活目标会被新目标覆盖（事件里记
+        "replaced by a new goal"）。condition 非法（空/超长）抛 GoalError。
+        """
+        state = self.goal_controller.set_goal(condition, self.total_tokens)
+        return f"Goal set: {state.condition}"
+
+    def clear_goal(self) -> str:
+        """清除当前目标（对应 CLI 的 /goal clear，含同义别名）。
+
+        清除后 agent_loop 的停止边界恢复"直接放行"；无目标时原样返回
+        "No goal set"。
+        """
+        return self.goal_controller.clear()
+
+    def goal_status(self) -> str:
+        """返回当前目标状态文本（对应 CLI 的 /goal 无参数）。
+
+        有激活目标：目标条件 / 存活时长 / 评估次数 / 目标期间花费 / 最近判定；
+        无激活目标：回显上次"达成/失败"结论，或 "No goal set"。
+        """
+        return self.goal_controller.status(self.total_tokens)
 
     def compact(self) -> None:
         """手动触发上下文压缩（/compact）。"""
@@ -418,12 +481,19 @@ class Agent:
                 response_msg = llm_response.choices[0].message
                 # 提取大模型回复中的工具调用
                 response_tool_calls = response_msg.tool_calls or []
+                # 累计 token 消耗（OpenAI usage：prompt_tokens 输入 + completion_tokens 输出）。
+                # /goal 状态里的"目标期间花费" = 当前累计 − 设置目标时的累计
+                # （tokens_at_start，见 Agent.set_goal）
+                usage = getattr(llm_response, "usage", None)
+                if usage is not None:
+                    self.total_tokens += int(getattr(usage, "prompt_tokens", 0) or 0) \
+                        + int(getattr(usage, "completion_tokens", 0) or 0)
                 # 打印大模型的思考和回复内容
                 # ANSI: \033[2m=暗(细体)，\033[90m=灰色，\033[0m=重置
                 self._print(
                     f"\033[2;90m[thinking]\n{truncate_chars(response_msg.reasoning_content, 300)}\n[/thinking]\033[0m"
                 )
-                self._print(f"[本轮回复]\n{response_msg.content}")
+                # self._print(f"[本轮回复]\n{response_msg.content}")
 
             except Exception as e:
                 # 外层异常处理：内层 with_retry 主动 raise 出来的"非临时错误"会到这一层。
@@ -457,7 +527,54 @@ class Agent:
             )
 
             if len(response_tool_calls) == 0:
-                # 增加一个hook，用于在大模型回复中检查是否需要强制结束当前轮次
+                # ── 停止边界（goal 的唯一拦截点，教程称"会话级 Stop 钩子"）──
+                # 模型不再调工具 = 它想停下来。无目标时 evaluate_after_turn
+                # 直接放行（allow），行为与原来完全一致；有目标时先裁决再放行。
+                decision = self.goal_controller.evaluate_after_turn(
+                    self.history_messages,
+                    background_running=self.background_manager.has_running(),
+                )
+                if decision.action == "block":
+                    # 目标未达成：把目标条件与评估器理由回注入消息（同时落盘），
+                    # continue 回环让 Worker 看到反馈后继续朝目标干活
+                    condition = (
+                        self.goal_controller.active.condition
+                        if self.goal_controller.active else ""
+                    )
+                    block_msg = {
+                        "role": "user",
+                        "content": (
+                            "[Goal still active]\n"
+                            f"Condition: {condition}\n"
+                            f"Evaluator: {decision.reason}\n"
+                            "Continue working and surface the missing evidence."
+                        ),
+                    }
+                    self.history_messages.append(block_msg)
+                    self.session_manager.append_message_to_session(
+                        self.session_file, block_msg
+                    )
+                    continue
+                if decision.action == "defer":
+                    # 后台任务仍在跑：此刻判"达成"不可靠（证据未回来），本轮先结束；
+                    # 后台结果由下轮 turn 起点的 collect_background_results 预热
+                    # 注入上下文，用户下次输入后再续判。目标保持激活。
+                    self._print(f"\033[33m[goal] defer: {decision.reason}\033[0m")
+                    return
+                # 终止态只打印结论供用户感知，目标状态已由控制器内部处理：
+                #   achieved（达成，清目标）/ failed（无法完成，清目标）/
+                #   limit（连续 block 超 block_cap，强制结束，目标保持激活）/
+                #   error（评估器调用出错，目标保持激活）
+                if decision.action == "achieved":
+                    self._print(f"\033[33m[goal] achieved: {decision.reason}\033[0m")
+                elif decision.action == "failed":
+                    self._print(f"\033[31m[goal] failed: {decision.reason}\033[0m")
+                elif decision.action == "limit":
+                    self._print(f"\033[31m[goal] limit: {decision.reason}\033[0m")
+                elif decision.action == "error":
+                    self._print(f"\033[31m[goal] evaluation error: {decision.reason}\033[0m")
+                # allow（无目标）与各终止态 → 走原有 Stop hook 流程
+                # （钩子返回非 None 仍可强制续跑，goal 之外的第二道拦截不受影响）
                 force = self.hook_system.trigger("Stop", self.history_messages)
                 if force:
                     # 往消息中记录强制结束的原因

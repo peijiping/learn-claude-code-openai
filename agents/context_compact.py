@@ -29,8 +29,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from llm_manage import LLMClient
+from streaming_client import streamed_create
 
 from paths import TRANSCRIPT_DIRNAME, TOOL_RESULTS_DIRNAME
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("compact")
 
 
 # ── 1. 配置常量（运行时可由 .env 覆盖） ──────────────────────────────
@@ -408,7 +413,9 @@ class ContextCompact:
         if chosen is not None:
             return chosen(prompt)
         
-        response = self.llm_client.chat.completions.create(
+        # 统一流式入口：摘要调用无 tools，不上 UI（sinks=None），仅内部聚合
+        msg, _finish, _usage = streamed_create(
+            self.llm_client,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=4000,
             temperature=0.5,
@@ -416,7 +423,7 @@ class ContextCompact:
             extra_body={"thinking":{"type":"disabled"}} #思考模式开关，值范围 disabled、enabled，默认 enabled
         )
 
-        return self.content_to_str(response.choices[0].message.content) or "(empty summary)"
+        return self.content_to_str(msg.content) or "(empty summary)"
 
     def write_transcript(self, messages: list, transcript_dir: Optional[Path] = None) -> Path:
         """把当前完整历史写到 .transcripts/transcript_<timestamp>.jsonl。"""
@@ -460,7 +467,10 @@ class ContextCompact:
         transcript_dir: Optional[Path] = None,
     ) -> list:
         """把中间一段 messages 压缩为单条摘要 HumanMessage。
-        保留前缀：SystemMessage + workspace 指令。
+
+        保留前缀：**仅 SystemMessage** —— `_protected_prefix_end()` 只保护 `messages[0]`。
+        注意：workspace 指令（AGENTS.md）**早已并入该条 system message**，不再是独立消息；
+        "另有一条指令消息受保护"是旧设计的说法，别据此把指令挪成独立消息（那会被 L4 摘要吃掉）。
         保留后缀：最后 PRESERVE_RECENT_SUMMARY_MESSAGES 条原文。
         压缩前先 write_transcript 做全量快照。
         """
@@ -479,7 +489,7 @@ class ContextCompact:
             return messages
 
         summary = self.summarize_history(to_summarize, summarizer=summarizer)
-        print(f"[transcript saved: {transcript_path}]")
+        log.info("[transcript saved: %s]", transcript_path)
         return [
             *messages[:prefix_end],
             HumanMessage(content=f"<context_summary>\n{summary}\n</context_summary>"),

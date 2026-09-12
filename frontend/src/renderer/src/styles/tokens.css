@@ -1,0 +1,47 @@
+:root {
+  /* 色板 */
+  --color-bg-main: #ffffff;          /* 主内容白底 */
+  --color-bg-sidebar: #f5f5f5;       /* 侧边栏浅灰 */
+  --color-bg-hover: rgba(0, 0, 0, 0.05);
+  --color-bg-active: rgba(124, 108, 255, 0.08);
+  --color-border: #e5e5e5;
+  --color-text-primary: #1f1f1f;     /* 主文字 */
+  --color-text-secondary: #8a8a8a;   /* 次要文字 */
+  --color-accent: #7c6cff;           /* 主色(紫) */
+  --color-accent-rgb: 124, 108, 255;
+  --color-action-left: #7c6cff;      /* 渐变起点(紫) */
+  --color-action-right: #4f8ef7;     /* 渐变终点(蓝) */
+  --color-badge: #7c6cff;            /* Lite badge 紫 */
+  --color-thinking: #9a9a9a;         /* thinking 灰 */
+  --color-thinking-bg: #f0f7ff;      /* thinking 框底色（浅蓝） */
+  --color-danger: #e0533d;
+  --color-ok: #34a853;
+
+  /* 圆角 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-pill: 999px;
+
+  /* 间距 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+
+  /* 字号 */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 24px;
+
+  /* 布局 */
+  --sidebar-width: 240px;
+  --statusbar-height: 26px;
+  --radii-btn: 12px;
+
+  /* 阴影 */
+  --shadow-md: 0 2px 12px rgba(0, 0, 0, 0.08);
+  --shadow-pop: 0 4px 24px rgba(0, 0, 0, 0.12);
+}

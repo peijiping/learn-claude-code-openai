@@ -5,9 +5,11 @@ memories.py - 持久化记忆管理
 模型可通过 write_memory / forget_memory 两个工具即时落盘记忆条目，
 存储在 .memory/ 目录，索引由 MEMORY.md 维护。
 
-设计要点（与 s09 课程保持一致）：
+设计要点：
 - 每条记忆是一个 *.md 文件，YAML frontmatter 记录 name / type / description
-- 每次写/删后扫描目录重建 MEMORY.md 索引，注入 SYSTEM 提示
+- 每次写/删后扫描目录重建 MEMORY.md 索引，并把**最新索引回显在工具返回值**里（一次调用闭环）
+- 索引**不再拼进 system prompt**（那会让整段前缀随会话失效、且跨会话无法共享缓存）；
+  改由 `agent_full_v2._sync_memory_index()` 在指纹变化时以**尾部追加**方式注入
 - 不再额外起 LLM 抽取/整合（由模型在调用 write_memory 时自决）
 """
 
@@ -92,8 +94,10 @@ class MemoryStore:
                 f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
             )
             self._rebuild_index()
-            # print(f"\033[33m[Memory saved: {name} ({mem_type})]\033[0m")
-            return f"Saved memory to {filepath.name}"
+            # 回显最新索引：一次工具调用即闭环，模型不必等下一轮的
+            # <memory_index> system-reminder 注入才知道权威列表。
+            return (f"Saved memory '{name}' -> {filepath.name}\n\n"
+                    f"当前记忆索引：\n{self.read_index() or '（暂无记忆）'}")
         except Exception as e:
             return f"Error saving memory: {e}"
 
@@ -112,7 +116,8 @@ class MemoryStore:
                     return f"Error: memory '{name}' not found"
             path.unlink()
             self._rebuild_index()
-            # print(f"\033[33m[Memory deleted: {name}]\033[0m")
-            return f"Deleted memory '{name}'"
+            # 回显最新索引（同 write）：删除后模型立刻看到权威列表
+            return (f"Deleted memory '{name}'\n\n"
+                    f"当前记忆索引：\n{self.read_index() or '（暂无记忆）'}")
         except Exception as e:
             return f"Error deleting memory: {e}"

@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 656" width="100%" height="auto" role="img" font-family="SF Pro Text, PingFang SC, system-ui, sans-serif">
+  <style>
+    .th { fill: #171717; font: 500 14px/20px "SF Pro Text","PingFang SC",system-ui,sans-serif; }
+    .ts { fill: #52525B; font: 400 12px/18px "SF Pro Text","PingFang SC",system-ui,sans-serif; }
+    .gl { fill: #52525B; font: 500 12px/18px "SF Pro Text","PingFang SC",system-ui,sans-serif; letter-spacing: .02em; }
+    .arr { stroke: #9AA0A6; stroke-width: 1.5; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    g.grp > rect { fill: #EFEFF2; stroke: #17171726; stroke-dasharray: 6 4; }
+    g.nd > rect { fill: #F7F7F8; stroke: #1717171F; }
+    g.nd-brand > rect { fill: #F2F7FF; stroke: #4B3FE3; }
+    g.nd-brand text.th { fill: #1A1759; }
+    g.nd-brand text.ts { fill: #4B3FE3; }
+  </style>
+  <defs>
+    <marker id="arw2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M1 1 L7 4 L1 7 Z" style="fill: #9AA0A6;"/>
+    </marker>
+  </defs>
+
+  <g class="nd">
+    <rect x="195" y="52" width="330" height="40" rx="20"/>
+    <text class="th" x="360" y="77" text-anchor="middle">输入：代码变更 args.changes</text>
+  </g>
+  <path class="arr" d="M360,92 L360,110" marker-end="url(#arw2)"/>
+
+  <g class="grp"><rect x="48" y="112" width="624" height="124" rx="12"/></g>
+  <text class="gl" x="68" y="134">Review 审查阶段 · 四维度并发（pipeline 无屏障）</text>
+  <g class="nd"><rect x="71" y="154" width="128" height="54" rx="8"/>
+    <text class="th" x="135" y="178" text-anchor="middle">正确性审查</text>
+    <text class="ts" x="135" y="196" text-anchor="middle">correctness</text></g>
+  <g class="nd"><rect x="221" y="154" width="128" height="54" rx="8"/>
+    <text class="th" x="285" y="178" text-anchor="middle">安全性审查</text>
+    <text class="ts" x="285" y="196" text-anchor="middle">security</text></g>
+  <g class="nd"><rect x="371" y="154" width="128" height="54" rx="8"/>
+    <text class="th" x="435" y="178" text-anchor="middle">性能审查</text>
+    <text class="ts" x="435" y="196" text-anchor="middle">performance</text></g>
+  <g class="nd"><rect x="521" y="154" width="128" height="54" rx="8"/>
+    <text class="th" x="585" y="178" text-anchor="middle">风格审查</text>
+    <text class="ts" x="585" y="196" text-anchor="middle">style</text></g>
+
+  <path class="arr" d="M360,236 L360,254" marker-end="url(#arw2)"/>
+
+  <g class="grp"><rect x="48" y="256" width="624" height="124" rx="12"/></g>
+  <text class="gl" x="68" y="278">Verify 验证阶段 · 每条 finding 对抗验证</text>
+  <g class="nd">
+    <rect x="100" y="298" width="240" height="48" rx="8"/>
+    <text class="th" x="220" y="316" text-anchor="middle">每条 finding 一个验证器</text>
+    <text class="ts" x="220" y="334" text-anchor="middle">parallel 屏障式并发</text>
+  </g>
+  <path class="arr" d="M340,322 L366,322" marker-end="url(#arw2)"/>
+  <g class="nd-brand">
+    <rect x="368" y="298" width="252" height="48" rx="8"/>
+    <text class="th" x="494" y="316" text-anchor="middle">对抗验证判定</text>
+    <text class="ts" x="494" y="334" text-anchor="middle">isReal: true / false</text>
+  </g>
+
+  <path class="arr" d="M360,380 L360,398" marker-end="url(#arw2)"/>
+
+  <g class="grp"><rect x="48" y="400" width="624" height="220" rx="12"/></g>
+  <text class="gl" x="68" y="422">汇总输出</text>
+  <g class="nd">
+    <rect x="210" y="438" width="300" height="44" rx="8"/>
+    <text class="th" x="360" y="456" text-anchor="middle">只保留 isReal = true</text>
+    <text class="ts" x="360" y="474" text-anchor="middle">过滤误报</text>
+  </g>
+  <path class="arr" d="M360,482 L360,496" marker-end="url(#arw2)"/>
+  <g class="nd">
+    <rect x="210" y="498" width="300" height="44" rx="8"/>
+    <text class="th" x="360" y="516" text-anchor="middle">按严重度排序</text>
+    <text class="ts" x="360" y="534" text-anchor="middle">high &gt; medium &gt; low</text>
+  </g>
+  <path class="arr" d="M360,542 L360,556" marker-end="url(#arw2)"/>
+  <g class="nd">
+    <rect x="210" y="558" width="300" height="40" rx="20"/>
+    <text class="th" x="360" y="583" text-anchor="middle">输出 confirmed[] 确认的发现</text>
+  </g>
+</svg>

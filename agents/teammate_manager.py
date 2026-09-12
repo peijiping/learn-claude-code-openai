@@ -25,6 +25,11 @@ from message_bus import MessageBus
 from llm_manage import LLMClient
 from paths import INBOX_DIR
 from tools import ToolRegistry
+from streaming_client import streamed_create
+from logger import get_logger
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("teammate")
 
 # ── 可调参数（遵循 .env 约定，见 AGENTS.md）──
 IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_INTERVAL", "5"))   # 空闲等待的兜底周期（秒），配合 Event 即时唤醒
@@ -76,7 +81,9 @@ class TeammateManager:
             tools: ToolRegistry 实例，用于执行工具调用（默认构造实例，非全局单例）
         """
         self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)                      # 确保目录存在
+        # 先判断再创建：目录已存在时跳过 mkdir，避免文件代理对 exist_ok 误报 EEXIST
+        if not self.dir.exists():
+            self.dir.mkdir(parents=True, exist_ok=True)    # 确保目录存在
         self.config_path = self.dir / "config.json"        # 团队配置文件路径
         self.config = self._load_config()                  # 加载团队配置
         self.threads = {}                                  # 存储队友线程 {name: Thread}
@@ -93,6 +100,11 @@ class TeammateManager:
         self.wake_events: dict[str, threading.Event] = {}
         # s18：队友 → 绑定的 worktree 路径（Path | None），文件操作以此为工作根
         self._member_worktrees: dict[str, Path | None] = {}
+
+    def set_llm(self, llm_client, model: str) -> None:
+        """配置热切换：就地重建队友协作的 LLM 绑定（无需重建实例）。"""
+        self.llm_client = llm_client
+        self.model = model
 
     # ═══════════════════════════════════════════════════════════
     #  团队配置持久化（config.json）
@@ -161,22 +173,21 @@ class TeammateManager:
         """通过 request_id 将响应与原始请求关联起来。"""
         state = self.pending_requests.get(request_id)
         if not state:
-            print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
+            log.error("[protocol] unknown request_id: %s", request_id)
             return
         # 校验响应类型与请求类型是否匹配
         if state.type == "shutdown" and response_type != "shutdown_response":
-            print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
-                  f"got {response_type}\033[0m")
+            log.error("[protocol] type mismatch: expected shutdown_response, "
+                      "got %s", response_type)
             return
         if state.type == "plan_approval" and response_type != "plan_approval_response":
-            print(f"  \033[31m[protocol] type mismatch: expected plan_approval_response, "
-                  f"got {response_type}\033[0m")
+            log.error("[protocol] type mismatch: expected plan_approval_response, "
+                      "got %s", response_type)
             return
         state.status = "approved" if approve else "rejected"
         icon = "✓" if approve else "✗"
-        color = "32" if approve else "31"
-        print(f"  \033[{color}m[protocol] {state.type} {icon} "
-              f"({request_id}: {state.status})\033[0m")
+        log.info("[protocol] %s %s (%s: %s)",
+                 state.type, icon, request_id, state.status)
 
     # ═══════════════════════════════════════════════════════════
     #  自主队友：任务板扫描 + 空闲轮询（来自 s17）
@@ -215,14 +226,14 @@ class TeammateManager:
                         self._send(name, "lead", "Shutting down gracefully.",
                                       "shutdown_response",
                                       {"request_id": req_id, "approve": True})
-                        print(f"  \033[35m[protocol] {name} approved shutdown "
-                              f"in idle ({req_id})\033[0m")
+                        log.info("[protocol] %s approved shutdown in idle (%s)",
+                                 name, req_id)
                         return "shutdown"
 
                 # 非协议消息：注入对话上下文，恢复工作
                 messages.append({"role": "user",
                     "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
-                print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
+                log.info("[idle] %s found inbox messages", name)
                 return "work"
 
             # 第二步：扫描任务板，自动认领未分配的任务
@@ -234,13 +245,11 @@ class TeammateManager:
                     messages.append({"role": "user",
                         "content": f"<auto-claimed>Task {task.id}: "
                                    f"{task.subject}</auto-claimed>"})
-                    print(f"  \033[32m[idle] {name} auto-claimed: "
-                          f"{task.subject}\033[0m")
+                    log.info("[idle] %s auto-claimed: %s", name, task.subject)
                     return "work"
-                print(f"  \033[33m[idle] {name} claim failed: "
-                      f"{result}\033[0m")
+                log.warning("[idle] %s claim failed: %s", name, result)
 
-        print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
+        log.error("[idle] %s timeout (%ds)", name, IDLE_TIMEOUT)
         return "timeout"
 
     # ═══════════════════════════════════════════════════════════
@@ -287,7 +296,7 @@ class TeammateManager:
         )
         self.threads[name] = thread
         thread.start()
-        print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
+        log.info("[teammate] %s spawned as %s", name, role)
         return f"Teammate '{name}' spawned as {role} (autonomous)"
 
     def _handle_inbox_message(self, name: str, msg: dict, messages: list) -> bool:
@@ -300,8 +309,7 @@ class TeammateManager:
             self._send(name, "lead", "Shutting down gracefully.",
                           "shutdown_response",
                           {"request_id": req_id, "approve": True})
-            print(f"  \033[35m[protocol] {name} approved shutdown "
-                  f"({req_id})\033[0m")
+            log.info("[protocol] %s approved shutdown (%s)", name, req_id)
             return True  # 返回 True 表示需要关闭
 
         if msg_type == "plan_approval_response":
@@ -358,7 +366,10 @@ class TeammateManager:
                             "content": f"<inbox>{json.dumps(non_protocol)}</inbox>"})
 
                 try:
-                    response = self.llm_client.chat.completions.create(
+                    # 统一流式入口：队友运行在后台线程，不上任何 UI（sinks=None），
+                    # 仅内部聚合出完整消息（接口兼容 OpenAI message）
+                    response_msg, finish_reason, _usage = streamed_create(
+                        self.llm_client,
                         model=self.model,
                         messages=messages,
                         tools=self._teammate_tools(),
@@ -366,10 +377,9 @@ class TeammateManager:
                         max_tokens=TEAM_MAX_TOKENS,
                     )
                 except Exception as e:
-                    print(f"  \033[31m[teammate] {name} LLM error: {e}\033[0m")
+                    log.error("[teammate] %s LLM error: %s", name, e)
                     break
 
-                response_msg = response.choices[0].message
                 tool_calls = response_msg.tool_calls or []
                 # 以 OpenAI 请求格式存 assistant 消息（仅保留 role/content/tool_calls，
                 # 去掉 model_dump() 混入的 refusal/audio/index 等响应字段）
@@ -380,7 +390,7 @@ class TeammateManager:
                     assistant_msg["tool_calls"] = [
                         tc.model_dump() for tc in tool_calls]
                 messages.append(assistant_msg)
-                if response.choices[0].finish_reason != "tool_calls" or not tool_calls:
+                if finish_reason != "tool_calls" or not tool_calls:
                     break  # 非工具调用 → 停止本轮
 
                 for tc in tool_calls:
@@ -417,7 +427,7 @@ class TeammateManager:
         self._update_member_status(name, "shutdown" if should_shutdown else "idle")
         self.active_teammates.pop(name, None)
         self.wake_events.pop(name, None)
-        print(f"  \033[32m[teammate] {name} finished\033[0m")
+        log.info("[teammate] %s finished", name)
 
     # ═══════════════════════════════════════════════════════════
     #  队友工具：定义（OpenAI function calling 格式）+ 执行分发
@@ -537,8 +547,7 @@ class TeammateManager:
         self._send("lead", teammate, "Please shut down gracefully.",
                       "shutdown_request",
                       {"request_id": req_id})
-        print(f"  \033[35m[protocol] shutdown_request → {teammate} "
-              f"({req_id})\033[0m")
+        log.info("[protocol] shutdown_request → %s (%s)", teammate, req_id)
         return f"Shutdown request sent to {teammate} (req: {req_id})"
 
     def request_plan(self, teammate: str, task: str) -> str:
@@ -561,7 +570,7 @@ class TeammateManager:
                       "plan_approval_response",
                       {"request_id": request_id, "approve": approve})
         icon = "✓" if approve else "✗"
-        print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
+        log.info("[protocol] plan %s (%s)", icon, request_id)
         return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
     # ═══════════════════════════════════════════════════════════

@@ -1,0 +1,265 @@
+/* ── 左侧边栏 ── */
+.sidebar {
+  width: var(--sidebar-width);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-sidebar);
+  border-right: 1px solid var(--color-border);
+  min-height: 0;
+}
+
+.sidebar-block {
+  padding: var(--sp-2);
+}
+
+/* 快捷操作 */
+.quick-action {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  font-size: var(--fs-md);
+}
+.quick-action:hover {
+  background: var(--color-bg-hover);
+}
+.quick-label {
+  flex: 1;
+  text-align: left;
+}
+.quick-shortcut {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* 任务树 */
+.tasktree {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.tasktree-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.tasktree-actions {
+  display: flex;
+  gap: var(--sp-1);
+}
+.mini-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+}
+.mini-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.tasktree-project {
+  padding: 0 var(--sp-3) var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tasktree-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--sp-2);
+}
+.tree-node {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.tree-node:hover {
+  background: var(--color-bg-hover);
+}
+.tree-node.active {
+  background: var(--color-bg-active);
+  color: var(--color-accent);
+}
+.tree-node.muted {
+  color: var(--color-text-secondary);
+}
+.tree-chevron {
+  transition: transform 0.15s;
+}
+/* 会话状态点：运行中青色脉冲 / 后台完成绿色未读，flex-none 防止挤压标题 */
+.tree-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.tree-dot.running {
+  background: var(--color-accent, #4facfe);
+  box-shadow: 0 0 0 0 rgba(79, 172, 254, 0.5);
+  animation: tree-dot-pulse 1.2s ease-out infinite;
+}
+.tree-dot.done {
+  background: #34c759;
+}
+@keyframes tree-dot-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(79, 172, 254, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(79, 172, 254, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(79, 172, 254, 0);
+  }
+}
+.tree-label {
+  flex: 1;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-count {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.tasktree-empty {
+  padding: var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+}
+
+/* 会话项三点按钮：默认透明，hover 节点时浮现 */
+.tree-more {
+  opacity: 0;
+  flex: none;
+  transition: opacity 0.12s;
+}
+.tree-node:hover .tree-more,
+.tree-node.active .tree-more {
+  opacity: 1;
+}
+
+/* 行内重命名输入框：贴合树节点高度 */
+.tree-rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+/* 会话弹出菜单（三点按钮 / 右键菜单共用） */
+.session-menu {
+  position: fixed;
+  z-index: 950;
+  min-width: 132px;
+  padding: var(--sp-1);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.2));
+}
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-2);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.session-menu-item:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+.session-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.session-menu-item.danger:hover:not(:disabled) {
+  color: var(--color-danger);
+}
+
+/* 用户卡 */
+.usercard {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-top: 1px solid var(--color-border);
+}
+.usercard-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ff9a5a, #ff7a5a);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: var(--fs-md);
+}
+.usercard-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.usercard-name {
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.badge-lite {
+  background: var(--color-badge);
+  color: #fff;
+  font-size: var(--fs-xs);
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  flex: none;
+}
+.usercard-settings {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+}
+.usercard-settings:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}

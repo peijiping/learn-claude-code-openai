@@ -1,0 +1,99 @@
+{
+  "runId": "wf_review-changes_9ed7f396bfc817c2",
+  "workflowName": "review-changes",
+  "args": {
+    "budget": null,
+    "changes": "def load_user(user_id):\n    query = f\"SELECT * FROM users WHERE id = {user_id}\"\n    return db.execute(query).fetchone()\n"
+  },
+  "task": {
+    "taskId": "local_workflow_wf_review-changes_9ed7f396bfc817c2",
+    "taskType": "local_workflow",
+    "runId": "wf_review-changes_9ed7f396bfc817c2",
+    "workflowName": "review-changes",
+    "status": "completed",
+    "usage": {
+      "agents": 0,
+      "tokens": 0
+    },
+    "progress": [
+      {
+        "type": "workflow_phase",
+        "title": "Review"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "audit:correctness",
+        "phase": "Review",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_phase",
+        "title": "Verify"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "audit:security",
+        "phase": "Review",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "audit:performance",
+        "phase": "Review",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "audit:style",
+        "phase": "Review",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:correctness:audit:correctness #1",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:security:audit:security #1",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:security:audit:security #2",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:performance:audit:performance #1",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:performance:audit:performance #2",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:style:audit:style #1",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_agent",
+        "label": "verify:style:audit:style #2",
+        "phase": "Verify",
+        "status": "cached"
+      },
+      {
+        "type": "workflow_log",
+        "message": "confirmed 6 real finding(s)"
+      }
+    ]
+  }
+}

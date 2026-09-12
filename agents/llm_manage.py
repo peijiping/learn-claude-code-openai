@@ -10,6 +10,8 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from config import CREDENTIALS_FILE
+
 
 class LLMClient:
     """
@@ -17,8 +19,8 @@ class LLMClient:
     """
 
     def __init__(self):
-        # 加载环境变量
-        load_dotenv(override=True)
+        # 加载环境变量：仅填充空缺，不覆盖 config.load() 已注入的 ~/.aigent 配置
+        load_dotenv(override=False)
 
         
         self.api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -28,7 +30,10 @@ class LLMClient:
 
         # 检查是否配置了模型参数
         if  not self.api_key or not self.base_url:
-            raise ValueError("请配置 OPENAI_API_KEY、OPENAI_BASE_URL 环境变量")
+            raise ValueError(
+                f"未配置 LLM 密钥/地址：请在 {CREDENTIALS_FILE} 填入 OPENAI_API_KEY / "
+                "OPENAI_BASE_URL（或设置同名环境变量）"
+            )
 
         # 初始化大模型实例
         self.llm = self.create_llm()

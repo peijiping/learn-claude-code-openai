@@ -1,0 +1,34 @@
+{
+  "confirmed": [
+    {
+      "dimension": "performance",
+      "title": "audit:performance #1",
+      "severity": "medium"
+    },
+    {
+      "dimension": "performance",
+      "title": "audit:performance #2",
+      "severity": "medium"
+    },
+    {
+      "dimension": "style",
+      "title": "audit:style #1",
+      "severity": "medium"
+    },
+    {
+      "dimension": "style",
+      "title": "audit:style #2",
+      "severity": "medium"
+    },
+    {
+      "dimension": "security",
+      "title": "audit:security #1",
+      "severity": "low"
+    },
+    {
+      "dimension": "security",
+      "title": "audit:security #2",
+      "severity": "low"
+    }
+  ]
+}

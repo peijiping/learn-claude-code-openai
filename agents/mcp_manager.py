@@ -13,7 +13,8 @@ mcp_manager.py - MCPManager（真实 MCP 客户端接入）
 - 传输：stdio（本地进程）/ streamable-http / sse（远程）；远程支持 headers 鉴权
   （streamable-http 经 httpx.AsyncClient(headers=...) 传入，sse 直接 headers=）。
 - 配置：WorkSpace/HomeDir/mcp/mcp_servers.json（mcpServers 主流格式，多服务器），
-  支持 ${VAR} 环境变量插值（密钥不落盘）。
+  支持 ${VAR} 环境变量插值（密钥不落盘）；每条目可选 `enable`：1=启用（缺省），
+  0=禁用（不连接、不可枚举），禁用/启用的翻转经热加载 reconcile 自动断连/重连。
 - 热加载：assemble_tools() 每轮检测配置文件 mtime，增删改自动 reconnect；死会话清理。
 - Resources：每服务器合成 list_resources / read_resource 两个只读工具暴露给模型。
 - 工具标注：消费 readOnlyHint / destructiveHint / openWorldHint，description 追加
@@ -84,7 +85,11 @@ def _interpolate_value(v):
 
 
 def load_config(path: Path) -> dict:
-    """读取 mcpServers 配置为 {name: config}；文件缺失/损坏返回 {}（不崩）。"""
+    """读取 mcpServers 配置为 {name: cfg}；文件缺失/损坏返回 {}（不崩）。
+
+    每个服务器条目支持可选 `enable` 字段：1=启用（缺省），0=禁用；
+    禁用的服务器不进入本返回值（不连接、不可枚举、不出现在目录里）。
+    """
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
@@ -93,7 +98,8 @@ def load_config(path: Path) -> dict:
     if not isinstance(servers, dict):
         return {}
     return {name: _interpolate_value(cfg)
-            for name, cfg in servers.items() if isinstance(cfg, dict)}
+            for name, cfg in servers.items()
+            if isinstance(cfg, dict) and cfg.get("enable", 1) not in (0, "0", False, "false")}
 
 
 # ── 调用结果格式化 ───────────────────────────────────────────────────

@@ -84,6 +84,53 @@ class SkillLoader:
             return "(no skills found)"
         return "\n".join(f"- **{s['name']}**: {s['description']}" for s in self.SKILL_REGISTRY.values())
 
+    # 句末标点（用于描述截断时优先停在语义完整处）
+    _SENTENCE_ENDS = "。！？!?.;；"
+    # 句末标点位置须 ≥ 预算的这个比例，才值得为"停在句末"牺牲后面的内容
+    _SENTENCE_MIN_RATIO = 0.6
+
+    @classmethod
+    def _truncate_desc(cls, text: str, max_chars: int) -> str:
+        """按字符预算截断描述，**避免把句子切成残句**（如 "...review cod…"）。
+
+        优先级：
+          ① 窗口内存在句末标点、且位置足够靠后（≥ 预算 × 0.6）→ 切在句末（语义完整）
+          ② 否则退回最后一个词边界（避免切在单词中间）
+          ③ 都没有 → 硬截
+        ②③ 会补省略号，明确表示"还有下文"，而非句型断裂。
+        """
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        window = text[:max_chars]
+        cut = max(window.rfind(ch) for ch in cls._SENTENCE_ENDS)
+        if cut >= int(max_chars * cls._SENTENCE_MIN_RATIO):
+            return window[:cut + 1]
+        space = window.rfind(" ")
+        if space > 0:
+            return window[:space].rstrip() + "…"
+        return window.rstrip() + "…"
+
+    def list_skills_compact(self, max_desc_chars: int = 120) -> str:
+        """精简技能列表（名字 + 截断后的首行描述），供 system prompt 静态段使用。
+
+        与 list_skills() 的分工：
+        - 本方法用于 system prompt 静态段：描述截断，避免部分技能 frontmatter 里
+          数百字的触发词清单**每轮**都占着缓存前缀（缓存命中是打折不是免费）。
+        - list_skills() 用于 list_skills 工具：返回完整描述，由模型按需获取。
+
+        截断策略见 `_truncate_desc()`：优先停在句末，其次退回词边界。
+        无技能时返回空串，让 system prompt 的「空段整体跳过」生效。
+        """
+        self._scan_skills()
+        lines = []
+        for s in self.SKILL_REGISTRY.values():
+            raw = (s.get("description") or "").strip().splitlines()
+            first = raw[0].strip() if raw else ""
+            lines.append(
+                f"- **{s['name']}**: {self._truncate_desc(first, max_desc_chars)}"
+            )
+        return "\n".join(lines)
+
 
     def load_skill(self, name: str) -> str:
         """Load full skill content. Lookup via registry — no path traversal."""

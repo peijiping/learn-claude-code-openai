@@ -15,8 +15,12 @@ agent_full_v2.py - 主智能体引擎（Agent 类）
   agent.run_turn("[Scheduled] ...") # 非交互单轮
 """
 
+import hashlib
 import json
 import os
+import platform
+import threading
+import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,20 +29,44 @@ from session_manage import SessionManager
 from subagent import SubAgent
 from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
-from paths import WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR, WORKTREE_DIR, MCP_CONFIG
+from paths import (WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR,
+                   WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR)
 from tools import ToolRegistry
 from worktree import WorktreeManager
 from mcp_manager import MCPManager
+from workflow import WorkflowManager, register_default_workflows
+from goal import (
+    GoalController,
+    PromptGoalEvaluator,
+    DEFAULT_STOP_HOOK_BLOCK_CAP,
+)
 from skills import SkillLoader
 from llm_manage import LLMClient
+from logger import get_logger
 from system_prompt import SystemPromptBuilder
 from error_recovery import ErrorRecovery, RecoveryAction
 from hooks import HookSystem
 from utils import truncate_chars
+from streaming_client import PrintSink, StreamEvent, streamed_create, TurnStopped
 
 
 # 加载环境变量
 load_dotenv(override=True)
+
+# 统一日志（~/.aigent/logs/agent_日期.log）
+log = get_logger("agent")
+
+# 「尾部按需注入」的块标记名。注入消息形如：
+#   <system-reminder><memory_index revision="ab12cd34ef56">…索引…</memory_index></system-reminder>
+# 必须用 <system-reminder> 包裹 —— ws_bridge._history_to_ui 会跳过以此开头的 user 消息，
+# 所以这类注入不会出现在前端回放 / 聊天界面里（与 _inject_todo_reminder 的约定一致）。
+# 每个 tag 各自独立判指纹，互不影响。
+MEMORY_INDEX_TAG = "memory_index"   # 记忆索引（L2 热段，变化最频繁）
+ENV_TAG = "env"                     # 环境与上下文：日期 / 星期 / 平台（L2 热段）
+PROJECT_RULES_TAG = "project_rules"  # 工作区指令文件（AGENTS.md）会话期间的变更全文
+
+# 星期中文名（time.localtime().tm_wday：0 = 周一）
+_WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
 class Agent:
@@ -75,6 +103,15 @@ class Agent:
 
         # ── silent 模式：抑制所有打印输出（cron 定时任务用） ──
         self.silent = silent
+        # 主循环的 CLI 增量输出 sink（流式 thinking/content 逐字打印）
+        self.stream_sink = PrintSink(silent=self.silent)
+
+        # ── 会话级请求覆盖（仅本会话生效，不写 llmconfig.json，不影响其它会话）──
+        # 由 ws_bridge 在发新请求前设置；None = 用全局 env 配置。
+        self._request_overrides: dict[str, str | None] = {
+            "reasoning_effort": None,  # low/high/very_high（思考强度）
+            "max_context": None,       # 字符串如 "1M" / "128k"（更大上下文）
+        }
 
         # ── 依赖（默认惰性构造；允许外部注入，多实例可共享/自定义） ──
         self.skills = skills if skills is not None else SkillLoader(SKILLS_DIR)
@@ -112,32 +149,206 @@ class Agent:
         # 由 CLI 的 /teams 置 True、/subagent 置 False，决定 agent_loop 喂哪套工具集。
         self.team_mode = False
 
-        # 子智能体：复用本实例的工具集/处理器/hooks；注入 tool_registry 供 workdir 场景
+        # 子智能体：复用本实例的工具集/处理器/hooks；注入 tool_registry 供 workdir 场景，
+        # 并注入本实例的 stream_sink，让子智能体的 tool_call 事件上行到同一输出通道
         self.subagent_runner = SubAgent(
             self.tools.base_tools, self.tools.handlers, self.hook_system,
             tool_registry=self.tools,
+            sinks=[self.stream_sink],
         )
 
-        # 系统 prompt：注入本实例的 skills / memory / tools
+        # 系统 prompt：注入本实例的 skills / tools。
+        # 工作区指令文件（CLAUDE.md / AGENT.md / AGENTS.md）**从 workdir 读** —— 那是用户
+        # 的工作空间，规则就写在那儿；仓库根的 AGENTS.md 是给"开发本项目的编码助手"看的，
+        # 不是给终端用户的助手看的（详见 SystemPromptBuilder._get_workspace_instructions）。
+        # 也**禁止**从 chat_history_dir.parent 反推：运行时数据迁到 ~/.aigent/projects/<slug>/
+        # 之后那个 parent 已不是工作空间，曾因此让指令文件恒加载不到。
         self.system_prompt = SystemPromptBuilder(
             workdir=WORKDIR,
             skills=self.skills,
-            memory=self.memory,
             tools=self.tools,
-            chat_history_dir=CHAT_HISTORY_DIR,
         )
+        # 当前「已进入 system prompt」的工作区指令指纹。进会话时由
+        # _refresh_system_prompt() 刷新；_sync_project_rules() 据此判断是否需要
+        # 把变更后的指令全文追加到消息尾部（方案 C）。
+        self._prompt_workspace_revision = self.system_prompt.workspace_revision
 
         # LLM 客户端 + S11 错误恢复控制器
         self.llm_client = LLMClient().llm
+        # 高级设置「输出上下文窗口」→ 默认 max_tokens（未配置走 error_recovery 默认值）
+        out_tokens = os.environ.get("OPENAI_MAX_OUTPUT_TOKENS")
         self.recovery = ErrorRecovery(
-            primary_model=self.model, fallback_model=self.fallback_model
+            primary_model=self.model, fallback_model=self.fallback_model,
+            **({"default_max_tokens": int(out_tokens)} if out_tokens else {}),
         )
+        # 高级设置「工具调用轮数」→ agent 循环上限（未配置走类默认 MAX_AGENT_ITERATIONS）
+        self.max_agent_iterations = self._read_tool_iterations()
+
+        # 工作流运行时（s16）：复用本实例的 LLM 客户端与模型跑工作流子智能体，
+        # 挂到本实例 tools 的 holder 上（实例级），并注册内置示例工作流
+        self.workflow_manager = WorkflowManager(WORKFLOW_DIR, self.llm_client, self.model)
+        register_default_workflows(self.workflow_manager)
+        self.tools.set_workflow_manager(self.workflow_manager)
+
+        # 目标循环（s17 Goal Loop）：goal 功能在主类的接入点（详见 goal.py 模块注释）
+        #   - PromptGoalEvaluator：独立评估器（无工具的 LLM 调用），读完整对话判定
+        #     目标是否达成；复用宿主 self.llm_client，不新建连接
+        #   - evaluator_model：评估器可单独配模（.env 的 GOAL_EVALUATOR_MODEL_ID，
+        #     留空则与 Worker 同模型）；goal_block_cap：连续判"未完成"的次数上限
+        #   - GoalController 只负责状态与裁决，"拦截动作"发生在 agent_loop 的
+        #     停止边界（无 tool_call 分支），见下方 agent_loop 内的注释
+        evaluator_model = os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model
+        goal_block_cap = int(
+            os.environ.get("GOAL_STOP_HOOK_BLOCK_CAP") or DEFAULT_STOP_HOOK_BLOCK_CAP
+        )
+        self.goal_controller = GoalController(
+            PromptGoalEvaluator(self.llm_client, evaluator_model),
+            block_cap=goal_block_cap,
+        )
+        # 累计 token 消耗：agent_loop 每次响应后累加（goal 状态展示"目标期间花费"用）
+        self.total_tokens = 0
 
         # ── 会话状态（由 init_session / new_session / switch_session 填充） ──
         self.session_manager: SessionManager | None = None
         self.session_num: int | None = None
         self.session_file: Path | None = None
         self.history_messages: list = []
+
+        # ── 子智能体执行过程（边通道，只进 jsonl，绝不进模型上下文） ──
+        # _run_subagent 把 spawn_subagent 返回的 transcript 按 tool_call_id 暂存，
+        # 并在拿到后立刻落盘为 role=subagent 行（后台路径由 worker 线程完成，
+        # 立即写盘保证"turn 结束后才完成的后台子智能体"也能被历史回放展示）；
+        # history_messages 只接收摘要（工具结果），保持主上下文纯净。
+        self._subagent_transcripts: dict[str, dict] = {}  # tool_call_id → transcript
+        self._subagent_persisted: set[str] = set()        # 已落盘的 tool_call_id
+        self._subagent_lock = threading.Lock()            # 落盘状态跨线程保护
+
+        # ── 协作式停止：request_stop() 置位，run_turn/agent_loop 轮询并干净收尾 ──
+        self._stop_evt = threading.Event()
+
+    def request_stop(self) -> None:
+        """请求停止当前 turn（线程安全）。只影响本会话的这次执行。"""
+        self._stop_evt.set()
+
+    def reload_llm_bindings(self) -> dict:
+        """
+        配置热切换：进程内就地重建全部 LLM 绑定，无需重启。
+        调用前须先 load_llm_config()（把 llmconfig.json 映射进 env）。
+
+        逐个重建：
+        - 自身 model / fallback_model / llm_client / recovery
+        - workflow_manager、goal_controller 评估器、subagent_runner、teammate_manager
+        """
+        new_model = os.environ.get("OPENAI_MODEL_ID", "")
+        new_fallback = os.environ.get("FALLBACK_MODEL_ID", "")
+        if not os.environ.get("OPENAI_API_KEY"):
+            log.warning("LLM 热切换未生效: 未配置 API Key")
+            return {"applied": False, "reason": "未配置 API Key"}
+        if not new_model:
+            # 模型被删光/全停用：env 绑定已清空，保持现状不重建（保留可用客户端）
+            log.warning("LLM 热切换未生效: 无启用模型，保持现状")
+            return {"applied": False, "reason": "无启用模型，LLM 绑定未切换"}
+        old_model = self.model
+        self.model = new_model
+        self.fallback_model = new_fallback
+        # 重建 OpenAI 客户端（持有新的 api_key / base_url）
+        self.llm_client = LLMClient().llm
+        # 错误恢复状态机绑定新主/备模型（高级设置「输出上下文」→ 默认 max_tokens）
+        out_tokens = os.environ.get("OPENAI_MAX_OUTPUT_TOKENS")
+        self.recovery = ErrorRecovery(
+            primary_model=self.model, fallback_model=self.fallback_model,
+            **({"default_max_tokens": int(out_tokens)} if out_tokens else {}),
+        )
+        # 高级设置「工具调用轮数」→ agent 循环上限
+        self.max_agent_iterations = self._read_tool_iterations()
+        # 各协作对象就地换绑定（复用既有 set_llm 接缝）
+        self.workflow_manager.set_llm(self.llm_client, self.model)
+        self.goal_controller.set_llm(
+            self.llm_client,
+            os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model,
+        )
+        self.subagent_runner.set_llm(self.llm_client, self.model)
+        self.teammate_manager.set_llm(self.llm_client, self.model)
+        log.info("LLM 绑定热切换: %s -> %s (fallback=%s)",
+                 old_model or "(unknown)", self.model, self.fallback_model or "(none)")
+        return {"applied": True, "primary": self.model, "fallback": self.fallback_model}
+
+    @staticmethod
+    def _read_tool_iterations() -> int:
+        """高级设置「工具调用轮数」→ agent 循环上限；未配置/非法走类默认。"""
+        raw = os.environ.get("OPENAI_TOOL_ITERATIONS", "")
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return Agent.MAX_AGENT_ITERATIONS
+        return val if val > 0 else Agent.MAX_AGENT_ITERATIONS
+
+    @staticmethod
+    def _map_reasoning_effort(strength: str | None) -> str:
+        """思考强度档位 → reasoning_effort 取值。
+
+        low=轻 → low；high=高 → high；very_high=极高 → max（DeepSeek API 取值）。
+        无法识别时返回 None，走默认。
+        """
+        return {"low": "low", "high": "high", "very_high": "max"}.get(strength)
+
+    def set_request_overrides(self, reasoning_effort: str | None = None,
+                              max_context: str | None = None) -> None:
+        """设置当前会话的请求级覆盖（仅本会话生效，不写配置文件）。
+
+        reasoning_effort: low/high/very_high 思考强度档位，None 表示用全局配置。
+        max_context: 字符串如 "1M" / "128k"，None 表示用全局配置。
+        """
+        self._request_overrides["reasoning_effort"] = reasoning_effort
+        self._request_overrides["max_context"] = max_context
+
+    def _advanced_llm_kwargs(self) -> dict:
+        """高级设置 → LLM 调用参数（chat.completions.create 的 kwargs）。
+
+        llmconfig.json 中主模型的高级配置经 apply_to_env() 映射进 env，
+        这里读取并合成调用参数；未配置的项走原默认
+        （temperature=0.5、思考开启 reasoning_effort=high）。
+
+        会话级覆盖（self._request_overrides）优先于全局 env 配置，
+        用于「当前会话新一轮请求直接生效」的思考强度/更大上下文。
+        """
+        kwargs: dict = {}
+        temp = os.environ.get("OPENAI_TEMPERATURE", "").strip()
+        if temp:
+            try:
+                kwargs["temperature"] = max(0.0, min(2.0, float(temp)))
+            except ValueError:
+                pass
+        top_p = os.environ.get("OPENAI_TOP_P", "").strip()
+        if top_p:
+            try:
+                kwargs["top_p"] = max(0.0, min(1.0, float(top_p)))
+            except ValueError:
+                pass
+        extra_body: dict = {}
+        top_k = os.environ.get("OPENAI_TOP_K", "").strip()
+        if top_k:
+            try:
+                extra_body["top_k"] = int(float(top_k))
+            except ValueError:
+                pass
+        # 思考档位：会话覆盖 > 全局思考模式 env（default/enabled → 思考开启，disabled → 关闭）
+        strength = self._request_overrides.get("reasoning_effort")
+        effort = self._map_reasoning_effort(strength) if strength else None
+        mode = os.environ.get("OPENAI_THINKING_MODE", "default")
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+            extra_body["thinking"] = {"type": "enabled"}
+        elif mode == "disabled":
+            extra_body["thinking"] = {"type": "disabled"}
+        else:
+            kwargs["reasoning_effort"] = "high"
+            extra_body["thinking"] = {"type": "enabled"}
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if "temperature" not in kwargs:
+            kwargs["temperature"] = 0.5
+        return kwargs
 
     # ── silent 打印辅助 ──────────────────────────────────────────
     def _print(self, *args, **kwargs):
@@ -148,6 +359,16 @@ class Agent:
     # ═══════════════════════════════════════════════════════════
     #  会话生命周期（CLI / cron / TUI 共用接缝）
     # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _strip_subagent_rows(messages: list) -> list:
+        """从会话历史中剔除 role=subagent 行。
+
+        子智能体执行记录只进 jsonl / 前端回放展示，绝不进入模型上下文。
+        load_session_history 保留它们（供 ws_bridge 回放），此处是
+        Agent 侧的统一过滤点（init / switch / clear 都会经过）。
+        """
+        return [m for m in messages if m.get("role") != "subagent"]
 
     def init_session(self, resume: bool = True) -> int:
         """
@@ -166,11 +387,20 @@ class Agent:
         else:
             self.session_num, self.session_file, self.history_messages = \
                 self.session_manager.create_initialized_session()
+        self.history_messages = self._strip_subagent_rows(self.history_messages)
+        # 方案 B：加载回来的 messages[0] 是文件里那份（会话创建时构建），
+        # 用最新构建的替换 —— 否则改了 AGENTS.md / 装了新技能，本会话看不到。
+        self._refresh_system_prompt()
         # todo 与 session 绑定：每次切会话都要重新指向对应的 todo 文件
         self.tools.set_todo_manager(self.session_num)
         # task 与 session 绑定：任务板限定在本会话作用域（"session_N"/"cron_N"）
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
         self._inject_todo_reminder()
+        # L2 尾部注入：首次注入落在用户提问之前（指纹已在历史里则是 no-op）
+        self._sync_memory_index()
+        self._sync_environment()
+        log.info("会话初始化: %s%d (resume=%s, messages=%d)",
+                 self.session_prefix, self.session_num, resume, len(self.history_messages))
         return self.session_num
 
     def run_turn(self, user_query: str) -> str:
@@ -180,7 +410,13 @@ class Agent:
         agent_loop 内部仍会打印 thinking / 本轮回复（保持现状 UX）；
         本方法额外返回历史最后一条消息的文本，供调用方打印。
         """
+        # 目标循环（s17）：每轮查询（用户输入 / cron 触发）都是全新过程，
+        # 重置连续 block 计数，避免上一轮的 block 累计误判触发 limit
+        self._stop_evt.clear()  # 新一轮开始，清掉可能遗留的停止信号
+        self.goal_controller.begin_query()
         self.hook_system.trigger("UserPromptSubmit", user_query)
+        log.info("turn 开始: %s%d user_query=%r",
+                 self.session_prefix, self.session_num, user_query[:100])
         self.history_messages.append({"role": "user", "content": user_query})
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
@@ -192,15 +428,49 @@ class Agent:
         last = self.history_messages[-1].get("content", "")
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
+        log.info("turn 结束: %s%d (tokens累计=%d)",
+                 self.session_prefix, self.session_num, self.total_tokens)
+        return str(last)
+
+    def run_background_followup(self) -> str:
+        """后台任务全部完成后的自动续轮：让主智能体拿到结果并给出最终总结。
+
+        与 run_turn 的区别（桌面端后台子智能体 / 后台 bash 完成后自动续一轮，
+        避免"子智能体跑完了主智能体却停在'稍等片刻'不回总结"）：
+        - 不伪造用户消息：不 append user 行、不触发 UserPromptSubmit，
+          由 agent_loop 起点的 collect_background_results 预热注入
+          <task_notification>（同一结果只注入一次）；
+        - 其余行为与 run_turn 一致（流式输出、工具循环、停止协作等）。
+        返回本轮最终回复文本；无新内容时返回空串。
+        """
+        self._stop_evt.clear()
+        self.goal_controller.begin_query()
+        # 仅当确有未消费的后台结果才续轮，避免空转发出无意义的一轮
+        if not self.background_manager.has_completed_pending():
+            return ""
+        log.info("后台续轮开始: %s%d", self.session_prefix, self.session_num)
+        self.agent_loop()
+        last = self.history_messages[-1].get("content", "")
+        if isinstance(last, list):
+            return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         return str(last)
 
     def new_session(self) -> tuple[int, str]:
         """创建新会话并绑定 todo，返回 (新会话编号, 提示语)。"""
+        # 方案 B：新建会话的 system message 由 SessionManager **持有**的那份产出
+        # （_build_initial_messages），必须先刷新为最新构建结果，否则长生命周期
+        # Agent（CLI）会拿到很久以前构建的版本。
+        self._refresh_system_prompt()
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.create_initialized_session()
+        self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 新会话的 todo 文件尚不存在，set_todo_manager 会建出空列表；reminder 不会注入
         self.tools.set_todo_manager(self.session_num)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
+        # 新会话：立即注入当前记忆索引与环境上下文（新会话扫不到指纹 → 必然注入）
+        self._sync_memory_index()
+        self._sync_environment()
+        log.info("新会话创建: %s%d", self.session_prefix, self.session_num)
         return self.session_num, f"已创建新会话: session_{self.session_num}.jsonl"
 
     def switch_session(self, target_num: int) -> tuple[int, int]:
@@ -208,26 +478,74 @@ class Agent:
         切换到指定会话，绑定对应 todo 并注入 reminder。
         返回 (会话编号, 消息数)；会话不存在时抛 FileNotFoundError。
         """
+        # 惰性构建（同 init_session）：桌面端 SessionRuntime.build_agent 会直接
+        # 对全新 Agent 实例调 switch_session，此时 session_manager 尚为 None
+        if self.session_manager is None:
+            self.session_manager = SessionManager(
+                CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
+                session_prefix=self.session_prefix,
+            )
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.switch_session(target_num)
+        self.history_messages = self._strip_subagent_rows(self.history_messages)
+        # 方案 B：与 init_session 同理 —— 换成最新构建的 system prompt
+        self._refresh_system_prompt()
         self.tools.set_todo_manager(self.session_num)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
         self._inject_todo_reminder()
+        # L2 尾部注入：若离开期间记忆/日期变过，这里会补注（指纹从本会话历史恢复）
+        self._sync_memory_index()
+        self._sync_environment()
+        log.info("会话切换: %s%d -> %s%d (messages=%d)",
+                 self.session_prefix, target_num, self.session_prefix,
+                 self.session_num, len(self.history_messages))
         return self.session_num, len(self.history_messages)
 
     def clear_session(self) -> int:
         """清空当前会话（todo 同步重置），返回被删除的消息数。"""
         deleted_count = self.session_manager.clear_session(self.session_file)
+        log.info("会话清空: %s%d (删除消息=%d)",
+                 self.session_prefix, self.session_num, deleted_count)
         # todo 与 chat history 同生共死：清空 chat 的同时把当前 session 的 todo 也重置为空
         self.tools.get_todo_manager().update([], fresh_start=False)
-        self.history_messages = self.session_manager.load_session_history(
-            self.session_file
+        self.history_messages = self._strip_subagent_rows(
+            self.session_manager.load_session_history(self.session_file)
         )
         return deleted_count
 
     def show_tasks(self) -> str:
         """返回当前会话待办看板文本。"""
         return self.tools.get_todo_manager().render()
+
+    # ═══════════════════════════════════════════════════════════
+    #  目标循环（s17 goal loop，CLI 斜杠命令共用接缝）
+    # ═══════════════════════════════════════════════════════════
+
+    def set_goal(self, condition: str) -> str:
+        """设置会话级目标（对应 CLI 的 /goal <condition>），返回确认文本。
+
+        记录此刻的累计 token（tokens_at_start），供 /goal 状态统计
+        "目标期间花费"；若已有激活目标会被新目标覆盖（事件里记
+        "replaced by a new goal"）。condition 非法（空/超长）抛 GoalError。
+        """
+        state = self.goal_controller.set_goal(condition, self.total_tokens)
+        return f"Goal set: {state.condition}"
+
+    def clear_goal(self) -> str:
+        """清除当前目标（对应 CLI 的 /goal clear，含同义别名）。
+
+        清除后 agent_loop 的停止边界恢复"直接放行"；无目标时原样返回
+        "No goal set"。
+        """
+        return self.goal_controller.clear()
+
+    def goal_status(self) -> str:
+        """返回当前目标状态文本（对应 CLI 的 /goal 无参数）。
+
+        有激活目标：目标条件 / 存活时长 / 评估次数 / 目标期间花费 / 最近判定；
+        无激活目标：回显上次"达成/失败"结论，或 "No goal set"。
+        """
+        return self.goal_controller.status(self.total_tokens)
 
     def compact(self) -> None:
         """手动触发上下文压缩（/compact）。"""
@@ -270,7 +588,164 @@ class Agent:
             self.session_file, self.history_messages[-1]
         )
 
-    def _make_executor(self, tool_name: str, tool_args: dict):
+    # ── 方案 B：进会话时刷新 system prompt ─────────────────────────────
+    #
+    # 问题：resume / 切换会话时 `load_session_history()` 读回来的 `messages[0]`
+    # 是**该会话创建时**那份；而 `build_system_prompt()` 虽然也重算过一次
+    # （SessionManager 构造时），结果随即被读回的历史覆盖 —— 等于白算。
+    # 于是"改了 AGENTS.md / 装了新技能，当前会话看不到"。
+    #
+    # 这里补上「替换」这一步，三个进会话入口（init / switch / new）都调用。
+
+    def _refresh_system_prompt(self) -> bool:
+        """用最新构建的 system prompt 替换 `messages[0]`，并同步 SessionManager 持有的那份。
+
+        只改内存、**不写回文件**：文件里那份旧的根本不会被使用（每次进会话都会
+        重建替换），且下次 `save_session_history` 重写时会自然带上新内容。
+        这样既拿到了实时性，又避免触碰会话文件的原子重写（无需 `.bak`）。
+
+        返回是否发生了替换 —— 替换会让整段前缀缓存失效一次，属预期代价
+        （只在 AGENTS.md / 技能列表真变过时才会发生）。
+        """
+        fresh = self.system_prompt.build_system_prompt()
+        # SessionManager 持有的那份用于"新建会话"（_build_initial_messages），同样要刷新，
+        # 否则 CLI 这类长生命周期 Agent 点"新建会话"会拿到很久以前构建的版本。
+        if self.session_manager is not None:
+            self.session_manager.system_prompt = fresh
+        self._prompt_workspace_revision = self.system_prompt.workspace_revision
+
+        if not self.history_messages:
+            return False
+        first = self.history_messages[0]
+        if first.get("role") != "system" or first.get("content") == fresh:
+            return False
+        self.history_messages[0] = {"role": "system", "content": fresh}
+        log.info("刷新 system prompt: %s%d (%d 字符)",
+                 self.session_prefix, self.session_num, len(fresh))
+        return True
+
+    # ── 尾部按需注入（L2 热段）────────────────────────────────────────
+    #
+    # 为什么不用 system prompt 承载：这些内容每轮都可能变，而 system 是消息数组的
+    # [0]。改它会从第一个 token 起让整段前缀缓存失效，且每个会话的内容都不同、
+    # 跨会话也无法共享缓存。改成「变化时往消息**末尾**追加一条」之后：
+    #   - 追加不改变前面任何字节 → 已缓存前缀继续命中，只有新增的那一条未缓存；
+    #   - 那条注入消息到下一轮就成为前缀的一部分、字节相同 → 继续命中。
+    #
+    # 通用约定：每个注入块用 <tag revision="指纹"> 自描述指纹，各 tag 独立判定。
+
+    def _last_injection_revision(self, tag: str) -> str:
+        """从本会话历史里恢复「某个注入块上次写入的指纹」。
+
+        指纹随注入消息一起落盘，因此不依赖任何外部状态：resume / 切换会话后
+        都能正确判断，既不重复注入也不漏注入。
+
+        若标记已被上下文压缩裁掉（snip 只保留头 3 + 尾 N 条），这里返回空串
+        → 视为「从未注入」→ 下一轮自动补注。**兜底不需要额外逻辑。**
+        """
+        marker = f'<{tag} revision="'
+        for message in reversed(self.history_messages):
+            if message.get("role") != "user":
+                continue
+            text = message.get("content")
+            if isinstance(text, str) and marker in text:
+                return text.split(marker, 1)[1].split('"', 1)[0]
+        return ""
+
+    def _append_injection(self, tag: str, revision: str, body: str) -> None:
+        """把一条 <system-reminder> 包裹的注入块追加到历史并落盘。
+
+        用 <system-reminder> 包裹是硬要求：ws_bridge._history_to_ui 只按
+        startswith("<system-reminder>") 过滤系统注入，否则会变成聊天界面的用户气泡。
+        """
+        reminder = (
+            f"<system-reminder>\n"
+            f'<{tag} revision="{revision}">\n'
+            f"{body}\n"
+            f"</{tag}>\n"
+            f"</system-reminder>"
+        )
+        msg = {"role": "user", "content": reminder}
+        self.history_messages.append(msg)
+        self.session_manager.append_message_to_session(self.session_file, msg)
+
+    def _sync_memory_index(self) -> None:
+        """记忆索引尾部按需注入：仅在指纹变化（或标记已消失）时追加一条。
+
+        幂等 —— 索引没变则零开销、历史零膨胀；写入记忆后下一轮即生效。
+        """
+        index_text = self.memory.read_index()
+        revision = hashlib.sha1(index_text.encode("utf-8")).hexdigest()[:12]
+        if revision == self._last_injection_revision(MEMORY_INDEX_TAG):
+            return
+        self._append_injection(
+            MEMORY_INDEX_TAG, revision, index_text or "（暂无记忆）"
+        )
+        log.info("注入记忆索引: %s%d revision=%s (条目=%d)",
+                 self.session_prefix, self.session_num, revision,
+                 len([ln for ln in index_text.splitlines() if ln.strip()]))
+
+    # ── 环境与上下文（日期 / 星期 / 平台）──────────────────────────────
+    #
+    # 每次判定都**现场取值**（不是会话创建时固化），所以：
+    #   - 跨天时日期自动更新；当天内指纹不变 → 不重复注入，零开销；
+    #   - 会话被搬到另一台机器 resume 时，平台会自动纠正；
+    #   - git 状态**故意不纳入** —— 它随每次 commit / 切分支变化，是缓存杀手，
+    #     真需要时让模型跑一条 git status 更划算。
+
+    @staticmethod
+    def _environment_snapshot() -> list[tuple[str, str]]:
+        """现场采集环境信息，返回 [(标签, 值)]（顺序固定 → 指纹稳定）。"""
+        now = time.localtime()
+        return [
+            ("当前日期", time.strftime("%Y-%m-%d", now)),
+            ("星期", _WEEKDAY_CN[now.tm_wday]),
+            ("运行平台", platform.system().lower() or "unknown"),
+        ]
+
+    def _sync_environment(self) -> None:
+        """环境上下文尾部按需注入：内容变了才追加（通常一天一次）。"""
+        snapshot = self._environment_snapshot()
+        body = "\n".join(f"{label}：{value}" for label, value in snapshot)
+        revision = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
+        if revision == self._last_injection_revision(ENV_TAG):
+            return
+        self._append_injection(ENV_TAG, revision, body)
+        log.info("注入环境上下文: %s%d revision=%s (%s)",
+                 self.session_prefix, self.session_num, revision,
+                 " | ".join(v for _, v in snapshot))
+
+    # ── 方案 C：工作区指令文件变更时的尾部注入 ────────────────────────
+    #
+    # 场景：会话跑到一半，用户（或智能体自己）改了 AGENTS.md 来记录项目记忆。
+    # 为什么走尾部而不是重建 system prompt：重建 messages[0] 会让**整段前缀**
+    # （含全部历史）失效并重新 prefill；尾部追加只让新块未缓存，其余前缀照旧命中。
+    # 长会话下后者便宜得多。
+
+    def _sync_project_rules(self) -> None:
+        """工作区指令文件在**会话期间**被改动时，把最新全文追加到尾部。
+
+        与 system prompt 里那份的关系：注入块内声明"以本条为准"，模型按最新版执行。
+        指纹与 system prompt 里那份一致时不注入（进会话时已由方案 B 刷新过）。
+        """
+        revision = self.system_prompt.workspace_revision
+        if revision == getattr(self, "_prompt_workspace_revision", None):
+            return  # 与 system prompt 里那份一致，无需注入
+        if revision == self._last_injection_revision(PROJECT_RULES_TAG):
+            return  # 这一版已经注入过
+        body = self.system_prompt.get_workspace_instructions()
+        if not body:
+            body = "工作区指令文件已被移除，此前 system 中的版本作废。"
+        self._append_injection(
+            PROJECT_RULES_TAG,
+            revision,
+            "工作区指令文件已在本次会话期间变更，以下为**最新版本**；"
+            "与之冲突时以本条为准。\n\n" + body,
+        )
+        log.info("注入工作区指令更新: %s%d revision=%s",
+                 self.session_prefix, self.session_num, revision)
+
+    def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = ""):
         """
         把"执行一个工具调用"包成无参闭包，供 background_manager 在后台线程调用。
 
@@ -279,14 +754,19 @@ class Agent:
         变量导致所有闭包都引用最后一次迭代值的经典坑。
         """
         if tool_name == "sub_agent":
-            return lambda: self._run_subagent(tool_args)
+            return lambda: self._run_subagent(tool_args, tool_call_id)
         elif self.tools.resolve_handler(tool_name) is not None:
             return lambda: self.tools.execute(tool_name, **tool_args)
         else:
             return lambda: f"Error: Unknown tool {tool_name}"
 
-    def _run_subagent(self, tool_args: dict) -> str:
-        """派发 sub_agent。若传了 workdir（worktree 名称），解析为路径并注入。"""
+    def _run_subagent(self, tool_args: dict, tool_call_id: str = "") -> str:
+        """派发 sub_agent。若传了 workdir（worktree 名称），解析为路径并注入。
+
+        子智能体返回 (摘要, transcript)：摘要作为工具结果回传主上下文；
+        transcript（思考 + 工具执行过程）经边通道按 tool_call_id 暂存，
+        由 _persist_pending_subagent_rows 落盘为 role=subagent 行，绝不进 history_messages。
+        """
         prompt = tool_args.get("prompt", "")
         workdir_name = tool_args.get("workdir")
         if workdir_name:
@@ -294,15 +774,57 @@ class Agent:
             if not wt.exists():
                 return (f"Worktree '{workdir_name}' not found. "
                         "Create it first via create_worktree.")
-            return self.subagent_runner.spawn_subagent(
+            summary, transcript = self.subagent_runner.spawn_subagent(
                 prompt,
                 allowed_tools=tool_args.get("allowed_tools"),
                 workdir=wt,
+                tool_call_id=tool_call_id,
             )
-        return self.subagent_runner.spawn_subagent(
-            prompt,
-            allowed_tools=tool_args.get("allowed_tools"),
-        )
+        else:
+            summary, transcript = self.subagent_runner.spawn_subagent(
+                prompt,
+                allowed_tools=tool_args.get("allowed_tools"),
+                tool_call_id=tool_call_id,
+            )
+        if tool_call_id:
+            # 边通道暂存（供 _persist_pending_subagent_rows 兜底去重）
+            # tool_call_id 一并记入 transcript，供回放时把执行记录挂回
+            # 发起它的 assistant 消息下（而非最近的末条 assistant）。
+            transcript = {**transcript, "tool_call_id": tool_call_id}
+            self._subagent_transcripts[tool_call_id] = transcript
+            # 立即落盘 role=subagent 行：同步路径在主线程写，后台路径由
+            # worker 线程写（append_subagent_to_session 内部持锁，不会与
+            # agent_loop 的写入交错）。立即写盘保证后台子智能体即使在
+            # turn 结束后才完成，历史里也有完整执行记录可供回放展示。
+            self._persist_one_subagent_row(tool_call_id)
+        return summary
+
+    def _persist_one_subagent_row(self, tool_call_id: str) -> None:
+        """按 tool_call_id 立即落盘一条子智能体 transcript（幂等，可跨线程调用）。"""
+        with self._subagent_lock:
+            if tool_call_id in self._subagent_persisted:
+                return
+            transcript = self._subagent_transcripts.get(tool_call_id)
+            if transcript is None:
+                return
+            self.session_manager.append_subagent_to_session(
+                self.session_file, transcript
+            )
+            self._subagent_persisted.add(tool_call_id)
+
+    def _persist_pending_subagent_rows(self) -> None:
+        """把边通道里未落盘的子智能体 transcript 写入会话文件（role=subagent 行）。
+
+        仅在主线程调用（工具回放循环后 / 后台通知注入后 / turn 起点预热后）；
+        写入只进 jsonl，不进 history_messages，模型上下文保持纯净。
+        """
+        with self._subagent_lock:
+            pending_ids = [
+                tid for tid in self._subagent_transcripts
+                if tid not in self._subagent_persisted
+            ]
+        for tid in pending_ids:
+            self._persist_one_subagent_row(tid)
 
     def _execute_tool_call(self, tool_call) -> dict:
         """
@@ -319,10 +841,14 @@ class Agent:
         raw_args = tool_call.function.arguments
         tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         tool_id = tool_call.id
+        started = time.monotonic()
+        log.info("工具执行开始: %s%d %s args=%s",
+                 self.session_prefix, self.session_num, tool_name,
+                 json.dumps(tool_args, ensure_ascii=False)[:200])
 
         # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式
         if self.background_manager.should_run_background(tool_name, tool_args):
-            executor = self._make_executor(tool_name, tool_args)
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
             bg_id = self.background_manager.start_background_task(
                 tool_name, tool_args, tool_id, executor
             )
@@ -337,10 +863,16 @@ class Agent:
                 f"Result will be available when complete."
             )
             self._print(f">> {tool_name} 后台分发: {bg_id}")
+            log.info("工具后台分发: %s%d %s -> %s (%.2fs)",
+                     self.session_prefix, self.session_num, tool_name, bg_id,
+                     time.monotonic() - started)
         else:
             # 同步路径：直接走原逻辑
-            executor = self._make_executor(tool_name, tool_args)
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
             tool_output = executor()
+            log.info("工具执行完成: %s%d %s (%.2fs, 输出 %d 字符)",
+                     self.session_prefix, self.session_num, tool_name,
+                     time.monotonic() - started, len(str(tool_output)))
 
         return {
             "role": "tool",
@@ -374,19 +906,36 @@ class Agent:
             self._print(
                 f"  \033[32m[inject pre-loop] {len(pre_notifs)} background notification(s)\033[0m"
             )
+        # 预热注入后，把上一 turn 结束时仍在跑、此刻已完成的后台子智能体记录落盘
+        self._persist_pending_subagent_rows()
+
+        # ── L2 尾部注入同步（turn 起点）────────────────────────────────
+        # 放在这里而不是去刷新 system prompt：这些内容走「尾部追加」，不碰 [0]，
+        # 所以已缓存的前缀继续命中，只有新增那一条是未缓存的（而它本来就是本轮新内容）。
+        # 位置覆盖 run_turn / run_background_followup / CLI 全路径；会话中途的
+        # write_memory / forget_memory、跨天导致的日期变化、以及 AGENTS.md 被改动，
+        # 都在下一轮由这里捕获。
+        self._sync_memory_index()
+        self._sync_environment()
+        self._sync_project_rules()
 
         iteration = 0  # 循环迭代计数
         rounds_since_todo = 0  # 记录距离上次调用 todo 工具的轮数，用于 nag reminder
 
-        # 这里可以增加s10课程中更新systemprompt的逻辑，同时更新内存message和会话记录的jsonl文件。
-        # 这样可以保证记忆、工具、skill的实时更新，但会影响缓存未命中率。
-
         while True:
+            # 协作式停止：请求停止后，在进入下一轮（再次调 LLM/工具）前提前收尾
+            if self._stop_evt.is_set():
+                self.stream_sink.emit(StreamEvent(type="turn_end", finish_reason="stop"))
+                self._stop_evt.clear()
+                break
+
             iteration += 1
-            if iteration > self.MAX_AGENT_ITERATIONS:
+            if iteration > self.max_agent_iterations:
                 self._print(
-                    f"\033[31m[警告] 智能体循环达到最大迭代次数 ({self.MAX_AGENT_ITERATIONS})，强制结束\033[0m"
+                    f"\033[31m[警告] 智能体循环达到最大迭代次数 ({self.max_agent_iterations})，强制结束\033[0m"
                 )
+                log.warning("%s%d 达到最大迭代次数 (%d)，强制结束 turn",
+                            self.session_prefix, self.session_num, self.max_agent_iterations)
                 break
 
             # 在调用 LLM 前检查上下文，达到阈值时阻塞执行压缩并同步会话文件。
@@ -396,38 +945,49 @@ class Agent:
 
             # S11 Error Recovery — 错误不是结束，是重试的开始（详见 agents/error_recovery.py）
             try:
-                # 调用大模型执行当前轮次的回复
-                # lambda 通过闭包把当前轮次的 max_tokens / model 锁住，控制器在循环里
-                # 可能会通过 ESCALATE / FALLBACK 改变这些值，但本轮 lambda 已固定
+                # 调用大模型执行当前轮次的回复。
+                # 走统一流式入口：增量事件经 self.stream_sink 逐字打印（thinking/content），
+                # 同时聚合出完整消息；lambda 通过闭包把当前轮次的 max_tokens / model 锁住，
+                # 控制器在循环里可能会通过 ESCALATE / FALLBACK 改变这些值，但本轮 lambda 已固定。
+                # 返回 (message, finish_reason, usage)，message 接口兼容 OpenAI message，
+                # 下游历史追加 / 截断恢复 / goal 评估无需改动。
                 llm_response = self.recovery.with_retry(
                     lambda mt=self.recovery.current_max_tokens, mdl=self.recovery.current_model:
-                    self.llm_client.chat.completions.create(
+                    streamed_create(
+                        self.llm_client,
+                        sinks=[self.stream_sink],
+                        should_stop=self._stop_evt.is_set,
                         model=mdl,
                         messages=self.history_messages,
                         max_tokens=mt,
                         tools=self.tools.build_agent_tools(team_mode=self.team_mode),
                         tool_choice="auto",  # 工具选择，值域 none、auto、required，默认 auto
                         parallel_tool_calls=True,  # 是否并行执行工具调用，默认 False
-                        stream=False,  # 是否流式输出，默认 False
-                        temperature=0.5,
-                        reasoning_effort="high",  # 思考强度，DeepSeek只有 high、max 两个选项
-                        extra_body={"thinking": {"type": "enabled"}},  # 思考模式开关
+                        **self._advanced_llm_kwargs(),  # 高级设置：temperature/top_p/top_k/思考模式（未配置走默认）
                     )
                 )
-                # 从大模型回复中提取消息
-                response_msg = llm_response.choices[0].message
+                response_msg, finish_reason, usage = llm_response
                 # 提取大模型回复中的工具调用
                 response_tool_calls = response_msg.tool_calls or []
-                # 打印大模型的思考和回复内容
-                # ANSI: \033[2m=暗(细体)，\033[90m=灰色，\033[0m=重置
-                self._print(
-                    f"\033[2;90m[thinking]\n{truncate_chars(response_msg.reasoning_content, 300)}\n[/thinking]\033[0m"
-                )
-                self._print(f"[本轮回复]\n{response_msg.content}")
+                # 累计 token 消耗（OpenAI usage：prompt_tokens 输入 + completion_tokens 输出）。
+                # /goal 状态里的"目标期间花费" = 当前累计 − 设置目标时的累计
+                # （tokens_at_start，见 Agent.set_goal）
+                if usage:
+                    self.total_tokens += int(usage.get("prompt_tokens", 0) or 0) \
+                        + int(usage.get("completion_tokens", 0) or 0)
+
+            except TurnStopped:
+                # 协作式停止：中途打断流式，不写入错误消息、不重试，
+                # 补发 turn_end 让前端把流式标记复位后干净收尾本轮。
+                self.stream_sink.emit(StreamEvent(type="turn_end", finish_reason="stop"))
+                self._stop_evt.clear()
+                return
 
             except Exception as e:
                 # 外层异常处理：内层 with_retry 主动 raise 出来的"非临时错误"会到这一层。
                 # 控制器根据错误类型决定：继续重试（CONTINUE）或退出（ABORT）。
+                log.error("%s%d LLM 调用异常: %s: %s",
+                          self.session_prefix, self.session_num, type(e).__name__, e)
                 if self.recovery.handle_exception(
                     e, self.history_messages, self.session_manager, self.session_file
                 ) == RecoveryAction.ABORT:
@@ -437,8 +997,8 @@ class Agent:
             # Path 1：max_tokens 截断恢复
             # 注意：max_tokens 不是异常，是 API 正常返回的 finish_reason 之一
             # DeepSeek 走 OpenAI 兼容协议，没有 Anthropic 的 stop_reason 字段；
-            # 截断的判定在 choices[0].finish_reason == "length"（OpenAI 官方语义）
-            if llm_response.choices[0].finish_reason == "length":
+            # 截断的判定在 finish_reason == "length"（OpenAI 官方语义）
+            if finish_reason == "length":
                 if self.recovery.handle_truncation(
                     response_msg, self.history_messages, self.session_manager, self.session_file
                 ) == RecoveryAction.ABORT:
@@ -457,7 +1017,66 @@ class Agent:
             )
 
             if len(response_tool_calls) == 0:
-                # 增加一个hook，用于在大模型回复中检查是否需要强制结束当前轮次
+                # ── 停止边界（goal 的唯一拦截点，教程称"会话级 Stop 钩子"）──
+                # 模型不再调工具 = 它想停下来。无目标时 evaluate_after_turn
+                # 直接放行（allow），行为与原来完全一致；有目标时先裁决再放行。
+                decision = self.goal_controller.evaluate_after_turn(
+                    self.history_messages,
+                    background_running=self.background_manager.has_running(),
+                )
+                if decision.action == "block":
+                    # 目标未达成：把目标条件与评估器理由回注入消息（同时落盘），
+                    # continue 回环让 Worker 看到反馈后继续朝目标干活
+                    condition = (
+                        self.goal_controller.active.condition
+                        if self.goal_controller.active else ""
+                    )
+                    block_msg = {
+                        "role": "user",
+                        "content": (
+                            "[Goal still active]\n"
+                            f"Condition: {condition}\n"
+                            f"Evaluator: {decision.reason}\n"
+                            "Continue working and surface the missing evidence."
+                        ),
+                    }
+                    self.history_messages.append(block_msg)
+                    self.session_manager.append_message_to_session(
+                        self.session_file, block_msg
+                    )
+                    log.info("goal block: %s%d 评估未达成，回注反馈继续 (%s)",
+                             self.session_prefix, self.session_num, decision.reason[:120])
+                    continue
+                if decision.action == "defer":
+                    # 后台任务仍在跑：此刻判"达成"不可靠（证据未回来），本轮先结束；
+                    # 后台结果由下轮 turn 起点的 collect_background_results 预热
+                    # 注入上下文，用户下次输入后再续判。目标保持激活。
+                    self._print(f"\033[33m[goal] defer: {decision.reason}\033[0m")
+                    log.info("goal defer: %s%d 后台任务在跑，暂缓判定 (%s)",
+                             self.session_prefix, self.session_num, decision.reason[:120])
+                    return
+                # 终止态只打印结论供用户感知，目标状态已由控制器内部处理：
+                #   achieved（达成，清目标）/ failed（无法完成，清目标）/
+                #   limit（连续 block 超 block_cap，强制结束，目标保持激活）/
+                #   error（评估器调用出错，目标保持激活）
+                if decision.action == "achieved":
+                    self._print(f"\033[33m[goal] achieved: {decision.reason}\033[0m")
+                    log.info("goal achieved: %s%d %s",
+                             self.session_prefix, self.session_num, decision.reason[:120])
+                elif decision.action == "failed":
+                    self._print(f"\033[31m[goal] failed: {decision.reason}\033[0m")
+                    log.warning("goal failed: %s%d %s",
+                                self.session_prefix, self.session_num, decision.reason[:120])
+                elif decision.action == "limit":
+                    self._print(f"\033[31m[goal] limit: {decision.reason}\033[0m")
+                    log.warning("goal limit: %s%d 连续 block 超上限，强制结束 (%s)",
+                                self.session_prefix, self.session_num, decision.reason[:120])
+                elif decision.action == "error":
+                    self._print(f"\033[31m[goal] evaluation error: {decision.reason}\033[0m")
+                    log.error("goal 评估器出错: %s%d %s",
+                              self.session_prefix, self.session_num, decision.reason[:120])
+                # allow（无目标）与各终止态 → 走原有 Stop hook 流程
+                # （钩子返回非 None 仍可强制续跑，goal 之外的第二道拦截不受影响）
                 force = self.hook_system.trigger("Stop", self.history_messages)
                 if force:
                     # 往消息中记录强制结束的原因
@@ -465,14 +1084,8 @@ class Agent:
                     continue
                 return
 
-            # ANSI: \033[2m=暗(细体)，\033[93m=浅黄，\033[0m=重置（与上方灰色 [thinking] 区分）
-            self._print(f"\033[2;93m[本轮大模型调用工具数量] {len(response_tool_calls)}\033[0m")
-            for tc in response_tool_calls:
-                # 单行打印超 200 字符截断，避免大参数（如大段代码/长路径）刷屏
-                self._print(
-                    f"\033[2;93m{truncate_chars(f"  - {tc.function.name}({tc.function.arguments})  #id={tc.id}\n ")}\033[0m"
-                )
-            self._print(f"\033[2;93m[本轮大模型工具调用结束,等待执行结果]\033[0m")
+            # 注：工具调用的工具行已由 PrintSink 在流式阶段预测式渲染（P3），
+            # 这里不再重复打印汇总，避免同一工具调用出现两行。
             # 三阶段执行：后台 → 并行 → 串行, 互斥分桶。
             #   后台桶: args.run_in_background=true, 立即分发给 background_manager 守护线程
             #   并行桶: args.parallel=true (且非后台), 线程池并发, 全部完成才走下一步
@@ -573,6 +1186,9 @@ class Agent:
                     self.session_file, tool_msg
                 )
 
+            # 工具回放完成后落盘子智能体执行记录（role=subagent 行，不进 history_messages）
+            self._persist_pending_subagent_rows()
+
             # 后台任务通知注入：本轮（或更早轮次）已完成的后台任务，
             # 把它们的输出整理成 <task_notification> 文本块作为 user 消息追加。
             # 与 s13 教程的"每轮都收集"语义一致：
@@ -593,6 +1209,9 @@ class Agent:
                 self._print(
                     f"  \033[32m[inject] {len(bg_notifications)} background notification(s)\033[0m"
                 )
+
+            # 后台结果注入后，把已完成后台子智能体的执行记录一并落盘
+            self._persist_pending_subagent_rows()
 
             # todo 更新追踪: 本轮用了 todo 就清零, 否则累加;
             # 连续 3 轮未更新且仍有 open items 时, 注入提醒作为本轮最后一条消息, 并清零避免重复打扰

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": false,
+    "jsx": "react-jsx",
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@renderer/*": ["src/renderer/src/*"],
+      "@protocols/*": ["src/renderer/src/protocols/*"],
+      "@components/*": ["src/renderer/src/components/*"],
+      "@store/*": ["src/renderer/src/store/*"],
+      "@hooks/*": ["src/renderer/src/hooks/*"]
+    }
+  },
+  "include": [
+    "src/renderer/src/**/*",
+    "src/preload/index.d.ts"
+  ]
+}
