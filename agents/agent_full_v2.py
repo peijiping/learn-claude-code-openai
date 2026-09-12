@@ -15,8 +15,10 @@ agent_full_v2.py - 主智能体引擎（Agent 类）
   agent.run_turn("[Scheduled] ...") # 非交互单轮
 """
 
+import hashlib
 import json
 import os
+import platform
 import threading
 import time
 
@@ -27,7 +29,8 @@ from session_manage import SessionManager
 from subagent import SubAgent
 from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
-from paths import WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR, WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR
+from paths import (WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR,
+                   WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR)
 from tools import ToolRegistry
 from worktree import WorktreeManager
 from mcp_manager import MCPManager
@@ -52,6 +55,18 @@ load_dotenv(override=True)
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("agent")
+
+# 「尾部按需注入」的块标记名。注入消息形如：
+#   <system-reminder><memory_index revision="ab12cd34ef56">…索引…</memory_index></system-reminder>
+# 必须用 <system-reminder> 包裹 —— ws_bridge._history_to_ui 会跳过以此开头的 user 消息，
+# 所以这类注入不会出现在前端回放 / 聊天界面里（与 _inject_todo_reminder 的约定一致）。
+# 每个 tag 各自独立判指纹，互不影响。
+MEMORY_INDEX_TAG = "memory_index"   # 记忆索引（L2 热段，变化最频繁）
+ENV_TAG = "env"                     # 环境与上下文：日期 / 星期 / 平台（L2 热段）
+PROJECT_RULES_TAG = "project_rules"  # 工作区指令文件（AGENTS.md）会话期间的变更全文
+
+# 星期中文名（time.localtime().tm_wday：0 = 周一）
+_WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
 class Agent:
@@ -142,14 +157,21 @@ class Agent:
             sinks=[self.stream_sink],
         )
 
-        # 系统 prompt：注入本实例的 skills / memory / tools
+        # 系统 prompt：注入本实例的 skills / tools。
+        # 工作区指令文件（CLAUDE.md / AGENT.md / AGENTS.md）**从 workdir 读** —— 那是用户
+        # 的工作空间，规则就写在那儿；仓库根的 AGENTS.md 是给"开发本项目的编码助手"看的，
+        # 不是给终端用户的助手看的（详见 SystemPromptBuilder._get_workspace_instructions）。
+        # 也**禁止**从 chat_history_dir.parent 反推：运行时数据迁到 ~/.aigent/projects/<slug>/
+        # 之后那个 parent 已不是工作空间，曾因此让指令文件恒加载不到。
         self.system_prompt = SystemPromptBuilder(
             workdir=WORKDIR,
             skills=self.skills,
-            memory=self.memory,
             tools=self.tools,
-            chat_history_dir=CHAT_HISTORY_DIR,
         )
+        # 当前「已进入 system prompt」的工作区指令指纹。进会话时由
+        # _refresh_system_prompt() 刷新；_sync_project_rules() 据此判断是否需要
+        # 把变更后的指令全文追加到消息尾部（方案 C）。
+        self._prompt_workspace_revision = self.system_prompt.workspace_revision
 
         # LLM 客户端 + S11 错误恢复控制器
         self.llm_client = LLMClient().llm
@@ -366,11 +388,17 @@ class Agent:
             self.session_num, self.session_file, self.history_messages = \
                 self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
+        # 方案 B：加载回来的 messages[0] 是文件里那份（会话创建时构建），
+        # 用最新构建的替换 —— 否则改了 AGENTS.md / 装了新技能，本会话看不到。
+        self._refresh_system_prompt()
         # todo 与 session 绑定：每次切会话都要重新指向对应的 todo 文件
         self.tools.set_todo_manager(self.session_num)
         # task 与 session 绑定：任务板限定在本会话作用域（"session_N"/"cron_N"）
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
         self._inject_todo_reminder()
+        # L2 尾部注入：首次注入落在用户提问之前（指纹已在历史里则是 no-op）
+        self._sync_memory_index()
+        self._sync_environment()
         log.info("会话初始化: %s%d (resume=%s, messages=%d)",
                  self.session_prefix, self.session_num, resume, len(self.history_messages))
         return self.session_num
@@ -429,12 +457,19 @@ class Agent:
 
     def new_session(self) -> tuple[int, str]:
         """创建新会话并绑定 todo，返回 (新会话编号, 提示语)。"""
+        # 方案 B：新建会话的 system message 由 SessionManager **持有**的那份产出
+        # （_build_initial_messages），必须先刷新为最新构建结果，否则长生命周期
+        # Agent（CLI）会拿到很久以前构建的版本。
+        self._refresh_system_prompt()
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 新会话的 todo 文件尚不存在，set_todo_manager 会建出空列表；reminder 不会注入
         self.tools.set_todo_manager(self.session_num)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
+        # 新会话：立即注入当前记忆索引与环境上下文（新会话扫不到指纹 → 必然注入）
+        self._sync_memory_index()
+        self._sync_environment()
         log.info("新会话创建: %s%d", self.session_prefix, self.session_num)
         return self.session_num, f"已创建新会话: session_{self.session_num}.jsonl"
 
@@ -453,9 +488,14 @@ class Agent:
         self.session_num, self.session_file, self.history_messages = \
             self.session_manager.switch_session(target_num)
         self.history_messages = self._strip_subagent_rows(self.history_messages)
+        # 方案 B：与 init_session 同理 —— 换成最新构建的 system prompt
+        self._refresh_system_prompt()
         self.tools.set_todo_manager(self.session_num)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
         self._inject_todo_reminder()
+        # L2 尾部注入：若离开期间记忆/日期变过，这里会补注（指纹从本会话历史恢复）
+        self._sync_memory_index()
+        self._sync_environment()
         log.info("会话切换: %s%d -> %s%d (messages=%d)",
                  self.session_prefix, target_num, self.session_prefix,
                  self.session_num, len(self.history_messages))
@@ -547,6 +587,163 @@ class Agent:
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
         )
+
+    # ── 方案 B：进会话时刷新 system prompt ─────────────────────────────
+    #
+    # 问题：resume / 切换会话时 `load_session_history()` 读回来的 `messages[0]`
+    # 是**该会话创建时**那份；而 `build_system_prompt()` 虽然也重算过一次
+    # （SessionManager 构造时），结果随即被读回的历史覆盖 —— 等于白算。
+    # 于是"改了 AGENTS.md / 装了新技能，当前会话看不到"。
+    #
+    # 这里补上「替换」这一步，三个进会话入口（init / switch / new）都调用。
+
+    def _refresh_system_prompt(self) -> bool:
+        """用最新构建的 system prompt 替换 `messages[0]`，并同步 SessionManager 持有的那份。
+
+        只改内存、**不写回文件**：文件里那份旧的根本不会被使用（每次进会话都会
+        重建替换），且下次 `save_session_history` 重写时会自然带上新内容。
+        这样既拿到了实时性，又避免触碰会话文件的原子重写（无需 `.bak`）。
+
+        返回是否发生了替换 —— 替换会让整段前缀缓存失效一次，属预期代价
+        （只在 AGENTS.md / 技能列表真变过时才会发生）。
+        """
+        fresh = self.system_prompt.build_system_prompt()
+        # SessionManager 持有的那份用于"新建会话"（_build_initial_messages），同样要刷新，
+        # 否则 CLI 这类长生命周期 Agent 点"新建会话"会拿到很久以前构建的版本。
+        if self.session_manager is not None:
+            self.session_manager.system_prompt = fresh
+        self._prompt_workspace_revision = self.system_prompt.workspace_revision
+
+        if not self.history_messages:
+            return False
+        first = self.history_messages[0]
+        if first.get("role") != "system" or first.get("content") == fresh:
+            return False
+        self.history_messages[0] = {"role": "system", "content": fresh}
+        log.info("刷新 system prompt: %s%d (%d 字符)",
+                 self.session_prefix, self.session_num, len(fresh))
+        return True
+
+    # ── 尾部按需注入（L2 热段）────────────────────────────────────────
+    #
+    # 为什么不用 system prompt 承载：这些内容每轮都可能变，而 system 是消息数组的
+    # [0]。改它会从第一个 token 起让整段前缀缓存失效，且每个会话的内容都不同、
+    # 跨会话也无法共享缓存。改成「变化时往消息**末尾**追加一条」之后：
+    #   - 追加不改变前面任何字节 → 已缓存前缀继续命中，只有新增的那一条未缓存；
+    #   - 那条注入消息到下一轮就成为前缀的一部分、字节相同 → 继续命中。
+    #
+    # 通用约定：每个注入块用 <tag revision="指纹"> 自描述指纹，各 tag 独立判定。
+
+    def _last_injection_revision(self, tag: str) -> str:
+        """从本会话历史里恢复「某个注入块上次写入的指纹」。
+
+        指纹随注入消息一起落盘，因此不依赖任何外部状态：resume / 切换会话后
+        都能正确判断，既不重复注入也不漏注入。
+
+        若标记已被上下文压缩裁掉（snip 只保留头 3 + 尾 N 条），这里返回空串
+        → 视为「从未注入」→ 下一轮自动补注。**兜底不需要额外逻辑。**
+        """
+        marker = f'<{tag} revision="'
+        for message in reversed(self.history_messages):
+            if message.get("role") != "user":
+                continue
+            text = message.get("content")
+            if isinstance(text, str) and marker in text:
+                return text.split(marker, 1)[1].split('"', 1)[0]
+        return ""
+
+    def _append_injection(self, tag: str, revision: str, body: str) -> None:
+        """把一条 <system-reminder> 包裹的注入块追加到历史并落盘。
+
+        用 <system-reminder> 包裹是硬要求：ws_bridge._history_to_ui 只按
+        startswith("<system-reminder>") 过滤系统注入，否则会变成聊天界面的用户气泡。
+        """
+        reminder = (
+            f"<system-reminder>\n"
+            f'<{tag} revision="{revision}">\n'
+            f"{body}\n"
+            f"</{tag}>\n"
+            f"</system-reminder>"
+        )
+        msg = {"role": "user", "content": reminder}
+        self.history_messages.append(msg)
+        self.session_manager.append_message_to_session(self.session_file, msg)
+
+    def _sync_memory_index(self) -> None:
+        """记忆索引尾部按需注入：仅在指纹变化（或标记已消失）时追加一条。
+
+        幂等 —— 索引没变则零开销、历史零膨胀；写入记忆后下一轮即生效。
+        """
+        index_text = self.memory.read_index()
+        revision = hashlib.sha1(index_text.encode("utf-8")).hexdigest()[:12]
+        if revision == self._last_injection_revision(MEMORY_INDEX_TAG):
+            return
+        self._append_injection(
+            MEMORY_INDEX_TAG, revision, index_text or "（暂无记忆）"
+        )
+        log.info("注入记忆索引: %s%d revision=%s (条目=%d)",
+                 self.session_prefix, self.session_num, revision,
+                 len([ln for ln in index_text.splitlines() if ln.strip()]))
+
+    # ── 环境与上下文（日期 / 星期 / 平台）──────────────────────────────
+    #
+    # 每次判定都**现场取值**（不是会话创建时固化），所以：
+    #   - 跨天时日期自动更新；当天内指纹不变 → 不重复注入，零开销；
+    #   - 会话被搬到另一台机器 resume 时，平台会自动纠正；
+    #   - git 状态**故意不纳入** —— 它随每次 commit / 切分支变化，是缓存杀手，
+    #     真需要时让模型跑一条 git status 更划算。
+
+    @staticmethod
+    def _environment_snapshot() -> list[tuple[str, str]]:
+        """现场采集环境信息，返回 [(标签, 值)]（顺序固定 → 指纹稳定）。"""
+        now = time.localtime()
+        return [
+            ("当前日期", time.strftime("%Y-%m-%d", now)),
+            ("星期", _WEEKDAY_CN[now.tm_wday]),
+            ("运行平台", platform.system().lower() or "unknown"),
+        ]
+
+    def _sync_environment(self) -> None:
+        """环境上下文尾部按需注入：内容变了才追加（通常一天一次）。"""
+        snapshot = self._environment_snapshot()
+        body = "\n".join(f"{label}：{value}" for label, value in snapshot)
+        revision = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
+        if revision == self._last_injection_revision(ENV_TAG):
+            return
+        self._append_injection(ENV_TAG, revision, body)
+        log.info("注入环境上下文: %s%d revision=%s (%s)",
+                 self.session_prefix, self.session_num, revision,
+                 " | ".join(v for _, v in snapshot))
+
+    # ── 方案 C：工作区指令文件变更时的尾部注入 ────────────────────────
+    #
+    # 场景：会话跑到一半，用户（或智能体自己）改了 AGENTS.md 来记录项目记忆。
+    # 为什么走尾部而不是重建 system prompt：重建 messages[0] 会让**整段前缀**
+    # （含全部历史）失效并重新 prefill；尾部追加只让新块未缓存，其余前缀照旧命中。
+    # 长会话下后者便宜得多。
+
+    def _sync_project_rules(self) -> None:
+        """工作区指令文件在**会话期间**被改动时，把最新全文追加到尾部。
+
+        与 system prompt 里那份的关系：注入块内声明"以本条为准"，模型按最新版执行。
+        指纹与 system prompt 里那份一致时不注入（进会话时已由方案 B 刷新过）。
+        """
+        revision = self.system_prompt.workspace_revision
+        if revision == getattr(self, "_prompt_workspace_revision", None):
+            return  # 与 system prompt 里那份一致，无需注入
+        if revision == self._last_injection_revision(PROJECT_RULES_TAG):
+            return  # 这一版已经注入过
+        body = self.system_prompt.get_workspace_instructions()
+        if not body:
+            body = "工作区指令文件已被移除，此前 system 中的版本作废。"
+        self._append_injection(
+            PROJECT_RULES_TAG,
+            revision,
+            "工作区指令文件已在本次会话期间变更，以下为**最新版本**；"
+            "与之冲突时以本条为准。\n\n" + body,
+        )
+        log.info("注入工作区指令更新: %s%d revision=%s",
+                 self.session_prefix, self.session_num, revision)
 
     def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = ""):
         """
@@ -712,11 +909,18 @@ class Agent:
         # 预热注入后，把上一 turn 结束时仍在跑、此刻已完成的后台子智能体记录落盘
         self._persist_pending_subagent_rows()
 
+        # ── L2 尾部注入同步（turn 起点）────────────────────────────────
+        # 放在这里而不是去刷新 system prompt：这些内容走「尾部追加」，不碰 [0]，
+        # 所以已缓存的前缀继续命中，只有新增那一条是未缓存的（而它本来就是本轮新内容）。
+        # 位置覆盖 run_turn / run_background_followup / CLI 全路径；会话中途的
+        # write_memory / forget_memory、跨天导致的日期变化、以及 AGENTS.md 被改动，
+        # 都在下一轮由这里捕获。
+        self._sync_memory_index()
+        self._sync_environment()
+        self._sync_project_rules()
+
         iteration = 0  # 循环迭代计数
         rounds_since_todo = 0  # 记录距离上次调用 todo 工具的轮数，用于 nag reminder
-
-        # 这里可以增加s10课程中更新systemprompt的逻辑，同时更新内存message和会话记录的jsonl文件。
-        # 这样可以保证记忆、工具、skill的实时更新，但会影响缓存未命中率。
 
         while True:
             # 协作式停止：请求停止后，在进入下一轮（再次调 LLM/工具）前提前收尾

@@ -225,14 +225,12 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(async () => {
+app.whenReady().then(() => {
   flog.info('app', `Electron 主进程启动 (electron=${process.versions.electron}, node=${process.versions.node}, pid=${process.pid})`)
-  // 方案A：先拉起后端并就绪，再建窗 + 连 WS。
-  // 原顺序是"先建窗再起后端"，首连 WS 时后端仍在 import，导致状态栏短暂"连接中"。
-  // 现在等 python.whenReady()（后端 listening 或崩溃/超时兜底）后才建窗，WS 首次即连上。
-  python.start()
-  await python.whenReady()
   createWindow()
+  // 方案B：先建窗显示界面；后端冷启动期间由渲染进程的"启动画面"遮罩覆盖
+  //（见 02-界面功能设计.md 启动遮罩），直至 WS 首次 connected 后切主界面。
+  python.start()
   ws.connect()
 
   app.on('activate', () => {

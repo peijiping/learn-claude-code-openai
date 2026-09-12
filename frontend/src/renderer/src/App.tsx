@@ -7,6 +7,7 @@ import SettingsModal from '@components/SettingsModal'
 import StatusBar from '@components/StatusBar'
 import ErrorBoundary from '@components/common/ErrorBoundary'
 import Toast from '@components/common/Toast'
+import StartupOverlay from '@components/common/StartupOverlay'
 
 export default function App(): JSX.Element {
   useAgentStream()
@@ -29,6 +30,7 @@ export default function App(): JSX.Element {
         <StatusBar />
         {settingsOpen && <SettingsModal />}
         <Toast />
+        <StartupOverlay />
       </div>
     </ErrorBoundary>
   )

@@ -169,18 +169,20 @@ class BackgroundManager:
                 for t in self.background_tasks.values()
             )
 
-    # 收集所有已完成的后台任务，生成 <task_notification> 通知列表。
+    # 收集所有已完成的后台任务，生成 task_notification 通知列表。
     # 设计要点（与教程版不同）：
     # - 通知里同时给 <summary>（200 字符预览）+ <full_output>（完整结果）：
     #   模型既能快速预览，也能直接读到全文，无需再查 check_background。
     # - 状态从 completed 改为 notified（不 pop 数据）：同一结果只注入一次，
     #   避免下轮重复出现；但 background_tasks / background_results 里的数据
     #   完整保留，check_background 仍能查到完整结果。
-    # - <task_notification> 是独立消息格式（普通 text 块），而非复用 tool_result——
+    # - task_notification 是独立消息格式（普通 text 块），而非复用 tool_result——
     #   因为 tool_result 必须对应具体 tool_call_id，而后台任务的结果与原始
     #   tool_use 早已"分离"了。
+    # - 整段用 <system-reminder> 包裹：这是"只给模型看、不下发前端"的判定依据
+    #   （ws_bridge._history_to_ui 按 startswith 过滤），详见下方实现处注释。
     def collect_background_results(self) -> list[str]:
-        """Collect completed background results as task_notification messages."""
+        """收集已完成的后台任务，产出 <system-reminder> 包裹的 task_notification 消息。"""
         with self.background_lock:
             ready_ids = [bid for bid, task in self.background_tasks.items()
                          if task["status"] == "completed"]
@@ -192,14 +194,20 @@ class BackgroundManager:
                 # 标记为已通知而不是 pop：同一结果只注入一次，但数据保留
                 self.background_tasks[bg_id]["status"] = "notified"
             summary = output[:200] if len(output) > 200 else output
+            # 必须用 <system-reminder> 包裹：ws_bridge._history_to_ui 只按
+            # startswith("<system-reminder>") 判定"系统注入消息"并跳过，否则这段
+            # 通知会以**用户气泡**的形式漏到聊天界面（看着像用户自己说的话）。
+            # 后台任务的用户可见性已由子智能体卡片 / 工具条承担，这里只给模型看。
             notifications.append(
+                f"<system-reminder>\n"
                 f"<task_notification>\n"
                 f"  <task_id>{bg_id}</task_id>\n"
                 f"  <status>completed</status>\n"
                 f"  <command>{task['command']}</command>\n"
                 f"  <summary>{summary}</summary>\n"
                 f"  <full_output>{output}</full_output>\n"
-                f"</task_notification>")
+                f"</task_notification>\n"
+                f"</system-reminder>")
             print(f"  \033[32m[background done] {bg_id}: "
                   f"{task['command'][:40]} ({len(output)} chars)\033[0m")
         return notifications

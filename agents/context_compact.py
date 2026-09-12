@@ -467,7 +467,10 @@ class ContextCompact:
         transcript_dir: Optional[Path] = None,
     ) -> list:
         """把中间一段 messages 压缩为单条摘要 HumanMessage。
-        保留前缀：SystemMessage + workspace 指令。
+
+        保留前缀：**仅 SystemMessage** —— `_protected_prefix_end()` 只保护 `messages[0]`。
+        注意：workspace 指令（AGENTS.md）**早已并入该条 system message**，不再是独立消息；
+        "另有一条指令消息受保护"是旧设计的说法，别据此把指令挪成独立消息（那会被 L4 摘要吃掉）。
         保留后缀：最后 PRESERVE_RECENT_SUMMARY_MESSAGES 条原文。
         压缩前先 write_transcript 做全量快照。
         """

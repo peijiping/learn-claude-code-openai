@@ -17,39 +17,9 @@ export class PythonManager {
   private child: ChildProcess | null = null
   private status: PythonStatus = 'stopped'
   private opts: PythonManagerOptions
-  // 就绪等待（方案A）：建窗前先等后端探测到 running，避免首连失败。
-  private readyResolvers: Array<() => void> = []
-  private readySettled = false
-  private readyTimer: NodeJS.Timeout | null = null
 
   constructor(opts: PythonManagerOptions) {
     this.opts = opts
-  }
-
-  /**
-   * 返回一个 Promise：后端探测到就绪("running")后 resolve。
-   * 兜底：后端崩溃/超时也会 resolve，保证调用方（建窗）不被卡死，降级为现状行为。
-   */
-  whenReady(timeoutMs = 6000): Promise<void> {
-    if (this.readySettled) return Promise.resolve()
-    return new Promise((resolve) => {
-      this.readyResolvers.push(resolve)
-      if (this.readyTimer === null) {
-        this.readyTimer = setTimeout(() => this.fireReady(), timeoutMs)
-      }
-    })
-  }
-
-  private fireReady(): void {
-    if (this.readySettled) return
-    if (this.readyTimer !== null) {
-      clearTimeout(this.readyTimer)
-      this.readyTimer = null
-    }
-    this.readySettled = true
-    const rs = this.readyResolvers
-    this.readyResolvers = []
-    for (const r of rs) r()
   }
 
   get isRunning(): boolean {
@@ -104,7 +74,6 @@ export class PythonManager {
     } catch (err) {
       this.opts.onLog?.(`[python] ${(err as Error).message}`)
       this.setStatus('crashed')
-      this.fireReady() // 找不到解释器：直接放行建窗，避免拖满超时
       return
     }
 
@@ -128,7 +97,6 @@ export class PythonManager {
     const readyProbe = (d: Buffer): void => {
       if (d.toString().includes('WS server') || d.toString().includes('listening')) {
         this.setStatus('running')
-        this.fireReady()
         child.stdout?.removeListener('data', readyProbe)
       }
     }
@@ -139,7 +107,6 @@ export class PythonManager {
       this.opts.onLog?.(`[python] 退出 code=${code}`)
       flog[code === 0 ? 'info' : 'error']('python', `后端进程退出 code=${code}`)
       this.setStatus(code === 0 ? 'stopped' : 'crashed')
-      this.fireReady()
     })
   }
 
