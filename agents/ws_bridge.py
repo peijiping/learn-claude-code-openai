@@ -35,6 +35,21 @@ load_llm_config()
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("ws_bridge")
 
+# 联调调试钩子：Electron 主进程在 launch.json 里通过 PYTHON_DEBUG_PORT 把这个
+# 变量随 spawn 透传给本进程（PythonManager 复制 process.env），据此决定是否
+# 起 debugpy，不设环境变量时零开销，完全不影响正常 `npm run dev`。
+# PYTHON_DEBUG_WAIT=1 时后端会一直等到调试器 attach 才继续，保证可从启动点断点。
+DEBUG_PORT = os.environ.get("PYTHON_DEBUG_PORT")
+if DEBUG_PORT:
+    try:
+        import debugpy
+        debugpy.listen(("127.0.0.1", int(DEBUG_PORT)))
+        if os.environ.get("PYTHON_DEBUG_WAIT") == "1":
+            debugpy.wait_for_client()
+        log.info("联调钩子: debugpy 监听 127.0.0.1:%s", DEBUG_PORT)
+    except Exception as e:  # debugpy 缺失等，仅警告不阻断启动
+        log.warning("联调钩子: debugpy 未就绪, 本次不联调: %s", e)
+
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
 
 # 全局 Agent 仅用于：大模型配置热切换（reload_llm_bindings）、会话标题生成、
@@ -472,12 +487,16 @@ async def handle(ws):
                 sm = _ensure_session_manager()
                 num = int(payload.get("num", 0))
                 log.info("会话切换请求: session_%d", num)
-                # 运行中的会话不读磁盘回放：turn 在途时 jsonl 可能处于
-                # "assistant(tool_calls) 已落盘、tool 响应未落盘" 的中间态，
-                # load_session_history 的孤儿清理会把它当坏数据重写文件，
-                # 截断在途消息。前端对运行中会话本就以实时缓冲为准
-                # （session_history 的 hasLive 守卫），此处回放空消息即可。
-                if registry.is_busy(num):
+                # 运行中（含"后台子智能体仍在跑"）的会话不读磁盘回放：turn 在途
+                # 或后台 worker 在写时，jsonl 可能处于 "assistant(tool_calls) 已
+                # 落盘、tool 响应未落盘" 的中间态，load_session_history 的孤儿清理
+                # 会把它当坏数据重写文件，截断在途消息。前端对运行中会话本就以实时
+                # 缓冲为准（session_history 的 hasLive 守卫），此处回放空消息即可。
+                # 注意用 is_active 而非 is_busy：后台子智能体执行期间 turn 已结束
+                # （busy=False），但后台线程仍在写文件，同样不能回放——
+                # 历史 bug：只判 busy 时，"子智能体一跑就切会话"会撞上原子重写，
+                # 表现为前后端会话状态错位（2026-09-14 修复）。
+                if registry.is_active(num):
                     # 消息回放跳过（以实时缓冲为准），但模型与参数仍按元数据恢复，
                     # 保证切到运行中会话时其参数覆盖也能正确加载。
                     meta = (await asyncio.to_thread(sm.load_meta, num)) or {}
@@ -543,9 +562,9 @@ async def handle(ws):
                 if num <= 0:
                     await safe_send(ws, _envelope("error", {"msg": "当前无激活会话"}))
                     continue
-                if registry.is_busy(num):
+                if registry.is_active(num):
                     await safe_send(ws, _envelope("error", {
-                        "msg": f"该会话 (session_{num}) 正在执行，暂不能清空",
+                        "msg": f"该会话 (session_{num}) 正在执行（或后台任务仍在跑），暂不能清空",
                     }))
                     continue
                 if not sm.get_session_file(num).exists():
@@ -578,10 +597,12 @@ async def handle(ws):
             elif kind == "session_trash":
                 sm = _ensure_session_manager()
                 num = int(payload.get("num", 0))
-                # 运行中的会话禁止进回收站（后台还在写文件 / 流式输出）
-                if registry.is_busy(num):
+                # 运行中（含后台子智能体仍在跑）的会话禁止进回收站：
+                # 后台 worker 还在往会话文件/旁路文件写，移动文件会造成写入丢失
+                # 与"孤儿文件复活"。用 is_active 覆盖 background 窗口（2026-09-14）。
+                if registry.is_active(num):
                     await safe_send(ws, _envelope("error", {
-                        "msg": f"该会话 (session_{num}) 正在执行，请先停止后再删除",
+                        "msg": f"该会话 (session_{num}) 正在执行（或后台任务仍在跑），请先停止后再删除",
                     }))
                     continue
                 try:
@@ -605,7 +626,7 @@ async def handle(ws):
 
             elif kind == "session_delete":
                 # 批量永久删除：逐条执行，单条失败不断整批；
-                # 运行中的会话拒绝删除（后台还在写文件）
+                # 有活动的会话拒绝删除（turn 在跑，或后台子智能体还在写文件）
                 sm = _ensure_session_manager()
                 nums = payload.get("nums") or []
                 deleted, failed = [], []
@@ -614,7 +635,7 @@ async def handle(ws):
                         num = int(n)
                     except (TypeError, ValueError):
                         continue
-                    if registry.is_busy(num):
+                    if registry.is_active(num):
                         failed.append(num)
                         continue
                     try:

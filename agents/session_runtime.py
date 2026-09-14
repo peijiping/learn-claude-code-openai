@@ -91,6 +91,46 @@ class SessionRuntime:
         self._load_meta: LoadMeta = load_meta
         self._bound_model: str | None = None  # 当前 agent 实际绑定的会话模型 id
         self._turn_started: float = 0.0  # 当前 turn 开始时间（耗时统计用）
+        # 本轮 LLM 响应画像（仅在事件流过时累计，纯排障用，不改变任何行为）
+        self._response_diag = self._new_response_diag()
+
+    # ── 每个 LLM 响应的画像（排障用）───────────────────────────────
+    @staticmethod
+    def _new_response_diag() -> dict:
+        return {"content": 0, "thinking": 0, "tools": []}
+
+    def _note_response_event(self, ev: dict) -> None:
+        """按事件流累计"主智能体本次 LLM 响应"的画像，并在 turn_end 打一行日志。
+
+        为什么要有这行日志（2026-09-14 事故复盘）：模型偶尔会产出
+        「正文承诺派发子智能体、但一个 tool_call 都没有」的**正常 stop** 响应，
+        此时 agent_loop 判定"模型想停"直接收尾 —— 前端只看到一句
+        "我派一个子智能体去读"然后就没有下文（用户描述为"直接中断、不往下执行"）。
+        而当时的日志里只有 "turn 结束"，无法区分「模型没发工具调用」与
+        「工具调用发了却丢了」，排查全靠反推 token 数。补上这行后一眼可判。
+
+        只统计主智能体事件（带 subagent_id 的是子智能体内部事件，另有打点）。
+        """
+        t = ev.get("type")
+        if ev.get("subagent_id"):
+            return
+        if t == "content_delta":
+            self._response_diag["content"] += len(ev.get("text") or "")
+        elif t == "thinking_delta":
+            self._response_diag["thinking"] += len(ev.get("text") or "")
+        elif t == "tool_call":
+            self._response_diag["tools"].append(ev.get("tool_name") or "?")
+        elif t == "turn_end":
+            diag = self._response_diag
+            finish = ev.get("finish_reason") or ""
+            log.info("session_%d LLM 响应: finish=%s 工具调用=%s content=%d字 thinking=%d字 usage=%s",
+                     self.num, finish or "(空)", diag["tools"] or "无",
+                     diag["content"], diag["thinking"], ev.get("usage") or {})
+            if finish == "tool_calls" and not diag["tools"]:
+                # 协议自相矛盾：声明"有工具调用"却一个都没聚合出来。
+                log.error("session_%d 协议异常: finish_reason=tool_calls 但未收到任何 tool_call "
+                          "事件（本轮工具调用丢失，表现为「说要干活却没有下文」）", self.num)
+            self._response_diag = self._new_response_diag()
 
     # ── 事件路由：把会话内事件打上 session_num ──────────────────
     def _bind_sink(self, agent: Agent) -> None:
@@ -113,6 +153,7 @@ class SessionRuntime:
                         name=(ev.get("text") or "子智能体")[:80],
                         prompt=ev.get("text") or "",
                     )
+            self._note_response_event(ev)
             self._deliver("event", ev)
         agent.stream_sink = WSSink(send_func=send_func)
         # 子智能体在 Agent.__init__ 阶段捕获了当时的 sinks（PrintSink），
@@ -354,6 +395,24 @@ class SessionRuntimeRegistry:
     def is_busy(self, num: int) -> bool:
         rt = self._sessions.get(num)
         return bool(rt and rt.busy)
+
+    def is_active(self, num: int) -> bool:
+        """会话是否有活动：turn 执行中，**或** turn 已结束但后台任务仍在跑。
+
+        与 is_busy 的关键区别：后台子智能体执行期间 turn 早已结束（busy=False），
+        但后台线程仍在写会话旁路文件、仍会追加主 jsonl 的 tool 结果/通知。
+        只看 busy 会把这个窗口当成"空闲"→ 前端切会话时触发磁盘回放、
+        load_session_history 的自愈可能**原子重写正在被写入的会话文件**，
+        表现为"子智能体一跑，前后端状态就错位/丢消息，过一会儿又对上了"。
+        （ws_bridge 里那段"运行中不回放"的注释说的就是这个 hazard，但守卫
+        只覆盖了 busy，漏了 background —— 2026-09-14 补齐。）
+        """
+        rt = self._sessions.get(num)
+        if rt is None:
+            return False
+        if rt.busy:
+            return True
+        return rt.agent is not None and rt.agent.background_manager.has_running()
 
     def remove(self, num: int) -> None:
         """会话被删除/回收后移除其运行时（运行中会被上层拒绝后才到达这里）。"""

@@ -129,7 +129,19 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     return (
       <>
         <div className="msg-row user" onContextMenu={openMenu}>
-          <div className="msg-bubble user">{msg.content}</div>
+          <div className="msg-bubble user">
+            {msg.content}
+            <button
+              className="msg-copy-btn"
+              title="复制"
+              onClick={(e) => {
+                e.stopPropagation()
+                copyContent()
+              }}
+            >
+              <Icon name="copy" size={12} />
+            </button>
+          </div>
         </div>
         {menu && <MessageMenu x={menu.x} y={menu.y} onCopy={copyContent} onClose={() => setMenu(null)} />}
       </>
@@ -162,6 +174,16 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
             {msg.streaming && msg.content && <span className="cursor" />}
           </div>
           {!msg.streaming && usage}
+          <button
+            className="msg-copy-btn"
+            title="复制"
+            onClick={(e) => {
+              e.stopPropagation()
+              copyContent()
+            }}
+          >
+            <Icon name="copy" size={12} />
+          </button>
         </div>
       </div>
       {menu && <MessageMenu x={menu.x} y={menu.y} onCopy={copyContent} onClose={() => setMenu(null)} />}

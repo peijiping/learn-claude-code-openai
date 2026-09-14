@@ -35,7 +35,10 @@ class SubAgent:
         ## 核心规则
         1. **任务导向**：严格按照任务描述完成指定工作，不要发散
         2. **输出控制**：每次工具调用都要限制输出量。读取文件时使用 limit 参数，bash 命令用 | head 限制行数
-        3. **PDF 读取**：必须使用 read_pdf 工具读取 PDF，不要使用 strings/cat 等命令
+        3. **工具名必须与下发的一致**：可用的基础工具名是 bash / run_read / run_read_pdf /
+           run_write / run_edit / run_glob（**没有** read_pdf / read_file / write_file 这些名字）。
+           读 PDF **必须**用 run_read_pdf，不要用 strings/cat 等命令；名字写错会直接报
+           "Unknown tool"，白白消耗轮次。
         4. **摘要优先**：你的输出是给主智能体看的，只返回关键发现和结果，不要返回原始数据
         5. **安全操作**：执行写入或删除操作前，确认目标路径在工作目录内
         6. **看板边界**：不要创建或更新任务看板；不要调用 task_create、task_create_many 或 task_update；任务看板由主智能体统一维护

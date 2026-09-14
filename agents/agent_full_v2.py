@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import threading
 import time
 
@@ -67,6 +68,85 @@ PROJECT_RULES_TAG = "project_rules"  # 工作区指令文件（AGENTS.md）会�
 
 # 星期中文名（time.localtime().tm_wday：0 = 周一）
 _WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+# ── 「承诺未兑现」守卫（2026-09-14 事故后新增）──────────────────────
+# 事故：模型回复「我派一个子智能体后台去读」，正文写得像去干活，但**一个
+# tool_call 都没发**，finish_reason=stop。停止边界只认"没有工具调用 = 模型想停"，
+# 于是这一轮直接结束 —— 任务从未执行，用户看到的是「直接中断、不往下执行、
+# 看不到最终结果」（实测 session_4，token 对账确认只有 2 次 LLM 调用）。
+# 这里在停止边界之前加一道**窄口径**拦截：只有"短正文 + 明确的行动承诺 +
+# 零工具调用 + 非过去语态"几条同时成立才回注一条提醒，让模型在本轮把话说圆
+# （要么立刻发起工具调用，要么给出最终答复）。
+# 宁可不拦，也绝不打断正常收尾：口径窄是刻意设计，触发条件任一条不满足就放行。
+# 关闭方式：PROMISE_GUARD_MAX=0（默认 1，即每轮最多拦一次）。
+PROMISE_GUARD_MAX = int(os.environ.get("PROMISE_GUARD_MAX") or 1)
+# 正文长度上限：真正的最终答复通常远超此值，而"我这就去…"这类占位承诺天然很短
+PROMISE_GUARD_MAX_CONTENT_CHARS = int(
+    os.environ.get("PROMISE_GUARD_MAX_CONTENT_CHARS") or 240
+)
+
+# 承诺句式：第一人称 + 「派发/调用/执行/读取」这类必须落成工具调用的动作动词。
+# 过去时（"我读了 / 我派了 / 我已经…"）不是承诺，由 _PAST_FOLLOW 否决。
+_PROMISE_RE = re.compile(
+    r"我(?:先|这就|立刻|立即|马上|直接|现在|接下来|准备|打算|会|要|将|来|去)*"
+    r"(?:去|来)?"
+    r"(?:派发|派|调度|分发|调用|执行|发起|跑一遍|跑一下|扫描|检索|读取|读一下|"
+    r"查询|查一下|查看|看一下|检查|启动|运行)"
+    r"|\bI(?:'ll| will| am going to|'m going to| shall)\s+"
+    r"(?:dispatch|call|invoke|run|read|spawn|launch|scan|start)\b"
+    r"|\bLet me\s+(?:dispatch|call|invoke|run|read|spawn|launch|scan|start)\b",
+    re.IGNORECASE,
+)
+# 完成/过去/名词化语态：命中后紧跟这些字 → 是在**汇报已做的事**，不是在承诺。
+# 例："我派了…" / "我读过…" / "我派的那个子智能体已完成" / "我派出的…"
+_PAST_FOLLOW = ("了", "过", "完", "的", "出")
+
+
+def _text_of_message(message) -> str:
+    """取消息正文的纯文本（content 可能是 str，也可能是多模态 list）。
+
+    与 run_turn / ws_bridge._text_of 的取值口径保持一致，供守卫判断模型正文。
+    """
+    content = message.get("content", "") if isinstance(message, dict) else message
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def _looks_like_unfulfilled_promise(content: str) -> str:
+    """判断"短正文里承诺了动作、但没有发起任何工具调用"的收尾，返回命中片段。
+
+    三条全中才判定（口径刻意收窄，避免误拦正常收尾）：
+    1. 正文非空且 ≤ PROMISE_GUARD_MAX_CONTENT_CHARS；
+    2. 命中承诺句式（第一人称 + 需落地的动作动词）；
+    3. 命中处不是过去/完成语态。
+    """
+    text = (content or "").strip()
+    if not text or len(text) > PROMISE_GUARD_MAX_CONTENT_CHARS:
+        return ""
+    for m in _PROMISE_RE.finditer(text):
+        if text[m.end():m.end() + 1] in _PAST_FOLLOW:
+            continue          # "我派了…" / "我读过…" → 汇报，放行
+        return m.group(0)
+    return ""
+
+
+# 回注提醒：必须是 <system-reminder> 包裹（ws_bridge._history_to_ui 按此前缀
+# 过滤，否则会以"用户气泡"的形式漏到聊天界面，见 docs/frontend/03 §2.1）。
+PROMISE_GUARD_REMINDER = (
+    "<system-reminder>\n"
+    "<promise_guard>\n"
+    "你上一条回复承诺了要执行的动作（派发子智能体 / 调用工具），但并没有真的发起\n"
+    "工具调用，本轮因此直接结束了 —— 那个任务实际上还没有开始执行。\n"
+    "现在必须二选一，并且在本条回复里立刻做到：\n"
+    "1) 动作确实还没做完 → 立即发起对应的工具调用（例如 sub_agent），"
+    "不要再只写一句「我这就去…」；\n"
+    "2) 任务其实已经完成、或本来就不需要工具 → 直接给出最终答复正文，"
+    "不要再描述「接下来要做什么」。\n"
+    "</promise_guard>\n"
+    "</system-reminder>"
+)
 
 
 class Agent:
@@ -921,6 +1001,9 @@ class Agent:
 
         iteration = 0  # 循环迭代计数
         rounds_since_todo = 0  # 记录距离上次调用 todo 工具的轮数，用于 nag reminder
+        # 「承诺未兑现」守卫的本轮拦截次数（局部量，天然随本轮 agent_loop 重置；
+        # 上限 PROMISE_GUARD_MAX，默认 1 —— 只拉一把，绝不反复纠缠）
+        promise_guard_hits = 0
 
         while True:
             # 协作式停止：请求停止后，在进入下一轮（再次调 LLM/工具）前提前收尾
@@ -1017,6 +1100,31 @@ class Agent:
             )
 
             if len(response_tool_calls) == 0:
+                # ── 「承诺未兑现」守卫（2026-09-14 事故后新增，先于 goal 裁决）──
+                # 模型只写了一句"我派/我这就去…"却没发起任何工具调用就停 —— 这不是
+                # 真正的收尾，而是任务从未开始。回注一条提醒让它本轮把话说圆；
+                # 每轮最多拦 PROMISE_GUARD_MAX 次（默认 1），不会死循环。
+                if promise_guard_hits < PROMISE_GUARD_MAX:
+                    promise_hit = _looks_like_unfulfilled_promise(
+                        _text_of_message(response_msg_dict)
+                    )
+                    if promise_hit:
+                        promise_guard_hits += 1
+                        log.warning(
+                            "promise guard: %s%d 拦截第 %d/%d 次 —— 模型承诺了动作"
+                            "（命中 %r）却没发起任何工具调用，回注提醒后继续本轮；"
+                            "正文 %d 字",
+                            self.session_prefix, self.session_num, promise_guard_hits,
+                            PROMISE_GUARD_MAX, promise_hit,
+                            len(_text_of_message(response_msg_dict)),
+                        )
+                        guard_msg = {"role": "user", "content": PROMISE_GUARD_REMINDER}
+                        self.history_messages.append(guard_msg)
+                        self.session_manager.append_message_to_session(
+                            self.session_file, guard_msg
+                        )
+                        continue
+
                 # ── 停止边界（goal 的唯一拦截点，教程称"会话级 Stop 钩子"）──
                 # 模型不再调工具 = 它想停下来。无目标时 evaluate_after_turn
                 # 直接放行（allow），行为与原来完全一致；有目标时先裁决再放行。

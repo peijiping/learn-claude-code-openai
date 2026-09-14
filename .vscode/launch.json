@@ -17,6 +17,30 @@
             "request": "launch",
             "program": "${workspaceFolder}/agents/agent_cli.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "前端渲染进程 (React)",
+            "type": "chrome",
+            "request": "attach",
+            "port": 9222,
+            "webRoot": "${workspaceFolder}/frontend/src/renderer"
+        },
+        {
+            "name": "Electron(前端) 主进程",
+            "type": "node",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/frontend",
+            "runtimeExecutable": "${workspaceFolder}/frontend/node_modules/.bin/electron-vite",
+            "args": ["dev", "--", "--inspect=9229", "--remote-debugging-port=9222"],
+            "env": { "PYTHON_DEBUG_PORT": "5678" },
+            "sourceMaps": true,
+            "outputCapture": "std"
+        },
+        {
+            "name": "Python: Attach 后端(ws_bridge)",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": { "host": "127.0.0.1", "port": 5678 }
         }
     ]
 }

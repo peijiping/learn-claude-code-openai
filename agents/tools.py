@@ -1075,26 +1075,43 @@ class ToolRegistry:
 
     # ── sub_agent 工具定义（默认与团队模式共用）────────────────────
     def _sub_agent_tool_def(self) -> dict:
-        """sub_agent 工具定义（分发子任务给通用型子智能体）。"""
+        """sub_agent 工具定义（分发子任务给通用型子智能体）。
+
+        ⚠️ 本定义的措辞直接决定模型能否稳定产出工具调用，改动前注意两条硬约束
+        （2026-09-14 事故复盘）：
+        1. **schema 不得自相矛盾**：`required` 里列出的字段，description 里不能
+           又禁止模型填。历史写法 `required=["prompt","parallel"]` + "已传
+           run_in_background=true 时不要再传 parallel" 让模型在「批量任务必须
+           后台」这个唯一高频场景下**每一次都必须违规**（实测模型确实只传
+           prompt/description/allowed_tools/run_in_background，缺 parallel）。
+           这种"必填但被禁止"的构造下模型偶尔会放弃工具调用、只回一句
+           "我派一个子智能体去读"，本轮随即结束 —— 用户看到的就是"直接中断"。
+        2. **示例里的工具名必须与 `base_tools` 完全一致**（bash / run_read /
+           run_read_pdf / run_write / run_edit / run_glob）。写成 read_file /
+           read_pdf 这类不存在的名字会污染 allowed_tools，子智能体直接拿不到
+           run_read_pdf，读 PDF 必然失败。
+        """
         return {"type": "function", "function": {
             "name": "sub_agent",
-            "description": "分发子任务给通用型子智能体。子智能体拥有独立上下文（不污染主对话），共享文件系统，只返回最终摘要。子智能体默认拥有执行工具权限，但不包含 task 系列工具；任务看板只由主智能体维护。当任务需要多步骤操作、读取多个文件、收集信息或可能产生大量工具调用时使用。\n\n⚠️ 强制规则（必须遵守，违例会阻塞主循环浪费时间）：\n凡是「批量 / 全量 / 跨多个文件 / 跨整个目录 / 预计耗时 > 30 秒」的任务，**必须传 run_in_background=true** 丢到后台线程异步执行，立即返回任务 ID，结果通过后续轮次的 <task_notification> 收回。绝对不要同步等待这类任务完成。\n判断标准（命中任意一条就必须后台）：\n  - 涉及 ≥ 2 个文件 / 整个目录 / 全部 N 个 X\n  - prompt 含「全部 / 全量 / 批量 / 跑一遍 / 扫描 / 审计 / 构建 / 测试套件」等关键词\n  - 需要多步骤工具调用且总耗时可能 > 30 秒\n允许同步（run_in_background 默认 false）的场景：\n  - 单个文件的快速查询、单步工具调用\n  - 必须等前序结果才能继续的下一步操作\n\n如果多个子任务之间没有依赖关系，设置 parallel=true 让它们并行执行以提升效率；串行时设为 false。注意：run_in_background 与 parallel 互斥——已传 run_in_background=true 时不要再传 parallel。\n\n可通过 allowed_tools 限制子智能体的工具范围，例如只允许只读操作。\n\n示例：\n- sub_agent(prompt=\"读取 DRG_Docs 目录下全部 19 个 PDF 的标题和摘要\", run_in_background=true)  ← 批量全目录，必须后台\n- sub_agent(prompt=\"实现用户注册功能\", parallel=\"false\")\n- sub_agent(prompt=\"分析当前代码架构并设计重构方案\", parallel=\"false\")\n- sub_agent(prompt=\"只读方式搜索代码中的安全问题\", allowed_tools=[\"bash\",\"read_file\",\"read_pdf\"], parallel=\"true\")\n- sub_agent(prompt=\"跑全量测试并报告失败用例\", parallel=\"false\", run_in_background=true)",
+            "description": "分发子任务给通用型子智能体。子智能体拥有独立上下文（不污染主对话），共享文件系统，只返回最终摘要。子智能体默认拥有执行工具权限，但不包含 task 系列工具；任务看板只由主智能体维护。当任务需要多步骤操作、读取多个文件、收集信息或可能产生大量工具调用时使用。\n\n⚠️ 决定派发就必须在**本轮同一条回复里立即发起本次工具调用**。只输出「我派一个子智能体去读」这类正文而不调用本工具，本轮会直接结束、子任务永远不会执行（实测事故：模型承诺派发但零工具调用 → turn 结束 → 用户侧表现为「直接中断、不往下执行」）。\n\n⚠️ 强制规则（必须遵守，违例会阻塞主循环浪费时间）：\n凡是「批量 / 全量 / 跨多个文件 / 跨整个目录 / 预计耗时 > 30 秒」的任务，**必须传 run_in_background=true** 丢到后台线程异步执行，立即返回任务 ID，结果通过后续轮次的 <task_notification> 收回。绝对不要同步等待这类任务完成。\n判断标准（命中任意一条就必须后台）：\n  - 涉及 ≥ 2 个文件 / 整个目录 / 全部 N 个 X\n  - prompt 含「全部 / 全量 / 批量 / 跑一遍 / 扫描 / 审计 / 构建 / 测试套件」等关键词\n  - 需要多步骤工具调用且总耗时可能 > 30 秒\n允许同步（不传 run_in_background）的场景：\n  - 单个文件的快速查询、单步工具调用\n  - 必须等前序结果才能继续的下一步操作\n\nparallel 只对**同步**子任务有意义：多个互不依赖的同步子任务设 parallel=true 可并发执行；不传按串行处理。run_in_background=true 时本字段无意义，可以完全不传（后台任务各自独立，不参与并行/串行分桶）。\n\n可通过 allowed_tools 限制子智能体的工具范围，例如只允许只读操作。**工具名必须与 API 下发的完全一致**（现有只读工具为 bash / run_read / run_read_pdf；名字写错会拿不到该工具）。\n\n示例：\n- sub_agent(prompt=\"读取 DRG_Docs 目录下全部 6 个 PDF 的标题和摘要\", run_in_background=true)  ← 批量全目录，必须后台\n- sub_agent(prompt=\"实现用户注册功能\", parallel=false)\n- sub_agent(prompt=\"分析当前代码架构并设计重构方案\", parallel=false)\n- sub_agent(prompt=\"只读方式搜索代码中的安全问题\", allowed_tools=[\"bash\",\"run_read\",\"run_read_pdf\"], parallel=true)\n- sub_agent(prompt=\"跑全量测试并报告失败用例\", run_in_background=true)",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "给子智能体的任务描述，应具体说明要做什么"},
                     "description": {"type": "string", "description": "任务的简短描述，用于日志记录"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "限制子智能体可用的工具名称列表。不设置则默认使用全部工具。例如 [\"bash\",\"read_file\",\"read_pdf\"] 限制为只读工具集"},
-                    "parallel": {"type": "boolean", "description": "是否与其他 sub_agent 并行执行。"},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "限制子智能体可用的工具名称列表。不设置则默认使用全部工具。例如 [\"bash\",\"run_read\",\"run_read_pdf\"] 限制为只读工具集"},
+                    "parallel": {"type": "boolean", "default": False,
+                        "description": "仅对同步子任务有意义：True 表示与其他同步 sub_agent 并行执行，"
+                                       "不传按串行处理。run_in_background=true 时无意义，不必传。"},
                     "run_in_background": {"type": "boolean", "default": False,
                         "description": "True 时把子任务丢到后台线程异步执行，立即返回后台任务 ID；"
                                        "结果通过 <task_notification> 在后续轮次通知。"
-                                       "与 parallel 互斥：传 True 时不再走并行/串行等待桶。"},
+                                       "批量/全量/多文件任务必须传 True。"},
                     "workdir": {"type": "string",
                         "description": "可选，已创建 worktree 的名称。给定时子智能体的工作目录（所有文件操作根）为 WORKTREE_DIR/<workdir>，"
                                        "用于在隔离 worktree 内改代码并运行测试。需先 create_worktree 创建。"}
                 },
-                "required": ["prompt", "parallel"]
+                "required": ["prompt"]
             }
         }}
 

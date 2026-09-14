@@ -68,6 +68,40 @@
   font-size: var(--fs-md);
   line-height: 1.6;
   user-select: text;
+  position: relative;
+}
+
+/* 消息悬浮复制按钮：悬停消息行时出现（淡入），定位在正文右上角。
+ * User 气泡右上角 / Assistant 正文右上角。点击复制该条消息原始正文（复制时停止事件冒泡）。 */
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  opacity: 0;
+  transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+.msg-copy-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.msg-bubble.user .msg-copy-btn {
+  position: absolute;
+  top: -26px;
+  right: -4px;
+}
+.assistant-body .msg-copy-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+.msg-row:hover .msg-copy-btn {
+  opacity: 1;
 }
 
 /* assistant 消息 */
@@ -90,6 +124,7 @@
 .assistant-body {
   flex: 1;
   min-width: 0;
+  position: relative;
 }
 
 /* 思考过程 */
