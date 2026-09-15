@@ -138,16 +138,17 @@ def migrate_workspace_data() -> None:
         print(f"[迁移] 运行时数据已搬迁到 {DATA_ROOT}：{', '.join(moved)}")
 
 
-def todo_file_for_session(session_num: int) -> Path:
+def todo_file_for_session(session_id: str) -> Path:
     """
-    返回指定 session 编号对应的 todo 文件路径。
+    返回指定会话对应的 todo 文件路径。
 
     todo 是会话内轻量级任务看板，与 chat history 一一绑定：
     每个 session 有独立 todo 文件，会话切换时同步切换。
 
-    文件命名：.todo/session_<N>.todo.json（与 .chathistory/session_<N>.jsonl 同 N）。
+    文件命名：.todo/session_<id>.todo.json（与 .chathistory/session_<id>.jsonl 同 id）。
+    id 为短随机串（新会话）或存量编号字符串（"6"），调用方统一传 str。
     """
-    return TODO_DIR / f"session_{session_num}.todo.json"
+    return TODO_DIR / f"session_{session_id}.todo.json"
 
 
 # 模块导入即保证目录存在（保持原 tool_base.py 的导入期副作用）。

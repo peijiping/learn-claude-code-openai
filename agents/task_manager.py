@@ -65,7 +65,7 @@ class TaskManager:
         设置作用域。作用域为 None 时是全局看板；非空时任务只在本会话内可见/可操作。
 
         由 Agent 在切换会话时调用（与 todo 的 set_todo_manager 平行），
-        scope 值取 f"{session_prefix}{session_num}"，如 "session_3"。
+        scope 值取 f"{session_prefix}{session_id}"，如 "session_Kx7mQ2vT8p"。
         """
         self.scope = scope
 

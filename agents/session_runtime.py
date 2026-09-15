@@ -7,17 +7,17 @@ SessionRuntime，由 SessionRuntimeRegistry 按会话号维护。仅作为 ws_br
 
 设计要点：
 - 每个在跑的会话各自一个 SessionRuntime，各自持有独立 Agent 实例，事件通过
-  各自的 WSSink 打上 session_num 后投递，前端据此路由到对应消息缓冲；
+  各自的 WSSink 打上 session_id 后投递，前端据此路由到对应消息缓冲；
 - run_turn 在 to_thread 工作线程里执行，EventLoop 不被阻塞 → 一个会话在后台跑时，
   其它会话的 chat / session_switch / stop 命令仍能被事件循环接收处理；
 - 停止为协作式：request_stop() 置位一个会话专属的 stop_evt，并同步调
   Agent.request_stop()；agent_loop 在迭代边界 / 流式 chunk 间检查并干净收尾，
   不影响其它会话。
 
-会话号确定时机（由 ws_bridge 保证确定性）：
-- 已有会话（前端携 num）：start_turn 时按 num build_agent() → switch_session 加载历史；
-- 全新会话（前端 fresh / 无 num）：由 ws_bridge 在事件循环内同步 create_new_session()
-  先领号并写入初始 system 消息，避免并发线程 race 到同一编号。
+会话 id 确定时机（由 ws_bridge 保证确定性）：
+- 已有会话（前端携 session_id）：start_turn 时按 id build_agent() → switch_session 加载历史；
+- 全新会话（前端 fresh / 无 session_id）：由 ws_bridge 在事件循环内同步 create_new_session()
+  先生成短 id 并写入初始 system 消息，避免并发线程 race 到同一会话。
 """
 import asyncio
 import json
@@ -47,10 +47,10 @@ Deliver = Callable[[str, dict], None]
 # 会话结束时刷新会话列表的协程（由 ws_bridge 提供，依赖当前 ws 连接）
 ReplySessions = Callable[[], Awaitable[None]]
 # 读取某会话元数据（供模型绑定；由 ws_bridge 注入）
-LoadMeta = Callable[[int], Optional[dict]]
+LoadMeta = Callable[[str], Optional[dict]]
 
 
-def _bind_agent_env(load_meta: LoadMeta, num: int, agent_or_factory,
+def _bind_agent_env(load_meta: LoadMeta, sid: str, agent_or_factory,
                     rebuild: bool) -> tuple[Agent, str | None]:
     """在全局锁内把会话记录模型换绑到 env，构造/重载 Agent 后再恢复全局 env。
 
@@ -62,7 +62,7 @@ def _bind_agent_env(load_meta: LoadMeta, num: int, agent_or_factory,
     rebuild=True（重载）：传入既有 Agent 实例，按会话模型就地
     reload_llm_bindings()。
     """
-    meta = load_meta(num) or {}
+    meta = load_meta(sid) or {}
     model_id = meta.get("model_id") or None
     with ENV_LLM_LOCK:
         snap = snapshot_llm_env()
@@ -78,9 +78,9 @@ def _bind_agent_env(load_meta: LoadMeta, num: int, agent_or_factory,
 
 
 class SessionRuntime:
-    def __init__(self, num: int, deliver: Deliver, reply_sessions: ReplySessions,
+    def __init__(self, sid: str, deliver: Deliver, reply_sessions: ReplySessions,
                  load_meta: LoadMeta):
-        self.num = num
+        self.sid = sid
         self.agent: Optional[Agent] = None
         self.busy = False  # 本会话当前是否有一个 turn 在跑（拒绝同会话并发）
         self.stop_evt = threading.Event()
@@ -123,23 +123,23 @@ class SessionRuntime:
         elif t == "turn_end":
             diag = self._response_diag
             finish = ev.get("finish_reason") or ""
-            log.info("session_%d LLM 响应: finish=%s 工具调用=%s content=%d字 thinking=%d字 usage=%s",
-                     self.num, finish or "(空)", diag["tools"] or "无",
+            log.info("session_%s LLM 响应: finish=%s 工具调用=%s content=%d字 thinking=%d字 usage=%s",
+                     self.sid, finish or "(空)", diag["tools"] or "无",
                      diag["content"], diag["thinking"], ev.get("usage") or {})
             if finish == "tool_calls" and not diag["tools"]:
                 # 协议自相矛盾：声明"有工具调用"却一个都没聚合出来。
-                log.error("session_%d 协议异常: finish_reason=tool_calls 但未收到任何 tool_call "
-                          "事件（本轮工具调用丢失，表现为「说要干活却没有下文」）", self.num)
+                log.error("session_%s 协议异常: finish_reason=tool_calls 但未收到任何 tool_call "
+                          "事件（本轮工具调用丢失，表现为「说要干活却没有下文」）", self.sid)
             self._response_diag = self._new_response_diag()
 
-    # ── 事件路由：把会话内事件打上 session_num ──────────────────
+    # ── 事件路由：把会话内事件打上 session_id ───────────────────
     def _bind_sink(self, agent: Agent) -> None:
         def send_func(line: str):
             try:
                 ev = json.loads(line)
             except (json.JSONDecodeError, TypeError):
                 ev = {"type": "unknown", "text": line}
-            ev["session_num"] = self.num
+            ev["session_id"] = self.sid
             # 子智能体启动：立刻落一条 running 占位记录。进程被强杀（无终态）
             # 时历史里仍留痕迹，回放显示"运行中/已中断"；终态记录由 Agent 在
             # 拿到 transcript 后写入（同 subagent_id，后写覆盖先写）。
@@ -182,8 +182,8 @@ class SessionRuntime:
         """会话执行状态的唯一出口：关键节点打日志 + 广播到前端。
         running=turn 执行中；background=turn 结束但后台任务仍在跑；
         done/stopped=全部结束。排查"前端执行状态断了"先看这串日志。"""
-        log.info("session_%d status -> %s", self.num, status)
-        self._deliver("session_status", {"num": self.num, "status": status})
+        log.info("session_%s status -> %s", self.sid, status)
+        self._deliver("session_status", {"session_id": self.sid, "status": status})
 
     def build_agent(self) -> Agent:
         """按需构造本会话的 Agent，并按其元数据记录的模型独立绑定（在工作线程里调用）。
@@ -193,23 +193,23 @@ class SessionRuntime:
         """
         if self.agent is None:
             agent, model_id = _bind_agent_env(
-                self._load_meta, self.num, lambda: Agent(silent=True), rebuild=False
+                self._load_meta, self.sid, lambda: Agent(silent=True), rebuild=False
             )
             self.agent = agent
             self._bound_model = model_id
             self._bind_sink(self.agent)
             # 必须在 switch_session 之前绑 store（后者会惰性构造 SessionManager）
             self._bind_subagent_store(self.agent)
-            self.agent.switch_session(self.num)
-            log.info("session_%d agent 构建完成 (model=%s)",
-                     self.num, model_id or "global-default")
+            self.agent.switch_session(self.sid)
+            log.info("session_%s agent 构建完成 (model=%s)",
+                     self.sid, model_id or "global-default")
             return self.agent
-        model_id = (self._load_meta(self.num) or {}).get("model_id") or None
+        model_id = (self._load_meta(self.sid) or {}).get("model_id") or None
         if model_id != self._bound_model:
-            log.info("session_%d 会话模型重绑: %s -> %s",
-                     self.num, self._bound_model or "global-default",
+            log.info("session_%s 会话模型重绑: %s -> %s",
+                     self.sid, self._bound_model or "global-default",
                      model_id or "global-default")
-            _bind_agent_env(self._load_meta, self.num, self.agent, rebuild=True)
+            _bind_agent_env(self._load_meta, self.sid, self.agent, rebuild=True)
             self._bound_model = model_id
         return self.agent
 
@@ -243,7 +243,7 @@ class SessionRuntime:
         """
         # 新 turn 开始：取消上一轮遗留的后台守望（避免旧守望把运行中的 turn 误报 done）
         if self._bg_watch_task is not None:
-            log.info("session_%d bg watch cancelled (new turn)", self.num)
+            log.info("session_%s bg watch cancelled (new turn)", self.sid)
             self._bg_watch_task.cancel()
             self._bg_watch_task = None
         self._pending_overrides = (reasoning_effort, max_context)
@@ -257,8 +257,8 @@ class SessionRuntime:
         except Exception as e:
             # run 线程内任何未捕获异常都不应压垮事件循环：
             # 状态按 done 回，让前端侧边栏复位；真实错误已由 agent 内部处理。
-            log.error("session_%d turn worker 异常: %s: %s",
-                      self.num, type(e).__name__, e)
+            log.error("session_%s turn worker 异常: %s: %s",
+                      self.sid, type(e).__name__, e)
             stopped = False
         finally:
             self.busy = False
@@ -273,13 +273,13 @@ class SessionRuntime:
             self._push_status(
                 "stopped" if stopped else ("background" if bg_running else "done")
             )
-            log.info("session_%d turn 结束 (%.1fs, %s, bg_running=%s)",
-                     self.num, elapsed, "stopped" if stopped else "done", bg_running)
+            log.info("session_%s turn 结束 (%.1fs, %s, bg_running=%s)",
+                     self.sid, elapsed, "stopped" if stopped else "done", bg_running)
             # 本轮结束：推送该会话最新的上下文统计（供前端圆圈指示器刷新）
             try:
                 if self.agent is not None and self.agent.session_manager is not None:
                     self._deliver("context_stats", {
-                        "num": self.num,
+                        "session_id": self.sid,
                         **self.agent.session_manager.context_stats_dict(
                             self.agent.history_messages
                         ),
@@ -301,7 +301,7 @@ class SessionRuntime:
         续轮本身也可能再派后台任务 → 循环守望；MAX_BG_FOLLOWUPS 兜底。
         """
         started = time.monotonic()
-        log.info("session_%d bg watch start", self.num)
+        log.info("session_%s bg watch start", self.sid)
         followups = 0
         try:
             while True:
@@ -316,14 +316,14 @@ class SessionRuntime:
                         or followups >= MAX_BG_FOLLOWUPS):
                     break
                 followups += 1
-                log.info("session_%d bg followup turn #%d", self.num, followups)
+                log.info("session_%s bg followup turn #%d", self.sid, followups)
                 self.busy = True
                 self._push_status("running")
                 try:
                     await asyncio.to_thread(self._run_followup_worker)
                 except Exception as e:
-                    log.error("session_%d bg followup 异常: %s: %s",
-                              self.num, type(e).__name__, e)
+                    log.error("session_%s bg followup 异常: %s: %s",
+                              self.sid, type(e).__name__, e)
                 finally:
                     self.busy = False
                 # 续轮结束后：若用户在这期间点了停止，保留停止信号并退出循环；
@@ -332,11 +332,11 @@ class SessionRuntime:
                     break
                 self.stop_evt.clear()
             total = turn_elapsed + (time.monotonic() - started)
-            log.info("session_%d bg watch done (%.1fs total)", self.num, total)
+            log.info("session_%s bg watch done (%.1fs total)", self.sid, total)
             self._push_status("done")
             await self._reply_sessions()
         except asyncio.CancelledError:
-            log.info("session_%d bg watch cancelled", self.num)
+            log.info("session_%s bg watch cancelled", self.sid)
             raise  # 新 turn 已开始，状态由 start_turn 接管
 
     def _run_followup_worker(self) -> None:
@@ -369,34 +369,34 @@ class SessionRuntime:
 
 
 class SessionRuntimeRegistry:
-    """会话号 → SessionRuntime 的映射；共享 delivery 与会话列表刷新回调。"""
+    """会话 id → SessionRuntime 的映射；共享 delivery 与会话列表刷新回调。"""
 
     def __init__(self, deliver: Deliver, reply_sessions: ReplySessions,
                  load_meta: LoadMeta):
         self._deliver = deliver
         self._reply_sessions = reply_sessions
         self._load_meta = load_meta
-        self._sessions: Dict[int, SessionRuntime] = {}
+        self._sessions: Dict[str, SessionRuntime] = {}
 
-    def get(self, num: int) -> Optional[SessionRuntime]:
-        return self._sessions.get(num)
+    def get(self, sid: str) -> Optional[SessionRuntime]:
+        return self._sessions.get(sid)
 
     def all_runtimes(self) -> list["SessionRuntime"]:
         """所有已注册的会话运行时（新连接状态重放用）。"""
         return list(self._sessions.values())
 
-    def get_or_create(self, num: int) -> SessionRuntime:
-        rt = self._sessions.get(num)
+    def get_or_create(self, sid: str) -> SessionRuntime:
+        rt = self._sessions.get(sid)
         if rt is None:
-            rt = SessionRuntime(num, self._deliver, self._reply_sessions, self._load_meta)
-            self._sessions[num] = rt
+            rt = SessionRuntime(sid, self._deliver, self._reply_sessions, self._load_meta)
+            self._sessions[sid] = rt
         return rt
 
-    def is_busy(self, num: int) -> bool:
-        rt = self._sessions.get(num)
+    def is_busy(self, sid: str) -> bool:
+        rt = self._sessions.get(sid)
         return bool(rt and rt.busy)
 
-    def is_active(self, num: int) -> bool:
+    def is_active(self, sid: str) -> bool:
         """会话是否有活动：turn 执行中，**或** turn 已结束但后台任务仍在跑。
 
         与 is_busy 的关键区别：后台子智能体执行期间 turn 早已结束（busy=False），
@@ -407,16 +407,16 @@ class SessionRuntimeRegistry:
         （ws_bridge 里那段"运行中不回放"的注释说的就是这个 hazard，但守卫
         只覆盖了 busy，漏了 background —— 2026-09-14 补齐。）
         """
-        rt = self._sessions.get(num)
+        rt = self._sessions.get(sid)
         if rt is None:
             return False
         if rt.busy:
             return True
         return rt.agent is not None and rt.agent.background_manager.has_running()
 
-    def remove(self, num: int) -> None:
+    def remove(self, sid: str) -> None:
         """会话被删除/回收后移除其运行时（运行中会被上层拒绝后才到达这里）。"""
-        self._sessions.pop(num, None)
+        self._sessions.pop(sid, None)
 
     def reload_llm_bindings(self) -> None:
         """模型配置热切换后重绑所有已构造的运行时会话 Agent。
@@ -427,5 +427,5 @@ class SessionRuntimeRegistry:
         for rt in self._sessions.values():
             if rt.agent is not None:
                 rt.agent, rt._bound_model = _bind_agent_env(
-                    self._load_meta, rt.num, rt.agent, rebuild=True
+                    self._load_meta, rt.sid, rt.agent, rebuild=True
                 )

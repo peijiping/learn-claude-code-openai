@@ -107,41 +107,41 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string; num?: number | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null }) => {
+  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null }) => {
     if (!isTrustedSender(e) || !payload?.text) return
-    // num 缺省/null = 新建任务（后端惰性领号建会话）；否则定位到目标会话
-    const num = typeof payload.num === 'number' ? payload.num : undefined
+    // session_id 缺省/null = 新建任务（后端惰性生成短 id 建会话）；否则定位到目标会话
+    const sessionId = typeof payload.session_id === 'string' && payload.session_id ? payload.session_id : undefined
     ws.send(JSON.stringify({
       kind: 'chat',
       payload: {
         text: payload.text,
-        ...(num !== undefined ? { num } : {}),
+        ...(sessionId !== undefined ? { session_id: sessionId } : {}),
         ...(payload.overrides ? { overrides: payload.overrides } : {}),
         ...(payload.model_id ? { model_id: payload.model_id } : {})
       }
     }))
   })
 
-  ipcMain.handle('agent:setSessionModel', (e, payload: { num?: number; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => {
-    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return
+  ipcMain.handle('agent:setSessionModel', (e, payload: { session_id?: string; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
     ws.send(JSON.stringify({
       kind: 'session_model',
       payload: {
-        num: payload.num,
+        session_id: payload.session_id,
         ...(payload.model_id ? { model_id: payload.model_id } : {}),
         ...(payload.overrides ? { overrides: payload.overrides } : {})
       }
     }))
   })
 
-  ipcMain.handle('agent:stop', (e, payload: { num?: number }) => {
-    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return
-    ws.send(JSON.stringify({ kind: 'stop', payload: { num: payload.num } }))
+  ipcMain.handle('agent:stop', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    ws.send(JSON.stringify({ kind: 'stop', payload: { session_id: payload.session_id } }))
   })
 
-  ipcMain.handle('agent:switchSession', (e, payload: { num?: number }) => {
-    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return
-    ws.send(JSON.stringify({ kind: 'session_switch', payload: { num: payload.num } }))
+  ipcMain.handle('agent:switchSession', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    ws.send(JSON.stringify({ kind: 'session_switch', payload: { session_id: payload.session_id } }))
     return { ok: true }
   })
   ipcMain.handle('agent:clearSession', (e) => {
@@ -156,22 +156,22 @@ function createWindow(): void {
   // 会话管理：重命名 / 软删除（回收站）/ 还原 / 批量永久删除 / 回收站列表
   ipcMain.handle(
     'agent:renameSession',
-    (e, payload: { num?: number; title?: string }) => {
-      if (!isTrustedSender(e) || typeof payload?.num !== 'number' || !payload?.title) return null
-      return request('session_rename', 'sessions', { num: payload.num, title: payload.title })
+    (e, payload: { session_id?: string; title?: string }) => {
+      if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id || !payload?.title) return null
+      return request('session_rename', 'sessions', { session_id: payload.session_id, title: payload.title })
     }
   )
-  ipcMain.handle('agent:trashSession', (e, payload: { num?: number }) => {
-    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return null
-    return request('session_trash', 'sessions', { num: payload.num })
+  ipcMain.handle('agent:trashSession', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    return request('session_trash', 'sessions', { session_id: payload.session_id })
   })
-  ipcMain.handle('agent:restoreSession', (e, payload: { num?: number }) => {
-    if (!isTrustedSender(e) || typeof payload?.num !== 'number') return null
-    return request('session_restore', 'sessions', { num: payload.num })
+  ipcMain.handle('agent:restoreSession', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    return request('session_restore', 'sessions', { session_id: payload.session_id })
   })
-  ipcMain.handle('agent:deleteSessions', (e, payload: { nums?: number[] }) => {
-    if (!isTrustedSender(e) || !Array.isArray(payload?.nums) || payload.nums.length === 0) return null
-    return request('session_delete', 'session_delete_result', { nums: payload.nums })
+  ipcMain.handle('agent:deleteSessions', (e, payload: { ids?: string[] }) => {
+    if (!isTrustedSender(e) || !Array.isArray(payload?.ids) || payload.ids.length === 0) return null
+    return request('session_delete', 'session_delete_result', { ids: payload.ids })
   })
   ipcMain.handle('agent:listTrash', (e) =>
     isTrustedSender(e) ? request('trash_list', 'sessions_trashed') : null

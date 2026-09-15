@@ -16,9 +16,9 @@ export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
 export type SettingsTab = 'general' | 'model' | 'trash' | 'about'
 
-/** 会话显示名：无标题（未生成/老会话）回退 session_N */
+/** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
-  return s.title?.trim() || `session_${s.num}`
+  return s.title?.trim() || `session_${s.id}`
 }
 
 /** 把会话级覆盖（思考档位 + 标准/扩展上下文）解析成后端 chat payload 的 overrides。
@@ -167,19 +167,20 @@ interface AgentState {
   python: PythonState
   /** 当前激活会话的消息投影（= messagesBySession[activeSession] ?? []），组件直接读取 */
   messages: Message[]
-  /** 每个会话各自的独立消息缓冲（单一事实源），多会话并发各自累积、互不覆盖 */
-  messagesBySession: Record<number, Message[]>
-  /** 正在执行 turn 的会话号集合（脉冲运行指示 + 停止按钮状态） */
-  runningSessions: number[]
-  /** turn 已结束但后台任务（如后台子智能体）仍在执行的会话号集合（脉冲运行指示，无停止按钮） */
-  bgSessions: number[]
-  /** 后台完成且尚未查看的会话号集合（侧边栏绿点未读） */
-  completedBg: number[]
-  /** 新建任务（activeSession==null）首条消息的临时草稿缓冲，后端回发 session 号后迁移 */
+  /** 每个会话各自的独立消息缓冲（单一事实源），多会话并发各自累积、互不覆盖；
+   *  键为会话 id（短随机串 / 存量编号字符串） */
+  messagesBySession: Record<string, Message[]>
+  /** 正在执行 turn 的会话 id 集合（脉冲运行指示 + 停止按钮状态） */
+  runningSessions: string[]
+  /** turn 已结束但后台任务（如后台子智能体）仍在执行的会话 id 集合（脉冲运行指示，无停止按钮） */
+  bgSessions: string[]
+  /** 后台完成且尚未查看的会话 id 集合（侧边栏绿点未读） */
+  completedBg: string[]
+  /** 新建任务（activeSession==null）首条消息的临时草稿缓冲，后端回发 session id 后迁移 */
   pendingFresh: Message[] | null
   sessions: SessionMeta[]
   trashSessions: SessionMeta[]
-  activeSession: number | null
+  activeSession: string | null
   isSending: boolean
   settingsOpen: boolean
   settingsTab: SettingsTab
@@ -205,12 +206,12 @@ interface AgentState {
   refreshSessions: () => Promise<void>
   refreshTrash: () => Promise<void>
   newSession: () => Promise<void>
-  switchSession: (num: number) => Promise<void>
+  switchSession: (sessionId: string) => Promise<void>
   clearSession: () => Promise<void>
-  renameSession: (num: number, title: string) => Promise<void>
-  trashSession: (num: number) => Promise<void>
-  restoreSession: (num: number) => Promise<void>
-  deleteSessions: (nums: number[]) => Promise<void>
+  renameSession: (sessionId: string, title: string) => Promise<void>
+  trashSession: (sessionId: string) => Promise<void>
+  restoreSession: (sessionId: string) => Promise<void>
+  deleteSessions: (ids: string[]) => Promise<void>
   openSettings: (tab?: SettingsTab) => void
   closeSettings: () => void
   loadLlConfig: () => Promise<void>
@@ -233,11 +234,11 @@ let msgSeq = 0
 const mid = (): string => `m${++msgSeq}`
 
 /** 去重追加（不可变数组） */
-function addUnique(arr: number[], n: number): number[] {
+function addUnique(arr: string[], n: string): string[] {
   return arr.includes(n) ? arr : [...arr, n]
 }
 
-function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
+function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
   return hist.map((m, i) => {
     // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
     // 数据未落盘），则从主 toolCalls 里的 sub_agent 调用派生一张基础卡片，
@@ -249,7 +250,7 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
       thinkingActive: false,
       // 工具 id 优先用后端给出的 tool_id（实时/回放同一 id，便于按 id 归位）
       toolCalls: (s.toolCalls ?? []).map((t, l) => ({
-        id: t.tool_id || `h${num}_${i}_s${k}_${l}`,
+        id: t.tool_id || `h${sid}_${i}_s${k}_${l}`,
         name: t.name,
         args: t.args,
         status: t.status === 'running' ? ('running' as const) : ('done' as const)
@@ -264,7 +265,7 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
     // 主 toolCalls 里的 sub_agent 调用 → 从中派生兜底卡片（含 prompt 作为名称），并从 toolCalls 剥离
     const subCalls = (m.toolCalls ?? []).filter((t) => t.name === 'sub_agent')
     const derivedSubs = subCalls.map((call, k) => ({
-      id: `h${num}_${i}_submain_${k}`,
+      id: `h${sid}_${i}_submain_${k}`,
       name: subAgentNameFromArgs(call.args),
       thinking: '',
       thinkingActive: false,
@@ -275,13 +276,13 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
     const subagents = backendSubs.length ? backendSubs : derivedSubs
     const normalCalls = (m.toolCalls ?? []).filter((t) => t.name !== 'sub_agent')
     return {
-      id: `h${num}_${i}`,
+      id: `h${sid}_${i}`,
       role: m.role,
       content: m.content ?? '',
       thinking: m.thinking ?? '',
       thinkingActive: false,
       toolCalls: normalCalls.map((t, j) => ({
-        id: `h${num}_${i}_${j}`,
+        id: `h${sid}_${i}_${j}`,
         name: t.name,
         args: t.args,
         status: t.status === 'running' ? ('running' as const) : ('done' as const)
@@ -647,7 +648,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   send: (text) => {
     const t = text.trim()
     if (!t || get().isSending) return
-    const num = get().activeSession
+    const sid = get().activeSession
     const modelId = get().sessionModelId
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
     const userMsg: Message = {
@@ -657,25 +658,25 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {}
     }
     set((s) => {
-      // 新建任务（尚无会话号）：首条消息进临时草稿缓冲，等后端 session 信封迁移
-      if (num === null) {
+      // 新建任务（尚无会话 id）：首条消息进临时草稿缓冲，等后端 session 信封迁移
+      if (sid === null) {
         const pendingFresh = [userMsg, assMsg]
         return { ...s, pendingFresh, messages: pendingFresh, isSending: true }
       }
-      const buf = s.messagesBySession[num] ?? []
-      const messagesBySession = { ...s.messagesBySession, [num]: [...buf, userMsg, assMsg] }
-      const messages = messagesBySession[num]
+      const buf = s.messagesBySession[sid] ?? []
+      const messagesBySession = { ...s.messagesBySession, [sid]: [...buf, userMsg, assMsg] }
+      const messages = messagesBySession[sid]
       return { ...s, messagesBySession, messages, isSending: true }
     })
-    // 发送实际交给后端：fresh 时后端领号并回发 session 信封，前端据此迁移草稿
-    window.agent.send(t, num, ov, modelId).catch(() => set({ isSending: false }))
+    // 发送实际交给后端：fresh 时后端生成短 id 并回发 session 信封，前端据此迁移草稿
+    window.agent.send(t, sid, ov, modelId).catch(() => set({ isSending: false }))
   },
 
   stop: () => {
-    const num = get().activeSession
+    const sid = get().activeSession
     const clearStreaming = (m: Message): Message =>
       m.role === 'assistant' && m.streaming ? { ...m, streaming: false, activeToolId: null } : m
-    if (num === null) {
+    if (sid === null) {
       // 新建任务草稿态：仅本地清流式标记（后端会话尚未建立，无需 stop 命令）
       set((s) => {
         if (!s.pendingFresh) return s
@@ -685,14 +686,14 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       return
     }
     // 真实停止：通知后端只停当前显示会话这一轮（其它后台会话不受影响）
-    window.agent.stop(num)
+    window.agent.stop(sid)
     set((s) => {
-      const buf = (s.messagesBySession[num] ?? []).map(clearStreaming)
+      const buf = (s.messagesBySession[sid] ?? []).map(clearStreaming)
       return {
         ...s,
-        messagesBySession: { ...s.messagesBySession, [num]: buf },
-        messages: s.activeSession === num ? buf : s.messages,
-        runningSessions: s.runningSessions.filter((n) => n !== num),
+        messagesBySession: { ...s.messagesBySession, [sid]: buf },
+        messages: s.activeSession === sid ? buf : s.messages,
+        runningSessions: s.runningSessions.filter((n) => n !== sid),
         isSending: false
       }
     })
@@ -700,14 +701,14 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   handleEvent: (ev) => {
     if (ev.kind === 'event') {
-      // 按 session_num 路由到对应会话缓冲；后台会话增量各自累积，显示会话投影实时更新
+      // 按 session_id 路由到对应会话缓冲；后台会话增量各自累积，显示会话投影实时更新
       const aev = ev.payload as AgentEvent
-      const num = aev.session_num
-      if (typeof num !== 'number') return
+      const sid = aev.session_id
+      if (typeof sid !== 'string' || !sid) return
       set((s) => {
-        const next = applyAgentEventBuffer(s.messagesBySession[num] ?? [], aev)
-        const messagesBySession = { ...s.messagesBySession, [num]: next }
-        const messages = s.activeSession === num ? next : s.messages
+        const next = applyAgentEventBuffer(s.messagesBySession[sid] ?? [], aev)
+        const messagesBySession = { ...s.messagesBySession, [sid]: next }
+        const messages = s.activeSession === sid ? next : s.messages
         return { ...s, messagesBySession, messages }
       })
       return
@@ -721,22 +722,22 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session': {
-        const num = (ev.payload as { num?: number })?.num
-        if (typeof num !== 'number') break
+        const sid = (ev.payload as { session_id?: string })?.session_id
+        if (typeof sid !== 'string' || !sid) break
         const wasFresh = get().pendingFresh !== null
         set((s) => {
-          // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话号）
+          // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话 id）
           let messagesBySession = s.messagesBySession
-          if (s.pendingFresh !== null && s.activeSession !== num) {
-            messagesBySession = { ...messagesBySession, [num]: s.pendingFresh }
+          if (s.pendingFresh !== null && s.activeSession !== sid) {
+            messagesBySession = { ...messagesBySession, [sid]: s.pendingFresh }
           }
           return {
             ...s,
-            activeSession: num,
+            activeSession: sid,
             pendingFresh: null,
             messagesBySession,
-            messages: messagesBySession[num] ?? [],
-            isSending: s.runningSessions.includes(num)
+            messages: messagesBySession[sid] ?? [],
+            isSending: s.runningSessions.includes(sid)
           }
         })
         // 新建会话由首条消息落号：把当前选定的模型与按模型参数覆盖写入该会话元数据
@@ -744,7 +745,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         // 单轮 resolved overrides，不写元数据）。
         if (wasFresh) {
           window.agent.setSessionModel({
-            num,
+            session_id: sid,
             model_id: get().sessionModelId,
             overrides: toBackendOverrides(get().overridesByModel)
           }).catch(() => {})
@@ -752,32 +753,32 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_status': {
-        const p = ev.payload as { num: number; status: SessionRunStatus }
+        const p = ev.payload as { session_id: string; status: SessionRunStatus }
         set((s) => {
           // running：turn 执行中（脉冲点 + 停止按钮）；background：turn 已结束
           // 但后台任务仍在执行（脉冲点，无停止按钮）；done/stopped：全部复位
           const runningSessions =
             p.status === 'running'
-              ? addUnique(s.runningSessions, p.num)
-              : s.runningSessions.filter((n) => n !== p.num)
+              ? addUnique(s.runningSessions, p.session_id)
+              : s.runningSessions.filter((n) => n !== p.session_id)
           const bgSessions =
             p.status === 'background'
-              ? addUnique(s.bgSessions, p.num)
+              ? addUnique(s.bgSessions, p.session_id)
               : p.status === 'done' || p.status === 'stopped'
-                ? s.bgSessions.filter((n) => n !== p.num)
+                ? s.bgSessions.filter((n) => n !== p.session_id)
                 : s.bgSessions
           let completedBg = s.completedBg
           if (p.status === 'done' || p.status === 'stopped') {
             // 执行完成（后台任务也结束后）且当前显示的不是它 → 绿点未读；切到该会话即清除
-            if (p.num !== s.activeSession) completedBg = addUnique(completedBg, p.num)
-            else completedBg = completedBg.filter((n) => n !== p.num)
+            if (p.session_id !== s.activeSession) completedBg = addUnique(completedBg, p.session_id)
+            else completedBg = completedBg.filter((n) => n !== p.session_id)
           }
           return {
             ...s,
             runningSessions,
             bgSessions,
             completedBg,
-            isSending: runningSessions.includes(s.activeSession ?? -1)
+            isSending: s.activeSession !== null && runningSessions.includes(s.activeSession)
           }
         })
         break
@@ -788,7 +789,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_delete_result': {
-        const payload = ev.payload as { deleted?: number[]; failed?: number[] } | null
+        const payload = ev.payload as { deleted?: string[]; failed?: string[] } | null
         const deleted = payload?.deleted?.length ?? 0
         const failed = payload?.failed?.length ?? 0
         if (deleted > 0) showToast(`已彻底删除 ${deleted} 个会话`, 'info')
@@ -796,24 +797,24 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { num?: number; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } | null
-        if (typeof payload?.num !== 'number' || !Array.isArray(payload.messages)) break
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } | null
+        if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { num: number; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null }
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
-          const buf = s.messagesBySession[p.num] ?? []
+          const buf = s.messagesBySession[p.session_id] ?? []
           const hasLive =
-            (s.runningSessions.includes(p.num) || s.bgSessions.includes(p.num)) &&
+            (s.runningSessions.includes(p.session_id) || s.bgSessions.includes(p.session_id)) &&
             buf.length > 0
           if (hasLive) return s
-          const histBuf = historyToMessage(p.num, p.messages)
-          const messagesBySession = { ...s.messagesBySession, [p.num]: histBuf }
-          const messages = s.activeSession === p.num ? histBuf : s.messages
+          const histBuf = historyToMessage(p.session_id, p.messages)
+          const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
+          const messages = s.activeSession === p.session_id ? histBuf : s.messages
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
-          if (s.activeSession !== p.num) {
+          if (s.activeSession !== p.session_id) {
             return { ...s, messagesBySession, messages }
           }
           return {
@@ -840,9 +841,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'context_stats': {
-        const p = ev.payload as { num: number } & ContextStats
+        const p = ev.payload as { session_id: string } & ContextStats
         // 仅当是本会话（当前显示会话）时更新，避免后台会话统计串台
-        if (p.num !== get().activeSession) break
+        if (p.session_id !== get().activeSession) break
         set({
           currentContextStats: {
             used_tokens: p.used_tokens,
@@ -895,56 +896,56 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }))
     return Promise.resolve()
   },
-  switchSession: async (num) => {
+  switchSession: async (sid) => {
     // 立即高亮 + 切换到该会话缓冲（后台会话继续执行不受影响，仅换投影）。
     // 模型/参数不在此处清空：由后端回发的 session_history 按元数据异步恢复。
     set((s) => ({
-      activeSession: num,
+      activeSession: sid,
       pendingFresh: null,
-      completedBg: s.completedBg.filter((n) => n !== num),
-      messages: s.messagesBySession[num] ?? [],
-      isSending: s.runningSessions.includes(num)
+      completedBg: s.completedBg.filter((n) => n !== sid),
+      messages: s.messagesBySession[sid] ?? [],
+      isSending: s.runningSessions.includes(sid)
     }))
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
-    await window.agent.switchSession(num)
+    await window.agent.switchSession(sid)
   },
   clearSession: async () => {
-    const num = get().activeSession
-    if (num === null) return
+    const sid = get().activeSession
+    if (sid === null) return
     await window.agent.clearSession()
     set((s) => {
       const messagesBySession = { ...s.messagesBySession }
-      delete messagesBySession[num]
-      return { ...s, messagesBySession, messages: [], activeSession: num }
+      delete messagesBySession[sid]
+      return { ...s, messagesBySession, messages: [], activeSession: sid }
     })
     get().refreshSessions()
   },
 
-  renameSession: async (num, title) => {
+  renameSession: async (sid, title) => {
     const t = title.trim()
     if (!t) return
     try {
-      await window.agent.renameSession(num, t)
+      await window.agent.renameSession(sid, t)
     } catch {
       showToast('重命名失败', 'error', 4000)
     }
     await get().refreshSessions()
   },
-  trashSession: async (num) => {
+  trashSession: async (sid) => {
     try {
-      await window.agent.trashSession(num)
+      await window.agent.trashSession(sid)
     } catch {
       showToast('删除失败', 'error', 4000)
       return
     }
-    if (get().activeSession === num) await get().newSession()
+    if (get().activeSession === sid) await get().newSession()
     await get().refreshSessions()
     await get().refreshTrash()
     showToast('已移入回收站', 'info')
   },
-  restoreSession: async (num) => {
+  restoreSession: async (sid) => {
     try {
-      await window.agent.restoreSession(num)
+      await window.agent.restoreSession(sid)
     } catch {
       showToast('还原失败', 'error', 4000)
       return
@@ -953,15 +954,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     await get().refreshTrash()
     showToast('已还原会话', 'info')
   },
-  deleteSessions: async (nums) => {
-    if (nums.length === 0) return
-    let deleted: number[] = []
+  deleteSessions: async (ids) => {
+    if (ids.length === 0) return
+    let deleted: string[] = []
     try {
-      const res = (await window.agent.deleteSessions(nums)) as {
-        deleted?: number[]
-        failed?: number[]
+      const res = (await window.agent.deleteSessions(ids)) as {
+        deleted?: string[]
+        failed?: string[]
       } | null
-      deleted = res?.deleted ?? nums
+      deleted = res?.deleted ?? ids
     } catch {
       showToast('删除失败', 'error', 4000)
       return
@@ -971,8 +972,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 避免删除后重建整张列表（逐个重数 message_count）造成的刷新延迟
       const remove = new Set(deleted)
       set((s) => ({
-        sessions: s.sessions.filter((x) => !remove.has(x.num)),
-        trashSessions: s.trashSessions.filter((x) => !remove.has(x.num)),
+        sessions: s.sessions.filter((x) => !remove.has(x.id)),
+        trashSessions: s.trashSessions.filter((x) => !remove.has(x.id)),
       }))
     }
   },
@@ -1032,11 +1033,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
   setSessionModel: (id) => {
     set({ sessionModelId: id, lastSessionModelId: id })
-    const num = get().activeSession
-    if (num !== null) {
+    const sid = get().activeSession
+    if (sid !== null) {
       // 选模型的会话级持久化：写会话元数据；无会话（新建预设）由首条 chat 落号后持久化
       window.agent.setSessionModel({
-        num,
+        session_id: sid,
         model_id: id,
         overrides: toBackendOverrides(get().overridesByModel)
       }).catch(() => {})
@@ -1054,10 +1055,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       delete last[modelId]
     }
     set({ overridesByModel: next, lastOverridesByModel: last })
-    const num = get().activeSession
-    if (num !== null) {
+    const sid = get().activeSession
+    if (sid !== null) {
       window.agent.setSessionModel({
-        num,
+        session_id: sid,
         model_id: get().sessionModelId,
         overrides: toBackendOverrides(next)
       }).catch(() => {})

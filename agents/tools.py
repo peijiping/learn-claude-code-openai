@@ -161,19 +161,19 @@ class ToolRegistry:
             )
         return mgr
 
-    def set_todo_manager(self, session_num: int) -> "TodoManager":
+    def set_todo_manager(self, session_id: str) -> "TodoManager":
         """
-        切换 TodoManager 到指定 session 编号对应的 todo 文件。
+        切换 TodoManager 到指定会话 id 对应的 todo 文件。
 
         调用时机：
         - 启动时 init_session 后
-        - /newsession、/switchsession N、/clearsession 后
+        - /newsession、/switchsession <id>、/clearsession 后
 
         每次调用都会重新构造 TodoManager（构造时即从磁盘 load），
         这样上一个会话的内存状态与新会话完全隔离。
         """
         TODO_DIR.mkdir(parents=True, exist_ok=True)
-        todo_file = todo_file_for_session(session_num)
+        todo_file = todo_file_for_session(session_id)
         self._todo_manager = TodoManager(todo_file)
         return self._todo_manager
 
@@ -186,7 +186,7 @@ class ToolRegistry:
         mgr = self._todo_manager
         if mgr is None:
             raise RuntimeError(
-                "TodoManager 未初始化。请先调用 set_todo_manager(session_num) "
+                "TodoManager 未初始化。请先调用 set_todo_manager(session_id) "
                 "或在启动后使用 init_session。"
             )
         return mgr

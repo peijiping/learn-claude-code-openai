@@ -156,7 +156,7 @@ class Agent:
     每个实例拥有独立的：
     - tools（ToolRegistry：基础工具方法 / definitions / handlers / execute）
     - skills / memory / hook_system / background_manager / subagent_runner / recovery
-    - session 状态（session_num / session_file / history_messages / todo holder）
+    - session 状态（session_id / session_file / history_messages / todo holder）
 
     交互入口 agent_cli.py 实例化本类并驱动 REPL；
     未来 cron（每任务独立会话）与 TUI（每会话一实例）直接复用。
@@ -290,7 +290,7 @@ class Agent:
 
         # ── 会话状态（由 init_session / new_session / switch_session 填充） ──
         self.session_manager: SessionManager | None = None
-        self.session_num: int | None = None
+        self.session_id: str | None = None
         self.session_file: Path | None = None
         self.history_messages: list = []
 
@@ -462,26 +462,26 @@ class Agent:
                 session_prefix=self.session_prefix,
             )
         if resume:
-            self.session_num, self.session_file, self.history_messages = \
+            self.session_id, self.session_file, self.history_messages = \
                 self.session_manager.init_session()
         else:
-            self.session_num, self.session_file, self.history_messages = \
+            self.session_id, self.session_file, self.history_messages = \
                 self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 方案 B：加载回来的 messages[0] 是文件里那份（会话创建时构建），
         # 用最新构建的替换 —— 否则改了 AGENTS.md / 装了新技能，本会话看不到。
         self._refresh_system_prompt()
         # todo 与 session 绑定：每次切会话都要重新指向对应的 todo 文件
-        self.tools.set_todo_manager(self.session_num)
+        self.tools.set_todo_manager(self.session_id)
         # task 与 session 绑定：任务板限定在本会话作用域（"session_N"/"cron_N"）
-        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
+        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         self._inject_todo_reminder()
         # L2 尾部注入：首次注入落在用户提问之前（指纹已在历史里则是 no-op）
         self._sync_memory_index()
         self._sync_environment()
         log.info("会话初始化: %s%d (resume=%s, messages=%d)",
-                 self.session_prefix, self.session_num, resume, len(self.history_messages))
-        return self.session_num
+                 self.session_prefix, self.session_id, resume, len(self.history_messages))
+        return self.session_id
 
     def run_turn(self, user_query: str) -> str:
         """
@@ -496,7 +496,7 @@ class Agent:
         self.goal_controller.begin_query()
         self.hook_system.trigger("UserPromptSubmit", user_query)
         log.info("turn 开始: %s%d user_query=%r",
-                 self.session_prefix, self.session_num, user_query[:100])
+                 self.session_prefix, self.session_id, user_query[:100])
         self.history_messages.append({"role": "user", "content": user_query})
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
@@ -509,7 +509,7 @@ class Agent:
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         log.info("turn 结束: %s%d (tokens累计=%d)",
-                 self.session_prefix, self.session_num, self.total_tokens)
+                 self.session_prefix, self.session_id, self.total_tokens)
         return str(last)
 
     def run_background_followup(self) -> str:
@@ -528,35 +528,35 @@ class Agent:
         # 仅当确有未消费的后台结果才续轮，避免空转发出无意义的一轮
         if not self.background_manager.has_completed_pending():
             return ""
-        log.info("后台续轮开始: %s%d", self.session_prefix, self.session_num)
+        log.info("后台续轮开始: %s%d", self.session_prefix, self.session_id)
         self.agent_loop()
         last = self.history_messages[-1].get("content", "")
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         return str(last)
 
-    def new_session(self) -> tuple[int, str]:
-        """创建新会话并绑定 todo，返回 (新会话编号, 提示语)。"""
+    def new_session(self) -> tuple[str, str]:
+        """创建新会话并绑定 todo，返回 (新会话 id, 提示语)。"""
         # 方案 B：新建会话的 system message 由 SessionManager **持有**的那份产出
         # （_build_initial_messages），必须先刷新为最新构建结果，否则长生命周期
         # Agent（CLI）会拿到很久以前构建的版本。
         self._refresh_system_prompt()
-        self.session_num, self.session_file, self.history_messages = \
+        self.session_id, self.session_file, self.history_messages = \
             self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 新会话的 todo 文件尚不存在，set_todo_manager 会建出空列表；reminder 不会注入
-        self.tools.set_todo_manager(self.session_num)
-        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
+        self.tools.set_todo_manager(self.session_id)
+        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         # 新会话：立即注入当前记忆索引与环境上下文（新会话扫不到指纹 → 必然注入）
         self._sync_memory_index()
         self._sync_environment()
-        log.info("新会话创建: %s%d", self.session_prefix, self.session_num)
-        return self.session_num, f"已创建新会话: session_{self.session_num}.jsonl"
+        log.info("新会话创建: %s%d", self.session_prefix, self.session_id)
+        return self.session_id, f"已创建新会话: session_{self.session_id}.jsonl"
 
-    def switch_session(self, target_num: int) -> tuple[int, int]:
+    def switch_session(self, target_id: str) -> tuple[str, int]:
         """
         切换到指定会话，绑定对应 todo 并注入 reminder。
-        返回 (会话编号, 消息数)；会话不存在时抛 FileNotFoundError。
+        返回 (会话 id, 消息数)；会话不存在时抛 FileNotFoundError。
         """
         # 惰性构建（同 init_session）：桌面端 SessionRuntime.build_agent 会直接
         # 对全新 Agent 实例调 switch_session，此时 session_manager 尚为 None
@@ -565,27 +565,27 @@ class Agent:
                 CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
                 session_prefix=self.session_prefix,
             )
-        self.session_num, self.session_file, self.history_messages = \
-            self.session_manager.switch_session(target_num)
+        self.session_id, self.session_file, self.history_messages = \
+            self.session_manager.switch_session(target_id)
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 方案 B：与 init_session 同理 —— 换成最新构建的 system prompt
         self._refresh_system_prompt()
-        self.tools.set_todo_manager(self.session_num)
-        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
+        self.tools.set_todo_manager(self.session_id)
+        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         self._inject_todo_reminder()
         # L2 尾部注入：若离开期间记忆/日期变过，这里会补注（指纹从本会话历史恢复）
         self._sync_memory_index()
         self._sync_environment()
-        log.info("会话切换: %s%d -> %s%d (messages=%d)",
-                 self.session_prefix, target_num, self.session_prefix,
-                 self.session_num, len(self.history_messages))
-        return self.session_num, len(self.history_messages)
+        log.info("会话切换: %s%s -> %s%s (messages=%d)",
+                 self.session_prefix, target_id, self.session_prefix,
+                 self.session_id, len(self.history_messages))
+        return self.session_id, len(self.history_messages)
 
     def clear_session(self) -> int:
         """清空当前会话（todo 同步重置），返回被删除的消息数。"""
         deleted_count = self.session_manager.clear_session(self.session_file)
         log.info("会话清空: %s%d (删除消息=%d)",
-                 self.session_prefix, self.session_num, deleted_count)
+                 self.session_prefix, self.session_id, deleted_count)
         # todo 与 chat history 同生共死：清空 chat 的同时把当前 session 的 todo 也重置为空
         self.tools.get_todo_manager().update([], fresh_start=False)
         self.history_messages = self._strip_subagent_rows(
@@ -701,7 +701,7 @@ class Agent:
             return False
         self.history_messages[0] = {"role": "system", "content": fresh}
         log.info("刷新 system prompt: %s%d (%d 字符)",
-                 self.session_prefix, self.session_num, len(fresh))
+                 self.session_prefix, self.session_id, len(fresh))
         return True
 
     # ── 尾部按需注入（L2 热段）────────────────────────────────────────
@@ -762,7 +762,7 @@ class Agent:
             MEMORY_INDEX_TAG, revision, index_text or "（暂无记忆）"
         )
         log.info("注入记忆索引: %s%d revision=%s (条目=%d)",
-                 self.session_prefix, self.session_num, revision,
+                 self.session_prefix, self.session_id, revision,
                  len([ln for ln in index_text.splitlines() if ln.strip()]))
 
     # ── 环境与上下文（日期 / 星期 / 平台）──────────────────────────────
@@ -792,7 +792,7 @@ class Agent:
             return
         self._append_injection(ENV_TAG, revision, body)
         log.info("注入环境上下文: %s%d revision=%s (%s)",
-                 self.session_prefix, self.session_num, revision,
+                 self.session_prefix, self.session_id, revision,
                  " | ".join(v for _, v in snapshot))
 
     # ── 方案 C：工作区指令文件变更时的尾部注入 ────────────────────────
@@ -823,7 +823,7 @@ class Agent:
             "与之冲突时以本条为准。\n\n" + body,
         )
         log.info("注入工作区指令更新: %s%d revision=%s",
-                 self.session_prefix, self.session_num, revision)
+                 self.session_prefix, self.session_id, revision)
 
     def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = ""):
         """
@@ -923,7 +923,7 @@ class Agent:
         tool_id = tool_call.id
         started = time.monotonic()
         log.info("工具执行开始: %s%d %s args=%s",
-                 self.session_prefix, self.session_num, tool_name,
+                 self.session_prefix, self.session_id, tool_name,
                  json.dumps(tool_args, ensure_ascii=False)[:200])
 
         # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式
@@ -944,14 +944,14 @@ class Agent:
             )
             self._print(f">> {tool_name} 后台分发: {bg_id}")
             log.info("工具后台分发: %s%d %s -> %s (%.2fs)",
-                     self.session_prefix, self.session_num, tool_name, bg_id,
+                     self.session_prefix, self.session_id, tool_name, bg_id,
                      time.monotonic() - started)
         else:
             # 同步路径：直接走原逻辑
             executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
             tool_output = executor()
             log.info("工具执行完成: %s%d %s (%.2fs, 输出 %d 字符)",
-                     self.session_prefix, self.session_num, tool_name,
+                     self.session_prefix, self.session_id, tool_name,
                      time.monotonic() - started, len(str(tool_output)))
 
         return {
@@ -1018,7 +1018,7 @@ class Agent:
                     f"\033[31m[警告] 智能体循环达到最大迭代次数 ({self.max_agent_iterations})，强制结束\033[0m"
                 )
                 log.warning("%s%d 达到最大迭代次数 (%d)，强制结束 turn",
-                            self.session_prefix, self.session_num, self.max_agent_iterations)
+                            self.session_prefix, self.session_id, self.max_agent_iterations)
                 break
 
             # 在调用 LLM 前检查上下文，达到阈值时阻塞执行压缩并同步会话文件。
@@ -1070,7 +1070,7 @@ class Agent:
                 # 外层异常处理：内层 with_retry 主动 raise 出来的"非临时错误"会到这一层。
                 # 控制器根据错误类型决定：继续重试（CONTINUE）或退出（ABORT）。
                 log.error("%s%d LLM 调用异常: %s: %s",
-                          self.session_prefix, self.session_num, type(e).__name__, e)
+                          self.session_prefix, self.session_id, type(e).__name__, e)
                 if self.recovery.handle_exception(
                     e, self.history_messages, self.session_manager, self.session_file
                 ) == RecoveryAction.ABORT:
@@ -1114,7 +1114,7 @@ class Agent:
                             "promise guard: %s%d 拦截第 %d/%d 次 —— 模型承诺了动作"
                             "（命中 %r）却没发起任何工具调用，回注提醒后继续本轮；"
                             "正文 %d 字",
-                            self.session_prefix, self.session_num, promise_guard_hits,
+                            self.session_prefix, self.session_id, promise_guard_hits,
                             PROMISE_GUARD_MAX, promise_hit,
                             len(_text_of_message(response_msg_dict)),
                         )
@@ -1153,7 +1153,7 @@ class Agent:
                         self.session_file, block_msg
                     )
                     log.info("goal block: %s%d 评估未达成，回注反馈继续 (%s)",
-                             self.session_prefix, self.session_num, decision.reason[:120])
+                             self.session_prefix, self.session_id, decision.reason[:120])
                     continue
                 if decision.action == "defer":
                     # 后台任务仍在跑：此刻判"达成"不可靠（证据未回来），本轮先结束；
@@ -1161,7 +1161,7 @@ class Agent:
                     # 注入上下文，用户下次输入后再续判。目标保持激活。
                     self._print(f"\033[33m[goal] defer: {decision.reason}\033[0m")
                     log.info("goal defer: %s%d 后台任务在跑，暂缓判定 (%s)",
-                             self.session_prefix, self.session_num, decision.reason[:120])
+                             self.session_prefix, self.session_id, decision.reason[:120])
                     return
                 # 终止态只打印结论供用户感知，目标状态已由控制器内部处理：
                 #   achieved（达成，清目标）/ failed（无法完成，清目标）/
@@ -1170,19 +1170,19 @@ class Agent:
                 if decision.action == "achieved":
                     self._print(f"\033[33m[goal] achieved: {decision.reason}\033[0m")
                     log.info("goal achieved: %s%d %s",
-                             self.session_prefix, self.session_num, decision.reason[:120])
+                             self.session_prefix, self.session_id, decision.reason[:120])
                 elif decision.action == "failed":
                     self._print(f"\033[31m[goal] failed: {decision.reason}\033[0m")
                     log.warning("goal failed: %s%d %s",
-                                self.session_prefix, self.session_num, decision.reason[:120])
+                                self.session_prefix, self.session_id, decision.reason[:120])
                 elif decision.action == "limit":
                     self._print(f"\033[31m[goal] limit: {decision.reason}\033[0m")
                     log.warning("goal limit: %s%d 连续 block 超上限，强制结束 (%s)",
-                                self.session_prefix, self.session_num, decision.reason[:120])
+                                self.session_prefix, self.session_id, decision.reason[:120])
                 elif decision.action == "error":
                     self._print(f"\033[31m[goal] evaluation error: {decision.reason}\033[0m")
                     log.error("goal 评估器出错: %s%d %s",
-                              self.session_prefix, self.session_num, decision.reason[:120])
+                              self.session_prefix, self.session_id, decision.reason[:120])
                 # allow（无目标）与各终止态 → 走原有 Stop hook 流程
                 # （钩子返回非 None 仍可强制续跑，goal 之外的第二道拦截不受影响）
                 force = self.hook_system.trigger("Stop", self.history_messages)

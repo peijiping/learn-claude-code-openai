@@ -5,7 +5,7 @@ import SessionMenu from './SessionMenu'
 import { sessionDisplayName, useAgentStore } from '@store/agentStore'
 import type { SessionMeta } from '@protocols/agentProtocol'
 
-/** 任务树：以后端会话列表驱动，点击切换会话；标题来自后端元数据（无标题回退 session_N） */
+/** 任务树：以后端会话列表驱动，点击切换会话；标题来自后端元数据（无标题回退 session_<id>） */
 export default function TaskTree(): JSX.Element {
   const sessions = useAgentStore((s) => s.sessions)
   const activeSession = useAgentStore((s) => s.activeSession)
@@ -20,8 +20,8 @@ export default function TaskTree(): JSX.Element {
 
   // 弹出菜单（三点按钮与右键菜单共用）：null = 关闭
   const [menu, setMenu] = useState<{ x: number; y: number; s: SessionMeta } | null>(null)
-  // 行内重命名中的会话编号
-  const [renaming, setRenaming] = useState<number | null>(null)
+  // 行内重命名中的会话 id
+  const [renaming, setRenaming] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
 
   const openMenu = (e: MouseEvent, s: SessionMeta): void => {
@@ -31,14 +31,14 @@ export default function TaskTree(): JSX.Element {
   }
 
   const startRename = (s: SessionMeta): void => {
-    setRenaming(s.num)
-    setDraft(s.title?.trim() || `session_${s.num}`)
+    setRenaming(s.id)
+    setDraft(s.title?.trim() || `session_${s.id}`)
   }
 
   const commitRename = (): void => {
     if (renaming !== null) {
       const t = draft.trim()
-      const current = sessions.find((x) => x.num === renaming)
+      const current = sessions.find((x) => x.id === renaming)
       const displayName = current ? sessionDisplayName(current) : ''
       // 空值或与现显示名相同不提交
       if (t && t !== displayName) void renameSession(renaming, t)
@@ -65,22 +65,22 @@ export default function TaskTree(): JSX.Element {
         {sessions.length === 0 && <div className="tasktree-empty">暂无任务</div>}
         {sessions.map((s) => (
           <div
-            key={s.num}
-            className={`tree-node ${s.num === activeSession ? 'active' : ''}`}
+            key={s.id}
+            className={`tree-node ${s.id === activeSession ? 'active' : ''}`}
             onClick={() => {
-              if (renaming === null) void switchSession(s.num)
+              if (renaming === null) void switchSession(s.id)
             }}
             onContextMenu={(e) => openMenu(e, s)}
           >
             <Icon name="chevronRight" size={12} className="tree-chevron" />
-            {runningSessions.includes(s.num) ? (
+            {runningSessions.includes(s.id) ? (
               <span className="tree-dot running" title="执行中" />
-            ) : bgSessions.includes(s.num) ? (
+            ) : bgSessions.includes(s.id) ? (
               <span className="tree-dot running" title="后台任务执行中" />
-            ) : completedBg.includes(s.num) ? (
+            ) : completedBg.includes(s.id) ? (
               <span className="tree-dot done" title="已完成，点击查看" />
             ) : null}
-            {renaming === s.num ? (
+            {renaming === s.id ? (
               <input
                 className="tree-rename-input"
                 value={draft}
@@ -99,7 +99,7 @@ export default function TaskTree(): JSX.Element {
               </span>
             )}
             <span className="tree-count">{s.message_count}</span>
-            {renaming !== s.num && (
+            {renaming !== s.id && (
               <button
                 title="更多操作"
                 className="tree-more mini-btn"
@@ -118,7 +118,7 @@ export default function TaskTree(): JSX.Element {
           y={menu.y}
           disabled={isSending}
           onRename={() => startRename(menu.s)}
-          onDelete={() => void trashSession(menu.s.num)}
+          onDelete={() => void trashSession(menu.s.id)}
           onClose={() => setMenu(null)}
         />
       )}

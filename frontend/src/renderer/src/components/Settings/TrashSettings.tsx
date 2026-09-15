@@ -19,9 +19,9 @@ export default function TrashSettings(): JSX.Element {
   const restoreSession = useAgentStore((s) => s.restoreSession)
   const deleteSessions = useAgentStore((s) => s.deleteSessions)
 
-  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   // 永久删除二次确认：首次点击记录目标并进入确认态，3 秒内再点执行，超时恢复
-  const [confirming, setConfirming] = useState<number[] | null>(null)
+  const [confirming, setConfirming] = useState<string[] | null>(null)
   const confirmTimer = useRef<number | undefined>(undefined)
 
   useEffect(() => {
@@ -30,35 +30,35 @@ export default function TrashSettings(): JSX.Element {
   }, [refreshTrash])
 
   const selectedArr = useMemo(
-    () => trashSessions.filter((s) => selected.has(s.num)).map((s) => s.num),
+    () => trashSessions.filter((s) => selected.has(s.id)).map((s) => s.id),
     [trashSessions, selected]
   )
   const allChecked = trashSessions.length > 0 && selectedArr.length === trashSessions.length
 
-  const toggle = (num: number): void => {
+  const toggle = (id: string): void => {
     setConfirming(null)
     setSelected((prev) => {
       const next = new Set(prev)
-      if (next.has(num)) next.delete(num)
-      else next.add(num)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
       return next
     })
   }
   const toggleAll = (): void => {
     setConfirming(null)
-    setSelected(allChecked ? new Set() : new Set(trashSessions.map((s) => s.num)))
+    setSelected(allChecked ? new Set() : new Set(trashSessions.map((s) => s.id)))
   }
 
-  const armConfirm = (nums: number[]): void => {
+  const armConfirm = (ids: string[]): void => {
     window.clearTimeout(confirmTimer.current)
-    setConfirming(nums)
+    setConfirming(ids)
     confirmTimer.current = window.setTimeout(() => setConfirming(null), 3000)
   }
-  const doDelete = (nums: number[]): void => {
+  const doDelete = (ids: string[]): void => {
     window.clearTimeout(confirmTimer.current)
     setConfirming(null)
     setSelected(new Set())
-    void deleteSessions(nums)
+    void deleteSessions(ids)
   }
 
   const batchConfirming =
@@ -87,11 +87,11 @@ export default function TrashSettings(): JSX.Element {
       ) : (
         <div className="trash-list">
           {trashSessions.map((s) => (
-            <div key={s.num} className="trash-row">
+            <div key={s.id} className="trash-row">
               <input
                 type="checkbox"
-                checked={selected.has(s.num)}
-                onChange={() => toggle(s.num)}
+                checked={selected.has(s.id)}
+                onChange={() => toggle(s.id)}
               />
               <span className="trash-title" title={sessionDisplayName(s)}>
                 {sessionDisplayName(s)}
@@ -101,22 +101,22 @@ export default function TrashSettings(): JSX.Element {
               </span>
               <button
                 className="btn trash-restore-btn"
-                onClick={() => void restoreSession(s.num)}
+                onClick={() => void restoreSession(s.id)}
               >
                 <Icon name="restore" size={13} />
                 <span>还原</span>
               </button>
               <button
                 className={`btn trash-row-delete-btn ${
-                  confirming?.length === 1 && confirming[0] === s.num ? 'confirm' : ''
+                  confirming?.length === 1 && confirming[0] === s.id ? 'confirm' : ''
                 }`}
                 onClick={() =>
-                  confirming?.length === 1 && confirming[0] === s.num
-                    ? doDelete([s.num])
-                    : armConfirm([s.num])
+                  confirming?.length === 1 && confirming[0] === s.id
+                    ? doDelete([s.id])
+                    : armConfirm([s.id])
                 }
               >
-                {confirming?.length === 1 && confirming[0] === s.num ? '确认' : '删除'}
+                {confirming?.length === 1 && confirming[0] === s.id ? '确认' : '删除'}
               </button>
             </div>
           ))}

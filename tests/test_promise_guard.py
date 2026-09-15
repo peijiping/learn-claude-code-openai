@@ -159,7 +159,7 @@ def _make_offline_agent(tmp: Path) -> Agent:
     """离线 Agent（绕开会真连 LLM/MCP 的 __init__），只填 agent_loop 需要的字段。"""
     agent = Agent.__new__(Agent)
     agent.session_prefix = "session_"
-    agent.session_num = 1
+    agent.session_id = "1"
     agent.silent = True
     agent.total_tokens = 0
     agent.max_agent_iterations = 10

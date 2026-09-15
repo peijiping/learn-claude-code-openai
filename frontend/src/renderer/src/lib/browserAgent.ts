@@ -146,7 +146,7 @@ class BrowserAgentBridge implements AgentApi {
 
   send(
     text: string,
-    num?: number | null,
+    sessionId?: string | null,
     overrides?: { thinking_strength?: string; max_context?: string } | null,
     modelId?: string | null
   ): Promise<void> {
@@ -154,7 +154,7 @@ class BrowserAgentBridge implements AgentApi {
       kind: 'chat',
       payload: {
         text,
-        ...(typeof num === 'number' ? { num } : {}),
+        ...(typeof sessionId === 'string' && sessionId ? { session_id: sessionId } : {}),
         ...(overrides ? { overrides } : {}),
         ...(modelId ? { model_id: modelId } : {})
       }
@@ -165,21 +165,21 @@ class BrowserAgentBridge implements AgentApi {
     this.sendRaw(JSON.stringify({
       kind: 'session_model',
       payload: {
-        ...(typeof payload?.num === 'number' ? { num: payload.num } : {}),
+        ...(typeof payload?.session_id === 'string' && payload.session_id ? { session_id: payload.session_id } : {}),
         ...(payload?.model_id ? { model_id: payload.model_id } : {}),
         ...(payload?.overrides ? { overrides: payload.overrides } : {})
       }
     }))
     return Promise.resolve()
   }
-  stop(num: number): Promise<void> {
-    this.sendRaw(JSON.stringify({ kind: 'stop', payload: { num } }))
+  stop(sessionId: string): Promise<void> {
+    this.sendRaw(JSON.stringify({ kind: 'stop', payload: { session_id: sessionId } }))
     return Promise.resolve()
   }
-  switchSession(num: number): Promise<{ num: number; message_count: number }> {
+  switchSession(sessionId: string): Promise<{ session_id: string; message_count: number }> {
     // 历史回放经由 session / session_history 事件信封驱动 store，无需等待应答
-    this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { num } }))
-    return Promise.resolve({ num, message_count: 0 })
+    this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { session_id: sessionId } }))
+    return Promise.resolve({ session_id: sessionId, message_count: 0 })
   }
   clearSession(): Promise<{ deleted: number }> {
     this.sendRaw(JSON.stringify({ kind: 'session_clear' }))
@@ -199,17 +199,17 @@ class BrowserAgentBridge implements AgentApi {
       | null
     return payload?.sessions ?? []
   }
-  async renameSession(num: number, title: string): Promise<unknown> {
-    return this.request('session_rename', 'sessions', { num, title })
+  async renameSession(sessionId: string, title: string): Promise<unknown> {
+    return this.request('session_rename', 'sessions', { session_id: sessionId, title })
   }
-  trashSession(num: number): Promise<unknown> {
-    return this.request('session_trash', 'sessions', { num })
+  trashSession(sessionId: string): Promise<unknown> {
+    return this.request('session_trash', 'sessions', { session_id: sessionId })
   }
-  restoreSession(num: number): Promise<unknown> {
-    return this.request('session_restore', 'sessions', { num })
+  restoreSession(sessionId: string): Promise<unknown> {
+    return this.request('session_restore', 'sessions', { session_id: sessionId })
   }
-  async deleteSessions(nums: number[]): Promise<unknown> {
-    return this.request('session_delete', 'session_delete_result', { nums })
+  async deleteSessions(ids: string[]): Promise<unknown> {
+    return this.request('session_delete', 'session_delete_result', { ids })
   }
 
   async goalStatus(): Promise<string> {

@@ -1,14 +1,14 @@
 export interface AgentApi {
-  send: (text: string, num?: number | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null) => Promise<void>
-  setSessionModel: (payload: { num?: number | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
-  stop: (num: number) => Promise<void>
-  switchSession: (num: number) => Promise<{ num: number; message_count: number }>
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null) => Promise<void>
+  setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
+  stop: (sessionId: string) => Promise<void>
+  switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>
-  renameSession: (num: number, title: string) => Promise<unknown>
-  trashSession: (num: number) => Promise<unknown>
-  restoreSession: (num: number) => Promise<unknown>
-  deleteSessions: (nums: number[]) => Promise<unknown>
+  renameSession: (sessionId: string, title: string) => Promise<unknown>
+  trashSession: (sessionId: string) => Promise<unknown>
+  restoreSession: (sessionId: string) => Promise<unknown>
+  deleteSessions: (ids: string[]) => Promise<unknown>
   listTrash: () => Promise<unknown[]>
   goalStatus: () => Promise<string>
   tasks: () => Promise<string>

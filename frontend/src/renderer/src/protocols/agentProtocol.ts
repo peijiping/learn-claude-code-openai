@@ -31,8 +31,8 @@ export interface ContextStats {
 
 export interface AgentEvent {
   type: StreamEventType
-  /** 事件所属会话号；多会话并发时据此路由到对应消息缓冲 */
-  session_num?: number
+  /** 事件所属会话 id（短随机串 / 存量编号字符串）；多会话并发时据此路由到对应消息缓冲 */
+  session_id?: string
   text?: string
   /** 工具调用 id。子智能体生命周期事件（sub_agent_start / sub_agent_end）里
    *  表示**发起该子任务的主智能体 tool_call_id** —— 前端据此执行"唯一锚点
@@ -61,13 +61,13 @@ export type UiEvent =
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
-  | { kind: 'session'; payload: { num: number; message_count: number } }
-  | { kind: 'session_status'; payload: { num: number; status: SessionRunStatus } }
-  | { kind: 'session_history'; payload: { num: number; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
-  | { kind: 'session_model'; payload: { num: number; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
-  | { kind: 'session_delete_result'; payload: { deleted: number[]; failed: number[] } }
+  | { kind: 'session'; payload: { session_id: string; message_count: number } }
+  | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
+  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
+  | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
+  | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   | { kind: 'llm_config'; payload: LlmConfigResult }
-  | { kind: 'context_stats'; payload: { num: number } & ContextStats }
+  | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
 export interface HistoryToolCall {
@@ -236,10 +236,11 @@ export interface LlmModelsResult {
   error?: string
 }
 
-/** 会话元数据（来自后端 index.jsonl + 会话文件统计） */
+/** 会话元数据（来自后端会话元数据 + 会话文件统计） */
 export interface SessionMeta {
-  num: number
-  /** 会话标题；null = 未生成（UI 回退显示 session_N） */
+  /** 会话 id：短随机串（新会话）/ 存量编号字符串（旧会话）；全链路唯一标识 */
+  id: string
+  /** 会话标题；null = 未生成（UI 回退显示 session_<id>） */
   title: string | null
   /** 标题来源：none 未生成 / auto LLM 生成 / trunc 截断兜底 / user 手动重命名 */
   title_source?: 'auto' | 'user' | 'trunc' | 'none'
@@ -289,10 +290,10 @@ export interface WsOutbound {
   payload?: Record<string, unknown>
 }
 
-/** 前端 → 后端 chat 命令载荷：num 指明目标会话（新建任务无激活会话时省略，由后端领号） */
+/** 前端 → 后端 chat 命令载荷：session_id 指明目标会话（新建任务无激活会话时省略，由后端生成短 id） */
 export interface ChatPayload {
   text: string
-  num?: number
+  session_id?: string
   fresh?: boolean
   /** 当前会话请求级覆盖（来自模型下拉悬浮配置面板） */
   overrides?: {
