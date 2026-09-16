@@ -220,6 +220,15 @@ class SessionRuntime:
         if self.agent is not None:
             self.agent.request_stop()
 
+    def record_model_switch(self, model_id: str | None) -> None:
+        """把一次用户侧模型切换记录到本会话运行中的 agent（turn 收尾净变化展示）。
+
+        仅当本会话确实在执行的 agent 存在时转发；空闲期（agent 未构造或
+        turn 未运行）由 Agent.record_model_switch 内部忽略。
+        """
+        if self.agent is not None and model_id is not None:
+            self.agent.record_model_switch(model_id)
+
     def current_status(self) -> Optional[str]:
         """新连接状态重放用（ws_bridge.handle）：
         running=turn 执行中；background=turn 已结束但后台任务仍在跑；None=空闲。"""
@@ -445,7 +454,15 @@ class SessionRuntimeRegistry:
         维护每会话独立绑定语义；不会把所有会话统一串到同一个新全局模型。
         """
         for rt in self._sessions.values():
-            if rt.agent is not None:
-                rt.agent, rt._bound_model = _bind_agent_env(
-                    self._load_meta, rt.sid, rt.agent, rebuild=True
-                )
+            if rt.agent is None:
+                continue
+            old_bound = rt._bound_model
+            rt.agent, rt._bound_model = _bind_agent_env(
+                self._load_meta, rt.sid, rt.agent, rebuild=True
+            )
+            # 绑定模型确实变化 → 记为一次用户侧模型切换（重绑可能来自全局/会话
+            # 模型变更，主循环后续迭代即用新模型）。不再限定 busy：turn 执行中
+            # 计入本轮，空闲期计入 pending（下一轮并入），两种都要有提示
+            #（修复 2026-09-16：空闲切换无提示）。
+            if old_bound != rt._bound_model:
+                rt.record_model_switch(rt._bound_model)

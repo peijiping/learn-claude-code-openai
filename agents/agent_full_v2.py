@@ -316,6 +316,11 @@ class Agent:
         # 由 SessionRuntime 在 run_turn 前设置，_finalize_turn_usage 据此生成
         # 轮级 model_info 快照（jsonl model_info 节点 + usage_stats 事件 model 字段）
         self._turn_model_id: str | None = None
+        # 本轮（turn 执行期）模型切换事件序列，每项
+        #   {from_id, from_name, to_id, to_name, ts}；收尾时取净变化（轮始→轮末）
+        # 注入 model_info.switch（持久化 + usage_stats.model.switch 上行）；
+        # 净切回原模型（from_id==to_id）则不入 → 前端不显示、jsonl 不记录。
+        self._turn_switches: list[dict] = []
 
         # ── 会话状态（由 init_session / new_session / switch_session 填充） ──
         self.session_manager: SessionManager | None = None
@@ -418,6 +423,65 @@ class Agent:
         场景保持 None，快照回落 self.model（env 绑定的模型名）。
         """
         self._turn_model_id = model_id
+
+    def record_model_switch(self, to_id: str | None) -> dict | None:
+        """记录一次模型切换。
+
+        turn 执行期：计入本轮 `_turn_switches`，本轮收尾经 `_net_turn_switch`
+        取净变化后展示（返回 None，由收尾统一处理）；
+        空闲期（turn 未执行）：立即上行 `model_switch` 事件 + 持久化到「切换时
+        最后一条 assistant 消息」的 `model_info.switch`（返回该切换快照）。
+
+        空闲期 from 取当前会话基准模型 `_turn_model_id`，切换后同步更新它为 to
+        （供后续连续切换链取 from）；turn 执行期 from 取首条切换前的轮始模型，
+        否则取上一条 to。display_name 经 get_model_by_id 解析（空 id 回落全局
+        active 模型）。首条 from 与末条 to 相同（切回原模型）时在 _net_turn_switch
+        处整体丢弃。
+        """
+        if to_id is None:
+            return None
+        if self._in_turn:
+            chain = self._turn_switches
+            from_id = chain[-1].get("to_id") if chain else (self._turn_model_id or None)
+        else:
+            from_id = self._turn_model_id
+        if not from_id:
+            # 无前序模型（如全新会话首次绑定模型）：不是「切换」，不记录
+            return None
+        if from_id == to_id:
+            return None  # 切到与当前相同：视为未切换，忽略
+        from_m = get_model_by_id(from_id)
+        to_m = get_model_by_id(to_id)
+        sw = {
+            "from_id": from_id or "",
+            "from_name": str(from_m.get("display_name") or from_m.get("model")
+                             or from_id or "未知"),
+            "to_id": to_id or "",
+            "to_name": str(to_m.get("display_name") or to_m.get("model")
+                           or to_id or "未知"),
+            "ts": time.time(),
+        }
+        if self._in_turn:
+            self._turn_switches.append(sw)
+            return None
+        # 空闲期：立即展示 + 持久化，并推进当前模型基准供连续切换链取 from
+        self._turn_model_id = to_id
+        self._emit_idle_model_switch(sw)
+        return sw
+
+    def _emit_idle_model_switch(self, sw: dict) -> None:
+        """空闲期切换：立即上行 model_switch 事件，并把 switch 写入切换时最后一条
+        assistant 消息（model_info.switch），使实时与回放都在「切换前的那条答复」上
+        展示（而非下一轮答复末尾）。"""
+        self.stream_sink.emit(StreamEvent(type="model_switch", switch=sw))
+        if self.session_manager is not None and self.session_file is not None:
+            self.session_manager.append_switch_to_last_assistant(self.session_file, sw)
+            for m in reversed(self.history_messages):
+                if m.get("role") == "assistant":
+                    mi = dict(m.get("model_info") or {})
+                    mi["switch"] = sw
+                    m["model_info"] = mi
+                    break
 
     def _advanced_llm_kwargs(self) -> dict:
         """高级设置 → LLM 调用参数（chat.completions.create 的 kwargs）。
@@ -603,12 +667,36 @@ class Agent:
             max_tokens = int(cm.max_context_tokens)
             label = cm.format_token_count(max_tokens)
         strength = self._request_overrides.get("reasoning_effort") or default_strength
-        return {
+        info = {
             "model_id": model_id,
             "model_name": name,
             "max_context": max_tokens,
             "max_context_label": label,
             "reasoning_effort": str(strength) if strength else "",
+        }
+        switch = self._net_turn_switch()
+        if switch:
+            info["switch"] = switch
+        return info
+
+    def _net_turn_switch(self) -> dict | None:
+        """本轮净模型切换（轮始→轮末）。
+
+        _turn_switches 为空 → 无切换，返回 None；多次切换 A→B→C 时取
+        首条 from 与末条 to（净变化）；净切回原模型（首条 from==末条 to，
+        如 A→B→A）→ 返回 None，不显示不记录。
+        """
+        if not self._turn_switches:
+            return None
+        first, last = self._turn_switches[0], self._turn_switches[-1]
+        if first.get("from_id") == last.get("to_id"):
+            return None
+        return {
+            "from_id": first.get("from_id", ""),
+            "from_name": first.get("from_name", ""),
+            "to_id": last.get("to_id", ""),
+            "to_name": last.get("to_name", ""),
+            "ts": last.get("ts"),
         }
 
     def _finalize_turn_usage(self) -> None:
@@ -632,14 +720,17 @@ class Agent:
             log.warning("usage_totals 落盘失败（不影响对话）: %s", e)
         try:
             if self.session_manager is not None and self.session_file is not None:
-                # jsonl 末条 assistant 行补写 usage + model_info，并同步内存态
+                # jsonl 末条 assistant 行补写 usage + model_info + usage_session
+                #（会话级累计快照，回放恢复 footer 第二段），并同步内存态
                 # （compact 重写保留）
                 if self.session_manager.append_usage_to_last_assistant(
-                        self.session_file, turn_usage, model_info):
+                        self.session_file, turn_usage, model_info,
+                        usage_session=dict(self.usage_totals)):
                     for m in reversed(self.history_messages):
                         if m.get("role") == "assistant":
                             m["usage"] = turn_usage
                             m["model_info"] = dict(model_info)
+                            m["usage_session"] = dict(self.usage_totals)
                             break
         except Exception as e:
             log.warning("轮级 usage 落盘失败（不影响对话）: %s", e)
@@ -674,6 +765,7 @@ class Agent:
         self._stop_evt.clear()  # 新一轮开始，清掉可能遗留的停止信号
         self.goal_controller.begin_query()
         self._turn_usage = dict(_ZERO_USAGE)  # 轮级统计重新累计
+        self._turn_switches = []  # 本轮切换序列归零（空闲期切换已在发生时即时上行）
         self.hook_system.trigger("UserPromptSubmit", user_query)
         log.info("turn 开始: %s%s user_query=%r",
                  self.session_prefix, self.session_id, user_query[:100])
@@ -708,6 +800,7 @@ class Agent:
         self._stop_evt.clear()
         self.goal_controller.begin_query()
         self._turn_usage = dict(_ZERO_USAGE)  # 轮级统计重新累计
+        self._turn_switches = []  # 本轮切换序列归零（空闲期切换已在发生时即时上行）
         # 仅当确有未消费的后台结果才续轮，避免空转发出无意义的一轮
         if not self.background_manager.has_completed_pending():
             return ""

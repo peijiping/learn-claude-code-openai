@@ -19,6 +19,9 @@ export type StreamEventType =
    *  修复后台子智能体执行期间卡片零更新的断连观感（2026-09-12）。 */
   | 'tool_exec_start'
   | 'tool_exec_end'
+  /** 空闲期模型切换：下拉框模型改变时即时上行，携带切换快照 switch
+   *  （挂到「切换时最后一条 assistant 消息」上，先于用户下一条指令展示） */
+  | 'model_switch'
 
 export interface ContextStats {
   /** 当前会话已用 token（启发式估算） */
@@ -42,6 +45,17 @@ export interface UsageStats {
   turns?: number
 }
 
+/** 轮级模型切换（净变化 = 轮始→轮末）：本轮执行中发生过模型切换时，
+ *  随 model_info.switch / usage_stats.model.switch 下发；净切回原模型不携带。 */
+export interface ModelSwitch {
+  from_id: string
+  from_name: string
+  to_id: string
+  to_name: string
+  /** 末次切换时间戳（秒） */
+  ts?: number
+}
+
 /** 轮级模型快照：本轮实际使用的模型与参数（jsonl 轮末 assistant 行 model_info
  *  节点 / usage_stats 事件 model 字段）。窗口即本轮统计所用口径；老轮次缺省不显示。 */
 export interface TurnModelInfo {
@@ -55,6 +69,8 @@ export interface TurnModelInfo {
   max_context_label: string
   /** 思考强度档位（low/high/very_high；空 = 未启用/未知） */
   reasoning_effort: string
+  /** 本轮净模型切换（仅本轮执行中切换过模型时存在；缺省 = 无切换） */
+  switch?: ModelSwitch
 }
 
 /** usage_stats 事件载荷：turn（本轮，主 + 子智能体）+ session（会话累计）两级汇总
@@ -83,6 +99,8 @@ export interface AgentEvent {
   usage?: UsageStatsEventUsage | Record<string, number>
   /** 子智能体来源标识：非空表示该事件由某次子智能体任务发出（前端折叠到子智能体块下） */
   subagent_id?: string
+  /** model_switch 事件：空闲期模型切换快照（from/to 展示名），挂到切换时最后一条 assistant 消息 */
+  switch?: ModelSwitch
 }
 
 /** 会话执行状态（后端 → 前端）：驱动侧边栏运行指示 / 完成绿点 / 停止按钮。
@@ -142,6 +160,9 @@ export interface HistoryMessage {
   usage?: UsageStats
   /** 本轮模型快照（轮末 assistant 行 model_info 节点；老轮次缺省不显示） */
   model_info?: TurnModelInfo
+  /** turn 收尾时的会话级累计快照（轮末 assistant 行 usage_session 节点；
+   *  回放恢复 footer 第二段「本会话累计」，与实时 usage_stats.session 同构） */
+  usage_session?: UsageStats
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -368,6 +389,7 @@ export function isKnownAgentEvent(ev: AgentEvent): boolean {
     'sub_agent_end',
     'usage_stats',
     'tool_exec_start',
-    'tool_exec_end'
+    'tool_exec_end',
+    'model_switch'
   ].includes(ev.type)
 }

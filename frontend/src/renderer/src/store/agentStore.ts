@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ContextStats, HistoryMessage, ModelSwitch, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -170,6 +170,9 @@ export interface Message {
   activeToolId: string | null
   streaming: boolean
   usage: MessageUsage | null
+  /** 模型切换提示（空闲期 model_switch 事件 / 本轮 usage_stats.model.switch /
+   *  回放 model_info.switch），挂到「切换发生时」那条 assistant 消息上 */
+  switch?: ModelSwitch
 }
 
 interface AgentState {
@@ -303,11 +306,18 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       activeToolId: null,
       streaming: false,
       subagents,
-      // 回放：jsonl 轮末 assistant 行携带的 usage / model_info → footer 第一段
-      // （本轮 + 本轮模型）；会话级快照不落盘，第二段（本会话累计）仅实时事件携带
+      // 回放：jsonl 轮末 assistant 行携带的 usage / model_info / usage_session →
+      // footer 第一段（本轮 + 本轮模型）+ 第二段「本会话累计」（usage_session 快照，
+      // 与实时 usage_stats 同构，老会话缺省不显示第二段）
       usage: m.usage && m.usage.total_tokens
-        ? { turn: m.usage, model: m.model_info ?? undefined }
-        : null
+        ? {
+            turn: m.usage,
+            model: m.model_info ?? undefined,
+            session: m.usage_session ?? undefined
+          }
+        : null,
+      // 回放：空闲期/本轮切换提示，落到「切换发生时」的 assistant 消息上
+      switch: m.model_info?.switch ?? undefined
     }
   })
 }
@@ -432,6 +442,18 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
           : m
       )
       break
+    case 'model_switch': {
+      // 空闲期切换：把切换提示挂到「切换时最后一条 assistant 消息」（即当前
+      // 缓冲末尾那条 assistant）上，先于用户下一条指令展示；无 assistant 不挂。
+      const sw = ev.switch
+      if (!sw || sw.from_id === sw.to_id) break
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role !== 'assistant') continue
+        msgs = msgs.map((m, idx) => (idx === i ? { ...m, switch: sw } : m))
+        break
+      }
+      break
+    }
   }
   return msgs
 }
@@ -742,7 +764,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
               for (let i = buf.length - 1; i >= 0; i--) {
                 if (buf[i].role !== 'assistant') continue
                 const patched = [...buf]
-                patched[i] = { ...patched[i], usage: { turn: u.turn, session: u.session, model: u.model } }
+                patched[i] = {
+                  ...patched[i],
+                  usage: { turn: u.turn, session: u.session, model: u.model },
+                  switch: u.model?.switch ?? patched[i].switch
+                }
                 messagesBySession = { ...messagesBySession, [sid]: patched }
                 messages = s.activeSession === sid ? patched : s.messages
                 break

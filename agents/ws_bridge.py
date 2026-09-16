@@ -381,12 +381,14 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
                 "_tc_ids": tc_ids,
                 "toolCalls": tool_calls,
             }
-            # 轮级 token 消耗 + 本轮模型快照（UI 展示元数据，turn 收尾时写入
-            # 末条 assistant 行的 usage / model_info 节点）
+            # 轮级 token 消耗 + 本轮模型快照 + 会话级累计快照（UI 展示元数据，
+            # turn 收尾时写入末条 assistant 行的 usage / model_info / usage_session 节点）
             if m.get("usage"):
                 ui_msg["usage"] = m["usage"]
             if m.get("model_info"):
                 ui_msg["model_info"] = m["model_info"]
+            if m.get("usage_session"):
+                ui_msg["usage_session"] = m["usage_session"]
             ui.append(ui_msg)
         elif role == "subagent":
             # 旧数据残留的 in-file 记录行（正常已由迁移搬到旁路文件）
@@ -587,6 +589,13 @@ async def handle(ws):
                     model_id=model_id if model_id is not None else None,
                     overrides=overrides if isinstance(overrides, dict) else None,
                 )
+                # 会话绑定模型被切换 → 记录到运行中 agent：turn 执行中被切换计入
+                # 本轮，空闲期切换计入 pending（下一轮并入）。不再限定 busy——
+                # 「切换模型后再发消息」的切换同样要展示（修复 2026-09-16）。
+                if model_id:
+                    rt = registry.get(sid)
+                    if rt is not None:
+                        await asyncio.to_thread(rt.record_model_switch, model_id)
                 await safe_send(ws, _envelope("session_model", {
                     "session_id": sid, "model_id": model_id, "overrides": overrides,
                 }))

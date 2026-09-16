@@ -187,6 +187,13 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
   // + turn 收尾时的会话级累计快照（回放缺省，只显示第一段）
   // + 本轮模型与参数（usage_stats 事件 model 字段 / 回放 jsonl model_info 节点；老轮次缺省）
   const modelText = msg.usage?.model ? modelInfoText(msg.usage.model) : null
+  // 模型切换提示：挂到「切换发生时」的那条 assistant 消息上——
+  // 空闲期切换即时显示（先于用户下一条指令），本轮执行中切换显示在本轮答复末尾。
+  const turnSwitch = msg.switch
+  const switchText =
+    turnSwitch && turnSwitch.from_name !== turnSwitch.to_name
+      ? `模型已从 ${turnSwitch.from_name} 更改为 ${turnSwitch.to_name}`
+      : null
   const usage = msg.usage && msg.usage.turn.total_tokens ? (
     <span className="msg-usage">
       本轮 {fmtTokens(msg.usage.turn.total_tokens)} tokens · 缓存命中 {cachePct(msg.usage.turn)}
@@ -220,6 +227,12 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
             {msg.streaming && msg.content && <span className="cursor" />}
           </div>
           {!msg.streaming && usage}
+          {!msg.streaming && switchText && (
+            <div className="model-switch-notice" title="已切换模型">
+              <span>{switchText}</span>
+              <span className="model-switch-info" aria-label="模型已切换">ⓘ</span>
+            </div>
+          )}
           <button
             className="msg-copy-btn"
             title="复制"

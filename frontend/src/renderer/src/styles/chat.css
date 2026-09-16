@@ -340,6 +340,29 @@
   vertical-align: middle;
 }
 
+/* 模型切换提示：本轮执行中切换过模型时，在答复末尾展示一条居中浅灰提示，
+   文字两侧各一条浅灰横线（无顶部线、无背景填充） */
+.model-switch-notice {
+  margin-top: var(--sp-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.model-switch-notice::before,
+.model-switch-notice::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+.model-switch-info {
+  font-size: 12px;
+  line-height: 1;
+}
+
 /* 输入区：宽度上限 940px（与消息列表一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
 .composer-wrap {
   padding: var(--sp-3) var(--sp-5) var(--sp-4);

@@ -305,6 +305,15 @@ class SessionManager:
                 #（Agent 侧发送 LLM 前会做白名单投影剔除）
                 if msg_data.get("usage"):
                     norm["usage"] = msg_data["usage"]
+                # model_info 同为 UI 展示元数据（本轮模型快照 + 净切换 switch），
+                # 与 usage 平级保留——否则切会话回放/compact 重写后 footer 模型
+                # 与「模型已切换」提示会永久丢失（balance 数据丢失 bug）
+                if msg_data.get("model_info"):
+                    norm["model_info"] = msg_data["model_info"]
+                # usage_session 为 turn 收尾时的会话级累计快照（回放恢复「本会话
+                # 累计」footer 第二段）；与 usage/model_info 同为展示元数据，保留
+                if msg_data.get("usage_session"):
+                    norm["usage_session"] = msg_data["usage_session"]
                 normalized.append(norm)
             elif msg_role == "tool":
                 normalized.append({
@@ -554,6 +563,12 @@ class SessionManager:
             # 轮级 token 消耗（UI 展示元数据），存在才写入
             if message.get("usage"):
                 row["usage"] = message["usage"]
+            # 本轮模型快照 + 净切换（model_info），与 usage 平级保留
+            if message.get("model_info"):
+                row["model_info"] = message["model_info"]
+            # 会话级累计快照（回放恢复 footer 第二段），存在才写入
+            if message.get("usage_session"):
+                row["usage_session"] = message["usage_session"]
             return row
         elif role == "tool":
             return {
@@ -602,7 +617,8 @@ class SessionManager:
             log.error("写入会话历史失败: %s", e)
 
     def append_usage_to_last_assistant(self, session_file: Path, usage: dict,
-                                       model_info: dict | None = None) -> bool:
+                                       model_info: dict | None = None,
+                                       usage_session: dict | None = None) -> bool:
         """把轮级 token 消耗 + 模型快照写进会话文件**最后一条 assistant 行**（就地重写最后一行）。
 
         turn 收尾时调用：末条 assistant 消息行落盘在前（append_message_to_session），
@@ -610,8 +626,10 @@ class SessionManager:
         故用「读尾块定位最后一行 → truncate 行首 → 重写该行」补写 usage 字段；
         model_info（本轮使用的模型与参数快照）与之同一次重写补进 model_info 节点，
         与 usage 平级——两者概念独立（配置 vs 消耗），且都被 _model_messages
-        白名单投影挡在 LLM 上下文之外。末行不是 assistant（停止/异常收尾在
-        tool/user 行截断）时跳过返回 False。
+        白名单投影挡在 LLM 上下文之外。usage_session（turn 收尾时的会话级累计快照）
+        同样补进该行——旧回放只见「本轮」段，切会话后「本会话累计」段缺失；持久化后
+        回放 footer 第二段也能恢复（与实时 usage_stats 事件同构）。
+        末行不是 assistant（停止/异常收尾在 tool/user 行截断）时跳过返回 False。
 
         持 _append_lock 与 append 互斥；调用方需同步内存态（history_messages[-1]）。
         """
@@ -646,6 +664,8 @@ class SessionManager:
                 obj["usage"] = usage
                 if model_info:
                     obj["model_info"] = model_info
+                if usage_session:
+                    obj["usage_session"] = usage_session
                 new_line = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
                 # 行首偏移 = 文件大小 - 末行字节长度 - 1（行尾换行符）
                 line_start = size - len(last) - 1
@@ -656,6 +676,55 @@ class SessionManager:
             return True
         except OSError as e:
             log.error("写入轮级 usage 失败: %s", e)
+            return False
+
+    def append_switch_to_last_assistant(self, session_file: Path, switch: dict) -> bool:
+        """把一次空闲期模型切换写进文件**最后一条 assistant 行**的 `model_info.switch`。
+
+        与 append_usage_to_last_assistant 体例一致：读尾块定位最后一行 → truncate 行首
+        → 重写该行。切换发生在空闲期，末条 assistant 必为上一轮已完成答复；把 switch
+        挂到它（而非下一轮答复）是「切换时最后一条 assistant 消息展示」的正确口径。
+        末行不是 assistant（切换发生在尚无任何答复的空会话）时跳过返回 False。
+        """
+        if not switch or not session_file.exists():
+            return False
+        try:
+            with self._append_lock:
+                with open(session_file, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    remaining, block = size, 4096
+                    tail = b""
+                    while remaining > 0:
+                        read_len = min(block, remaining)
+                        remaining -= read_len
+                        f.seek(remaining)
+                        chunk = f.read(read_len)
+                        tail = chunk + tail
+                        if b"\n" in chunk:
+                            break
+                lines = tail.rstrip(b"\n").split(b"\n") if tail.strip() else []
+                if not lines:
+                    return False
+                last = lines[-1]
+                try:
+                    obj = json.loads(last)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return False
+                if not isinstance(obj, dict) or obj.get("role") != "assistant":
+                    return False
+                model_info = dict(obj.get("model_info") or {})
+                model_info["switch"] = switch
+                obj["model_info"] = model_info
+                new_line = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+                line_start = size - len(last) - 1
+                with open(session_file, "r+b") as f:
+                    f.truncate(line_start)
+                    f.seek(line_start)
+                    f.write(new_line)
+            return True
+        except OSError as e:
+            log.error("写入空闲期模型切换失败: %s", e)
             return False
 
     def append_subagent_to_session(self, session_file: Path, transcript: dict) -> None:

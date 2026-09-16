@@ -45,7 +45,7 @@ class StreamEvent:
     前端据此把思考/工具事件折叠到对应子智能体块下；空串 = 主智能体事件。
     """
     def __init__(self, type, text="", tool_id="", tool_name="", args="",
-                 finish_reason="", usage=None, subagent_id=""):
+                 finish_reason="", usage=None, subagent_id="", switch=None):
         self.type = type
         self.text = text
         self.tool_id = tool_id
@@ -54,6 +54,7 @@ class StreamEvent:
         self.finish_reason = finish_reason
         self.usage = usage or {}
         self.subagent_id = subagent_id
+        self.switch = switch
 
     def to_dict(self) -> dict:
         """P4 线协议：把事件完整序列化成 dict（前端可直接渲染）。"""
@@ -66,6 +67,7 @@ class StreamEvent:
             "finish_reason": self.finish_reason,
             "usage": self.usage,
             "subagent_id": self.subagent_id,
+            "switch": self.switch,
         }
 
     def to_json(self) -> str:
