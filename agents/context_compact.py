@@ -43,8 +43,11 @@ log = get_logger("compact")
 # 新增/修改时同步更新 .env 与 .env.example，详见 AGENTS.md。
 
 
-# 上下文窗口默认 token 上限；构造 ContextCompact 时若 .env 未配 MAX_CONTEXT_TOKENS 则回落到此值。
-DEFAULT_MAX_CONTEXT_TOKENS = int(os.environ.get("DEFAULT_MAX_CONTEXT_TOKENS") or 1000000)
+# 上下文窗口默认 token 上限（最后兜底）：模型元数据缺失且无显式覆盖时使用。
+# LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+# （llm_config.resolve_model_window / SessionRuntime 每轮传入），不再读全局 env
+# （历史 bug：全局 MAX_CONTEXT_TOKENS 与所选模型真实窗口不符导致统计误用 1M）。
+DEFAULT_MAX_CONTEXT_TOKENS = 1_000_000
 
 # L1 snip —— 消息条数裁剪
 # 消息总条数超过该值时触发 snip_compact，把中间替换为单条占位 HumanMessage。
@@ -101,7 +104,7 @@ _SUMMARY_PROMPT = """\
 class ContextStats:
     """上下文用量统计：用于 UI 展示与压缩决策。"""
     used_tokens: int          # 当前消息历史估算占用的 token 数（启发式估算，非精确值）
-    max_tokens: int           # 上下文窗口的 token 上限（来自 .env MAX_CONTEXT_TOKENS 或默认值）
+    max_tokens: int           # 上下文窗口的 token 上限（会话覆盖值或默认兜底值）
     used_percent: float       # 已用比例 0-100，用于触发压缩管线的阈值判断
     remaining_percent: float  # 剩余比例 0-100，主要给 UI 展示"还剩多少可用"
     max_label: str            # 上限的可读化文本（"200K" / "1M"），给 UI 标签用
@@ -143,7 +146,7 @@ class ContextCompact:
     ):
         self.max_context_tokens = (
             max_context_tokens
-            or self.parse_max_context_tokens(os.environ.get("MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT_TOKENS)
+            or DEFAULT_MAX_CONTEXT_TOKENS
         )
         self.summarizer = summarizer
         self.transcript_dir = Path(transcript_dir) if transcript_dir else Path.cwd() / TRANSCRIPT_DIRNAME

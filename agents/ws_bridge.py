@@ -20,7 +20,10 @@ from openai import OpenAI
 
 from agent_full_v2 import Agent
 from config import load as load_config
-from llm_config import fetch_remote_models, get_config, load_llm_config, save_config
+from llm_config import (
+    fetch_remote_models, get_config, load_llm_config, resolve_model_window,
+    save_config,
+)
 from logger import get_logger, install_excepthooks
 from paths import CHAT_HISTORY_DIR
 from session_manage import SessionManager
@@ -324,6 +327,25 @@ def _attach_subagent(ui: list[dict], rec: dict) -> None:
     })
 
 
+def _resolve_session_window(meta: dict) -> Optional[str]:
+    """按会话元数据解析该会话的上下文窗口字符串（供切会话的 context_stats）。
+
+    口径与前端 resolveOverridesPayload 一致：绑定模型 + 参数覆盖里的
+    max_context_option（extended 显式选过才取扩展窗口，否则标准窗口）。
+    未绑定模型/元数据缺失返回 None（沿用全局默认）。
+
+    历史 bug：切会话直接用共享 SessionManager 的默认窗口（全局 env
+    MAX_CONTEXT_TOKENS=1M），导致所有会话圆圈都显示 1M，与所选模型
+    真实窗口（如 128k）不符。
+    """
+    model_id = meta.get("model_id") or None
+    if not model_id:
+        return None
+    ov = ((meta.get("overrides") or {}).get(model_id)) or {}
+    extended = isinstance(ov, dict) and ov.get("max_context_option") == "extended"
+    return resolve_model_window(model_id, extended=extended)
+
+
 def _history_to_ui(messages: list, subagent_records: list | None = None) -> list[dict]:
     """session 历史 → 前端可渲染消息列表。
 
@@ -352,13 +374,20 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
                     "name": (tc.get("function") or {}).get("name", ""),
                     "args": (tc.get("function") or {}).get("arguments", ""),
                 })
-            ui.append({
+            ui_msg = {
                 "role": "assistant",
                 "content": _text_of(m.get("content")),
                 "thinking": m.get("reasoning_content") or "",
                 "_tc_ids": tc_ids,
                 "toolCalls": tool_calls,
-            })
+            }
+            # 轮级 token 消耗 + 本轮模型快照（UI 展示元数据，turn 收尾时写入
+            # 末条 assistant 行的 usage / model_info 节点）
+            if m.get("usage"):
+                ui_msg["usage"] = m["usage"]
+            if m.get("model_info"):
+                ui_msg["model_info"] = m["model_info"]
+            ui.append(ui_msg)
         elif role == "subagent":
             # 旧数据残留的 in-file 记录行（正常已由迁移搬到旁路文件）
             legacy_rows.append(m)
@@ -504,6 +533,7 @@ async def handle(ws):
                         "session_id": sid, "messages": [],
                         "model_id": meta.get("model_id"),
                         "overrides": meta.get("overrides") or {},
+                        "usage_totals": meta.get("usage_totals"),
                     }))
                     await reply_sessions()
                     continue
@@ -525,10 +555,16 @@ async def handle(ws):
                         "messages": _history_to_ui(history, records),
                         "model_id": meta.get("model_id"),
                         "overrides": meta.get("overrides") or {},
+                        "usage_totals": meta.get("usage_totals"),
                     }))
-                    # 切换会话后推送该会话的上下文统计（供前端圆圈指示器按会话展示）
+                    # 切换会话后推送该会话的上下文统计（供前端圆圈指示器按会话展示）；
+                    # 窗口按会话元数据（绑定模型 + 参数覆盖）解析，不用共享
+                    # SessionManager 的全局默认（见 _resolve_session_window 注释）
                     try:
-                        stats = await asyncio.to_thread(sm.context_stats_dict, history)
+                        stats = await asyncio.to_thread(
+                            sm.context_stats_dict, history,
+                            _resolve_session_window(meta),
+                        )
                         await safe_send(ws, _envelope("context_stats", {"session_id": sid, **stats}))
                     except Exception:
                         pass

@@ -330,6 +330,16 @@
   font-size: var(--fs-xs);
 }
 
+/* token footer 两段式（本轮 / 本会话累计）之间的分隔 */
+.msg-usage-sep {
+  display: inline-block;
+  width: 1px;
+  height: 10px;
+  margin: 0 var(--sp-2);
+  background: var(--color-border);
+  vertical-align: middle;
+}
+
 /* 输入区：宽度上限 940px（与消息列表一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
 .composer-wrap {
   padding: var(--sp-3) var(--sp-5) var(--sp-4);
@@ -589,6 +599,11 @@
   color: var(--color-text-primary);
   z-index: 950;
   pointer-events: none;
+  text-align: left;
+}
+/* 多行统计（上下文 / 累计输入 / 缓存命中 / 输出）逐行展示 */
+.context-tooltip div {
+  line-height: 1.7;
 }
 .send-btn:disabled {
   opacity: 0.5;

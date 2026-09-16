@@ -249,10 +249,17 @@ def consume_stream(response, sinks: Optional[List[EventSink]] = None,
         # include_usage 时 usage 在最后的尾包上（choices 为空）
         u = getattr(chunk, "usage", None)
         if u is not None:
+            # 缓存命中：OpenAI 系在 prompt_tokens_details.cached_tokens；
+            # DeepSeek 旧版字段为 prompt_cache_hit_tokens（未命中为 prompt_cache_miss_tokens）
+            pd = getattr(u, "prompt_tokens_details", None)
+            cached = int(getattr(pd, "cached_tokens", 0) or 0) if pd is not None else 0
+            if not cached:
+                cached = int(getattr(u, "prompt_cache_hit_tokens", 0) or 0)
             usage = {
-                "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(u, "total_tokens", 0) or 0,
+                "prompt_tokens": int(getattr(u, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(u, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(u, "total_tokens", 0) or 0),
+                "cached_tokens": cached,
             }
         if not chunk.choices:
             continue

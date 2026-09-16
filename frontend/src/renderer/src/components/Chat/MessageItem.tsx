@@ -2,8 +2,43 @@ import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
+import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
 import type { Message, SubAgentMsg, ToolCallMsg } from '@store/agentStore'
 import MessageMenu from './MessageMenu'
+
+/** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
+function fmtTokens(n: number): string {
+  if (n >= 10000) {
+    const k = n / 1000
+    return `${k >= 100 ? Math.round(k) : k.toFixed(1).replace(/\.0$/, '')}k`
+  }
+  return n.toLocaleString()
+}
+
+/** 缓存命中率 = cached_tokens / prompt_tokens（输入侧）；
+ *  provider 未返回缓存信息（cached=0 / prompt=0）时显示 — */
+function cachePct(u: UsageStats): string {
+  if (!u.cached_tokens || !u.prompt_tokens) return '—'
+  return `${Math.round((u.cached_tokens / u.prompt_tokens) * 100)}%`
+}
+
+/** 思考强度档位展示映射（与输入区悬浮面板 THINKING_LABELS 一致） */
+const THINKING_LABELS: Record<string, string> = {
+  low: '轻',
+  high: '高',
+  very_high: '极高'
+}
+
+/** 本轮模型快照 → footer 模型段文本：`deepseek-flash · 128K · 思考 高`。
+ *  模型名/窗口都缺时不渲染；思考档位缺省（空串）不显示该节。 */
+function modelInfoText(mi: TurnModelInfo): string | null {
+  const parts: string[] = []
+  if (mi.model_name) parts.push(mi.model_name)
+  if (mi.max_context_label) parts.push(mi.max_context_label)
+  const strength = THINKING_LABELS[mi.reasoning_effort]
+  if (strength) parts.push(`思考 ${strength}`)
+  return parts.length ? parts.join(' · ') : null
+}
 
 function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
   return (
@@ -148,9 +183,20 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     )
   }
 
-  const usage = msg.usage && msg.usage.total_tokens ? (
+  // token footer 两段式：本轮消耗（主 + 子智能体，usage_stats 事件 / 回放 jsonl usage 字段）
+  // + turn 收尾时的会话级累计快照（回放缺省，只显示第一段）
+  // + 本轮模型与参数（usage_stats 事件 model 字段 / 回放 jsonl model_info 节点；老轮次缺省）
+  const modelText = msg.usage?.model ? modelInfoText(msg.usage.model) : null
+  const usage = msg.usage && msg.usage.turn.total_tokens ? (
     <span className="msg-usage">
-      {msg.usage.prompt_tokens}→{msg.usage.completion_tokens} tokens
+      本轮 {fmtTokens(msg.usage.turn.total_tokens)} tokens · 缓存命中 {cachePct(msg.usage.turn)}
+      {modelText ? <>（{modelText}）</> : null}
+      {msg.usage.session && msg.usage.session.total_tokens ? (
+        <>
+          <span className="msg-usage-sep" />
+          本会话累计 {fmtTokens(msg.usage.session.total_tokens)} tokens · 命中 {cachePct(msg.usage.session)}
+        </>
+      ) : null}
     </span>
   ) : null
 

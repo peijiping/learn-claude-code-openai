@@ -12,6 +12,8 @@ export type StreamEventType =
   | 'turn_end'
   | 'sub_agent_start'
   | 'sub_agent_end'
+  /** token 消耗统计（turn 收尾 / 迟到子智能体补发）：usage 为 {turn?, session} 两级汇总 */
+  | 'usage_stats'
   /** 子智能体内部工具「开始真正执行」：流聚合完成（tool_call）≠ 执行开始，
    *  执行阶段（往往最耗时）据此把卡片里对应工具行拨回"执行中"，
    *  修复后台子智能体执行期间卡片零更新的断连观感（2026-09-12）。 */
@@ -29,6 +31,41 @@ export interface ContextStats {
   max_label: string
 }
 
+/** token 消耗统计（后端 usage 节点统一结构，四字段；占比由前端计算） */
+export interface UsageStats {
+  prompt_tokens: number
+  completion_tokens: number
+  /** 缓存命中 token（OpenAI prompt_tokens_details.cached_tokens / DeepSeek prompt_cache_hit_tokens 归一） */
+  cached_tokens: number
+  total_tokens: number
+  /** 累计轮数（仅会话级 usage_totals 携带） */
+  turns?: number
+}
+
+/** 轮级模型快照：本轮实际使用的模型与参数（jsonl 轮末 assistant 行 model_info
+ *  节点 / usage_stats 事件 model 字段）。窗口即本轮统计所用口径；老轮次缺省不显示。 */
+export interface TurnModelInfo {
+  /** llmconfig.json 模型条目 id（如 "m_xxx"；未绑定模型时为空串） */
+  model_id: string
+  /** 展示名（模型 display_name；未绑定时为 env 模型名） */
+  model_name: string
+  /** 本轮生效的上下文窗口（token 数；未知为 0） */
+  max_context: number
+  /** 窗口缩写标签（如 "128K" / "1M"） */
+  max_context_label: string
+  /** 思考强度档位（low/high/very_high；空 = 未启用/未知） */
+  reasoning_effort: string
+}
+
+/** usage_stats 事件载荷：turn（本轮，主 + 子智能体）+ session（会话累计）两级汇总
+ *  + model（本轮模型快照）。turn 缺省 = 后台子智能体迟到完成的 session 级补发
+ *  （只刷新圆圈 tooltip，不动消息 footer）。 */
+export interface UsageStatsEventUsage {
+  turn?: UsageStats
+  session: UsageStats
+  model?: TurnModelInfo
+}
+
 export interface AgentEvent {
   type: StreamEventType
   /** 事件所属会话 id（短随机串 / 存量编号字符串）；多会话并发时据此路由到对应消息缓冲 */
@@ -41,7 +78,9 @@ export interface AgentEvent {
   tool_name?: string
   args?: string
   finish_reason?: string
-  usage?: Record<string, number>
+  /** usage_stats 事件：{turn?, session} 两级汇总（见 UsageStatsEventUsage）；
+   *  其余事件（turn_end 遗留）为扁平 usage dict（前端不再消费） */
+  usage?: UsageStatsEventUsage | Record<string, number>
   /** 子智能体来源标识：非空表示该事件由某次子智能体任务发出（前端折叠到子智能体块下） */
   subagent_id?: string
 }
@@ -63,7 +102,7 @@ export type UiEvent =
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { session_id: string; message_count: number } }
   | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
-  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
+  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   | { kind: 'llm_config'; payload: LlmConfigResult }
@@ -99,6 +138,10 @@ export interface HistoryMessage {
   toolCalls?: HistoryToolCall[]
   /** 本 assistant 消息下调用过的子智能体执行块（后端由 role=subagent 行挂载，回放展示用） */
   subagents?: HistorySubAgent[]
+  /** 本轮 token 消耗（轮末 assistant 行携带；老会话/无消耗轮缺省） */
+  usage?: UsageStats
+  /** 本轮模型快照（轮末 assistant 行 model_info 节点；老轮次缺省不显示） */
+  model_info?: TurnModelInfo
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -323,6 +366,7 @@ export function isKnownAgentEvent(ev: AgentEvent): boolean {
     'turn_end',
     'sub_agent_start',
     'sub_agent_end',
+    'usage_stats',
     'tool_exec_start',
     'tool_exec_end'
   ].includes(ev.type)

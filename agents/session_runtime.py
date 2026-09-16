@@ -27,7 +27,8 @@ from typing import Awaitable, Callable, Dict, Optional
 
 from agent_full_v2 import Agent
 from llm_config import (
-    ENV_LLM_LOCK, apply_model_to_env, restore_llm_env, snapshot_llm_env,
+    ENV_LLM_LOCK, apply_model_to_env, resolve_model_window, restore_llm_env,
+    snapshot_llm_env,
 )
 from logger import get_logger
 from paths import CHAT_HISTORY_DIR
@@ -339,6 +340,19 @@ class SessionRuntime:
             log.info("session_%s bg watch cancelled", self.sid)
             raise  # 新 turn 已开始，状态由 start_turn 接管
 
+    def _resolve_turn_context(self, max_context: str | None) -> str | None:
+        """本轮统计/压缩窗口：显式覆盖优先；缺省回落所选模型的标准窗口。
+
+        后端兜底（修 1M 统计 bug）：此前 None 会回落全局 env MAX_CONTEXT_TOKENS
+        （如 1M），与所选模型真实窗口（如 128k）不符。模型元数据也缺失时
+        才维持 None（走全局默认）。
+        """
+        if max_context:
+            return max_context
+        if self._bound_model:
+            return resolve_model_window(self._bound_model, extended=False)
+        return None
+
     def _run_followup_worker(self) -> None:
         """后台完成后的自动续轮 worker（非用户输入，复用会话模型与参数覆盖）。"""
         agent = self.build_agent()
@@ -346,9 +360,12 @@ class SessionRuntime:
         agent.set_request_overrides(
             reasoning_effort=reasoning_effort, max_context=max_context
         )
+        agent.set_turn_model_snapshot(self._bound_model)
+        # 会话级上下文覆盖同步到压缩器阈值（缺省回落模型标准窗口）
         try:
             if agent.session_manager is not None:
-                agent.session_manager.set_max_context(max_context)
+                agent.session_manager.set_max_context(
+                    self._resolve_turn_context(max_context))
         except Exception:
             pass
         agent.run_background_followup()
@@ -359,10 +376,13 @@ class SessionRuntime:
         agent.set_request_overrides(
             reasoning_effort=reasoning_effort, max_context=max_context
         )
-        # 会话级上下文覆盖同步到压缩器阈值（None 恢复全局默认）
+        agent.set_turn_model_snapshot(self._bound_model)
+        # 会话级上下文覆盖同步到压缩器阈值：显式覆盖优先，缺省回落所选模型的
+        # 标准窗口（不再让 None 回落全局 env，避免统计/压缩用错窗口）
         try:
             if agent.session_manager is not None:
-                agent.session_manager.set_max_context(max_context)
+                agent.session_manager.set_max_context(
+                    self._resolve_turn_context(max_context))
         except Exception:
             pass
         agent.run_turn(text)

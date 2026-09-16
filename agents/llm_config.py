@@ -687,3 +687,38 @@ def apply_model_to_env(model_id: str | None) -> bool:
     }
     apply_to_env(ephemeral)
     return True
+
+
+def get_model_by_id(model_id: str | None) -> dict | None:
+    """按 id 查归一化模型条目（llmconfig.json v2）。
+
+    id 为空（会话绑定的是全局 active 模型，会话元数据 model_id 为 None）时
+    回落全局 active 模型条目；模型未配置/找不到返回 None。
+    供轮级 model_info 快照、会话上下文窗口解析等按 id 反查模型元数据
+    （display_name / max_context / default_thinking 等）的场景使用。
+    """
+    data = _load_normalized()
+    if not model_id:
+        model_id = data.get("active_model_id")
+    if not model_id:
+        return None
+    for m in data.get("models") or []:
+        if m.get("id") == model_id:
+            return m
+    return None
+
+
+def resolve_model_window(model_id: str | None, extended: bool = False) -> str | None:
+    """按模型元数据解析上下文窗口字符串（如 "128k" / "1M"）。
+
+    extended=True 且模型声明了扩展窗口时取扩展值，否则取标准窗口；
+    模型未配置/无窗口声明返回 None（调用方回落全局默认）。
+    统计与压缩阈值以「所选模型的真实窗口」为准，避免全局 env
+    MAX_CONTEXT_TOKENS 与模型实际窗口不符导致的误统计。
+    """
+    m = get_model_by_id(model_id)
+    if not m:
+        return None
+    if extended:
+        return str(m.get("max_context_extended") or "").strip() or None
+    return str(m.get("max_context") or "").strip() or None

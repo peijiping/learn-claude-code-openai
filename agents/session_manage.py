@@ -38,6 +38,9 @@ log = get_logger("session")
 BASE62_CHARS = string.ascii_letters + string.digits
 SESSION_ID_LEN = 10
 
+# token 消耗统计的四字段（与 LLM usage 投影结构一致，会话级累计/轮级明细共用）
+USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "cached_tokens", "total_tokens")
+
 
 def new_session_id() -> str:
     """生成 10 字符 base62 随机短 id；恰好全为数字则重掷。
@@ -102,8 +105,11 @@ class SessionManager:
     def set_max_context(self, max_context: str | None) -> None:
         """设置会话级上下文窗口覆盖（如 "1M" / "128k"）。
 
-        空串/None 时恢复为环境变量/默认值。同步影响 ContextCompact 的
-        压缩阈值与前端展示的上下文上限。
+        空串/None 时恢复默认窗口（DEFAULT_MAX_CONTEXT_TOKENS 兜底）。
+        LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+        （SessionRuntime 每轮把解析结果传入），不再读全局 env
+        MAX_CONTEXT_TOKENS（历史 bug：该值与所选模型真实窗口不符导致统计误用 1M）。
+        同步影响 ContextCompact 的压缩阈值与前端展示的上下文上限。
         """
         if max_context and str(max_context).strip():
             parsed = self.compact_manager.parse_max_context_tokens(
@@ -111,18 +117,28 @@ class SessionManager:
             )
             self.compact_manager.max_context_tokens = parsed
         else:
-            self.compact_manager.max_context_tokens = self.compact_manager.parse_max_context_tokens(
-                os.environ.get("MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT_TOKENS
-            )
+            self.compact_manager.max_context_tokens = DEFAULT_MAX_CONTEXT_TOKENS
 
-    def context_stats_dict(self, messages: list) -> dict:
-        """计算当前消息的上下文统计 dict（供前端 context_stats 事件）。"""
-        s = self.compact_manager.context_stats(messages)
+    def context_stats_dict(self, messages: list, max_context: str | None = None) -> dict:
+        """计算当前消息的上下文统计 dict（供前端 context_stats 事件）。
+
+        max_context 传入时按该窗口计算（如切会话时按会话元数据解析出的
+        所选模型窗口），**不改共享压缩器状态**——并发会话/多次切换互不污染；
+        缺省沿用 compact_manager 当前窗口。
+        """
+        cm = self.compact_manager
+        if max_context and str(max_context).strip():
+            window = cm.parse_max_context_tokens(
+                str(max_context).strip(), cm.max_context_tokens)
+        else:
+            window = cm.max_context_tokens
+        used = cm.estimate_tokens(messages)
+        used_percent = min(100.0, (used / window) * 100) if window else 0.0
         return {
-            "used_tokens": s.used_tokens,
-            "max_tokens": s.max_tokens,
-            "used_percent": round(s.used_percent, 1),
-            "max_label": s.max_label,
+            "used_tokens": used,
+            "max_tokens": window,
+            "used_percent": round(used_percent, 1),
+            "max_label": cm.format_token_count(window),
         }
     def get_latest_session(self) -> tuple[Optional[str], Optional[Path]]:
         """
@@ -279,12 +295,17 @@ class SessionManager:
             elif msg_role == "user":
                 normalized.append({"role": "user", "content": content})
             elif msg_role == "assistant":
-                normalized.append({
+                norm = {
                     "role": "assistant",
                     "content": content,
                     "reasoning_content": msg_data.get("reasoning_content", ""),
                     "tool_calls": msg_data.get("tool_calls", []),
-                })
+                }
+                # usage 为 UI 展示元数据（轮级 token 消耗），不进模型上下文
+                #（Agent 侧发送 LLM 前会做白名单投影剔除）
+                if msg_data.get("usage"):
+                    norm["usage"] = msg_data["usage"]
+                normalized.append(norm)
             elif msg_role == "tool":
                 normalized.append({
                     "role": "tool",
@@ -524,12 +545,16 @@ class SessionManager:
         elif role == "user":
             return {"role": "user", "content": message.get("content", "")}
         elif role == "assistant":
-            return {
+            row = {
                 "role": "assistant",
                 "content": message.get("content", ""),
                 "reasoning_content": message.get("reasoning_content", ""),
                 "tool_calls": message.get("tool_calls", []),
             }
+            # 轮级 token 消耗（UI 展示元数据），存在才写入
+            if message.get("usage"):
+                row["usage"] = message["usage"]
+            return row
         elif role == "tool":
             return {
                 "role": "tool",
@@ -575,6 +600,63 @@ class SessionManager:
             self._touch_updated_at(session_file)
         except Exception as e:
             log.error("写入会话历史失败: %s", e)
+
+    def append_usage_to_last_assistant(self, session_file: Path, usage: dict,
+                                       model_info: dict | None = None) -> bool:
+        """把轮级 token 消耗 + 模型快照写进会话文件**最后一条 assistant 行**（就地重写最后一行）。
+
+        turn 收尾时调用：末条 assistant 消息行落盘在前（append_message_to_session），
+        而整轮 usage 汇总（主循环全部调用 + 同步子智能体）要等 turn 结束才能确定，
+        故用「读尾块定位最后一行 → truncate 行首 → 重写该行」补写 usage 字段；
+        model_info（本轮使用的模型与参数快照）与之同一次重写补进 model_info 节点，
+        与 usage 平级——两者概念独立（配置 vs 消耗），且都被 _model_messages
+        白名单投影挡在 LLM 上下文之外。末行不是 assistant（停止/异常收尾在
+        tool/user 行截断）时跳过返回 False。
+
+        持 _append_lock 与 append 互斥；调用方需同步内存态（history_messages[-1]）。
+        """
+        if not usage or not session_file.exists():
+            return False
+        try:
+            with self._append_lock:
+                # 从文件尾部反向找最后一个完整行（块读避免整文件加载）
+                with open(session_file, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    remaining, block = size, 4096
+                    tail = b""
+                    while remaining > 0:
+                        read_len = min(block, remaining)
+                        remaining -= read_len
+                        f.seek(remaining)
+                        chunk = f.read(read_len)
+                        tail = chunk + tail
+                        if b"\n" in chunk:
+                            break
+                lines = tail.rstrip(b"\n").split(b"\n") if tail.strip() else []
+                if not lines:
+                    return False
+                last = lines[-1]
+                try:
+                    obj = json.loads(last)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return False
+                if not isinstance(obj, dict) or obj.get("role") != "assistant":
+                    return False
+                obj["usage"] = usage
+                if model_info:
+                    obj["model_info"] = model_info
+                new_line = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+                # 行首偏移 = 文件大小 - 末行字节长度 - 1（行尾换行符）
+                line_start = size - len(last) - 1
+                with open(session_file, "r+b") as f:
+                    f.truncate(line_start)
+                    f.seek(line_start)
+                    f.write(new_line)
+            return True
+        except OSError as e:
+            log.error("写入轮级 usage 失败: %s", e)
+            return False
 
     def append_subagent_to_session(self, session_file: Path, transcript: dict) -> None:
         """
@@ -1151,6 +1233,29 @@ class SessionManager:
                 e["overrides"] = overrides
         return self._update_entry(session_id, mutate)
 
+    def add_usage_totals(self, session_id: str, delta: dict,
+                         count_turn: bool = True) -> None:
+        """把一轮 token 消耗增量累进会话元数据 usage_totals（O(1) 原子写）。
+
+        delta 为轮级 usage dict（USAGE_FIELDS 四字段）；count_turn=False 用于
+        后台子智能体迟到完成的补记（只加量不计数，turns 已在该轮收尾时 +1）。
+        """
+        if not delta:
+            return
+
+        def mutate(e):
+            totals = e.get("usage_totals") or {}
+            for k in USAGE_FIELDS:
+                totals[k] = int(totals.get(k) or 0) + int(delta.get(k) or 0)
+            if count_turn:
+                totals["turns"] = int(totals.get("turns") or 0) + 1
+            e["usage_totals"] = totals
+
+        try:
+            self._update_entry(session_id, mutate)
+        except FileNotFoundError:
+            pass  # 会话文件已不存在（如被并发删除），统计丢失可接受
+
     def trash_session(self, session_id: str) -> dict:
         """软删除：标记 status=trashed，jsonl/todo 原样保留。"""
         return self._update_entry(
@@ -1277,6 +1382,14 @@ class SessionManager:
             self.subagent_rows.pop(session_file, None)
             if self.subagent_store is not None:
                 self.subagent_store.clear(session_file)
+
+            # token 累计统计随会话内容同生共死：元数据 usage_totals 一并清零
+            sid = self._sid_from_stem(session_file.stem)
+            if sid:
+                try:
+                    self._update_entry(sid, lambda e: e.pop("usage_totals", None))
+                except FileNotFoundError:
+                    pass
 
             return max(0, deleted_count - 1)  # 减去保留的系统提示词
         except Exception as e:

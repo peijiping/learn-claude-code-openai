@@ -26,6 +26,7 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
   const setSessionOverrides = useAgentStore((s) => s.setSessionOverrides)
   const sessionModelId = useAgentStore((s) => s.sessionModelId)
   const currentContextStats = useAgentStore((s) => s.currentContextStats)
+  const sessionUsageBySession = useAgentStore((s) => s.sessionUsageBySession)
   const overridesByModel = useAgentStore((s) => s.overridesByModel)
   const activeSession = useAgentStore((s) => s.activeSession)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -85,6 +86,15 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
   const hasSession = activeSession !== null
   const usedPct = stats ? stats.used_percent : 0
   const indicatorColor = usedPct >= 90 ? '#e5484d' : usedPct >= 70 ? '#f5a623' : '#2ea043'
+  // 本会话 token 消耗累计（usage_stats 事件 / 切会话 usage_totals 恢复）：tooltip 后三行数据源
+  const sesUsage = activeSession !== null ? sessionUsageBySession[activeSession] ?? null : null
+  const sesHasData = !!sesUsage && sesUsage.total_tokens > 0
+  const ctxMultiple =
+    sesUsage && stats && stats.max_tokens > 0 ? (sesUsage.total_tokens / stats.max_tokens).toFixed(2) : null
+  const sesCachePct =
+    sesUsage && sesUsage.cached_tokens && sesUsage.prompt_tokens
+      ? `${Math.round((sesUsage.cached_tokens / sesUsage.prompt_tokens) * 100)}%`
+      : '—'
 
   return (
     <div className="composer">
@@ -222,7 +232,21 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
               </svg>
               {ctxTooltip && (
                 <div className="context-tooltip">
-                  已用 {stats.used_tokens.toLocaleString()} / 总计 {stats.max_label} tokens（{Math.round(usedPct)}%）
+                  <div>
+                    上下文：已用 {stats.used_tokens.toLocaleString()} / 总计 {stats.max_label} tokens（{Math.round(usedPct)}%）
+                  </div>
+                  {sesHasData && sesUsage && (
+                    <>
+                      <div>
+                        本会话累计输入：{sesUsage.prompt_tokens.toLocaleString()} tokens
+                        {ctxMultiple ? `（约为上下文窗口的 ${ctxMultiple} 倍）` : ''}
+                      </div>
+                      <div>
+                        缓存命中：{sesUsage.cached_tokens.toLocaleString()} tokens（命中率 {sesCachePct}）
+                      </div>
+                      <div>输出：{sesUsage.completion_tokens.toLocaleString()} tokens</div>
+                    </>
+                  )}
                 </div>
               )}
             </div>

@@ -170,6 +170,7 @@ class SubagentStore:
             "text": transcript.get("text", ""),
             "toolCalls": transcript.get("toolCalls", []),
             "error": error,
+            "usage": transcript.get("usage") or {},  # 本任务的 token 消耗（排障/回放可见）
         })
 
     # ── 读取 ───────────────────────────────────────────────────

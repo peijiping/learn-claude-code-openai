@@ -209,6 +209,10 @@ class SubAgent:
         # transcript 名称取任务 prompt 前 80 字，便于回放时辨认
         name = (prompt[:80] + "…") if len(prompt) > 80 else (prompt or "子智能体")
 
+        # 本次子任务的 LLM token 消耗累计（多次迭代调用求和，回传主智能体记账）
+        sub_usage = {"prompt_tokens": 0, "completion_tokens": 0,
+                     "cached_tokens": 0, "total_tokens": 0}
+
         def _finish(summary: str, err: str = "") -> tuple[str, dict]:
             """收束为 (回传主智能体的摘要, transcript)：统一补齐状态/正文/耗时。"""
             return summary, self._build_transcript(
@@ -219,6 +223,7 @@ class SubAgent:
                 tool_call_id=tool_call_id,
                 started_at=_started_at,
                 duration_ms=int((time.monotonic() - _t0) * 1000),
+                usage=sub_usage,
             )
 
         sub_msg = None
@@ -230,7 +235,7 @@ class SubAgent:
                     # 第二个值必须叫 finish_reason —— 早期误写成 `_finish`，把上面
                     # 定义的 _finish() 闭包覆盖成了字符串，导致后续 `_finish(...)`
                     # 抛 "TypeError: 'str' object is not callable"（子智能体跑完即崩）。
-                    sub_msg, finish_reason, _usage = streamed_create(
+                    sub_msg, finish_reason, sub_llm_usage = streamed_create(
                         self.sub_llm_client,
                         sinks=sub_sinks,
                         model=self.model,
@@ -241,6 +246,9 @@ class SubAgent:
                         reasoning_effort="high", #思考强度，DeepSeek只有 high、max 两个选项
                         extra_body={"thinking":{"type":"enabled"}} #思考模式开关，值范围 disabled、enabled，默认 enabled
                     )
+                    # 子任务 token 消耗累计（含缓存命中），随 transcript 回传主智能体
+                    for k in sub_usage:
+                        sub_usage[k] += int(sub_llm_usage.get(k, 0) or 0)
                 except Exception as e:
                     error_msg = f"子智能体 API 调用失败 (第 {iteration + 1} 轮): {type(e).__name__}: {e}"
                     print(f"  [subagent] {error_msg}")
@@ -330,7 +338,8 @@ class SubAgent:
     def _build_transcript(self, subagent_id: str, name: str, events: list,
                           error: str = "", text: str = "", prompt: str = "",
                           tool_call_id: str = "", started_at: str = "",
-                          duration_ms: int | None = None) -> dict:
+                          duration_ms: int | None = None,
+                          usage: dict | None = None) -> dict:
         """把旁路收集的子智能体事件聚合为可持久化的 transcript（旁路记录一条）。
 
         字段与 `subagent_store` 的记录结构、前端 SubAgentMsg 的可视字段一致。
@@ -394,4 +403,5 @@ class SubAgent:
             "error": error,
             "started_at": started_at,
             "duration_ms": duration_ms,
+            "usage": usage or {},
         }

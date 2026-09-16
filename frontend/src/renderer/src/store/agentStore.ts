@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, UiEvent, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ContextStats, HistoryMessage, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -23,36 +23,37 @@ export function sessionDisplayName(s: SessionMeta): string {
 
 /** 把会话级覆盖（思考档位 + 标准/扩展上下文）解析成后端 chat payload 的 overrides。
  * maxContextOption 的 standard/extended 需结合模型元数据换算成具体窗口字符串。
- * 覆盖参数按模型 id 保存在 overridesByModel map 里，取绑定模型（modelId 缺省回落
- * 全局 active_model_id）对应条目；新建任务（无会话号）同样携带：用户可在空态/新会话
- * 预设对话参数，随首条消息下发生效。 */
+ * 上下文窗口只要模型元数据可查就**始终显式携带**（未选择 = 标准窗口）：
+ * 历史 bug——未选择时不上送 max_context，后端 set_max_context(None) 回落全局
+ * env（如 MAX_CONTEXT_TOKENS=1M），统计/压缩阈值与所选模型真实窗口（如 128k）不符。
+ * 思考档位仍只在用户显式选择时携带；覆盖参数按模型 id 保存在 overridesByModel
+ * map 里，取绑定模型（modelId 缺省回落全局 active_model_id）对应条目；新建任务
+ * （无会话号）同样携带：用户可在空态/新会话预设对话参数，随首条消息下发生效。 */
 export function resolveOverridesPayload(
   llmConfig: LlmConfig | null,
   overridesByModel: SessionOverridesMap | null,
   modelId?: string | null
 ): { thinking_strength?: string; max_context?: string } | undefined {
-  if (!overridesByModel) return undefined
   const modelOf = modelId || llmConfig?.active_model_id
-  const overrides = (modelOf && overridesByModel[modelOf]) || undefined
-  if (!overrides) return undefined
+  const overrides = (modelOf && overridesByModel?.[modelOf]) || undefined
   const payload: { thinking_strength?: string; max_context?: string } = {}
   let hasOverride = false
-  if (overrides.thinkingStrength) {
+  if (overrides?.thinkingStrength) {
     hasOverride = true
     payload.thinking_strength = overrides.thinkingStrength
   }
-  if (overrides.maxContextOption) {
-    // 依据该模型元数据（max_context / max_context_extended）换算窗口字符串
-    const activeModel = (llmConfig?.models ?? []).find((m) => m.id === modelOf)
-    const meta = resolveModelMeta(llmConfig, activeModel)
-    if (meta) {
-      const window = overrides.maxContextOption === 'extended'
-        ? meta.max_context_extended
-        : meta.max_context
-      if (window) {
-        hasOverride = true
-        payload.max_context = window
-      }
+  // 依据该模型元数据（max_context / max_context_extended）换算窗口字符串；
+  // 元数据缺失（无窗口声明的模型）才不携带，后端走全局默认
+  const activeModel = modelOf ? (llmConfig?.models ?? []).find((m) => m.id === modelOf) : undefined
+  const meta = resolveModelMeta(llmConfig, activeModel)
+  if (meta) {
+    const option = overrides?.maxContextOption ?? 'standard'
+    const window = option === 'extended'
+      ? meta.max_context_extended
+      : meta.max_context
+    if (window) {
+      hasOverride = true
+      payload.max_context = window
     }
   }
   return hasOverride ? payload : undefined
@@ -144,6 +145,15 @@ export interface SubAgentMsg {
   error?: string
 }
 
+/** 消息 footer 的 token 统计：turn=本轮消耗（主 + 子智能体），
+ *  session=turn 收尾时的会话级累计快照（实时事件携带；回放仅恢复 turn，缺省不显示第二段），
+ *  model=本轮模型快照（usage_stats 事件 model 字段 / 回放 jsonl model_info 节点） */
+export interface MessageUsage {
+  turn: UsageStats
+  session?: UsageStats
+  model?: TurnModelInfo
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant'
@@ -159,7 +169,7 @@ export interface Message {
   subAgentToolIds?: string[]
   activeToolId: string | null
   streaming: boolean
-  usage: Record<string, number>
+  usage: MessageUsage | null
 }
 
 interface AgentState {
@@ -188,6 +198,9 @@ interface AgentState {
   llmSaving: boolean
   /** 当前激活会话的上下文统计（每轮 turn_end / 切会话时后端下发） */
   currentContextStats: ContextStats | null
+  /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
+   *  圆圈 tooltip 数据源，按会话 id 键控，多会话互不覆盖） */
+  sessionUsageBySession: Record<string, UsageStats>
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -290,7 +303,11 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       activeToolId: null,
       streaming: false,
       subagents,
-      usage: {}
+      // 回放：jsonl 轮末 assistant 行携带的 usage / model_info → footer 第一段
+      // （本轮 + 本轮模型）；会话级快照不落盘，第二段（本会话累计）仅实时事件携带
+      usage: m.usage && m.usage.total_tokens
+        ? { turn: m.usage, model: m.model_info ?? undefined }
+        : null
     }
   })
 }
@@ -337,7 +354,7 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null }
     ]
     return id
   }
@@ -407,9 +424,11 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
       }))
       break
     case 'turn_end':
+      // usage 不在此写：轮级/会话级统计由随后的 usage_stats 事件统一携带
+      //（避免显示"最后一次 LLM 调用"的错误数字）
       msgs = msgs.map((m) =>
         m.role === 'assistant' && m.streaming
-          ? { ...m, streaming: false, usage: ev.usage ?? {}, activeToolId: null, thinkingActive: false }
+          ? { ...m, streaming: false, activeToolId: null, thinkingActive: false }
           : m
       )
       break
@@ -447,7 +466,7 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null }
     ]
     return id
   }
@@ -625,6 +644,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   llmConfig: null,
   llmSaving: false,
   currentContextStats: null,
+  sessionUsageBySession: {},
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
@@ -652,10 +672,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const modelId = get().sessionModelId
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
     const userMsg: Message = {
-      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: {}
+      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null
     }
     const assMsg: Message = {
-      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {}
+      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null
     }
     set((s) => {
       // 新建任务（尚无会话 id）：首条消息进临时草稿缓冲，等后端 session 信封迁移
@@ -707,9 +727,30 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       if (typeof sid !== 'string' || !sid) return
       set((s) => {
         const next = applyAgentEventBuffer(s.messagesBySession[sid] ?? [], aev)
-        const messagesBySession = { ...s.messagesBySession, [sid]: next }
-        const messages = s.activeSession === sid ? next : s.messages
-        return { ...s, messagesBySession, messages }
+        let messagesBySession = { ...s.messagesBySession, [sid]: next }
+        let messages = s.activeSession === sid ? next : s.messages
+        // token 消耗统计：session 级写入圆圈 tooltip 数据源；带 turn 时同步写入
+        // 该会话末条 assistant 消息 footer（{turn, session} 快照，回放同构）。
+        // turn 缺省 = 后台子智能体迟到完成的补发（只刷 tooltip，不动 footer）。
+        let sessionUsageBySession = s.sessionUsageBySession
+        if (aev.type === 'usage_stats') {
+          const u = aev.usage as UsageStatsEventUsage | undefined
+          if (u && u.session && u.session.total_tokens !== undefined) {
+            sessionUsageBySession = { ...sessionUsageBySession, [sid]: u.session }
+            if (u.turn && u.turn.total_tokens) {
+              const buf = messagesBySession[sid] ?? []
+              for (let i = buf.length - 1; i >= 0; i--) {
+                if (buf[i].role !== 'assistant') continue
+                const patched = [...buf]
+                patched[i] = { ...patched[i], usage: { turn: u.turn, session: u.session, model: u.model } }
+                messagesBySession = { ...messagesBySession, [sid]: patched }
+                messages = s.activeSession === sid ? patched : s.messages
+                break
+              }
+            }
+          }
+        }
+        return { ...s, messagesBySession, messages, sessionUsageBySession }
       })
       return
     }
@@ -797,11 +838,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } | null
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null }
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
           const buf = s.messagesBySession[p.session_id] ?? []
@@ -812,15 +853,24 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           const histBuf = historyToMessage(p.session_id, p.messages)
           const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
           const messages = s.activeSession === p.session_id ? histBuf : s.messages
+          // 会话级累计从元数据恢复（null=老会话无统计，清除避免残留旧值）
+          let sessionUsageBySession = s.sessionUsageBySession
+          if (p.usage_totals) {
+            sessionUsageBySession = { ...sessionUsageBySession, [p.session_id]: p.usage_totals }
+          } else {
+            const { [p.session_id]: _drop, ...rest } = sessionUsageBySession
+            sessionUsageBySession = rest
+          }
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
           if (s.activeSession !== p.session_id) {
-            return { ...s, messagesBySession, messages }
+            return { ...s, messagesBySession, messages, sessionUsageBySession }
           }
           return {
             ...s,
             messagesBySession,
             messages,
+            sessionUsageBySession,
             sessionModelId: p.model_id || s.sessionModelId,
             overridesByModel,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
@@ -916,7 +966,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     set((s) => {
       const messagesBySession = { ...s.messagesBySession }
       delete messagesBySession[sid]
-      return { ...s, messagesBySession, messages: [], activeSession: sid }
+      // 清空会话同步清掉 token 统计（后端 meta 的 usage_totals 已一并清除）
+      const { [sid]: _drop, ...sessionUsageBySession } = s.sessionUsageBySession
+      return { ...s, messagesBySession, messages: [], activeSession: sid, sessionUsageBySession }
     })
     get().refreshSessions()
   },
