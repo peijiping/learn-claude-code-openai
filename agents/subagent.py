@@ -22,16 +22,16 @@ from streaming_client import CallbackSink, FilterSink, StreamEvent, streamed_cre
 # 对照后端工具执行打点与前端卡片更新时间即可定位断连窗口。
 log = get_logger("subagent")
 
-class SubAgent:
-    """
-    通用型子智能体。
 
-    每次 run() 调用都会在隔离的消息上下文里独立循环，只把最终摘要回传给
-    调用方。默认拥有全部工具权限，通过 system_prompt 引导行为，
-    也可通过 allowed_tools 在单次调用时收窄工具集。
-    """
+def build_default_system_prompt(workdir=None) -> str:
+    """子智能体默认系统提示（工作目录随所属工作空间变化）。
 
-    DEFAULT_SYSTEM_PROMPT = f"""你是一个通用型子智能体，工作目录是 {WORKDIR}。
+    曾是类级 f-string 常量 → 导入期就把 WORKDIR 烤死了，多工作空间下所有子智能体
+    都会自称"工作目录是 default 的沙盒"，与它真正操作的空间不符（子智能体的
+    文件工具用的是注入的 tool_registry.workdir）。改为按实例构造。
+    """
+    wd = workdir if workdir is not None else WORKDIR
+    return f"""你是一个通用型子智能体，工作目录是 {wd}。
         ## 核心规则
         1. **任务导向**：严格按照任务描述完成指定工作，不要发散
         2. **输出控制**：每次工具调用都要限制输出量。读取文件时使用 limit 参数，bash 命令用 | head 限制行数
@@ -52,6 +52,22 @@ class SubAgent:
         ### 注意
         [需要注意的问题或后续工作]"""
 
+
+# 兼容：模块级常量保留（= default 沙箱根口径），实例请用 self.DEFAULT_SYSTEM_PROMPT
+DEFAULT_SYSTEM_PROMPT = build_default_system_prompt()
+
+
+class SubAgent:
+    """
+    通用型子智能体。
+
+    每次 run() 调用都会在隔离的消息上下文里独立循环，只把最终摘要回传给
+    调用方。默认拥有全部工具权限，通过 system_prompt 引导行为，
+    也可通过 allowed_tools 在单次调用时收窄工具集。
+    """
+
+    DEFAULT_SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+
     MAX_ITERATIONS = 100
 
     def __init__(self, base_tools: list, tool_handlers: dict, hook_system: HookSystem | None = None, tool_registry=None, sinks=None):
@@ -71,6 +87,12 @@ class SubAgent:
         self.hook_system = hook_system
         self.sub_llm_client = LLMClient().llm
         self.model = os.environ.get("OPENAI_MODEL_ID", "")
+        # 默认系统提示按本实例的工作根构造（= 注入的 ToolRegistry 的 workdir）。
+        # 仍作为**实例属性**暴露：既有 `self.DEFAULT_SYSTEM_PROMPT` 引用无需改动。
+        registry_workdir = getattr(tool_registry, "workdir", None) if tool_registry else None
+        self.DEFAULT_SYSTEM_PROMPT = build_default_system_prompt(
+            registry_workdir or getattr(hook_system, "workdir", None)
+        )
 
     def set_llm(self, llm_client, model: str) -> None:
         """配置热切换：就地重建子智能体的 LLM 绑定（无需重建实例）。"""

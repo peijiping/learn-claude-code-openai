@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, nativeImage } from 'electron'
+import { app, shell, BrowserWindow, dialog, ipcMain, nativeImage } from 'electron'
 import { join } from 'path'
 import { PythonManager, PythonStatus } from './pythonManager'
 import { AgentWS, ConnStatus } from './agentWS'
@@ -110,15 +110,18 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null }) => {
+  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null }) => {
     if (!isTrustedSender(e) || !payload?.text) return
     // session_id 缺省/null = 新建任务（后端惰性生成短 id 建会话）；否则定位到目标会话
     const sessionId = typeof payload.session_id === 'string' && payload.session_id ? payload.session_id : undefined
+    // project_id：新建任务的归属工作空间（已有会话由后端按 session_id 解析归属）
+    const projectId = typeof payload.project_id === 'string' && payload.project_id ? payload.project_id : undefined
     ws.send(JSON.stringify({
       kind: 'chat',
       payload: {
         text: payload.text,
         ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+        ...(projectId !== undefined ? { project_id: projectId } : {}),
         ...(payload.overrides ? { overrides: payload.overrides } : {}),
         ...(payload.model_id ? { model_id: payload.model_id } : {})
       }
@@ -160,6 +163,56 @@ function createWindow(): void {
 
   ipcMain.handle('agent:listSessions', (e) =>
     isTrustedSender(e) ? request('sessions_list') : null
+  )
+
+  // ── 工作空间（多项目）──────────────────────────────────────────────
+  // 目录选择与"在 Finder 中打开"属于**宿主能力**（原生对话框 / 文件管理器），
+  // 只能由主进程提供：渲染层拿到路径后再发 project_add 给后端登记。
+  ipcMain.handle('agent:pickFolder', async (e) => {
+    if (!isTrustedSender(e) || !mainWindow) return null
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择工作空间目录',
+      // createDirectory：macOS 上允许在对话框里新建文件夹（选到的新目录也能直接用）
+      properties: ['openDirectory', 'createDirectory'],
+      buttonLabel: '选择'
+    })
+    if (r.canceled || !r.filePaths.length) return null
+    return r.filePaths[0]
+  })
+
+  ipcMain.handle('agent:openInFinder', async (e, payload: { path?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) {
+      return { ok: false, error: '空路径' }
+    }
+    // openPath 在系统文件管理器中定位；失败返回非空错误串（不抛异常）
+    const err = await shell.openPath(payload.path)
+    return err ? { ok: false, error: err } : { ok: true }
+  })
+
+  ipcMain.handle('agent:listProjects', (e) =>
+    isTrustedSender(e) ? request('projects_list', 'projects') : null
+  )
+  ipcMain.handle('agent:addProject', (e, payload: { path?: string }) =>
+    isTrustedSender(e) && typeof payload?.path === 'string' && payload.path
+      ? request('project_add', 'projects', { path: payload.path })
+      : null
+  )
+  ipcMain.handle('agent:openProject', (e, payload: { project_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.project_id !== 'string' || !payload.project_id) return
+    ws.send(JSON.stringify({ kind: 'project_open', payload: { project_id: payload.project_id } }))
+  })
+  ipcMain.handle('agent:renameProject', (e, payload: { project_id?: string; name?: string }) =>
+    isTrustedSender(e) && typeof payload?.project_id === 'string' && payload.project_id
+      ? request('project_rename', 'projects', {
+          project_id: payload.project_id,
+          name: payload.name ?? ''
+        })
+      : null
+  )
+  ipcMain.handle('agent:removeProject', (e, payload: { project_id?: string }) =>
+    isTrustedSender(e) && typeof payload?.project_id === 'string' && payload.project_id
+      ? request('project_remove', 'projects', { project_id: payload.project_id })
+      : null
   )
   // 会话管理：重命名 / 软删除（回收站）/ 还原 / 批量永久删除 / 回收站列表
   ipcMain.handle(

@@ -1,5 +1,5 @@
 export interface AgentApi {
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null) => Promise<void>
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
@@ -12,6 +12,19 @@ export interface AgentApi {
   restoreSession: (sessionId: string) => Promise<unknown>
   deleteSessions: (ids: string[]) => Promise<unknown>
   listTrash: () => Promise<unknown[]>
+  /** 弹原生目录选择框（工作空间新增）；取消返回 null */
+  pickFolder: () => Promise<string | null>
+  /** 在系统文件管理器中定位目录（工作空间右键菜单） */
+  openInFinder: (path: string) => Promise<{ ok: boolean; error?: string }>
+  /** 工作空间列表（主要数据源是 `projects` 广播信封，这里是主动拉取的兜底） */
+  listProjects: () => Promise<unknown>
+  /** 把选定目录登记为工作空间（已登记则复用；后端同时置为活动空间） */
+  addProject: (path: string) => Promise<unknown>
+  /** 切换活动工作空间 */
+  openProject: (projectId: string) => Promise<void>
+  renameProject: (projectId: string, name: string) => Promise<unknown>
+  /** 删除工作空间（只删元数据目录；调用方需先二次确认） */
+  removeProject: (projectId: string) => Promise<unknown>
   goalStatus: () => Promise<string>
   tasks: () => Promise<string>
   skills: () => Promise<string>

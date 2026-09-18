@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '@components/common/Icon'
-import { useAgentStore, resolveModelMeta, providerDot } from '@store/agentStore'
+import { useAgentStore, resolveModelMeta, providerDot, projectDisplayName } from '@store/agentStore'
 
 interface InputBoxProps {
   value: string
@@ -29,8 +29,16 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
   const sessionUsageBySession = useAgentStore((s) => s.sessionUsageBySession)
   const overridesByModel = useAgentStore((s) => s.overridesByModel)
   const activeSession = useAgentStore((s) => s.activeSession)
+  const projects = useAgentStore((s) => s.projects)
+  const activeProject = useAgentStore((s) => s.activeProject)
+  const pendingProjectId = useAgentStore((s) => s.pendingProjectId)
+  const newSession = useAgentStore((s) => s.newSession)
+  const openProject = useAgentStore((s) => s.openProject)
+  const addProjectFromPicker = useAgentStore((s) => s.addProjectFromPicker)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const [modelOpen, setModelOpen] = useState(false)
+  // 工作空间下拉（chip 点开）：上部分 = 已打开过的空间，末尾固定项 = 选择文件夹
+  const [wsOpen, setWsOpen] = useState(false)
   const [hoveredPanel, setHoveredPanel] = useState<{ id: string; x: number; y: number } | null>(null)
   const [ctxTooltip, setCtxTooltip] = useState(false)
   // 面板以 Portal 渲染在 body 顶层，离开菜单项会先触发 onMouseLeave，
@@ -68,6 +76,12 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
     enabled.find((m) => m.id === llmConfig?.active_model_id) ??
     enabled[0] ??
     null
+
+  // 当前工作空间：有会话时 = 该会话所属空间（切会话时 store 已同步 activeProject）；
+  // 空态时 = 「+」/chip 选定的目标空间，缺省跟随后端的活动空间。
+  const currentProjectId =
+    activeSession === null ? (pendingProjectId ?? activeProject) : activeProject
+  const currentProjectPath = projects.find((p) => p.id === currentProjectId)?.path ?? null
 
   const autoGrow = (el: HTMLTextAreaElement): void => {
     el.style.height = 'auto'
@@ -262,8 +276,58 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
         <span className="ctx-chip">
           <Icon name="terminal" size={13} /> 本地 <Icon name="chevronDown" size={11} />
         </span>
-        <span className="ctx-chip">
-          <Icon name="folder" size={13} /> learn-claude-code-… <Icon name="chevronDown" size={11} />
+        <span className="ws-select">
+          <span
+            className={`ctx-chip clickable ${wsOpen ? 'open' : ''}`}
+            title={currentProjectPath ? `工作空间目录：${currentProjectPath}` : '默认工作空间（无真实目录）'}
+            onClick={() => setWsOpen((v) => !v)}
+          >
+            <Icon name="folder" size={13} />
+            <span className="ctx-chip-label">{projectDisplayName(projects, currentProjectId)}</span>
+            <Icon name="chevronDown" size={11} />
+          </span>
+          {/* 工作空间下拉：上部分 = 已打开过的空间（点即切到该空间并新建任务），
+              末尾固定项 = 选择文件夹（登记新工作空间并打开）。 */}
+          {wsOpen && (
+            <>
+              <div className="ws-picker-mask" onClick={() => setWsOpen(false)} />
+              <div className="ws-picker">
+                <div className="ws-picker-group">已打开的工作空间</div>
+                {projects.map((p) => (
+                  <div
+                    key={p.id}
+                    role="menuitem"
+                    className={`ws-picker-item ${p.id === currentProjectId ? 'active' : ''} ${p.exists ? '' : 'missing'}`}
+                    title={p.path ?? '默认工作空间'}
+                    onClick={() => {
+                      setWsOpen(false)
+                      if (p.exists) void openProject(p.id)
+                      void newSession(p.id)
+                    }}
+                  >
+                    <Icon name="folder" size={13} />
+                    <span className="ws-picker-name">{p.name}</span>
+                    {p.id === currentProjectId && <Icon name="check" size={13} />}
+                  </div>
+                ))}
+                {projects.length === 0 && (
+                  <div className="ws-picker-empty">暂无工作空间</div>
+                )}
+                <div className="ws-picker-sep" />
+                <div
+                  role="menuitem"
+                  className="ws-picker-item pick"
+                  onClick={() => {
+                    setWsOpen(false)
+                    void addProjectFromPicker()
+                  }}
+                >
+                  <Icon name="plus" size={13} />
+                  <span className="ws-picker-name">选择文件夹…</span>
+                </div>
+              </div>
+            </>
+          )}
         </span>
       </div>
     </div>

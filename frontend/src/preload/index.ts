@@ -7,9 +7,10 @@ import { contextBridge, ipcRenderer } from 'electron'
 const agent = {
   /** 发起一次对话；sessionId=目标会话 id（新建任务时传 null/缺省，后端惰性生成短 id 建会话）。
    * overrides=当前会话请求级覆盖（思考强度/更大上下文），随本轮请求带上。
-   * modelId=当前会话绑定模型，新建任务随首条消息持久化。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}) }),
+   * modelId=当前会话绑定模型，新建任务随首条消息持久化。
+   * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}) }),
 
   /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
    * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
@@ -39,6 +40,26 @@ const agent = {
   deleteSessions: (ids: string[]): Promise<unknown> =>
     ipcRenderer.invoke('agent:deleteSessions', { ids }),
   listTrash: (): Promise<unknown[]> => ipcRenderer.invoke('agent:listTrash'),
+
+  /** ── 工作空间（多项目）─────────────────────────────────────────────
+   * 目录选择与"在 Finder 中打开"是宿主能力，必须走主进程原生对话框/文件管理器。 */
+  /** 弹原生目录选择框；用户取消返回 null */
+  pickFolder: (): Promise<string | null> => ipcRenderer.invoke('agent:pickFolder'),
+  /** 在系统文件管理器中定位该目录 */
+  openInFinder: (path: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('agent:openInFinder', { path }),
+  /** 工作空间列表（`projects` 信封为主要数据源，这里是主动拉取的兜底） */
+  listProjects: (): Promise<unknown> => ipcRenderer.invoke('agent:listProjects'),
+  /** 把选定目录登记为工作空间（已登记过则复用；后端同时把它设为活动空间） */
+  addProject: (path: string): Promise<unknown> => ipcRenderer.invoke('agent:addProject', { path }),
+  /** 切换活动工作空间（后端持久化，广播 projects） */
+  openProject: (projectId: string): Promise<void> => ipcRenderer.invoke('agent:openProject', { project_id: projectId }),
+  /** 重命名（默认空间后端会拒绝并回 error 信封） */
+  renameProject: (projectId: string, name: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:renameProject', { project_id: projectId, name }),
+  /** 删除工作空间（只删元数据目录，真实目录保留；不可恢复，调用方必须先确认） */
+  removeProject: (projectId: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:removeProject', { project_id: projectId }),
 
   /** 状态类查询 */
   goalStatus: (): Promise<string> => ipcRenderer.invoke('agent:goalStatus'),

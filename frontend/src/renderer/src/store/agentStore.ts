@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, ModelSwitch, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ContextStats, HistoryMessage, ModelSwitch, ProjectMeta, ProjectsPayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -19,6 +19,46 @@ export type SettingsTab = 'general' | 'model' | 'trash' | 'about'
 /** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
   return s.title?.trim() || `session_${s.id}`
+}
+
+/** 默认工作空间 id（后端常量同值；前端用它判"是否默认空间"与兜底分组） */
+export const DEFAULT_PROJECT_ID = 'default'
+
+/** 工作空间显示名：按 id 查名称；查不到（列表未到/已删除）回退 id 本身 */
+export function projectDisplayName(projects: ProjectMeta[], id?: string | null): string {
+  if (!id) return '默认'
+  return projects.find((p) => p.id === id)?.name ?? (id === DEFAULT_PROJECT_ID ? '默认' : id)
+}
+
+/** 会话所属工作空间 id（存量会话缺字段 → default） */
+export function sessionProjectId(s: SessionMeta): string {
+  return s.project || DEFAULT_PROJECT_ID
+}
+
+/** 每个空间默认最多展示的会话条数（超出折叠，末尾给"展开全部"入口） */
+export const SESSION_PREVIEW_LIMIT = 15
+
+/** 展开态持久化（按空间 id 记；缺省 = 展开） */
+const EXPANDED_KEY = 'aigent.workspace.expanded'
+const PREVIEW_KEY = 'aigent.workspace.previewExpanded'
+
+function loadFlagMap(key: string): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, boolean>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveFlagMap(key: string, map: Record<string, boolean>): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(map))
+  } catch {
+    /* 隐私模式等场景忽略：持久化失败不影响本次会话内的展开态 */
+  }
 }
 
 /** 把会话级覆盖（思考档位 + 标准/扩展上下文）解析成后端 chat payload 的 overrides。
@@ -193,6 +233,16 @@ interface AgentState {
   /** 新建任务（activeSession==null）首条消息的临时草稿缓冲，后端回发 session id 后迁移 */
   pendingFresh: Message[] | null
   sessions: SessionMeta[]
+  /** 全部工作空间（`projects` 信封驱动；default 恒第一） */
+  projects: ProjectMeta[]
+  /** 当前活动工作空间 id（后端持久化；chip 显示与新建任务归属的默认值） */
+  activeProject: string
+  /** 侧边栏空间节点的展开态（localStorage 持久化；缺省 = 展开） */
+  expandedProjects: Record<string, boolean>
+  /** 会话列表"超过 15 条折叠"的展开态（按空间记；localStorage 持久化） */
+  previewExpanded: Record<string, boolean>
+  /** 新建任务的目标工作空间（点哪个空间的「+」/ chip 选哪个空间；首条消息随 chat 带上） */
+  pendingProjectId: string | null
   trashSessions: SessionMeta[]
   activeSession: string | null
   isSending: boolean
@@ -226,8 +276,24 @@ interface AgentState {
   stop: () => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
+  /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
+  refreshProjects: () => Promise<void>
   refreshTrash: () => Promise<void>
-  newSession: () => Promise<void>
+  /** 新建任务：清空当前显示回到欢迎空态（可指定归属工作空间）。会话仍由首条消息惰性创建 */
+  newSession: (projectId?: string) => Promise<void>
+  /** 展开/折叠某工作空间的会话列表 */
+  toggleProject: (projectId: string) => void
+  /** 展开/收起某工作空间"超过 15 条折叠"的完整会话列表 */
+  toggleSessionPreview: (projectId: string) => void
+  /** 切换活动工作空间（后端持久化 + 广播 projects） */
+  openProject: (projectId: string) => Promise<void>
+  /** 弹目录选择框并登记为新工作空间（成功则打开并回到新任务态） */
+  addProjectFromPicker: () => Promise<void>
+  renameProject: (projectId: string, name: string) => Promise<void>
+  /** 删除工作空间（只删元数据；调用方需先确认） */
+  removeProject: (projectId: string) => Promise<void>
+  /** 在系统文件管理器中定位该工作空间的真实目录 */
+  revealProject: (projectId: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<void>
   setSessionUnread: (sessionId: string, unread?: boolean) => Promise<void>
   clearSession: () => Promise<void>
@@ -680,6 +746,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   bgSessions: [],
   pendingFresh: null,
   sessions: [],
+  projects: [],
+  activeProject: DEFAULT_PROJECT_ID,
+  expandedProjects: loadFlagMap(EXPANDED_KEY),
+  previewExpanded: loadFlagMap(PREVIEW_KEY),
+  pendingProjectId: null,
   trashSessions: [],
   activeSession: null,
   isSending: false,
@@ -715,6 +786,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     if (!t || get().isSending) return
     const sid = get().activeSession
     const modelId = get().sessionModelId
+    // 新建任务的归属工作空间（点「+」/ chip 选定；未指定 = 后端当前活动空间）
+    const projectId = sid === null ? (get().pendingProjectId ?? get().activeProject) : null
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
     const userMsg: Message = {
       id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso()
@@ -733,8 +806,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       const messages = messagesBySession[sid]
       return { ...s, messagesBySession, messages, isSending: true }
     })
-    // 发送实际交给后端：fresh 时后端生成短 id 并回发 session 信封，前端据此迁移草稿
-    window.agent.send(t, sid, ov, modelId).catch(() => set({ isSending: false }))
+    // 发送实际交给后端：fresh 时后端生成短 id 并回发 session 信封，前端据此迁移草稿；
+    // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）
+    window.agent.send(t, sid, ov, modelId, projectId).catch(() => set({ isSending: false }))
   },
 
   stop: () => {
@@ -808,12 +882,42 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         const payload = ev.payload as { sessions?: SessionMeta[] } | SessionMeta[] | null
         const raw = Array.isArray(payload) ? payload : payload?.sessions
         if (!Array.isArray(raw)) break
-        set({ sessions: raw as SessionMeta[] })
+        const list = raw as SessionMeta[]
+        // 活动空间与"当前正在看的会话"必须一致：列表是权威（每条带真实 project），
+        // 若两者不符（比如别处把活动空间改了），以会话归属为准 —— 否则 chip 会
+        // 显示成另一个空间，接下来的「+」会把新任务建到那个空间去。
+        const cur = get().activeSession
+        const curPid = cur ? list.find((x) => x.id === cur)?.project : undefined
+        set((s) => ({
+          sessions: list,
+          ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
+        }))
+        break
+      }
+      case 'projects': {
+        // 工作空间列表（连接重放 / 增删改后广播）。**整份替换**（幂等）。
+        // 会话列表不在这里动：它是另一条信封（sessions），两者独立刷新。
+        const payload = ev.payload as ProjectsPayload | null
+        if (!payload || !Array.isArray(payload.projects)) break
+        const active = payload.active || DEFAULT_PROJECT_ID
+        set((s) => {
+          // 活动空间被删/失效时后端已回落到 default（payload.active），跟随即可；
+          // 若前端"新建任务"停在了一个已消失的空间，一并复位到 default，
+          // 否则首条消息会带着一个不存在的 project_id 发出去。
+          const alive = payload.projects.some((p) => p.id === s.pendingProjectId)
+          return {
+            projects: payload.projects,
+            activeProject: active,
+            pendingProjectId: alive ? s.pendingProjectId : null
+          }
+        })
         break
       }
       case 'session': {
-        const sid = (ev.payload as { session_id?: string })?.session_id
+        const sp = ev.payload as { session_id?: string; project_id?: string } | null
+        const sid = sp?.session_id
         if (typeof sid !== 'string' || !sid) break
+        const newPid = typeof sp?.project_id === 'string' && sp.project_id ? sp.project_id : null
         const wasFresh = get().pendingFresh !== null
         set((s) => {
           // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话 id）
@@ -827,7 +931,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             pendingFresh: null,
             messagesBySession,
             messages: messagesBySession[sid] ?? [],
-            isSending: s.runningSessions.includes(sid)
+            isSending: s.runningSessions.includes(sid),
+            // 活动空间对齐到新会话的归属（点空间 B 的「+」新建时，活动空间可能还停在 A）
+            ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {})
           }
         })
         // 新建会话由首条消息落号：把当前选定的模型与按模型参数覆盖写入该会话元数据
@@ -840,6 +946,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             overrides: toBackendOverrides(get().overridesByModel)
           }).catch(() => {})
         }
+        // 让后端"活动空间"跟上新会话的归属：否则下一次 projects 广播会把 chip 拉回旧空间
+        if (newPid) void window.agent.openProject(newPid)
         break
       }
       case 'session_status': {
@@ -993,6 +1101,18 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 
+  /** 工作空间列表：后端收到 projects_list 后会广播 `projects`（主进程同管道转发），
+   *  渲染层在 handleEvent 的 'projects' 分支落库；这里的返回值只作兜底。 */
+  refreshProjects: async () => {
+    try {
+      const payload = (await window.agent.listProjects()) as ProjectsPayload | null
+      if (!payload?.projects) return
+      set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
+    } catch {
+      /* 后端未就绪时忽略：连接建立后后端会主动重放 projects */
+    }
+  },
+
   refreshTrash: async () => {
     try {
       const list = (await window.agent.listTrash()) as SessionMeta[]
@@ -1004,8 +1124,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   /** 新建任务：纯前端行为——清空当前显示与草稿、回到欢迎空态；jsonl 由首条消息发送时惰性创建。
-   * 继承上一会话最后选择的模型与按模型参数覆盖（主流智能体行为），随首条消息持久化进新会话元数据。 */
-  newSession: () => {
+   * 继承上一会话最后选择的模型与按模型参数覆盖（主流智能体行为），随首条消息持久化进新会话元数据。
+   * `projectId`：目标工作空间（侧边栏「+」/ chip 下拉）；缺省沿用当前活动空间。 */
+  newSession: (projectId) => {
     set((s) => ({
       messages: [],
       activeSession: null,
@@ -1013,22 +1134,118 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       isSending: false,
       currentContextStats: null,
       sessionModelId: s.lastSessionModelId,
-      overridesByModel: s.lastOverridesByModel
+      overridesByModel: s.lastOverridesByModel,
+      pendingProjectId: projectId ?? s.pendingProjectId ?? s.activeProject
     }))
     return Promise.resolve()
+  },
+
+  toggleProject: (projectId) => {
+    set((s) => {
+      // 缺省（未记录）= 展开：首次点击变成"折叠"，符合直觉
+      const expanded = s.expandedProjects[projectId] !== false
+      const next = { ...s.expandedProjects, [projectId]: !expanded }
+      saveFlagMap(EXPANDED_KEY, next)
+      return { expandedProjects: next }
+    })
+  },
+
+  toggleSessionPreview: (projectId) => {
+    set((s) => {
+      const next = { ...s.previewExpanded, [projectId]: !s.previewExpanded[projectId] }
+      saveFlagMap(PREVIEW_KEY, next)
+      return { previewExpanded: next }
+    })
+  },
+
+  openProject: async (projectId) => {
+    // 本地即时切换（chip 立刻反映），后端持久化后再以 projects 广播校准
+    set({ activeProject: projectId })
+    try {
+      await window.agent.openProject(projectId)
+    } catch {
+      showToast('切换工作空间失败', 'error', 4000)
+    }
+  },
+
+  /** 选择文件夹 → 登记为新工作空间 → 打开它并回到"新建任务"态。
+   *  失败（目录不可写 / 已选过 / 取消）由后端 error 信封 toast 提示。 */
+  addProjectFromPicker: async () => {
+    let path: string | null = null
+    try {
+      path = await window.agent.pickFolder()
+    } catch {
+      showToast('无法打开目录选择框', 'error', 4000)
+      return
+    }
+    if (!path) return
+    let payload: ProjectsPayload | null = null
+    try {
+      payload = (await window.agent.addProject(path)) as ProjectsPayload | null
+    } catch {
+      showToast('新增工作空间失败', 'error', 4000)
+      return
+    }
+    if (!payload?.projects) return  // 失败时后端回 error 信封（已 toast），这里不再重复报错
+    set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
+    await get().newSession(payload.active || DEFAULT_PROJECT_ID)
+  },
+
+  renameProject: async (projectId, name) => {
+    const n = name.trim()
+    if (!n) return
+    try {
+      const payload = (await window.agent.renameProject(projectId, n)) as ProjectsPayload | null
+      if (payload?.projects) set({ projects: payload.projects })
+    } catch {
+      showToast('重命名失败', 'error', 4000)
+    }
+  },
+
+  /** 删除工作空间：**只删元数据目录**（会话/任务/记忆/回收站一并消失，不可恢复），
+   *  用户选定的真实目录保留。调用方（右键菜单）必须先弹确认。 */
+  removeProject: async (projectId) => {
+    try {
+      const payload = (await window.agent.removeProject(projectId)) as ProjectsPayload | null
+      if (!payload?.projects) return  // 被拒（空间有会话在跑 / 删 default）时后端回 error 信封
+      set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
+      // 该空间的会话已随目录消失：本地列表里清掉，避免点进去报"会话不存在"
+      set((s) => ({ sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId) }))
+      if (get().pendingProjectId === projectId) await get().newSession(DEFAULT_PROJECT_ID)
+      showToast('已删除工作空间（仅元数据，真实目录已保留）', 'info', 4000)
+    } catch {
+      showToast('删除工作空间失败', 'error', 4000)
+    }
+  },
+
+  revealProject: async (projectId) => {
+    const p = get().projects.find((x) => x.id === projectId)
+    if (!p?.path) {
+      showToast('默认工作空间没有真实目录', 'info')
+      return
+    }
+    const r = await window.agent.openInFinder(p.path)
+    if (r && !r.ok) showToast(`无法打开目录：${r.error ?? ''}`, 'error', 4000)
   },
   switchSession: async (sid) => {
     // 进入会话 = 已读。先本地即时置已读（即时反馈），再持久化到后端元数据。
     void get().setSessionUnread(sid, false)
     // 立即高亮 + 切换到该会话缓冲（后台会话继续执行不受影响，仅换投影）。
     // 模型/参数不在此处清空：由后端回发的 session_history 按元数据异步恢复。
+    // 同时也把"活动工作空间"对齐到该会话的归属 —— chip 显示的必须是当前会话所在空间。
+    const target = get().sessions.find((x) => x.id === sid)
+    const pid = target ? sessionProjectId(target) : null
+    const prevPid = get().activeProject
     set((s) => ({
       activeSession: sid,
       pendingFresh: null,
       messages: s.messagesBySession[sid] ?? [],
-      isSending: s.runningSessions.includes(sid)
+      isSending: s.runningSessions.includes(sid),
+      ...(pid ? { activeProject: pid, pendingProjectId: pid } : {})
     }))
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
+    // 切到别的空间时同步后端"活动空间"：否则下一次 projects 广播会把 chip 拉回去
+    if (pid && pid !== prevPid) void window.agent.openProject(pid)
     await window.agent.switchSession(sid)
   },
   /** 标记某会话未读/已读：本地即时生效 + 后端写入元数据持久化（跨窗口/重启随 sessions 同步）。

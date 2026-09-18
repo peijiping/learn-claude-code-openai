@@ -173,8 +173,11 @@ export type UiEvent =
   | { kind: 'tasks'; payload: { text: string } }
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
+  /** 工作空间列表（连接建立时重放 + 增删改后广播）。前端侧边栏空间树与
+   *  输入框 chip 下拉都由它驱动；`active` 是后端持久化的"当前活动空间"。 */
+  | { kind: 'projects'; payload: ProjectsPayload }
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
-  | { kind: 'session'; payload: { session_id: string; message_count: number } }
+  | { kind: 'session'; payload: { session_id: string; message_count: number; /** 新会话所属工作空间 id（前端据此对齐活动空间） */ project_id?: string } }
   | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
   | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
@@ -378,12 +381,41 @@ export interface SessionMeta {
   file?: string
   /** 会话绑定的模型 id（记录进会话元数据）；null = 未绑定（用全局） */
   model_id?: string | null
-  /** 所属项目 slug（工作空间）；单项目阶段固定 "default"（悬停卡片展示用） */
+  /** 所属工作空间 id（多工作空间：前端据此把会话挂到对应空间节点下）。
+   *  存量会话缺字段时后端按目录归属兜底，故这里可能缺省（视为 default）。 */
   project?: string
   /** 会话累计 token 消耗（后端 add_usage_totals 写入元数据；无消耗会话缺省） */
   usage_totals?: UsageStats | null
   /** 未读标记：会话完整结束且用户尚未进入查看时为 true（后端元数据持久化，跨重启/多窗口同步） */
   unread?: boolean
+}
+
+/**
+ * 工作空间元数据（`projects` 信封里的元素）。
+ *
+ * 一个工作空间 = 一个真实目录 + 一份元数据目录（`~/.aigent/projects/<id>/`）。
+ * 它的会话历史 / 任务 / 记忆 / 沙箱根都按 id 隔离（见 docs/frontend/11）。
+ */
+export interface ProjectMeta {
+  /** 工作空间 id：默认空间恒为 "default"，其余为 "ws" + 10 位 base62 短码 */
+  id: string
+  /** 展示名（新增时默认取文件夹名；同名目录后端自动加 " (2)" 后缀） */
+  name: string
+  /** 真实目录绝对路径；默认空间为 null（它没有真实目录） */
+  path: string | null
+  /** 是否为默认工作空间（固定第一位，不可重命名/删除） */
+  system: boolean
+  /** 真实目录当前是否可达（被删/移动硬盘未挂载 → false，UI 置灰并禁止新建/发送） */
+  exists: boolean
+  created_at?: string | null
+  last_opened_at?: string | null
+}
+
+/** `projects` 信封载荷：全部工作空间 + 当前活动空间 */
+export interface ProjectsPayload {
+  projects: ProjectMeta[]
+  /** 当前活动工作空间 id（后端持久化；chip 显示与新建任务归属的默认值） */
+  active: string
 }
 
 /** 会话元数据里记录的模型参数（UI 级：后端不参与窗口换算，仅保存已选档位） */
@@ -410,10 +442,17 @@ export type ControlKind =
   | 'session_restore'
   | 'session_delete'
   | 'trash_list'
+  /** 工作空间（多项目）：列表 / 新增（登记目录）/ 切换活动 / 重命名 / 删除 */
+  | 'projects_list'
+  | 'project_add'
+  | 'project_open'
+  | 'project_rename'
+  | 'project_remove'
   | 'goal_status'
   | 'tasks'
   | 'skills'
   | 'stop'
+  | 'status_query'
   | 'llm_config_get'
   | 'llm_config_save'
   | 'llm_models_fetch'
@@ -428,6 +467,9 @@ export interface ChatPayload {
   text: string
   session_id?: string
   fresh?: boolean
+  /** 新建任务的归属工作空间 id（点哪个空间的「+」就进哪个空间）。
+   *  缺省 = 后端当前活动空间。已有会话无需携带（后端按 session_id 解析归属）。 */
+  project_id?: string
   /** 当前会话请求级覆盖（来自模型下拉悬浮配置面板） */
   overrides?: {
     thinking_strength?: string

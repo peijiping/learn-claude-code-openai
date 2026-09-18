@@ -21,9 +21,10 @@ import string
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
+import paths  # 运行期读 paths.TASKS_DIR（测试/CLI 会临时改写模块级值，不能静态捕获）
 from paths import DEFAULT_PROJECT_SLUG, task_files_for_session
 from logger import get_logger
 
@@ -54,6 +55,34 @@ def new_session_id() -> str:
             return sid
 
 
+# 会话 id 的**跨工作空间**唯一性守卫（多工作空间改造，2026-09-18）。
+# 由桥层注入"该 id 是否已被任意工作空间占用"的查询（见 set_session_id_guard）。
+_SESSION_ID_TAKEN: Optional[Callable[[str], bool]] = None
+
+
+def set_session_id_guard(fn: Optional[Callable[[str], bool]]) -> None:
+    """注入会话 id 的全局占用查询（None = 关闭）。
+
+    为什么必须有：id 若只在**单个空间**的目录里查重，两个工作空间就可能各自
+    生成同一个 `session_x`。而 session_id 是全链路路由键（前端按它分发事件与
+    消息缓冲、桥层按它解析所属空间），一旦重号就是"事件进了别的会话 / 切会话
+    切到别的空间"，且没有任何自愈路径。概率极低，但代价是数据错位级别的，
+    所以宁可每次新建多 N 次 stat。
+    """
+    global _SESSION_ID_TAKEN
+    _SESSION_ID_TAKEN = fn
+
+
+def _id_taken_globally(sid: str) -> bool:
+    fn = _SESSION_ID_TAKEN
+    if fn is None:
+        return False
+    try:
+        return bool(fn(sid))
+    except Exception:  # noqa: BLE001 - 守卫本身不能阻断建会话
+        return False
+
+
 def _now_iso() -> str:
     """本地时间秒级 isoformat（单机桌面产品，无时区转换需求）。"""
     return datetime.now().isoformat(timespec="seconds")
@@ -63,7 +92,8 @@ class SessionManager:
     """会话管理器，负责对话历史的持久化和管理"""
 
     def __init__(self, chat_history_dir: Path, system_prompt: str,
-                 session_prefix: str = "session_", subagent_store=None):
+                 session_prefix: str = "session_", subagent_store=None,
+                 project_id: str = DEFAULT_PROJECT_SLUG, tasks_dir: Path | None = None):
         """
         初始化会话管理器
 
@@ -77,11 +107,18 @@ class SessionManager:
                             `session_N.subagents.jsonl`，主会话文件只保留标准
                             消息（并在加载时把历史遗留的 in-file 行一次性迁出）。
                             为 None 时（CLI 旧路径）：保持原行为。
+            project_id: 本管理器服务的**工作空间 id**（多工作空间，2026-09-18）。
+                        写进会话元数据的 `project` 字段，前端据此把会话挂到对应
+                        空间节点下；缺省 "default"（CLI / 单空间行为不变）。
+            tasks_dir: 该工作空间的任务目录（删会话/清空会话时级联清理用）。
+                       缺省回落模块级 `paths.TASKS_DIR`（= default 空间）。
         """
         self.chat_history_dir = chat_history_dir
         self.system_prompt = system_prompt
         self.session_prefix = session_prefix
         self.subagent_store = subagent_store
+        self.project_id = project_id
+        self._tasks_dir = tasks_dir
         self.compact_manager = ContextCompact(
             transcript_dir=chat_history_dir.parent / ".transcripts",
             tool_results_dir=chat_history_dir.parent / ".task_outputs" / "tool-results",
@@ -101,6 +138,21 @@ class SessionManager:
     def format_context_label(self, messages: list) -> str:
         """格式化当前上下文窗口显示信息。"""
         return self.compact_manager.format_context_label(messages)
+
+    @property
+    def tasks_dir(self) -> Path:
+        """本会话所属工作空间的任务目录（元数据目录下的 `.tasks`）。
+
+        多工作空间（2026-09-18）：由调用方（`Agent` / `SessionRuntime`）按
+        `workspace.tasks_dir` 显式注入，**不从 `chat_history_dir.parent` 反推** ——
+        反推要求"chat_history_dir 一定叫 .chathistory 且直接挂在元数据目录下"，
+        这个约定在 CLI / 测试夹具（直接给一个裸目录当 chat_history_dir）下不成立，
+        会算到隔壁目录去。未注入时回落模块级 `paths.TASKS_DIR`（= default 空间），
+        与改造前完全一致。
+        """
+        if self._tasks_dir is not None:
+            return self._tasks_dir
+        return paths.TASKS_DIR
 
     def set_max_context(self, max_context: str | None) -> None:
         """设置会话级上下文窗口覆盖（如 "1M" / "128k"）。
@@ -995,12 +1047,15 @@ class SessionManager:
         """
         创建新会话：随机短 id 命名（撞名重掷，工程上不可能重复）
 
+        查重范围 = 本空间目录 **+ 全部工作空间**（`set_session_id_guard` 注入的
+        全局守卫）：session_id 是全链路路由键，跨空间重号会导致事件/归属错位。
+
         Returns:
             (新会话 id, 新会话文件路径)
         """
         sid = new_session_id()
         new_file = self.get_session_file(sid)
-        while new_file.exists():  # 碰撞重试：理论概率 ~0，防御性兜底
+        while new_file.exists() or _id_taken_globally(sid):  # 碰撞重试：防御性兜底
             sid = new_session_id()
             new_file = self.get_session_file(sid)
         new_file.touch()
@@ -1105,7 +1160,7 @@ class SessionManager:
             "updated_at": now,
             "status": "active",
             "trashed_at": None,
-            "project": DEFAULT_PROJECT_SLUG,
+            "project": self.project_id,
             "model_id": None,
             "overrides": None,
             "unread": False,
@@ -1205,7 +1260,7 @@ class SessionManager:
                 "updated_at": ts,
                 "status": "active",
                 "trashed_at": None,
-                "project": DEFAULT_PROJECT_SLUG,
+                "project": self.project_id,
                 "unread": False,
             }
             changed = True
@@ -1378,7 +1433,9 @@ class SessionManager:
         # 任务板与 chat history 同生共死：删除本会话作用域下的全部 task 文件。
         # （原此处删除 todo 文件；todo 已于 2026-09-16 下线，改由 task 承接）
         # 单个删除失败不阻断会话删除 —— 与子智能体旁路文件的处理策略一致。
-        for task_file in task_files_for_session(session_id, self.session_prefix):
+        for task_file in task_files_for_session(
+            session_id, self.session_prefix, self.tasks_dir
+        ):
             try:
                 task_file.unlink()
             except OSError as e:
@@ -1426,8 +1483,10 @@ class SessionManager:
                 "trashed_at": meta.get("trashed_at"),
                 "file": f.name,
                 "model_id": meta.get("model_id"),
-                # 悬停卡片展示用：所属项目（工作空间）与会话级 token 累计
-                "project": meta.get("project", DEFAULT_PROJECT_SLUG),
+                # 悬停卡片展示用：所属项目（工作空间）与会话级 token 累计。
+                # 存量 meta 缺 project 字段时兜底为**本管理器的空间 id**：
+                # 老会话按目录归属，永远不会被错认成 default 空间的会话。
+                "project": meta.get("project", self.project_id),
                 "usage_totals": meta.get("usage_totals"),
                 "unread": bool(meta.get("unread", False)),
             })
@@ -1477,7 +1536,9 @@ class SessionManager:
             # session_clear 分支是**直接调 sm.clear_session** 的，不经过 Agent。
             sid = self._sid_from_stem(session_file.stem)
             if sid:
-                for task_file in task_files_for_session(sid, self.session_prefix):
+                for task_file in task_files_for_session(
+                    sid, self.session_prefix, self.tasks_dir
+                ):
                     try:
                         task_file.unlink()
                     except OSError as e:

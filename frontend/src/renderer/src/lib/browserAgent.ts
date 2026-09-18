@@ -148,13 +148,15 @@ class BrowserAgentBridge implements AgentApi {
     text: string,
     sessionId?: string | null,
     overrides?: { thinking_strength?: string; max_context?: string } | null,
-    modelId?: string | null
+    modelId?: string | null,
+    projectId?: string | null
   ): Promise<void> {
     this.sendRaw(JSON.stringify({
       kind: 'chat',
       payload: {
         text,
         ...(typeof sessionId === 'string' && sessionId ? { session_id: sessionId } : {}),
+        ...(typeof projectId === 'string' && projectId ? { project_id: projectId } : {}),
         ...(overrides ? { overrides } : {}),
         ...(modelId ? { model_id: modelId } : {})
       }
@@ -214,6 +216,34 @@ class BrowserAgentBridge implements AgentApi {
   }
   async deleteSessions(ids: string[]): Promise<unknown> {
     return this.request('session_delete', 'session_delete_result', { ids })
+  }
+
+  // ── 工作空间（浏览器无宿主能力，降级为可用的最小实现）────────────
+  /** 浏览器无原生目录选择框：退化为输入路径（仍是本机后端进程去读写，语义一致） */
+  pickFolder(): Promise<string | null> {
+    const p = window.prompt('输入工作空间目录的绝对路径：')
+    return Promise.resolve(p && p.trim() ? p.trim() : null)
+  }
+  /** 浏览器无法调起 Finder：仅记录告警，不阻断调用方 */
+  openInFinder(_path: string): Promise<{ ok: boolean; error?: string }> {
+    console.warn('[browserAgent] openInFinder 仅在 Electron 宿主中可用')
+    return Promise.resolve({ ok: false, error: 'not supported in browser' })
+  }
+  async listProjects(): Promise<unknown> {
+    return this.request('projects_list', 'projects')
+  }
+  async addProject(path: string): Promise<unknown> {
+    return this.request('project_add', 'projects', { path })
+  }
+  openProject(projectId: string): Promise<void> {
+    this.sendRaw(JSON.stringify({ kind: 'project_open', payload: { project_id: projectId } }))
+    return Promise.resolve()
+  }
+  async renameProject(projectId: string, name: string): Promise<unknown> {
+    return this.request('project_rename', 'projects', { project_id: projectId, name })
+  }
+  async removeProject(projectId: string): Promise<unknown> {
+    return this.request('project_remove', 'projects', { project_id: projectId })
   }
 
   async goalStatus(): Promise<string> {

@@ -1,6 +1,6 @@
 import { Icon } from '@components/common/Icon'
 import type { SessionMeta, UsageStats } from '@protocols/agentProtocol'
-import { sessionDisplayName } from '@store/agentStore'
+import { projectDisplayName, sessionDisplayName, sessionProjectId, useAgentStore } from '@store/agentStore'
 
 interface SessionTooltipProps {
   /** 视口坐标（悬停会话行右缘），fixed 定位于此 */
@@ -43,13 +43,16 @@ function Row({ icon, label, value }: { icon: string; label: string; value: strin
 
 /** 会话行悬停信息卡：完整标题 / 所属项目（工作空间）/ 总 token 消耗 / 缓存命中率 / 最后更新。
  *  纯展示（pointer-events: none，不拦截鼠标、不闪烁），fixed 定位于悬停行右缘，
- *  靠近视口边缘时回收。数据全部来自会话元数据（list_sessions 透传 project / usage_totals）。 */
+ *  靠近视口边缘时回收。数据全部来自会话元数据（list_sessions 透传 project / usage_totals）。
+ *  多工作空间（2026-09-18）：project 是工作空间 id，展示名经 projects 映射，
+ *  查不到时回退 id（列表未到/空间已删）。 */
 export default function SessionTooltip({ x, y, session }: SessionTooltipProps): JSX.Element {
   const CARD_W = 280
   const CARD_H = 150
   const left = Math.min(x, window.innerWidth - CARD_W - 8)
   const top = Math.min(y, window.innerHeight - CARD_H - 8)
   const u = session.usage_totals
+  const projects = useAgentStore((s) => s.projects)
 
   return (
     <div className="session-tip" style={{ left, top }}>
@@ -57,7 +60,8 @@ export default function SessionTooltip({ x, y, session }: SessionTooltipProps): 
         {sessionDisplayName(session)}
       </div>
       <div className="session-tip-rows">
-        <Row icon="folder" label="所属项目" value={session.project || 'default'} />
+        <Row icon="folder" label="所属项目"
+             value={projectDisplayName(projects, sessionProjectId(session))} />
         <Row icon="chart" label="总消耗" value={`${fmtTokens(u)} tokens`} />
         <Row icon="refresh" label="缓存命中率" value={cachePct(u)} />
         <Row icon="clock" label="最后更新" value={fmtTime(session.updated_at)} />

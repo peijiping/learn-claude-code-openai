@@ -852,3 +852,94 @@
 }
 
 
+
+/* ═══════════════════════════════════════════════════════════════
+   工作空间选择器（输入框底部 chip 的下拉，2026-09-18）
+   - .ws-select：定位容器（chip + 下拉的相对锚点）
+   - .ws-picker：向上弹出（与 .model-menu 同款：mask 遮罩 + 面板）
+   - 上段 = 已打开的工作空间，底部固定项 = 选择文件夹…
+   ═══════════════════════════════════════════════════════════════ */
+.ws-select {
+  position: relative;
+  display: inline-flex;
+}
+.ctx-chip.clickable {
+  cursor: pointer;
+}
+.ctx-chip.clickable:hover,
+.ctx-chip.clickable.open {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.ctx-chip-label {
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ws-picker-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+}
+.ws-picker {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 220px;
+  max-width: 360px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.2));
+  z-index: 901;
+}
+.ws-picker-group {
+  padding: var(--sp-1) var(--sp-3);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+.ws-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+.ws-picker-item:hover {
+  background: var(--color-bg-hover);
+}
+.ws-picker-item.active {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+/* 路径失效的空间：可见但不可选（点了会切到一个不存在的目录） */
+.ws-picker-item.missing {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ws-picker-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ws-picker-sep {
+  height: 1px;
+  margin: var(--sp-1) 0;
+  background: var(--color-border);
+}
+.ws-picker-empty {
+  padding: var(--sp-3);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}

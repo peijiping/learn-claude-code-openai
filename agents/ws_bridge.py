@@ -25,8 +25,9 @@ from llm_config import (
     save_config,
 )
 from logger import get_logger, install_excepthooks
-from paths import CHAT_HISTORY_DIR
-from session_manage import SessionManager
+from paths import CHAT_HISTORY_DIR, DEFAULT_PROJECT_ID, WorkspacePaths
+from project_registry import WorkspaceError, get_registry
+from session_manage import SessionManager, set_session_id_guard
 from session_runtime import SessionRuntimeRegistry
 from subagent_store import SubagentStore
 from task_manager import current_board
@@ -35,6 +36,12 @@ from task_manager import current_board
 load_config()
 # 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
 load_llm_config()
+# 工作空间索引自举：projects.json 缺失/损坏时重建为只含 default 的索引
+# （老用户升级路径：只有 default 一个空间，行为与升级前完全一致）。
+try:
+    get_registry().ensure()
+except Exception as _e:  # noqa: BLE001 - 索引坏了也不能拦启动（get_registry 内部已自愈）
+    print(f"[projects] projects.json 自举失败：{_e}")
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("ws_bridge")
@@ -112,6 +119,11 @@ registry: Optional["SessionRuntimeRegistry"] = None
 # 同一事件循环里只排一次队（全量重建列表，幂等）。
 _sessions_refresh_pending = False
 
+# ── 工作空间路由缓存（多工作空间，2026-09-18）──────────────────────────
+# 一个后端进程承载全部工作空间：会话 → 空间 → 路径束 / SessionManager。
+_MANAGER_CACHE: dict[str, SessionManager] = {}  # project_id → SessionManager
+_SID_PROJECT: dict[str, str] = {}               # session_id → project_id
+
 
 async def _refresh_sessions_once() -> None:
     global _sessions_refresh_pending
@@ -149,11 +161,71 @@ async def safe_send(ws, line: str) -> None:
 
 
 async def reply_sessions() -> None:
-    """会话列表广播到所有活跃连接（全局 UI 状态，与连接解耦）。"""
-    sm = await asyncio.to_thread(_ensure_session_manager)
-    items = await asyncio.to_thread(sm.list_sessions)
-    sessions = [_session_meta(i) for i in items]
+    """会话列表广播到所有活跃连接（**全部工作空间**，分组由前端按 project 完成）。
+
+    与改造前的差别只有一处：以前只有 default 一个空间的会话；现在把所有空间的
+    会话合成一份列表，每条都带 `project`（所属空间 id）。前端拿 `projects` 信封
+    把 id 映射成名称，挂到对应空间节点下。
+
+    **刻意不做全局重排**：各空间的列表自身已按「最后修改时间」倒序
+    （`SessionManager.list_sessions` 的口径），前端按空间过滤时顺序天然正确；
+    再来一次全局排序反而会把某个空间的顺序按别的空间的时间戳打乱。
+    """
+    sessions = await asyncio.to_thread(_list_all_sessions)
     hub.broadcast("sessions", {"sessions": sessions})
+
+
+def _list_all_sessions() -> list[dict]:
+    """遍历全部工作空间列出活跃会话（单个空间出错只跳过它，不拖垮整个列表）。"""
+    out: list[dict] = []
+    for info in _list_infos():
+        try:
+            sm = _ensure_session_manager(info.id)
+            items = sm.list_sessions("active")
+        except Exception as e:
+            log.error("列出工作空间 %s 的会话失败: %s: %s",
+                      info.id, type(e).__name__, e)
+            continue
+        for s in items:
+            # meta 里缺 project（存量会话）时按目录归属兜底，绝不落到 default
+            s["project"] = s.get("project") or info.id
+            out.append(s)
+    return out
+
+
+def _list_all_trashed() -> list[dict]:
+    """全部工作空间的回收站条目（回收站是全局视图，删除时按 sid 各自解析空间）。"""
+    out: list[dict] = []
+    for info in _list_infos():
+        try:
+            items = _ensure_session_manager(info.id).list_sessions("trashed")
+        except Exception as e:
+            log.error("列出工作空间 %s 的回收站失败: %s: %s",
+                      info.id, type(e).__name__, e)
+            continue
+        for s in items:
+            s["project"] = s.get("project") or info.id
+            out.append(s)
+    return out
+
+
+def _projects_payload() -> dict:
+    """工作空间列表载荷（侧边栏树 + 输入框 chip 下拉的数据源）。
+
+    只含空间元数据与可达性；会话数由前端按 `sessions` 信封自行分组统计 ——
+    避免为了一个角标在每次广播时多扫一遍全部会话文件。
+    """
+    reg = get_registry()
+    return {
+        "projects": [info.to_payload() for info in reg.list_infos()],
+        "active": reg.active_id(),
+    }
+
+
+async def reply_projects() -> None:
+    """工作空间列表广播（连接建立时重放 + 每次增删改后刷新）。"""
+    payload = await asyncio.to_thread(_projects_payload)
+    hub.broadcast("projects", payload)
 
 
 def _session_meta(item: dict) -> dict:
@@ -220,12 +292,15 @@ def _default_session_title(text: str) -> Optional[str]:
 
 
 async def _finalize_title_after_turn(turn_task, session_id: str,
-                                     first_user_text: str) -> None:
+                                     first_user_text: str, sm: SessionManager) -> None:
     """第一轮 run_turn 结束后，用大模型总结生成标题（≤20 字）并写回会话元数据。
 
     标题生成不再与首轮并行抢跑（旧 _start_title_thread 方案）：创建会话时已有
     "首条消息前 30 字"的默认标题可读，第一轮执行完后再调一次 LLM 精炼。
     LLM 失败/不合法则保留默认标题；任何异常都不影响主流程。
+
+    `sm` 由调用方按**该会话所属工作空间**传入（多工作空间）：写错空间会把标题
+    写进另一个空间的同名会话文件。
     """
     try:
         await turn_task
@@ -235,7 +310,6 @@ async def _finalize_title_after_turn(turn_task, session_id: str,
         title = await asyncio.to_thread(_generate_session_title, first_user_text)
         if not title:
             return  # 保留创建时的默认标题（首条消息前 30 字）
-        sm = _ensure_session_manager()
         await asyncio.to_thread(sm.set_auto_title, session_id, title, "auto")
         await reply_sessions()
     except Exception:
@@ -273,27 +347,130 @@ async def _reply_task_board(ws, sm, sid: str) -> None:
     """
     try:
         scope = f"{sm.session_prefix}{sid}"
-        board = await asyncio.to_thread(current_board, scope)
+        # tasks_dir 由该会话所属空间的 SessionManager 给出（多工作空间：模块级
+        # TASKS_DIR 只代表 default，直接用它会让自定义空间的会话读到空面板）
+        board = await asyncio.to_thread(current_board, scope, sm.tasks_dir)
     except Exception as e:
         log.error("读取任务板失败 session_%s: %s: %s", sid, type(e).__name__, e)
         board = None
     await safe_send(ws, _envelope("task_board", {"session_id": sid, "board": board}))
 
 
-def _ensure_session_manager():
-    """惰性会话下 session_manager 可能为 None（尚未 init/switch），
-    列会话等只读操作前先兜底构建（构建后 init_session 也会复用）。
+def _ensure_session_manager(project_id: str = DEFAULT_PROJECT_ID) -> SessionManager:
+    """按工作空间取（并缓存）会话管理器。
 
-    注入 SubagentStore：子智能体执行过程写到 `session_<id>.subagents.jsonl`，
-    主会话文件只保留标准消息（并在首次加载时把历史遗留的 in-file 行迁出）。
+    每个工作空间一份：会话历史 / 任务目录 / 子智能体旁路记录都跟随该空间的元数据
+    目录。改造前只有一个挂在全局 agent 上的 SessionManager（恒指 default），多空间
+    下它回答不了"这个会话属于哪个空间"。
+
+    两个缓存都只增不删 —— 命中后 O(1)，量级 = 空间数 / 会话数，可忽略。
     """
-    if agent.session_manager is None:
-        agent.session_manager = SessionManager(
-            CHAT_HISTORY_DIR, agent.system_prompt.build_system_prompt(),
-            session_prefix=agent.session_prefix,
-            subagent_store=SubagentStore(CHAT_HISTORY_DIR),
-        )
-    return agent.session_manager
+    pid = project_id or DEFAULT_PROJECT_ID
+    sm = _MANAGER_CACHE.get(pid)
+    if sm is not None:
+        return sm
+    ws = _workspace_of(pid)
+    sm = SessionManager(
+        ws.chat_history_dir, agent.system_prompt.build_system_prompt(),
+        session_prefix=agent.session_prefix,
+        subagent_store=SubagentStore(ws.chat_history_dir),
+        project_id=ws.id,
+        tasks_dir=ws.tasks_dir,
+    )
+    _MANAGER_CACHE[pid] = sm
+    return sm
+
+
+def _workspace_of(project_id: str) -> WorkspacePaths:
+    """工作空间 id → 路径束（沙箱根 / 元数据目录的唯一出处）。"""
+    return get_registry().paths(project_id)
+
+
+def _list_infos() -> list:
+    """全部工作空间元数据（注册表异常时退化为空列表，只影响列表展示）。"""
+    try:
+        return get_registry().list_infos()
+    except Exception as e:
+        log.error("读取工作空间列表失败: %s: %s", type(e).__name__, e)
+        return []
+
+
+def _active_project() -> str:
+    """当前活动工作空间（前端 chip 默认值 / 未指定 project_id 的新会话归属）。"""
+    try:
+        return get_registry().active_id()
+    except Exception as e:
+        log.error("读取活动工作空间失败，回落 default: %s: %s", type(e).__name__, e)
+        return DEFAULT_PROJECT_ID
+
+
+def _project_ready(project_id: str) -> bool:
+    """该工作空间的真实目录是否可用（被删/改名/移动硬盘未挂载 → False）。
+
+    default 恒 True（它没有真实目录）。不可用时拒绝新建会话/发消息 ——
+    否则工具会在一片"空气目录"里跑，或把文件写到别处。
+    """
+    try:
+        info = get_registry().get(project_id)
+    except Exception:
+        return False
+    return bool(info and info.exists)
+
+
+def _project_of_session(sid: str) -> str:
+    """会话 id → 所属工作空间 id（进程内缓存 + 磁盘探测兜底）。
+
+    会话 id **全局唯一**（`new_session_id` 的查重范围已扩到全部工作空间，见
+    session_manage），所以缓存"已知归属"是安全的：一个 sid 只可能属于一个空间。
+
+    未命中（老会话 / 管理操作带来的陌生 id）按各空间的元数据目录探测：meta 文件
+    或 jsonl 命中即缓存；都不命中则回落 default（与改造前"只有 default"一致）。
+    """
+    pid = _SID_PROJECT.get(sid)
+    if pid:
+        return pid
+    prefix = agent.session_prefix
+    for info in _list_infos():
+        try:
+            base = _workspace_of(info.id).chat_history_dir
+        except WorkspaceError:
+            continue
+        if ((base / f"{prefix}{sid}.meta.json").exists()
+                or (base / f"{prefix}{sid}.jsonl").exists()):
+            _SID_PROJECT[sid] = info.id
+            return info.id
+    return DEFAULT_PROJECT_ID
+
+
+def _manager_for_session(sid: str) -> SessionManager:
+    """会话 → 其**所属空间**的 SessionManager。
+
+    ⚠️ 所有按 session_id 操作的命令（重命名/回收站/还原/删除/清空/模型绑定）
+    都必须经这里取 sm —— 直接调 `_ensure_session_manager()` 会拿到 default 的
+    实例，对自定义空间的会话就会"查无此会话"或误改同名的 default 文件。
+    """
+    return _ensure_session_manager(_project_of_session(sid))
+
+
+def _busy_sessions_of_project(project_id: str) -> list[str]:
+    """该工作空间里仍在执行（turn 在跑，或后台任务仍在写文件）的会话 id。
+
+    删除工作空间的守卫：目录里还有人在写就不能删（`is_active` 而非 `is_busy`——
+    后台子智能体执行期 turn 已结束但线程仍在写会话文件）。
+    """
+    if registry is None:
+        return []
+    return [rt.sid for rt in registry.all_runtimes()
+            if rt.workspace is not None and rt.workspace.id == project_id
+            and registry.is_active(rt.sid)]
+
+
+def _sessions_of_project(project_id: str) -> list[str]:
+    """该工作空间下已注册的会话运行时 id（删除后清理用）。"""
+    if registry is None:
+        return []
+    return [rt.sid for rt in registry.all_runtimes()
+            if rt.workspace is not None and rt.workspace.id == project_id]
 
 
 def _text_of(content) -> str:
@@ -309,6 +486,10 @@ def _status_snapshot_lines() -> list[str]:
     """所有仍在运行（running/background）会话的 session_status 信封列表。
     连接建立重放与 status_query 命令共用，保证两处行为一致。"""
     lines = []
+    if registry is None:
+        # 仅可能出现在 main() 赋值之前（测试直调 handle）；按"无运行会话"处理，
+        # 不让一个未初始化的模块状态把整个连接循环打死。
+        return lines
     for rt in registry.all_runtimes():
         status = rt.current_status()
         if status is not None:
@@ -445,6 +626,10 @@ async def handle(ws):
     # 渲染进程刷新（HMR/Cmd+R）不重建此连接，那种场景由前端主动发
     # status_query 命令拉取（走同一快照函数）。
     replay = _status_snapshot_lines()
+    # 工作空间列表重放：新连接（含断线重连 / 渲染进程刷新）立即拿到侧边栏树与
+    # chip 下拉所需的全部空间元数据，不必等前端主动拉。放在会话列表之前 ——
+    # 前端要用它把 session.project（id）映射成名称、决定挂在哪个节点下。
+    line_q.put_nowait(_envelope("projects", await asyncio.to_thread(_projects_payload)))
     if replay:
         log.info("WS 状态重放: %d 个运行中会话", len(replay))
     for line in replay:
@@ -479,20 +664,37 @@ async def handle(ws):
                 # 并发会话：每个会话由注册表里的 SessionRuntime 独立跑 run_turn，
                 # 事件按 session_id 路由到前端对应缓冲。本循环不做 await run_turn，
                 # 派发后立即继续读命令 → 任意会话可后台执行、切换不断流。
-                sm = _ensure_session_manager()
                 sid = payload.get("session_id")
                 text = payload.get("text", "")
+                # 目标工作空间：新建会话时由前端显式带上（点哪个空间的「+」就进哪个
+                # 空间）；老前端 / 未带时用当前活动空间。**显式优先**，不依赖进程级
+                # 活动态 —— 两个窗口并发时各发各的，不会互相串空间。
+                want_pid = str(payload.get("project_id") or "") or None
                 # 全新会话（前端无激活会话 / 未带 session_id）：事件循环内确定性
                 # 生成短 id + 写入初始 system 消息（随机 id + 查重在这个单线程
                 # 事件循环里执行，避免并发线程 race 到同一会话文件）。
                 if sid is None:
+                    pid = want_pid or _active_project()
+                    if not _project_ready(pid):
+                        await safe_send(ws, _envelope("error", {
+                            "msg": "该工作空间的目录当前不可用（已被移动或删除），"
+                                   "请重新选择目录后再试",
+                        }))
+                        continue
+                    sm = _ensure_session_manager(pid)
                     new_sid, new_file = sm.create_new_session()
                     for m in sm._build_initial_messages():
                         sm.append_message_to_session(new_file, m)
                     sid = new_sid
-                    log.info("新会话创建: session_%s (model=%s)",
-                             sid, payload.get("model_id") or "global-default")
-                    await safe_send(ws, _envelope("session", {"session_id": sid, "message_count": 0}))
+                    # 会话归属一建立就入缓存：后续 _load_meta / 管理操作都靠它定位空间
+                    _SID_PROJECT[sid] = pid
+                    log.info("新会话创建: session_%s (project=%s, model=%s)",
+                             sid, pid, payload.get("model_id") or "global-default")
+                    # 带上 project_id：前端据此把"活动空间"对齐到新会话的归属
+                    #（点空间 B 的「+」新建时，活动空间可能还停在 A）
+                    await safe_send(ws, _envelope("session", {
+                        "session_id": sid, "message_count": 0, "project_id": pid,
+                    }))
                     # 新建会话首批：把前端选择的模型持久化进该会话元数据。
                     #（参数覆盖由前端在收到 session 信封后按 UI 形状 map 写入，此处只记模型；
                     #  chat 透传的 overrides 是已换算的单轮 resolved 形状，不宜直接落元数据。）
@@ -508,7 +710,12 @@ async def handle(ws):
                             sm.set_auto_title, new_sid, default_title, "trunc"
                         )
                     await reply_sessions()
-                rt = registry.get_or_create(sid)
+                # 已有会话：按该会话**所属空间**取管理器（不能用 default 的实例，
+                # 否则会读写错空间的同名文件 / 报"会话不存在"）
+                pid = _SID_PROJECT.get(sid) or want_pid or _project_of_session(sid)
+                _SID_PROJECT[sid] = pid
+                sm = _ensure_session_manager(pid)
+                rt = registry.get_or_create(sid, workspace=_workspace_of(pid))
                 if rt.busy:
                     # 同会话并发 turn 拒绝：避免两线程同时写同一会话 jsonl
                     await safe_send(ws, _envelope("error", {
@@ -539,7 +746,8 @@ async def handle(ws):
                 )
                 if first_turn:
                     # 第一轮 run_turn 执行完之后，再调用一次大模型总结生成标题（≤20 字）
-                    asyncio.create_task(_finalize_title_after_turn(turn_task, sid, text))
+                    asyncio.create_task(
+                        _finalize_title_after_turn(turn_task, sid, text, sm))
 
             elif kind == "stop":
                 # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响
@@ -559,9 +767,13 @@ async def handle(ws):
                     line_q.put_nowait(line)
 
             elif kind == "session_switch":
-                sm = _ensure_session_manager()
                 sid = str(payload.get("session_id") or "")
                 log.info("会话切换请求: session_%s", sid)
+                # 切到哪个会话就切到它所属的空间：管理器（会话文件/meta）与运行时的
+                # 路径束都按该会话的归属解析（多工作空间）
+                pid = _SID_PROJECT.get(sid) or _project_of_session(sid)
+                _SID_PROJECT[sid] = pid
+                sm = _ensure_session_manager(pid)
                 # 运行中（含"后台子智能体仍在跑"）的会话不读磁盘回放：turn 在途
                 # 或后台 worker 在写时，jsonl 可能处于 "assistant(tool_calls) 已
                 # 落盘、tool 响应未落盘" 的中间态，load_session_history 的孤儿清理
@@ -623,10 +835,10 @@ async def handle(ws):
             elif kind == "session_set_unread":
                 # 标记会话未读/已读（读/未读由前端判定：进入会话=已读，非当前查看会话
                 # 完整结束=未读）。写入元数据持久化后重播会话列表，跨窗口/重启生效。
-                sm = _ensure_session_manager()
                 sid = str(payload.get("session_id") or "")
                 if not sid:
                     continue
+                sm = _manager_for_session(sid)
                 if not sm.get_session_file(sid).exists():
                     continue
                 unread = bool(payload.get("unread", False))
@@ -636,10 +848,10 @@ async def handle(ws):
             elif kind == "session_model":
                 # 记录会话最后选择的模型 + 参数到会话元数据（会话级独立绑定）；
                 # 无 session_id（新建任务预设态）由 chat 首条统一持久化，此处仅处理已建会话。
-                sm = _ensure_session_manager()
                 sid = str(payload.get("session_id") or "")
                 if not sid:
                     continue
+                sm = _manager_for_session(sid)
                 if not sm.get_session_file(sid).exists():
                     await safe_send(ws, _envelope("error", {"msg": f"session {sid} not found"}))
                     continue
@@ -663,11 +875,11 @@ async def handle(ws):
                 await reply_sessions()
 
             elif kind == "session_clear":
-                sm = _ensure_session_manager()
                 sid = str(payload.get("session_id") or "")
                 if not sid:
                     await safe_send(ws, _envelope("error", {"msg": "当前无激活会话"}))
                     continue
+                sm = _manager_for_session(sid)
                 if registry.is_active(sid):
                     await safe_send(ws, _envelope("error", {
                         "msg": f"该会话 (session_{sid}) 正在执行（或后台任务仍在跑），暂不能清空",
@@ -684,24 +896,92 @@ async def handle(ws):
             elif kind == "sessions_list":
                 await reply_sessions()
 
-            elif kind == "session_rename":
-                sm = _ensure_session_manager()
+            # ── 工作空间（多项目，2026-09-18）───────────────────────────
+            # 目录选择由 Electron 主进程弹原生选择框（dialog.showOpenDialog），
+            # 后端只负责登记 + 建元数据目录 + 落索引，职责边界与其它命令一致。
+            elif kind == "projects_list":
+                await reply_projects()
+
+            elif kind == "project_add":
+                try:
+                    info = await asyncio.to_thread(
+                        get_registry().create, str(payload.get("path") or ""))
+                except WorkspaceError as exc:
+                    # 目录不存在/不可写/选了 ~/.aigent 内部目录 → 原样告诉用户原因
+                    await safe_send(ws, _envelope("error", {"msg": str(exc)}))
+                except Exception as exc:  # noqa: BLE001 - 桥层兜底，绝不打死连接
+                    log.error("新增工作空间失败: %s: %s", type(exc).__name__, exc)
+                    await safe_send(ws, _envelope("error", {"msg": f"新增工作空间失败：{exc}"}))
+                else:
+                    log.info("工作空间就绪: %s（%s）", info.id, info.path)
+                    await reply_projects()
+                    await reply_sessions()
+
+            elif kind == "project_open":
                 try:
                     await asyncio.to_thread(
-                        sm.rename_session,
-                        str(payload.get("session_id") or ""), str(payload.get("title", "")),
+                        get_registry().set_active, str(payload.get("project_id") or ""))
+                except WorkspaceError as exc:
+                    await safe_send(ws, _envelope("error", {"msg": str(exc)}))
+                else:
+                    await reply_projects()
+
+            elif kind == "project_rename":
+                try:
+                    await asyncio.to_thread(
+                        get_registry().rename,
+                        str(payload.get("project_id") or ""), str(payload.get("name") or ""),
+                    )
+                except WorkspaceError as exc:
+                    await safe_send(ws, _envelope("error", {"msg": str(exc)}))
+                else:
+                    await reply_projects()
+
+            elif kind == "project_remove":
+                pid = str(payload.get("project_id") or "")
+                # 守卫：该空间还有会话在跑（或后台任务在跑）就拒绝 —— 删掉正在写的
+                # 会话文件是不可逆事故，且用户还没机会看到"总结没出来"。
+                busy = _busy_sessions_of_project(pid)
+                if busy:
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"该工作空间还有 {len(busy)} 个会话正在执行，请先停止后再删除",
+                    }))
+                    continue
+                try:
+                    info = await asyncio.to_thread(get_registry().remove, pid)
+                except WorkspaceError as exc:
+                    await safe_send(ws, _envelope("error", {"msg": str(exc)}))
+                except Exception as exc:  # noqa: BLE001
+                    log.error("删除工作空间失败 %s: %s: %s", pid, type(exc).__name__, exc)
+                    await safe_send(ws, _envelope("error", {"msg": f"删除工作空间失败：{exc}"}))
+                else:
+                    # 清掉该空间的缓存与 sid→project 映射：目录已不存在，留着会
+                    # 让后续按 sid 的操作去建/读一个已删除的目录
+                    _MANAGER_CACHE.pop(pid, None)
+                    for sid_key, pid_val in [kv for kv in _SID_PROJECT.items() if kv[1] == pid]:
+                        _SID_PROJECT.pop(sid_key, None)
+                    for sid_key in _sessions_of_project(pid):
+                        registry.remove(sid_key)
+                    log.info("工作空间已删除: %s（%s）真实目录保留", info.id, info.path)
+                    await reply_projects()
+                    await reply_sessions()
+
+            elif kind == "session_rename":
+                tgt = str(payload.get("session_id") or "")
+                sm = _manager_for_session(tgt)
+                try:
+                    await asyncio.to_thread(
+                        sm.rename_session, tgt, str(payload.get("title", "")),
                     )
                 except FileNotFoundError:
-                    await safe_send(ws, _envelope("error", {"msg": f"session {payload.get('session_id')} not found"}))
+                    await safe_send(ws, _envelope("error", {"msg": f"session {tgt} not found"}))
                 except ValueError as exc:
                     await safe_send(ws, _envelope("error", {"msg": f"重命名失败：{exc}"}))
                 else:
-                    log.info("会话重命名: session_%s -> %r",
-                             payload.get("session_id"), payload.get("title"))
+                    log.info("会话重命名: session_%s -> %r", tgt, payload.get("title"))
                     await reply_sessions()
 
             elif kind == "session_trash":
-                sm = _ensure_session_manager()
                 sid = str(payload.get("session_id") or "")
                 # 运行中（含后台子智能体仍在跑）的会话禁止进回收站：
                 # 后台 worker 还在往会话文件/旁路文件写，移动文件会造成写入丢失
@@ -711,29 +991,30 @@ async def handle(ws):
                         "msg": f"该会话 (session_{sid}) 正在执行（或后台任务仍在跑），请先停止后再删除",
                     }))
                     continue
+                sm = _manager_for_session(sid)
                 try:
                     await asyncio.to_thread(sm.trash_session, sid)
                 except (FileNotFoundError, ValueError):
                     await safe_send(ws, _envelope("error", {"msg": f"session {sid} not found"}))
                 else:
-                    log.info("会话进回收站: session_%s", sid)
+                    log.info("会话进回收站: session_%s (project=%s)", sid, _project_of_session(sid))
                     registry.remove(sid)
                     await reply_sessions()
 
             elif kind == "session_restore":
-                sm = _ensure_session_manager()
+                tgt = str(payload.get("session_id") or "")
+                sm = _manager_for_session(tgt)
                 try:
-                    await asyncio.to_thread(sm.restore_session, str(payload.get("session_id") or ""))
+                    await asyncio.to_thread(sm.restore_session, tgt)
                 except (FileNotFoundError, ValueError):
-                    await safe_send(ws, _envelope("error", {"msg": f"session {payload.get('session_id')} not found"}))
+                    await safe_send(ws, _envelope("error", {"msg": f"session {tgt} not found"}))
                 else:
-                    log.info("会话从回收站还原: session_%s", payload.get("session_id"))
+                    log.info("会话从回收站还原: session_%s", tgt)
                     await reply_sessions()
 
             elif kind == "session_delete":
                 # 批量永久删除：逐条执行，单条失败不断整批；
                 # 有活动的会话拒绝删除（turn 在跑，或后台子智能体还在写文件）
-                sm = _ensure_session_manager()
                 ids = payload.get("ids") or []
                 deleted, failed = [], []
                 for raw in ids:
@@ -743,6 +1024,8 @@ async def handle(ws):
                     if registry.is_active(sid):
                         failed.append(sid)
                         continue
+                    # 每个 sid 各自解析空间（批量删除可能跨空间：回收站是全局列表）
+                    sm = _manager_for_session(sid)
                     try:
                         ok = await asyncio.to_thread(sm.delete_session_permanent, sid)
                     except (TypeError, ValueError):
@@ -760,11 +1043,10 @@ async def handle(ws):
                 }))
 
             elif kind == "trash_list":
-                sm = _ensure_session_manager()
-                items = await asyncio.to_thread(sm.list_sessions, "trashed")
-                await safe_send(ws, _envelope("sessions_trashed", {
-                    "sessions": [_session_meta(i) for i in items],
-                }))
+                # 回收站是**全局**的（跨工作空间）：删除按 sid 各自解析空间，
+                # 所以这里要把每个空间的 trashed 合起来返回，每条带 project。
+                items = await asyncio.to_thread(_list_all_trashed)
+                await safe_send(ws, _envelope("sessions_trashed", {"sessions": items}))
 
             elif kind == "goal_status":
                 text = await asyncio.to_thread(agent.goal_status)
@@ -857,13 +1139,35 @@ def _watch_parent():
             os._exit(0)
 
 
+def _session_id_taken_globally(sid: str) -> bool:
+    """该会话 id 是否已被**任意工作空间**占用（跨空间查重的唯一实现）。
+
+    注入给 `session_manage.set_session_id_guard`：新建会话时逐空间 stat
+    `session_<id>.jsonl` / `.meta.json`。id 是前端事件路由键，跨空间重号会让
+    事件进错会话、切会话切错空间，且无法自愈 —— 用 N 次 stat 换掉这个风险。
+    """
+    prefix = agent.session_prefix
+    for info in _list_infos():
+        try:
+            base = _workspace_of(info.id).chat_history_dir
+        except WorkspaceError:
+            continue
+        if ((base / f"{prefix}{sid}.jsonl").exists()
+                or (base / f"{prefix}{sid}.meta.json").exists()):
+            return True
+    return False
+
+
 async def main():
     global _loop, registry
     _loop = asyncio.get_running_loop()
+    # 会话 id 跨工作空间唯一性守卫（见 _session_id_taken_globally）
+    set_session_id_guard(_session_id_taken_globally)
     # 全局唯一会话运行时注册表：所有连接共享。连接可断可换，
     # 运行中的会话事件始终经 hub 广播到当前活跃连接（见 ConnectionHub）。
     def _load_meta(sid: str):
-        return _ensure_session_manager().load_meta(sid)
+        # 会话 → 所属空间的管理器（多工作空间：不能固定用 default 的那份）
+        return _manager_for_session(sid).load_meta(sid)
     registry = SessionRuntimeRegistry(deliver, reply_sessions, _load_meta)
     async with websockets.serve(handle, "127.0.0.1", PORT):
         log.info("ws_bridge 后端启动: WS server listening on 127.0.0.1:%d "

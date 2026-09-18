@@ -47,14 +47,23 @@ AGENTS_DIR = ROOT / "agents"
 if str(AGENTS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENTS_DIR))
 
+import paths  # noqa: E402
 from background_manager import BackgroundManager  # noqa: E402
 from session_runtime import MAX_BG_FOLLOWUP_RETRIES, SessionRuntime  # noqa: E402
 from tools import ToolRegistry  # noqa: E402
 
 
 def _bare_tools() -> ToolRegistry:
-    """跳过 __init__ 的依赖注入，只要 run_bash 能用（它只依赖两个 staticmethod）。"""
-    return ToolRegistry.__new__(ToolRegistry)
+    """跳过 __init__ 的依赖注入，只要 run_bash 能用。
+
+    2026-09-18：run_bash 不再只依赖 staticmethod —— 多工作空间改造后它读
+    `self.bash_cwd`（命令的缺省工作目录）与 `self.workdir`（文件工具沙箱根），
+    故这里手工补上这两个路径字段（与 `Agent` 构造时的口径一致）。
+    """
+    reg = ToolRegistry.__new__(ToolRegistry)
+    reg.workdir = paths.WORKDIR
+    reg.bash_cwd = None  # None = 进程 cwd（default 空间的历史行为）
+    return reg
 
 
 class RunBashDecodingTests(unittest.TestCase):

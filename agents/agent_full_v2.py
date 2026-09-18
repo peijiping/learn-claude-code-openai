@@ -31,10 +31,12 @@ from session_manage import SessionManager
 from subagent import SubAgent
 from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
-from paths import (WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR,
-                   WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR)
+from paths import (SKILLS_DIR, WORKTREE_DIR, MCP_CONFIG, DEFAULT_PROJECT_ID,
+                   WorkspacePaths, workspace_paths)
 from tools import ToolRegistry
-from task_manager import current_board
+from task_manager import TaskManager, current_board
+from memories import MemoryStore
+from message_bus import MessageBus
 from worktree import WorktreeManager
 from mcp_manager import MCPManager
 from workflow import WorkflowManager, register_default_workflows
@@ -189,7 +191,18 @@ class Agent:
         session_prefix: str = "session_",
         cron_scheduler=None,
         silent: bool = False,
+        workspace: WorkspacePaths | None = None,
     ):
+        # ── 工作空间（多工作空间改造，2026-09-18）──────────────────────
+        # 一个 Agent 实例**只服务一个工作空间**：会话历史 / 任务 / 记忆 / 收件箱 /
+        # 团队 / 工作流 / 沙箱根全部由这份路径束决定（见 docs/frontend/11）。
+        # 不传 = default 空间（沙箱根取遗留 WORKDIR、元数据取 ~/.aigent/projects/default），
+        # 与改造前**逐字一致** —— CLI 与既有调用方零改动。
+        self.workspace: WorkspacePaths = (
+            workspace if workspace is not None
+            else workspace_paths(DEFAULT_PROJECT_ID)
+        )
+
         # ── 模型参数（从 .env 读取） ──
         self.model = os.environ.get("OPENAI_MODEL_ID", "")
         self.fallback_model = os.environ.get("FALLBACK_MODEL_ID", "")
@@ -210,14 +223,23 @@ class Agent:
         }
 
         # ── 依赖（默认惰性构造；允许外部注入，多实例可共享/自定义） ──
+        # 技能**保持全局**（SKILLS_DIR，不随工作空间变）：技能是应用级能力，
+        # 换空间后"技能全没了"是割裂体验；沙箱根与运行时数据才按空间隔离。
         self.skills = skills if skills is not None else SkillLoader(SKILLS_DIR)
         self.tools = tools if tools is not None else ToolRegistry(
             skills=self.skills, cron_scheduler=cron_scheduler,
+            workdir=self.workspace.workdir,
+            # default 空间 bash 沿用进程 cwd（历史行为，见 ToolRegistry.bash_cwd）；
+            # 自定义空间 bash 与文件工具都落在选定的真实目录。
+            bash_cwd=None if self.workspace.is_default else self.workspace.workdir,
+            memory=MemoryStore(self.workspace.memory_dir),
+            task_manager=TaskManager(self.workspace.tasks_dir),
+            bus=MessageBus(self.workspace.inbox_dir),
         )
         self.memory = memory if memory is not None else self.tools.memory
 
-        # 钩子实例：每实例独立，主循环与子智能体共用
-        self.hook_system = HookSystem(silent=self.silent)
+        # 钩子实例：每实例独立，主循环与子智能体共用（工作根 = 本空间沙箱根）
+        self.hook_system = HookSystem(silent=self.silent, workdir=self.workspace.workdir)
         self.hook_system.register_default_hooks()
 
         # 后台任务管理器：挂到本实例 tools 的 holder 上（实例级，非全局）
@@ -225,7 +247,8 @@ class Agent:
         self.tools.set_background_manager(self.background_manager)
 
         # 团队成员管理器（s17）：挂到本实例 tools 的 holder 上（注入本实例 tools，实例级）
-        self.teammate_manager = TeammateManager(TEAM_DIR, tools=self.tools)
+        # 队伍收件箱按工作空间隔离（换空间 = 换队伍，符合"不同项目分开"的直觉）
+        self.teammate_manager = TeammateManager(self.workspace.team_dir, tools=self.tools)
         self.tools.set_teammate_manager(self.teammate_manager)
 
         # worktree 管理器（s18）：挂到本实例 tools 的 holder 上（实例级）
@@ -260,7 +283,7 @@ class Agent:
         # 也**禁止**从 chat_history_dir.parent 反推：运行时数据迁到 ~/.aigent/projects/<slug>/
         # 之后那个 parent 已不是工作空间，曾因此让指令文件恒加载不到。
         self.system_prompt = SystemPromptBuilder(
-            workdir=WORKDIR,
+            workdir=self.workspace.workdir,
             skills=self.skills,
             tools=self.tools,
         )
@@ -282,7 +305,8 @@ class Agent:
 
         # 工作流运行时（s16）：复用本实例的 LLM 客户端与模型跑工作流子智能体，
         # 挂到本实例 tools 的 holder 上（实例级），并注册内置示例工作流
-        self.workflow_manager = WorkflowManager(WORKFLOW_DIR, self.llm_client, self.model)
+        self.workflow_manager = WorkflowManager(
+            self.workspace.workflow_dir, self.llm_client, self.model)
         register_default_workflows(self.workflow_manager)
         self.tools.set_workflow_manager(self.workflow_manager)
 
@@ -561,8 +585,9 @@ class Agent:
         """
         if self.session_manager is None:
             self.session_manager = SessionManager(
-                CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
-                session_prefix=self.session_prefix,
+                self.workspace.chat_history_dir, self.system_prompt.build_system_prompt(),
+                session_prefix=self.session_prefix, project_id=self.workspace.id,
+                tasks_dir=self.workspace.tasks_dir,
             )
         if resume:
             self.session_id, self.session_file, self.history_messages = \
@@ -854,8 +879,9 @@ class Agent:
         # 对全新 Agent 实例调 switch_session，此时 session_manager 尚为 None
         if self.session_manager is None:
             self.session_manager = SessionManager(
-                CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
-                session_prefix=self.session_prefix,
+                self.workspace.chat_history_dir, self.system_prompt.build_system_prompt(),
+                session_prefix=self.session_prefix, project_id=self.workspace.id,
+                tasks_dir=self.workspace.tasks_dir,
             )
         self.session_id, self.session_file, self.history_messages = \
             self.session_manager.switch_session(target_id)
@@ -1006,7 +1032,11 @@ class Agent:
         if tm is None or self.session_manager is None:
             return
         try:
-            board = current_board(tm.scope)
+            # 任务板按**本空间**的 .tasks 目录读（模块级 TASKS_DIR 只代表 default）。
+            # 用 getattr 兜底：离线测试桩常以 `Agent.__new__` 手工填字段，
+            # 缺 workspace 时语义上就是 default 空间（传 None 即回落 TASKS_DIR）。
+            ws = getattr(self, "workspace", None)
+            board = current_board(tm.scope, ws.tasks_dir if ws is not None else None)
         except Exception as e:
             log.error("读取任务板失败: %s: %s", type(e).__name__, e)
             return

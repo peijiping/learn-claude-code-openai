@@ -167,9 +167,13 @@ class SystemInjectionContractTests(unittest.TestCase):
         }
 
     def _patch_board(self, board):
-        """替换快照来源，避免测试读用户真实的 .tasks/ 目录。"""
+        """替换快照来源，避免测试读用户真实的 .tasks/ 目录。
+
+        签名需与调用口径一致：`_sync_task_board` 传 `(scope, tasks_dir)`
+        （tasks_dir = 本会话所属工作空间的 .tasks，多工作空间改造后新增）。
+        """
         orig = agent_full_v2.current_board
-        agent_full_v2.current_board = lambda scope: board
+        agent_full_v2.current_board = lambda scope, tasks_dir=None: board
         self.addCleanup(lambda: setattr(agent_full_v2, "current_board", orig))
 
     def test_task_board_reminder_is_wrapped(self):

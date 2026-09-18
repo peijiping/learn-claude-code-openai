@@ -74,7 +74,22 @@ class ToolRegistry:
         bus: MessageBus | None = None,
         cron_scheduler=None,
         teammate_manager=None,
+        workdir: Path | None = None,
+        bash_cwd: Path | None = None,
     ):
+        # 工作根（图省事也叫"沙箱根"）：文件工具（run_read/run_write/run_edit/
+        # run_glob）相对路径的基准，也是 `safe_path` 的越界判定基准。
+        # 多工作空间下每个 Agent 传自己空间的 `workdir`（= 用户选定的真实目录）；
+        # 不传时沿用遗留 WORKDIR（default 空间），行为一字不变。
+        self.workdir = Path(workdir) if workdir is not None else WORKDIR
+        # run_bash 的**缺省**工作目录。None = 进程 cwd（历史行为）。
+        # 为什么和 workdir 分开（2026-09-18）：default 空间历史上 bash 就跑在
+        # 进程 cwd（Electron 拉起后端时 = 应用/仓库目录），文件工具跑在 WORKDIR，
+        # 两者本就不同；把 default 的 bash 一并挪到 WORKDIR 会改变既有会话里
+        # 相对路径命令的落点（风险远大于收益）。**自定义工作空间**则两者都落在
+        # 选定目录（Agent 构造时显式传 `bash_cwd=ws.workdir`），语义自洽。
+        self.bash_cwd = Path(bash_cwd) if bash_cwd is not None else None
+
         # ── 依赖注入：默认惰性构造，允许外部传入自定义实例 ──
         self.skills = skills if skills is not None else SkillLoader(SKILLS_DIR)
         self.memory = memory if memory is not None else MemoryStore(MEMORY_DIR)
@@ -232,26 +247,30 @@ class ToolRegistry:
         tail = text[-tail_size:]
         return f"{head}\n\n... [输出已截断，共 {len(text)} 字符，保留首 {head_size} + 尾 {tail_size} 字符] ...\n\n{tail}"
 
-    @staticmethod
-    def safe_path(p: str, base: Path | None = None) -> Path:
+    def safe_path(self, p: str, base: Path | None = None) -> Path:
         """
         验证路径是否在指定工作根内，防止路径遍历攻击
         安全机制：
-        - 将相对路径与工作根（base，默认 WORKDIR）拼接后转换为绝对路径
+        - 将相对路径与工作根（base，默认本实例的 workdir）拼接后转换为绝对路径
         - 检查最终路径是否仍然在 base 内
         - 如果路径逃逸到 base 之外，抛出 ValueError
         参数：
             p: 相对路径字符串
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；
+                  None 时用 **本实例的 `self.workdir`**
         返回：
             验证通过后的绝对路径(Path对象)
         异常：
             ValueError: 当路径试图逃逸到工作根之外时抛出
                          例如：p = "../../etc/passwd" 会被拒绝
+        说明（2026-09-18）：
+            原为 `@staticmethod` + 模块级 `WORKDIR`。多工作空间下每个 Agent 的沙箱根
+            不同（= 该空间选定的真实目录），故改为实例方法读 `self.workdir`。
+            `base` 覆盖语义不变（worktree / 子智能体 scoped workdir 仍走它）。
         """
         # 拼接工作根和输入路径，并解析为绝对路径
         # .resolve() 会解析符号链接并返回绝对路径
-        base = base or WORKDIR
+        base = base or self.workdir
         path = (base / p).resolve()
 
         # is_relative_to() 检查 path 是否在 base 的子目录中
@@ -270,7 +289,8 @@ class ToolRegistry:
         - 输出截断：结果最多返回50000字符，防止内存溢出
         参数：
             command: 要执行的shell命令字符串
-            base: 可选，命令的工作目录（worktree 场景传入 worktree 路径）；None 时用进程当前目录
+            base: 可选，命令的工作目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `bash_cwd`，再退到进程 cwd
         返回：
             命令成功：返回标准输出+标准错误的合并内容（最多50000字符）
             命令失败：返回格式 "Error: command failed with return code X\\n错误信息"
@@ -284,7 +304,7 @@ class ToolRegistry:
             r = subprocess.run(
                 command,
                 shell=True,
-                cwd=base or os.getcwd(),
+                cwd=base or self.bash_cwd or os.getcwd(),
                 capture_output=True,
                 text=True,
                 # 显式 utf-8 + errors="replace"：**绝不能**用默认的严格解码。
@@ -326,7 +346,8 @@ class ToolRegistry:
         参数：
             path: 要读取的文件路径（相对路径）
             limit: 可选，限制读取的行数。默认None表示读取全部
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：文件内容字符串（可能被截断）
             失败：格式 "Error: {异常信息}"
@@ -351,7 +372,8 @@ class ToolRegistry:
             path: PDF 文件路径（相对路径）
             max_pages: 最大读取页数，默认5
             chars_per_page: 每页最大字符数，默认3000
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：PDF 文本内容
             失败：格式 "Error: {异常信息}"
@@ -396,7 +418,8 @@ class ToolRegistry:
         参数：
             path: 要写入的文件路径（相对路径）
             content: 要写入的内容字符串
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：格式 "Wrote {字节数} bytes to {路径}"
             失败：格式 "Error: {异常信息}"
@@ -425,7 +448,8 @@ class ToolRegistry:
             path: 要编辑的文件路径（相对路径）
             old_text: 要被替换的原文本（必须是完整的连续字符串）
             new_text: 替换后的新文本
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：格式 "Edited {路径}"
             失败（文本未找到）：格式 "Error: Text not found in {路径}"
@@ -453,12 +477,13 @@ class ToolRegistry:
         - 仅返回相对于工作目录的路径
         参数：
             pattern: 要匹配的文件路径模式（支持 glob 模式）
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：匹配的文件路径列表（每个路径占一行）
             失败：格式 "Error: {异常信息}"
         """
-        base = base or WORKDIR
+        base = base or self.workdir
         try:
             results = []
             for match in g.glob(pattern, root_dir=base):

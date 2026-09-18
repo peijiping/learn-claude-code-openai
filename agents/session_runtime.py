@@ -85,9 +85,13 @@ def _bind_agent_env(load_meta: LoadMeta, sid: str, agent_or_factory,
 
 class SessionRuntime:
     def __init__(self, sid: str, deliver: Deliver, reply_sessions: ReplySessions,
-                 load_meta: LoadMeta):
+                 load_meta: LoadMeta, workspace=None):
         self.sid = sid
         self.agent: Optional[Agent] = None
+        # 本会话所属工作空间的路径束（多工作空间，2026-09-18）。
+        # None = default 空间（老调用方 / 复现脚本不传；行为与改造前一致，
+        # 模块级 CHAT_HISTORY_DIR 仍作兜底，见 _bind_subagent_store）。
+        self.workspace = workspace
         self.busy = False  # 本会话当前是否有一个 turn 在跑（拒绝同会话并发）
         self.stop_evt = threading.Event()
         self._pending_overrides: tuple = (None, None)  # (reasoning_effort, max_context)
@@ -174,12 +178,18 @@ class SessionRuntime:
         `if self.session_manager is None`），所以在 switch_session 之前先把
         带 store 的实例建好即可；已存在则直接改属性。绑定后子智能体执行过程
         写到 `session_N.subagents.jsonl`，主会话文件只保留标准消息。
+
+        目录取 `agent.workspace`（该会话所属工作空间的元数据目录），
+        **不能**再用模块级 `CHAT_HISTORY_DIR`（那只代表 default 空间）。
         """
-        store = SubagentStore(CHAT_HISTORY_DIR)
+        chat_dir = self.workspace.chat_history_dir if self.workspace else CHAT_HISTORY_DIR
+        store = SubagentStore(chat_dir)
         if agent.session_manager is None:
             agent.session_manager = SessionManager(
-                CHAT_HISTORY_DIR, agent.system_prompt.build_system_prompt(),
+                chat_dir, agent.system_prompt.build_system_prompt(),
                 session_prefix=agent.session_prefix, subagent_store=store,
+                project_id=agent.workspace.id,
+                tasks_dir=agent.workspace.tasks_dir,
             )
         else:
             agent.session_manager.subagent_store = store
@@ -224,7 +234,10 @@ class SessionRuntime:
         """
         if self.agent is None:
             agent, model_id = _bind_agent_env(
-                self._load_meta, self.sid, lambda: Agent(silent=True), rebuild=False
+                self._load_meta, self.sid,
+                # 每会话的 Agent 携带**该会话所属工作空间**的路径束：会话历史 /
+                # 任务 / 记忆 / 沙箱根都随空间走（多工作空间改造的接线点）。
+                lambda: Agent(silent=True, workspace=self.workspace), rebuild=False
             )
             self.agent = agent
             self._bound_model = model_id
@@ -472,10 +485,18 @@ class SessionRuntimeRegistry:
         """所有已注册的会话运行时（新连接状态重放用）。"""
         return list(self._sessions.values())
 
-    def get_or_create(self, sid: str) -> SessionRuntime:
+    def get_or_create(self, sid: str, workspace=None) -> SessionRuntime:
+        """取（或创建）某会话的运行时。
+
+        `workspace`：该会话所属工作空间的路径束。首次创建时传入并固化在本运行时上；
+        已存在时**忽略**新值（一个会话的工作空间不可漂移 —— 否则同一个 sid 的
+        事件前半段写 A 空间、后半段写 B 空间）。多工作空间下调用方必须先解析出
+        该 sid 的归属再调用。
+        """
         rt = self._sessions.get(sid)
         if rt is None:
-            rt = SessionRuntime(sid, self._deliver, self._reply_sessions, self._load_meta)
+            rt = SessionRuntime(sid, self._deliver, self._reply_sessions,
+                                self._load_meta, workspace=workspace)
             self._sessions[sid] = rt
         return rt
 

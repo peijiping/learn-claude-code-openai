@@ -306,3 +306,153 @@
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
 }
+/* ═══════════════════════════════════════════════════════════════
+   工作空间树（多工作空间，2026-09-18；见 docs/frontend/11）
+   - .ws-node：空间行（文件夹图标 + 名称 + 折叠箭头 + 行内「+」）
+   - .ws-sessions：其下的会话列表（带左侧竖线缩进，复用 .tree-node 会话行）
+   - .ws-more-sessions：超 15 条折叠后的「展开全部 N 条」入口
+   ═══════════════════════════════════════════════════════════════ */
+.ws-group {
+  margin-bottom: 2px;
+}
+.ws-node {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-1);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+.ws-node:hover {
+  background: var(--color-bg-hover);
+}
+.ws-node.missing {
+  opacity: 0.6;
+}
+.ws-node.active .ws-name {
+  font-weight: 600;
+}
+.ws-node.active .ws-folder,
+.ws-node.active .ws-chevron {
+  color: var(--color-accent);
+}
+.ws-chevron,
+.ws-folder {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-secondary);
+}
+.ws-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 行内重命名输入框（与 .tree-rename-input 同款，作用在空间行） */
+.ws-rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+/* 「+」= 在该空间新建任务：默认透明，hover / 激活空间时浮现 */
+.ws-add {
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.ws-node:hover .ws-add,
+.ws-node.active .ws-add {
+  opacity: 1;
+}
+/* 空间徽标：未读计数 / 目录失效 */
+.ws-badge {
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+.ws-badge.unread {
+  background: #ff9500;
+  color: #fff;
+}
+.ws-badge.missing {
+  background: var(--color-danger, #e5534b);
+  color: #fff;
+  font-weight: 600;
+}
+/* 空间级运行指示（子会话运行状态上浮；折叠时也能看出"还有活没干完"） */
+.ws-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-accent, #4facfe);
+  animation: tree-dot-pulse 1.2s ease-out infinite;
+}
+.ws-sessions {
+  margin-left: 9px;
+  padding-left: 3px;
+  border-left: 1px solid var(--color-border);
+}
+.ws-empty {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+.ws-more-sessions {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.ws-more-sessions:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-accent);
+}
+
+/* 空间右键菜单（复用 .session-menu 外壳，故只补差异部分） */
+.ws-menu {
+  min-width: 168px;
+}
+.ws-menu-sep {
+  height: 1px;
+  margin: var(--sp-1) 0;
+  background: var(--color-border);
+}
+/* 二次确认态：整项变红加粗，与设置页回收站的 arm-confirm 同一语言 */
+.session-menu-item.armed,
+.session-menu-item.armed:hover {
+  color: var(--color-danger);
+  font-weight: 600;
+}
+.ws-menu-hint {
+  padding: var(--sp-1) var(--sp-2) var(--sp-2);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+.ws-menu-path {
+  word-break: break-all;
+  color: var(--color-text-primary);
+}
