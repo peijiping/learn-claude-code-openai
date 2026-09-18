@@ -119,12 +119,6 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
           <button className="tool-btn access">
             完全访问 <Icon name="chevronDown" size={12} />
           </button>
-          <button className="tool-btn" title="附件（后续增量）">
-            <Icon name="paperclip" size={16} />
-          </button>
-          <button className="tool-btn" title="图片（后续增量）">
-            <Icon name="chart" size={16} />
-          </button>
         </div>
 
         <div className="toolbar-right">

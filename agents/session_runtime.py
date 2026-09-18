@@ -179,6 +179,31 @@ class SessionRuntime:
         else:
             agent.session_manager.subagent_store = store
 
+    def _bind_task_board(self, agent: Agent) -> None:
+        """把任务板快照接到本会话的前端通道（桌面端任务面板的实时数据源）。
+
+        接线选在 TaskManager 层、而不是工具 handler 层：
+        子智能体与队友复用**同一个** TaskManager 实例（`tools.handlers` 的闭包
+        指向同一对象），所以"子智能体认领/完成任务 → 面板实时更新"不需要任何
+        额外接线就自动成立。放到 handler 层就得为每个调用方各接一遍。
+
+        `self._deliver` 是线程安全的（投递到事件循环队列），因此后台子智能体在
+        daemon 线程里改任务也能安全推送。
+
+        推送的是**整份快照**（幂等替换，不是增量）：面板 ≤20 行、体积可忽略，
+        换来的是前端 store 无需增量合并状态机 —— 断线重连 / 会话切换 / 回放
+        三条路径天然幂等。多线程乱序则由快照里的 revision 兜住。
+        """
+        def emit(payload: dict) -> None:
+            try:
+                self._deliver("task_board", {"session_id": self.sid, **payload})
+            except Exception as e:
+                # 推送失败绝不能影响任务本身（任务已落盘）
+                log.error("session_%s 任务快照投递失败: %s: %s",
+                          self.sid, type(e).__name__, e)
+
+        agent.tools.task_manager.set_emitter(emit)
+
     def _push_status(self, status: str) -> None:
         """会话执行状态的唯一出口：关键节点打日志 + 广播到前端。
         running=turn 执行中；background=turn 结束但后台任务仍在跑；
@@ -202,6 +227,9 @@ class SessionRuntime:
             # 必须在 switch_session 之前绑 store（后者会惰性构造 SessionManager）
             self._bind_subagent_store(self.agent)
             self.agent.switch_session(self.sid)
+            # 任务板推送必须在 switch_session 之后：set_scope 在 switch_session 里完成，
+            # 而 TaskManager 的 scope 决定快照读哪个会话的文件。
+            self._bind_task_board(self.agent)
             log.info("session_%s agent 构建完成 (model=%s)",
                      self.sid, model_id or "global-default")
             return self.agent

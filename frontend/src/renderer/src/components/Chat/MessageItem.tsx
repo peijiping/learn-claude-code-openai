@@ -146,6 +146,13 @@ function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
   )
 }
 
+/** 消息时间展示：jsonl 秒级 ISO（2026-09-18T10:30:00）→ 年月日时分秒（2026-09-18 10:30:00）；
+ *  空值（老会话行无 created_at）不渲染 */
+function fmtMsgTime(iso?: string): string {
+  if (!iso) return ''
+  return iso.replace('T', ' ').slice(0, 19)
+}
+
 export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
 
@@ -166,16 +173,19 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
         <div className="msg-row user" onContextMenu={openMenu}>
           <div className="msg-bubble user">
             {msg.content}
-            <button
-              className="msg-copy-btn"
-              title="复制"
-              onClick={(e) => {
-                e.stopPropagation()
-                copyContent()
-              }}
-            >
-              <Icon name="copy" size={12} />
-            </button>
+            <div className="msg-meta">
+              {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}
+              <button
+                className="msg-copy-btn"
+                title="复制"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  copyContent()
+                }}
+              >
+                <Icon name="copy" size={12} />
+              </button>
+            </div>
           </div>
         </div>
         {menu && <MessageMenu x={menu.x} y={menu.y} onCopy={copyContent} onClose={() => setMenu(null)} />}
@@ -233,16 +243,19 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
               <span className="model-switch-info" aria-label="模型已切换">ⓘ</span>
             </div>
           )}
-          <button
-            className="msg-copy-btn"
-            title="复制"
-            onClick={(e) => {
-              e.stopPropagation()
-              copyContent()
-            }}
-          >
-            <Icon name="copy" size={12} />
-          </button>
+          <div className="msg-meta">
+            {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}
+            <button
+              className="msg-copy-btn"
+              title="复制"
+              onClick={(e) => {
+                e.stopPropagation()
+                copyContent()
+              }}
+            >
+              <Icon name="copy" size={12} />
+            </button>
+          </div>
         </div>
       </div>
       {menu && <MessageMenu x={menu.x} y={menu.y} onCopy={copyContent} onClose={() => setMenu(null)} />}

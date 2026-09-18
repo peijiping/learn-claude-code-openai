@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useAgentStore } from '@store/agentStore'
 import MessageList from './MessageList'
 import InputBox from './InputBox'
+import TaskBoard from './TaskBoard'
 
 /** 中央聊天面板：空态品牌 / 消息流 + 输入区 */
 export default function ChatPanel(): JSX.Element {
@@ -25,6 +26,9 @@ export default function ChatPanel(): JSX.Element {
       ) : (
         <MessageList />
       )}
+
+      {/* 任务面板：固定在输入框上方（有未完成任务组时才渲染） */}
+      <TaskBoard />
 
       <div className="composer-wrap">
         <InputBox value={draft} onChange={setDraft} onSend={doSend} />

@@ -97,7 +97,7 @@ export default function TrashSettings(): JSX.Element {
                 {sessionDisplayName(s)}
               </span>
               <span className="trash-meta">
-                {s.message_count} 条 · 删除于 {fmtTime(s.trashed_at ?? s.created_at) || '—'}
+                删除于 {fmtTime(s.trashed_at ?? s.created_at) || '—'}
               </span>
               <button
                 className="btn trash-restore-btn"

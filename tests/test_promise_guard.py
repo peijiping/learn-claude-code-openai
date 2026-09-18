@@ -162,6 +162,15 @@ def _make_offline_agent(tmp: Path) -> Agent:
     agent.session_id = "1"
     agent.silent = True
     agent.total_tokens = 0
+    # token 记账字段：对齐 Agent.__init__（2026-09 新增的用量统计段）。
+    # 本桩直接调 agent.agent_loop()（绕过 __init__ 与 run_turn），必须手工补齐，
+    # 否则 _accumulate_usage 抛 AttributeError → [_unrecoverable] 提前收尾，
+    # 表现为"脚本只被调用 1 次"（2026-09-16 修复：随引擎新增记账字段而桩过期）。
+    agent._turn_usage = dict(agent_full_v2._ZERO_USAGE)
+    agent.usage_totals = {**agent_full_v2._ZERO_USAGE, "turns": 0}
+    agent._in_turn = True          # 真实链路里由 run_turn 置位
+    agent._turn_model_id = None    # 由 SessionRuntime 在 run_turn 前设置
+    agent._turn_switches = []
     agent.max_agent_iterations = 10
     agent._stop_evt = __import__("threading").Event()
     agent.model = "offline-stub"

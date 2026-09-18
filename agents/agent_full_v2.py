@@ -5,8 +5,9 @@ agent_full_v2.py - 主智能体引擎（Agent 类）
 从函数式 REPL 重构为类形式：所有依赖与会话状态收敛为实例属性，
 不再使用模块级可变单例（tools.py 的全局 TOOL_REGISTRY 已移除）。
 
-- 每个 Agent 实例拥有独立的 ToolRegistry / todo holder / background holder /
+- 每个 Agent 实例拥有独立的 ToolRegistry / background holder / task_manager /
   hook_system / subagent_runner / session 状态，支持多实例隔离。
+  （todo holder 已于 2026-09-16 随 todo 下线停用，定义保留不引用。）
 - 交互入口：`python agents/agent_cli.py`（实例化 Agent 驱动 REPL）。
 
 为 s14 定时任务（每任务独立会话）与未来 TUI 多会话预留的接缝：
@@ -33,6 +34,7 @@ from teammate_manager import TeammateManager
 from paths import (WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR,
                    WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR)
 from tools import ToolRegistry
+from task_manager import current_board
 from worktree import WorktreeManager
 from mcp_manager import MCPManager
 from workflow import WorkflowManager, register_default_workflows
@@ -61,7 +63,7 @@ log = get_logger("agent")
 # 「尾部按需注入」的块标记名。注入消息形如：
 #   <system-reminder><memory_index revision="ab12cd34ef56">…索引…</memory_index></system-reminder>
 # 必须用 <system-reminder> 包裹 —— ws_bridge._history_to_ui 会跳过以此开头的 user 消息，
-# 所以这类注入不会出现在前端回放 / 聊天界面里（与 _inject_todo_reminder 的约定一致）。
+# 所以这类注入不会出现在前端回放 / 聊天界面里（与 _sync_task_board / _sync_memory_index 的约定一致）。
 # 每个 tag 各自独立判指纹，互不影响。
 MEMORY_INDEX_TAG = "memory_index"   # 记忆索引（L2 热段，变化最频繁）
 ENV_TAG = "env"                     # 环境与上下文：日期 / 星期 / 平台（L2 热段）
@@ -170,7 +172,7 @@ class Agent:
     每个实例拥有独立的：
     - tools（ToolRegistry：基础工具方法 / definitions / handlers / execute）
     - skills / memory / hook_system / background_manager / subagent_runner / recovery
-    - session 状态（session_id / session_file / history_messages / todo holder）
+    - session 状态（session_id / session_file / history_messages / task_manager 作用域）
 
     交互入口 agent_cli.py 实例化本类并驱动 REPL；
     未来 cron（每任务独立会话）与 TUI（每会话一实例）直接复用。
@@ -553,7 +555,7 @@ class Agent:
 
     def init_session(self, resume: bool = True) -> int:
         """
-        创建/恢复会话：构建 SessionManager → 初始化 → 绑定 todo → 注入 reminder。
+        创建/恢复会话：构建 SessionManager → 初始化 → 绑定任务板作用域 → 注入 reminder。
 
         resume=True：加载最近一次会话；resume=False：新建独立会话（cron 用）。
         """
@@ -572,14 +574,16 @@ class Agent:
         # 方案 B：加载回来的 messages[0] 是文件里那份（会话创建时构建），
         # 用最新构建的替换 —— 否则改了 AGENTS.md / 装了新技能，本会话看不到。
         self._refresh_system_prompt()
-        # todo 与 session 绑定：每次切会话都要重新指向对应的 todo 文件
-        self.tools.set_todo_manager(self.session_id)
+        # todo 已下线（2026-09-16）：不再绑定 TodoManager，todo reminder 一并移除。
+        # self.tools.set_todo_manager(self.session_id)
         # task 与 session 绑定：任务板限定在本会话作用域（"session_N"/"cron_N"）
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
-        self._inject_todo_reminder()
+        # 中断/恢复提示改由 _sync_task_board() 承接（见 Step 3），原 _inject_todo_reminder 已移除
         # L2 尾部注入：首次注入落在用户提问之前（指纹已在历史里则是 no-op）
         self._sync_memory_index()
         self._sync_environment()
+        # 任务板注入：恢复会话时提示"还有活没干完"（判据=存在未完成组，非"是否中断"）
+        self._sync_task_board()
         self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
         log.info("会话初始化: %s%s (resume=%s, messages=%d)",
                  self.session_prefix, self.session_id, resume, len(self.history_messages))
@@ -766,6 +770,15 @@ class Agent:
         self.goal_controller.begin_query()
         self._turn_usage = dict(_ZERO_USAGE)  # 轮级统计重新累计
         self._turn_switches = []  # 本轮切换序列归零（空闲期切换已在发生时即时上行）
+        # 中断恢复：把上一轮遗留（无人持有）的 in_progress 归一为 pending。
+        # 放在本轮任何工具调用之前 —— 此处看到的 in_progress 必然属于上一轮
+        #（本轮还没机会 claim 任何任务），因此无需再比较时间戳。
+        # 守卫：后台子智能体可能正合法持有某个 in_progress，此时不能动。
+        # 归一后这些任务才能被重新 claim —— 否则中断一次任务板就永久卡死。
+        if not self.background_manager.has_running():
+            _tm = getattr(self.tools, "task_manager", None)
+            if _tm is not None:
+                _tm.release_stale_in_progress()
         self.hook_system.trigger("UserPromptSubmit", user_query)
         log.info("turn 开始: %s%s user_query=%r",
                  self.session_prefix, self.session_id, user_query[:100])
@@ -814,7 +827,7 @@ class Agent:
         return str(last)
 
     def new_session(self) -> tuple[str, str]:
-        """创建新会话并绑定 todo，返回 (新会话 id, 提示语)。"""
+        """创建新会话并绑定任务板作用域，返回 (新会话 id, 提示语)。"""
         # 方案 B：新建会话的 system message 由 SessionManager **持有**的那份产出
         # （_build_initial_messages），必须先刷新为最新构建结果，否则长生命周期
         # Agent（CLI）会拿到很久以前构建的版本。
@@ -823,8 +836,8 @@ class Agent:
             self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         self.usage_totals = {**_ZERO_USAGE, "turns": 0}  # 新会话：token 计数器归零
-        # 新会话的 todo 文件尚不存在，set_todo_manager 会建出空列表；reminder 不会注入
-        self.tools.set_todo_manager(self.session_id)
+        # todo 已下线（2026-09-16）：不再绑定 TodoManager，也不再有 reminder
+        # self.tools.set_todo_manager(self.session_id)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         # 新会话：立即注入当前记忆索引与环境上下文（新会话扫不到指纹 → 必然注入）
         self._sync_memory_index()
@@ -834,7 +847,7 @@ class Agent:
 
     def switch_session(self, target_id: str) -> tuple[str, int]:
         """
-        切换到指定会话，绑定对应 todo 并注入 reminder。
+        切换到指定会话，绑定对应任务板作用域并按需注入提醒。
         返回 (会话 id, 消息数)；会话不存在时抛 FileNotFoundError。
         """
         # 惰性构建（同 init_session）：桌面端 SessionRuntime.build_agent 会直接
@@ -849,12 +862,15 @@ class Agent:
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 方案 B：与 init_session 同理 —— 换成最新构建的 system prompt
         self._refresh_system_prompt()
-        self.tools.set_todo_manager(self.session_id)
+        # todo 已下线（2026-09-16）：见 init_session 同处注释
+        # self.tools.set_todo_manager(self.session_id)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
-        self._inject_todo_reminder()
+        # 中断/恢复提示改由 _sync_task_board() 承接（见 Step 3）
         # L2 尾部注入：若离开期间记忆/日期变过，这里会补注（指纹从本会话历史恢复）
         self._sync_memory_index()
         self._sync_environment()
+        # 任务板注入：切回会话时提示"还有活没干完"（去重，见 _history_has_task_board）
+        self._sync_task_board()
         self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
         log.info("会话切换: %s%s -> %s%s (messages=%d)",
                  self.session_prefix, target_id, self.session_prefix,
@@ -862,12 +878,13 @@ class Agent:
         return self.session_id, len(self.history_messages)
 
     def clear_session(self) -> int:
-        """清空当前会话（todo 同步重置），返回被删除的消息数。"""
+        """清空当前会话（任务板同步清空），返回被删除的消息数。"""
         deleted_count = self.session_manager.clear_session(self.session_file)
         log.info("会话清空: %s%s (删除消息=%d)",
                  self.session_prefix, self.session_id, deleted_count)
-        # todo 与 chat history 同生共死：清空 chat 的同时把当前 session 的 todo 也重置为空
-        self.tools.get_todo_manager().update([], fresh_start=False)
+        # 任务板清理已下沉到 SessionManager.clear_session：因为 ws_bridge 的
+        # session_clear 分支是**直接调 sm.clear_session** 的，不经过本方法；
+        # 只在此处清理会漏掉那条路径。故这里不再重复调用 clear_scope()。
         self.history_messages = self._strip_subagent_rows(
             self.session_manager.load_session_history(self.session_file)
         )
@@ -876,8 +893,8 @@ class Agent:
         return deleted_count
 
     def show_tasks(self) -> str:
-        """返回当前会话待办看板文本。"""
-        return self.tools.get_todo_manager().render()
+        """返回当前会话任务看板文本（todo 已下线，改用 task 看板）。"""
+        return self.tools.task_manager.run_list_tasks()
 
     # ═══════════════════════════════════════════════════════════
     #  目标循环（s17 goal loop，CLI 斜杠命令共用接缝）
@@ -927,28 +944,112 @@ class Agent:
     #  工具执行辅助
     # ═══════════════════════════════════════════════════════════
 
-    def _inject_todo_reminder(self) -> None:
-        """
-        会话恢复/切换时，若当前 session 有未完成的 todo，注入一条 reminder
-        让模型意识到"上次有活没干完"。
+    # ── 已下线（2026-09-16）：原 todo reminder ────────────────────────
+    #
+    # 原实现：会话恢复/切换时，若当前 session 有未完成的 todo，注入一条
+    # <system-reminder> 让模型意识到"上次有活没干完"。
+    #
+    # 下线原因（三个都是硬伤）：
+    # 1. 只读 TodoManager，对 task 看板零感知 —— 而 todo 已下线，它必然永不触发；
+    # 2. 只在 init_session / switch_session 触发，**同一会话内中断后再发消息不经过
+    #    这两个入口** → 最高频的"中断续跑"场景它根本不工作；
+    # 3. 注入的是整份 todo 清单，粒度太粗。
+    #
+    # 替代实现：_sync_task_board()（尾部注入 + 指纹去重，见本文件）
+    #   - 判据改为「存在未完成任务组」且「当前上下文里找不到该组的任务板注入」
+    #   - 调用点覆盖 init_session / switch_session / agent_loop 每轮开头
+    #
+    # def _inject_todo_reminder(self) -> None:
+    #     """
+    #     会话恢复/切换时，若当前 session 有未完成的 todo，注入一条 reminder
+    #     让模型意识到"上次有活没干完"。
+    #
+    #     reminder 写在 user query 之前、system / 旧 history 之后，
+    #     模型下一轮必能直接看到。reminder 同时落盘 session_file，
+    #     保证下次启动 reload 仍可见。
+    #     """
+    #     mgr = self.tools.get_todo_manager()
+    #     if not mgr.has_open_items():
+    #         return
+    #     reminder = (
+    #         "<system-reminder>本次会话检测到上次有未完成的待办事项：\n"
+    #         f"{mgr.render()}\n"
+    #         "请在继续之前确认是否继续执行；如果任务已不再相关，请用 todo 工具把对应项标记为 completed，"
+    #         "或开启新计划（fresh_start=true 整体替换）。</system-reminder>"
+    #     )
+    #     self.history_messages.append({"role": "user", "content": reminder})
+    #     self.session_manager.append_message_to_session(
+    #         self.session_file, self.history_messages[-1]
+    #     )
 
-        reminder 写在 user query 之前、system / 旧 history 之后，
-        模型下一轮必能直接看到。reminder 同时落盘 session_file，
-        保证下次启动 reload 仍可见。
+    # ── 尾部注入：任务板（中断续跑的可见性保障）──────────────────────
+
+    def _sync_task_board(self) -> None:
+        """有未完成任务组、且当前上下文里看不到它的注入时，注入一份任务板。
+
+        **为什么必须有**（原 `_inject_todo_reminder` 的两个硬伤）：
+        1. 原机制只读 TodoManager —— todo 已下线，它必然永不触发；
+        2. 它只在 init_session / switch_session 触发，而**同一会话内中断后再发
+           一条消息不经过这两个入口** —— 那恰恰是最高频的"中断续跑"场景。
+
+        **去重口径**：注入条件是「有未完成组」**且**「历史里找不到该 group_id 的
+        `<task_board>` 注入」。于是：
+        - 进会话 / 重启 resume → 历史里没有 → 注入一次
+        - 同会话中断后再发消息 → 旧注入还在历史里 → 不重复（不刷屏）
+        - 上下文压缩把注入段裁掉 → 自动补注
+
+        **判据用"是否存在未完成组"，而不是"是否发生过中断"**：前端切换会话不会
+        中断会话（每会话一个独立 SessionRuntime），而"模型自己收尾时留了尾巴"
+        同样需要续跑 —— 用中断做判据会漏掉这种情况。
         """
-        mgr = self.tools.get_todo_manager()
-        if not mgr.has_open_items():
+        tm = getattr(self.tools, "task_manager", None)
+        if tm is None or self.session_manager is None:
             return
+        try:
+            board = current_board(tm.scope)
+        except Exception as e:
+            log.error("读取任务板失败: %s: %s", type(e).__name__, e)
+            return
+        if board is None:
+            return  # 无未完成组：不注入，也不清理旧标记
+        gid = board["group_id"]
+        if self._history_has_task_board(gid):
+            return
+        pending_rows = [t for t in board["tasks"] if t["derived_status"] != "completed"]
+        if not pending_rows:
+            return
+        lines = "\n".join(
+            f"- [{t['derived_status']}] {t['subject']}  ({t['id']})" for t in pending_rows
+        )
         reminder = (
-            "<system-reminder>本次会话检测到上次有未完成的待办事项：\n"
-            f"{mgr.render()}\n"
-            "请在继续之前确认是否继续执行；如果任务已不再相关，请用 todo 工具把对应项标记为 completed，"
-            "或开启新计划（fresh_start=true 整体替换）。</system-reminder>"
+            f'<system-reminder><task_board group="{gid}">\n'
+            f"本会话还有未完成的任务（共 {board['counts']['total']} 项，"
+            f"剩 {len(pending_rows)} 项）：\n{lines}\n"
+            "请接着把这些做完再开新活。剩余项状态是 pending，直接 claim_task 即可；"
+            "被阻塞的项要等依赖完成；"
+            "若某项已不再需要或依赖填错了，用 update_task 就地修（blockedBy 传 [] 可清空依赖）"
+            "或 delete_task 删掉 —— 不要另建\"修正版\"新任务，也别留下无人认领的残留项，"
+            "否则任务面板会一直停在未完成状态。\n"
+            "</task_board></system-reminder>"
         )
         self.history_messages.append({"role": "user", "content": reminder})
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
         )
+        log.info("注入任务板提醒: group=%s 剩余=%d 项", gid, len(pending_rows))
+
+    def _history_has_task_board(self, group_id: str) -> bool:
+        """历史里是否已存在该组的任务板注入（去重依据）。
+
+        只认注入头部的 `<task_board group="...">` 标记，不做自然语言匹配 ——
+        模型自己在正文里提到任务时不能被误判成"已经注入过"。
+        """
+        marker = f'<task_board group="{group_id}">'
+        for msg in self.history_messages:
+            content = msg.get("content")
+            if isinstance(content, str) and marker in content:
+                return True
+        return False
 
     # ── 方案 B：进会话时刷新 system prompt ─────────────────────────────
     #
@@ -1282,9 +1383,15 @@ class Agent:
         self._sync_memory_index()
         self._sync_environment()
         self._sync_project_rules()
+        # 任务板兜底注入：这是"同会话中断后再发一条消息"这类场景的**唯一**覆盖点
+        #（那条路径不经过 init_session / switch_session）。去重由 _history_has_task_board
+        # 负责，压缩把注入段裁掉后也会在这里自动补注。
+        self._sync_task_board()
 
         iteration = 0  # 循环迭代计数
-        rounds_since_todo = 0  # 记录距离上次调用 todo 工具的轮数，用于 nag reminder
+        # 原 rounds_since_todo（连续 3 轮未更新 todo 就注入 "Update your tasks."）已整段删除。
+        # 理由：与 Claude Code 删掉的"每 5 轮提醒看清单"完全同构，会把计划变成不可违背的剧本；
+        # 且其注入用的是 <reminder> 而非 <system-reminder>，会漏成用户气泡（违反注入契约）。
         # 「承诺未兑现」守卫的本轮拦截次数（局部量，天然随本轮 agent_loop 重置；
         # 上限 PROMISE_GUARD_MAX，默认 1 —— 只拉一把，绝不反复纠缠）
         promise_guard_hits = 0
@@ -1489,11 +1596,9 @@ class Agent:
             # 结果用 {tool_call_id: result} 收集, 最后按 LLM 原始声明顺序回放到 history,
             # 保证 tool 消息顺序与 tool_calls 顺序一致(OpenAI 协议硬约束)。
             tool_call_results: dict[str, dict] = {}
-            used_todo = False
             background_calls, parallel_calls, serial_calls = [], [], []
             for tool_call in response_tool_calls:
-                if tool_call.function.name == "todo":
-                    used_todo = True
+                # （原 used_todo 追踪已随 todo nag 一并删除）
                 # 解析一次参数, 后面复用, 避免每阶段都重复 json.loads
                 raw_args = tool_call.function.arguments
                 tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -1609,15 +1714,7 @@ class Agent:
             # 后台结果注入后，把已完成后台子智能体的执行记录一并落盘
             self._persist_pending_subagent_rows()
 
-            # todo 更新追踪: 本轮用了 todo 就清零, 否则累加;
-            # 连续 3 轮未更新且仍有 open items 时, 注入提醒作为本轮最后一条消息, 并清零避免重复打扰
-            rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-            if rounds_since_todo >= 3 and self.tools.get_todo_manager().has_open_items():
-                reminder_msg = {"role": "user", "content": "<reminder>Update your tasks.</reminder>"}
-                self.history_messages.append(reminder_msg)
-                self.session_manager.append_message_to_session(
-                    self.session_file, reminder_msg
-                )
-                rounds_since_todo = 0
+            # （原 todo nag 注入块已整段删除 —— 见 rounds_since_todo 声明处注释。
+            #   断点续跑提示现由 _sync_task_board() 在每轮开头按需注入。）
 
         self._print("\033[2;93m[****一个turn循环结束****]\n \033[0m\n")

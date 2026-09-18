@@ -28,11 +28,12 @@
   color: var(--color-text-primary);
 }
 
-/* 消息流：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
+/* 消息流：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩。
+ * 底部留 28px 滚动空间：消息右下角悬浮的「时间+复制」元信息（-26px）滚动到底时仍可见。 */
 .msglist {
   flex: 1;
   overflow-y: auto;
-  padding: var(--sp-5) var(--sp-5) var(--sp-2);
+  padding: var(--sp-5) var(--sp-5) calc(var(--sp-5) + var(--sp-1));
   min-height: 0;
   width: 100%;
   max-width: 940px;
@@ -71,8 +72,23 @@
   position: relative;
 }
 
-/* 消息悬浮复制按钮：悬停消息行时出现（淡入），定位在正文右上角。
- * User 气泡右上角 / Assistant 正文右上角。点击复制该条消息原始正文（复制时停止事件冒泡）。 */
+/* 消息底部元信息（时间 + 复制按钮）：悬停消息行时淡入，定位在消息体右下角。
+ * User 气泡 / Assistant 正文统一浮在消息体右下外侧（bottom: -26px）。
+ * 点击复制该条消息原始正文（复制时停止事件冒泡）。 */
+.msg-meta {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.msg-time {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  user-select: none;
+}
 .msg-copy-btn {
   display: inline-flex;
   align-items: center;
@@ -83,24 +99,21 @@
   color: var(--color-text-secondary);
   background: var(--color-bg-main);
   border: 1px solid var(--color-border);
-  opacity: 0;
-  transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 .msg-copy-btn:hover {
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
 }
-.msg-bubble.user .msg-copy-btn {
-  position: absolute;
-  top: -26px;
-  right: -4px;
-}
-.assistant-body .msg-copy-btn {
-  position: absolute;
-  top: 0;
+.msg-bubble.user .msg-meta {
+  bottom: -26px;
   right: 0;
 }
-.msg-row:hover .msg-copy-btn {
+.assistant-body .msg-meta {
+  bottom: -26px;
+  right: 0;
+}
+.msg-row:hover .msg-meta {
   opacity: 1;
 }
 
@@ -388,6 +401,7 @@
   font-family: inherit;
   font-size: var(--fs-md);
   line-height: 1.6;
+  min-height: calc(1.6em * 2 + var(--sp-3) * 2); /* 默认两行高度（行高×2 + 上下内边距） */
   max-height: 160px;
 }
 .composer-input::placeholder {
@@ -657,4 +671,174 @@
   border: 1px solid var(--color-border);
   background: var(--color-bg-main);
 }
+
+/* ══════════════════════════════════════════════════════════════
+   任务面板（TaskBoard）：固定在输入框上方
+   - 展开态固定高度 168px，超出滚动；折叠态只留 40px 表头
+   - 执行中不提供任何关闭入口（由组件决定不渲染），完成后才出现「关闭」
+   - 不提供「继续执行」按钮（2026-09-16 移除）：续跑靠用户在输入框手打消息
+   ══════════════════════════════════════════════════════════════ */
+.task-card {
+  flex: none;
+  width: 100%;
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 0 var(--sp-5);
+}
+.task-card__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 40px;
+  padding: 0 var(--sp-3);
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+}
+.task-card:not(.task-card--collapsed) .task-card__head {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.task-card__title {
+  font-weight: 500;
+}
+.task-card__count {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.task-card__meta {
+  color: var(--color-text-secondary);
+}
+.task-card__spacer {
+  flex: 1;
+}
+.task-card__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 1px var(--sp-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-xs);
+}
+.task-card__badge--running {
+  color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.task-card__badge--done {
+  color: var(--color-ok);
+  background: rgba(52, 168, 83, 0.1);
+}
+/* 执行中的脉冲点：与侧边栏 .tree-dot.running 同语义（"还有活没干完"） */
+.task-card__pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  animation: task-pulse 1.4s ease-in-out infinite;
+}
+@keyframes task-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+/* 注意：`.mini-btn`（sidebar.css）是**固定 24×24 的纯图标**按钮，
+   带文字时会被挤成竖排并溢出——本区块内只用它渲染图标（如「关闭」×）。
+   原先的「继续执行」按钮误用了它，2026-09-16 已删除。 */
+
+.task-card__bar {
+  height: 2px;
+  background: var(--color-border);
+}
+.task-card__bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  transition: width 0.25s ease;
+}
+.task-card--done .task-card__bar-fill {
+  background: var(--color-ok);
+}
+
+/* 固定高度 + 滚动条：20 条任务也不会撑破布局 */
+.task-card__body {
+  height: 168px;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-top: none;
+  border-radius: 0 0 var(--radii-btn) var(--radii-btn);
+  background: var(--color-bg-main);
+}
+.task-card--collapsed .task-card__body,
+.task-card--collapsed .task-card__bar {
+  display: none;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 26px;
+  padding-right: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.task-row__subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-row__meta,
+.task-row__result {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.task-row__result {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-row__owner {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.task-row--completed .task-row__subject {
+  color: var(--color-text-secondary);
+  text-decoration: line-through;
+}
+.task-row--blocked .task-row__subject {
+  color: var(--color-text-secondary);
+}
+
+.task-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-text-secondary);
+  background: transparent;
+}
+.task-dot--running {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  animation: task-pulse 1.4s ease-in-out infinite;
+}
+.task-dot--done {
+  border-color: var(--color-ok);
+  background: var(--color-ok);
+}
+.task-dot--blocked {
+  border-color: var(--color-danger);
+  border-style: dashed;
+}
+
 

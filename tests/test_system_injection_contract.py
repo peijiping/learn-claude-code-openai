@@ -29,6 +29,7 @@ if str(AGENTS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENTS_DIR))
 
 from agent_full_v2 import Agent  # noqa: E402
+import agent_full_v2  # noqa: E402
 from background_manager import BackgroundManager  # noqa: E402
 
 SYSTEM_REMINDER_PREFIX = "<system-reminder>"
@@ -68,9 +69,20 @@ class _StubTodoManager:
         return "- [ ] 待办样例"
 
 
+class _StubTaskManager:
+    """只提供 `_sync_task_board` 需要的 scope。
+
+    快照内容由测试 patch `agent_full_v2.current_board` 提供 ——
+    这样测试不会去读用户真实的 `.tasks/` 目录。
+    """
+
+    scope = "session_test"
+
+
 class _StubTools:
-    def __init__(self, todo_manager):
+    def __init__(self, todo_manager, task_manager=None):
         self._todo_manager = todo_manager
+        self.task_manager = task_manager if task_manager is not None else _StubTaskManager()
 
     def get_todo_manager(self):
         return self._todo_manager
@@ -126,14 +138,79 @@ class SystemInjectionContractTests(unittest.TestCase):
         # 再收集一次不重复
         self.assertEqual(bm.collect_background_results(), [])
 
-    def test_todo_reminder_is_wrapped(self):
+    def test_todo_reminder_is_gone(self):
+        """防回退：todo reminder 已于 2026-09-16 下线，不应再存在该入口。
+
+        它有三个硬伤：只读 TodoManager 对 task 零感知、只在 init/switch 触发
+        （同会话中断后续轮根本不注入）、注入粒度过粗。
+        替代实现是 _sync_task_board()，其注入契约由 test_task_board 系列守护。
+        """
         agent = _make_agent()
-        agent._inject_todo_reminder()
+        self.assertFalse(hasattr(agent, "_inject_todo_reminder"))
+
+    # ── 任务板注入（2026-09-16 新增，承接原 todo reminder 的职责）────
+
+    @staticmethod
+    def _board(group_id="g_test", derived="pending"):
+        def row(i, subject, status, ds):
+            return {"id": f"t{i}", "subject": subject, "status": status,
+                    "derived_status": ds, "owner": None, "parentId": None,
+                    "depth": 0, "orderIndex": i, "blockedBy": [], "result": "",
+                    "started_at": None, "updated_at": 0.0,
+                    "child_total": 0, "child_completed": 0}
+        return {
+            "group_id": group_id, "revision": 1, "status": "running",
+            "counts": {"total": 2, "completed": 1, "in_progress": 0,
+                       "pending": 1, "blocked": 0},
+            "tasks": [row(1, "已完成项", "completed", "completed"),
+                      row(2, "剩下的活", "pending", derived)],
+        }
+
+    def _patch_board(self, board):
+        """替换快照来源，避免测试读用户真实的 .tasks/ 目录。"""
+        orig = agent_full_v2.current_board
+        agent_full_v2.current_board = lambda scope: board
+        self.addCleanup(lambda: setattr(agent_full_v2, "current_board", orig))
+
+    def test_task_board_reminder_is_wrapped(self):
+        """必须 <system-reminder> 包裹，否则会以用户气泡的形式漏到前端。"""
+        self._patch_board(self._board())
+        agent = _make_agent()
+        agent._sync_task_board()
 
         self.assertEqual(len(agent.history_messages), 1)
-        self.assertTrue(
-            agent.history_messages[0]["content"].startswith(SYSTEM_REMINDER_PREFIX)
-        )
+        content = agent.history_messages[0]["content"]
+        self.assertTrue(content.startswith(SYSTEM_REMINDER_PREFIX))
+        self.assertIn('<task_board group="g_test">', content)
+        self.assertIn("剩下的活", content)
+        self.assertNotIn("已完成项", content, "已完成的项不该出现在提醒里")
+
+    def test_task_board_reminder_dedups_by_group(self):
+        """同组二次调用不再注入 —— "同会话中断后继续"不刷屏的保证。"""
+        self._patch_board(self._board())
+        agent = _make_agent()
+        agent._sync_task_board()
+        agent._sync_task_board()
+
+        self.assertEqual(len(agent.history_messages), 1, "同组只注入一次")
+
+    def test_task_board_injects_again_for_new_group(self):
+        """换组要重新注入，否则新一轮的活模型看不到。"""
+        self._patch_board(self._board())
+        agent = _make_agent()
+        agent._sync_task_board()
+        self._patch_board(self._board(group_id="g_next"))
+        agent._sync_task_board()
+
+        self.assertEqual(len(agent.history_messages), 2)
+
+    def test_no_task_board_reminder_without_unfinished_group(self):
+        """没有未完成组时既不注入、也不清理旧标记。"""
+        self._patch_board(None)
+        agent = _make_agent()
+        agent._sync_task_board()
+
+        self.assertEqual(agent.history_messages, [])
 
     def test_memory_index_is_wrapped(self):
         agent = _make_agent()
@@ -164,10 +241,14 @@ class SystemInjectionContractTests(unittest.TestCase):
         )
 
     def test_injected_messages_are_filtered_by_history_to_ui(self):
-        """端到端：三条注入消息都不应在 UI 回放里出现为 user 气泡。"""
+        """端到端：全部注入消息都不应在 UI 回放里出现为 user 气泡。"""
         src = (AGENTS_DIR / "ws_bridge.py").read_text(encoding="utf-8")
         seg = src[src.index("def _text_of("):src.index("async def handle(ws):")]
-        ns: dict = {}
+        # 片段内已出现类型标注（Optional[...] 等）；exec 命名空间为裸 dict，
+        # 注解在 def 处即求值会 NameError，故预置整个 typing 命名空间。
+        # （2026-09-16 修复，与 test_subagent_sidecar 同因）
+        import typing
+        ns: dict = {n: getattr(typing, n) for n in dir(typing) if not n.startswith("_")}
         exec(compile(seg, "ws_bridge_hist", "exec"), ns)  # noqa: S102 - 测试内自用
         history_to_ui = ns["_history_to_ui"]
 
@@ -181,7 +262,8 @@ class SystemInjectionContractTests(unittest.TestCase):
         agent._sync_environment()
         agent.system_prompt.workspace_text = "CHANGED-RULES"
         agent._sync_project_rules()
-        agent._inject_todo_reminder()
+        self._patch_board(self._board())
+        agent._sync_task_board()
 
         messages = [
             {"role": "user", "content": "真实用户提问"},

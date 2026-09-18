@@ -185,6 +185,10 @@ class BrowserAgentBridge implements AgentApi {
     this.sendRaw(JSON.stringify({ kind: 'session_clear' }))
     return Promise.resolve({ deleted: 0 })
   }
+  async setSessionUnread(payload: Parameters<AgentApi['setSessionUnread']>[0]): Promise<unknown> {
+    if (typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    return this.request('session_set_unread', 'sessions', { session_id: payload.session_id, unread: Boolean(payload.unread) })
+  }
 
   async listSessions(): Promise<unknown[]> {
     const payload = (await this.request('sessions_list', 'sessions')) as

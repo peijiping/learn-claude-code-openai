@@ -25,6 +25,9 @@ const agent = {
   clearSession: (): Promise<{ deleted: number }> =>
     ipcRenderer.invoke('agent:clearSession'),
   listSessions: (): Promise<unknown[]> => ipcRenderer.invoke('agent:listSessions'),
+  /** 标记会话未读/已读（进入会话=已读，后端写入元数据持久化） */
+  setSessionUnread: (payload: { session_id?: string; unread?: boolean }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:setSessionUnread', payload),
 
   /** 会话管理：重命名 / 软删除（回收站）/ 还原 / 批量永久删除 / 回收站列表 */
   renameSession: (sessionId: string, title: string): Promise<unknown> =>

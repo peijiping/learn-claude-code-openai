@@ -4,11 +4,11 @@
 
 | 项 | 值 |
 | --- | --- |
-| 生成时间 | 2026-09-11 18:01:38 |
+| 生成时间 | 2026-09-16 18:38:47 |
 | 工作空间（工具沙盒 & 指令文件来源） | `/Users/peijiping/Documents/Codes/AiCodes/learn-claude-code-main/WorkSpace/task1` |
 | 指令文件候选（按序，全部存在则都加载） | `AGENTS.md`, `CLAUDE.md`, `AGENT.md` |
 | SKILL_DESC_MAX_CHARS | 120 |
-| 字符数 | 3896 |
+| 字符数 | 3782 |
 
 > 注意 1：工作区指令来自**用户的 workspace**（本例 `WorkSpace/task1/` 下的
 > `CLAUDE.md` + `AGENT.md`，两者并存则都加载）。本仓库根的 `AGENTS.md` 是
@@ -18,7 +18,7 @@
 > 本例 task1 不是 git 仓库，故未出现。
 >
 > 注意 3：仓库根的 `AGENTS.md` 约占 8886 字节，**不再计入**本 prompt ——
-> 因此体积从 8891 降到 3896 字符。
+> 因此体积从 8891 降到 3782 字符。
 
 重新生成（项目根执行）：
 
@@ -63,23 +63,28 @@ PYTHONPATH=agents .venv/bin/python -c "import sys; sys.path.insert(0,'agents'); 
 
 ## sub_agent（子智能体）
 **强制使用**（主对话不得直接执行）：读 ≥3 文件 / 读 PDF / 工具调用 ≥5 步 / 探索代码库。
-- 默认不含 todo/task 工具（只由主智能体维护）
+- 默认不含 task 工具（只由主智能体维护）
 - 只读场景设 `allowed_tools=["bash","run_read","run_read_pdf"]`（**名字必须与 API 下发的完全一致**，写错会拿不到该工具）
 - 无依赖想省时间 → `parallel=true` 并发；有依赖 → `parallel=false` 串行
 - 想拿 ID 后回头查 → `run_in_background=true`（立即返回 bg_id；不参与并行/串行桶，永远独立后台化）
 
-# 待办与任务（两套并存，按任务特征自选）
-轻量 **TodoWrite** 与重型 **Task 全家桶**（create / list / get / claim / complete）可共存。
+# 任务看板（task）
 
-## L1：TodoWrite（单响应内的轻量进度）
-适用：步骤 ≤7、本响应内完成、不派 subagent、不需跨子任务共享。
-规范：动手前列全（pending）→ 开做标 in_progress（同时仅 1 个）→ 完成立刻标 completed → 换计划用 fresh_start 整体替换 → 收尾调一次 render。
+会话级任务看板，**只活在当前会话**，不承担跨会话续接。
 
-## L2：Task 全家桶（会话内看板，支持依赖）
-**满足任一即用 L2**：步骤 >7 / 要派 subagent / 多 agent（或队友）共享同一份清单 / 任务间有依赖（创建时声明 blockedBy，被阻塞任务须等依赖完成才能认领）。
-规范：派 subagent 前先拆好任务 → 让 subagent 认领 → 完成后回填状态 → 主对话收尾汇总。
+**何时用**：步骤 >7 / 要派 subagent / 多 agent（或队友）共享同一份清单 / 任务间有依赖。
+步骤 ≤7 且单线程一次能做完的小事不必建板，直接做完即可。
 
-**任务板只活在当前会话**，不承担跨会话续接：跨会话的"干到哪、下一步"一律用 `write_memory` 落盘（`project` 类），不要依赖任务板，也不要直接改记忆文件。
+**规范**：
+- 动手前先 `create_task` 把计划铺开；有从属关系用 `parent_id` 拆成子树
+- 有依赖的任务在创建时声明 `blockedBy`；被阻塞的任务在依赖完成前无法认领，这是预期行为，**不要绕过**
+- 派 subagent 前先拆好任务 → 让 subagent 用 `claim_task` 认领 → 完成后 `complete_task` 回填
+- **中断后继续**：若上下文里出现 `<task_board>` 提醒，说明本会话有未完成的任务，
+  先接着把它们做完（剩下的项会标成 pending，直接 claim 即可），不要另起一套新计划
+- 收尾用 `list_tasks` 汇总一次
+
+**跨会话**：跨会话的"干到哪、下一步"一律用 `write_memory` 落盘（`project` 类），
+不要依赖任务板，也不要直接改记忆文件。
 
 
 # 技能（Skills）
@@ -89,7 +94,6 @@ PYTHONPATH=agents .venv/bin/python -c "import sys; sys.path.insert(0,'agents'); 
 - **academic-pipeline**: Orchestrator for the full academic research pipeline: research -> write -> integrity check -> review -> revise ->…
 - **code-review**: Perform thorough code reviews with security, performance, and maintainability analysis.
 - **deep-research**: Universal deep research agent team. 13-agent pipeline for rigorous academic research on any topic.
-- **mcp-builder**: Build MCP (Model Context Protocol) servers that give Claude new capabilities.
 
 
 # 记忆系统（memory）
@@ -156,34 +160,6 @@ PYTHONPATH=agents .venv/bin/python -c "import sys; sys.path.insert(0,'agents'); 
 - 不执行破坏性操作，除非用户明确要求并确认。
 - 不删除、覆盖或重命名 workspace 中的用户资料。
 - 对外部信息、政策、价格、实时数据等可能变化的内容，应在需要时联网核验。
-
-
-
-````
-
----
-
-## 附：紧随其后的 L2 尾部注入（**不属于** system prompt）
-
-system prompt 之后，消息数组**尾部**会按需追加 `<system-reminder>` 块
-（机制与触发规则见 `docs/frontend/03-前后端通信协议.md` §2.1.2）。
-以下是本次生成时的实际内容：
-
-````text
-<system-reminder>
-<memory_index revision="77aa616e4bfa">
-- [python-env-use-uv](python-env-use-uv.md) — 项目Python环境管理使用uv而非pip
-- [user-token-efficiency-preference](user-token-efficiency-preference.md) — 用户偏好token节约，简单任务直接执行，避免复杂pipeline
-</memory_index>
-</system-reminder>
-
-<system-reminder>
-<env revision="57f05c25a829">
-当前日期：2026-09-11
-星期：周五
-运行平台：darwin
-</env>
-</system-reminder>
 ````
 
 > 另有第三个块 `<project_rules>`：**仅当工作区指令文件在本次会话期间被改动**时追加，

@@ -46,7 +46,11 @@ def _load_history_to_ui():
     """
     src = (AGENTS_DIR / "ws_bridge.py").read_text(encoding="utf-8")
     seg = src[src.index("def _text_of("):src.index("async def handle(ws):")]
-    ns: dict = {}
+    # 该片段内已出现类型标注（如 Optional[...]）。exec 的命名空间是裸 dict，
+    # 而注解在 def 处即求值 → 会 NameError。预置整个 typing 命名空间兜住。
+    # （2026-09-16 修复：片段随 ws_bridge 演进引入 Optional，本测试一度加载失败）
+    import typing
+    ns: dict = {n: getattr(typing, n) for n in dir(typing) if not n.startswith("_")}
     exec(compile(seg, "ws_bridge_hist", "exec"), ns)  # noqa: S102 - 测试内自用
     return ns["_history_to_ui"]
 

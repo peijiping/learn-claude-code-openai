@@ -9,13 +9,14 @@ tools.py - 工具注册中心（ToolRegistry）
 - 工具定义（base_tools / tools / main_agent_tools）→ 懒加载属性
 - 工具处理器（handlers）→ 懒加载属性，方法名到调用方的统一映射
 - 统一执行入口 execute(name, **args)
-- 依赖注入（skills / memory / task_manager / bus）+ holder 模式（background / todo）
+- 依赖注入（skills / memory / task_manager / bus）+ holder 模式（background）
 
 路径常量统一从 paths.py 导入，不再在此模块内声明（见 AGENTS.md 路径规则）。
 
 ⚠️ 不再提供全局单例 TOOL_REGISTRY。
 由调用方（Agent 等）显式实例化 ToolRegistry()，保证多实例隔离。
-每个 Agent 实例拥有独立的 ToolRegistry / todo holder / background holder。
+每个 Agent 实例拥有独立的 ToolRegistry / background holder / task_manager。
+（todo holder 已于 2026-09-16 随 todo 工具下线停用，定义保留但不再被引用。）
 """
 
 import os
@@ -93,7 +94,9 @@ class ToolRegistry:
         self._default_agent_tools_cache = None
 
     # ═══════════════════════════════════════════════════════════
-    #  holder 模式：background / todo（运行期注入）
+    #  holder 模式：background（运行期注入）
+    #  todo holder（_todo_manager / set_todo_manager / get_todo_manager）已于
+    #  2026-09-16 随 todo 工具下线停用 —— 定义保留以便回滚，但**不应新增引用**。
     # ═══════════════════════════════════════════════════════════
 
     def set_background_manager(self, bm) -> None:
@@ -453,7 +456,7 @@ class ToolRegistry:
         """建立工具名称到调用入口的映射（懒构建、可缓存）。
 
         当大模型返回工具调用请求时，agent 循环 / SubAgent 按工具名
-        从这里取出处理器执行。holder 型依赖（todo / background）在
+        从这里取出处理器执行。holder 型依赖（background）在
         调用时才 get，保证运行期注入后依然拿到同一实例。
         """
         return {
@@ -464,7 +467,13 @@ class ToolRegistry:
             "run_write":   lambda **kw: self.run_write(kw["path"], kw["content"]),
             "run_edit":    lambda **kw: self.run_edit(kw["path"], kw["old_text"], kw["new_text"]),
             "run_glob":    lambda **kw: self.run_glob(kw["pattern"]),
-            "todo":        lambda **kw: self.get_todo_manager().update(kw["items"], kw.get("fresh_start", False)),
+            # ── todo 已下线（2026-09-16）────────────────────────────────
+            # 原 TodoWrite：单列表、整表替换语义 update(items, fresh_start)。
+            # 下线原因：与 task 看板功能高度重合；且「每轮整表覆盖写」会冲掉
+            # 并发修改、容易漏项（Claude Code 已走过同一条路并删掉该工具）。
+            # 能力由 create_task / claim_task / complete_task 承接。
+            # 回滚方式：取消下一行注释，并恢复 _tools_cache 里的 "todo" 定义。
+            # "todo":      lambda **kw: self.get_todo_manager().update(kw["items"], kw.get("fresh_start", False)),
             "load_skill":  lambda **kw: self.skills.load_skill(kw["name"]),
             "list_skills": lambda **kw: self.skills.list_skills(),
             "write_memory":   lambda **kw: self.memory.write(kw["name"], kw["type"], kw["description"], kw["body"]),
@@ -473,11 +482,25 @@ class ToolRegistry:
                 subject=kw["subject"],
                 description=kw.get("description", ""),
                 blockedBy=kw.get("blockedBy"),
+                parent_id=kw.get("parent_id"),
             ),
             "list_tasks": lambda **kw: self.task_manager.run_list_tasks(),
             "get_task": lambda **kw: self.task_manager.run_get_task(kw["task_id"]),
             "claim_task": lambda **kw: self.task_manager.run_claim_task(kw["task_id"]),
-            "complete_task": lambda **kw: self.task_manager.run_complete_task(kw["task_id"]),
+            "complete_task": lambda **kw: self.task_manager.run_complete_task(
+                kw["task_id"], kw.get("result", "")
+            ),
+            # 2026-09-18 新增：残留/写错的任务要能**就地**修或删。
+            # 缺这两个出口时，模型只能另建"修正依赖版"新任务，
+            # 旧任务永久留在板上 → 面板永远停在「执行中」（事故见 task_manager 模块头）
+            "update_task": lambda **kw: self.task_manager.run_update_task(
+                kw["task_id"],
+                subject=kw.get("subject"),
+                description=kw.get("description"),
+                blockedBy=kw.get("blockedBy"),
+                result=kw.get("result"),
+            ),
+            "delete_task": lambda **kw: self.task_manager.run_delete_task(kw["task_id"]),
             # check_background：仅查询语义，不消费结果；可重复调用。
             # agent_full_v2.py 在每个 turn 开头以及 turn 内每轮 tool 执行后，
             # 会自动把已完成任务以 <task_notification> 注入上下文（消费语义），
@@ -562,8 +585,8 @@ class ToolRegistry:
         """返回 handler 的浅拷贝，仅文件类工具改用 `base=cwd` 调用。
 
         供子智能体 / 队友注入工作目录（worktree）使用，让文件操作落在
-        指定 cwd（如 WORKTREE_DIR/<name>）内。其余工具（todo/技能/记忆/
-        任务/团队等）复用共享 handlers，不改动 lead 的 handlers 本体。
+        指定 cwd（如 WORKTREE_DIR/<name>）内。其余工具（任务/技能/记忆/
+        团队等）复用共享 handlers，不改动 lead 的 handlers 本体。
         """
         scoped = self.handlers.copy()
         scoped["bash"] = lambda **kw: self.run_bash(kw["command"], base=cwd)
@@ -671,18 +694,20 @@ class ToolRegistry:
         if self._tools_cache is None:
             self._tools_cache = [
                 *self.base_tools,
-                {"type": "function", "function": {
-                    "name": "todo",
-                    "description": "更新当前会话的待办列表。整体替换语义：传入完整的 items 数组即可。对复杂任务建议在动手前先调用一次（把计划铺开），执行中逐步把对应项标记为 in_progress / completed。fresh_start=True 表示开始新计划——会先丢弃当前列表里所有已完成的任务，适合在同一会话内切换到下一个独立任务时使用。",
-                    "parameters": {"type": "object", "properties": {
-                        "items": {"type": "array", "description": "完整的待办事项列表。", "items": {"type": "object", "properties": {
-                            "id": {"type": "string", "description": "任务标识，可省略，省略时按数组下标生成。"},
-                            "text": {"type": "string", "description": "任务内容（必填）。"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "任务状态；同一时刻只能有 1 个 in_progress。"},
-                        }, "required": ["text", "status"]}},
-                        "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
-                    }, "required": ["items"]}
-                }},
+                # ── "todo" 工具定义已下线（2026-09-16）────────────────────
+                # 下线理由见 _build_handlers 内同处注释。保留原文便于审阅/回滚：
+                # {"type": "function", "function": {
+                #     "name": "todo",
+                #     "description": "更新当前会话的待办列表。整体替换语义：传入完整的 items 数组即可。对复杂任务建议在动手前先调用一次（把计划铺开），执行中逐步把对应项标记为 in_progress / completed。fresh_start=True 表示开始新计划——会先丢弃当前列表里所有已完成的任务，适合在同一会话内切换到下一个独立任务时使用。",
+                #     "parameters": {"type": "object", "properties": {
+                #         "items": {"type": "array", "description": "完整的待办事项列表。", "items": {"type": "object", "properties": {
+                #             "id": {"type": "string", "description": "任务标识，可省略，省略时按数组下标生成。"},
+                #             "text": {"type": "string", "description": "任务内容（必填）。"},
+                #             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "任务状态；同一时刻只能有 1 个 in_progress。"},
+                #         }, "required": ["text", "status"]}},
+                #         "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
+                #     }, "required": ["items"]}
+                # }},
                 {"type": "function", "function": {
                     "name": "load_skill", "description": "加载指定名称的专业技能（skill）知识。",
                     "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "要加载的专业技能（skill）名称"}}, "required": ["name"]}
@@ -721,13 +746,22 @@ class ToolRegistry:
                 # ── [改动 3] 新增：任务管理工具 ──────────────────────────────
                 {"type": "function", "function": {
                     "name": "create_task",
-                    "description": "Create a new task with optional blockedBy dependencies.",
+                    "description": "创建一个任务。可选 blockedBy 声明依赖（依赖未完成时无法认领），"
+                                   "可选 parent_id 拆成子树（最多 3 层）。同一批计划的任务会自动归为一组。",
                     "parameters": {"type": "object",
                                    "properties": {
-                                       "subject": {"type": "string"},
-                                       "description": {"type": "string"},
+                                       "subject": {"type": "string",
+                                                   "description": "简短标题，用于任务面板列表展示"},
+                                       "description": {"type": "string",
+                                                       "description": "详细说明，建议包含验收标准"},
                                        "blockedBy": {"type": "array",
-                                                     "items": {"type": "string"}}},
+                                                     "items": {"type": "string"},
+                                                     "description": "依赖的任务 ID：须等这些任务全部 completed 后才能认领本任务。"
+                                                                    "**必须是从 create_task / list_tasks 返回里复制的真实 id**"
+                                                                    "（形如 t_<时间戳>_<随机数>）；写序号或不存在的 id 会被直接拒绝创建。"
+                                                                    "若要依赖同批新建的前序任务：先建它、拿到 id 后再建本任务"},
+                                       "parent_id": {"type": "string",
+                                                     "description": "父任务 ID（可选）。用于把大任务拆成子项，最多 3 层"}},
                                    "required": ["subject"]}
                 }},
                 {"type": "function", "function": {
@@ -759,7 +793,43 @@ class ToolRegistry:
                 }},
                 {"type": "function", "function": {
                     "name": "complete_task",
-                    "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+                    "description": "完成一个 in_progress 任务，并返回因此解锁的下游任务。",
+                    "parameters": {"type": "object",
+                                   "properties": {
+                                       "task_id": {"type": "string"},
+                                       "result": {"type": "string",
+                                                  "description": "可选完成摘要（一句话说明这条做了什么），会显示在任务面板上"}},
+                                   "required": ["task_id"]}
+                }},
+                # ── 2026-09-18 新增：残留任务的**就地**修正 / 删除出口 ──────────
+                {"type": "function", "function": {
+                    "name": "update_task",
+                    "description": "就地修正一条任务（改 blockedBy / subject / description / result）。"
+                                   "任务写错了、依赖填错了、或已不再照原计划做时用本工具，"
+                                   "**不要另建一条\"修正版\"新任务** —— 旧任务会永久留在面板上，"
+                                   "让整组永远回不到「全部完成」。"
+                                   "status 与 parent_id 不可改：状态只走 claim_task / complete_task，"
+                                   "层级本期不支持移动。",
+                    "parameters": {"type": "object",
+                                   "properties": {
+                                       "task_id": {"type": "string"},
+                                       "subject": {"type": "string",
+                                                   "description": "新的简短标题（不传则不改）"},
+                                       "description": {"type": "string",
+                                                       "description": "新的详细说明（不传则不改）"},
+                                       "blockedBy": {"type": "array",
+                                                     "items": {"type": "string"},
+                                                     "description": "新的依赖列表，整体替换；传 [] 清空依赖。"
+                                                                    "必须是真实存在的 task id（不存在的会被拒绝），且不能成环"},
+                                       "result": {"type": "string",
+                                                  "description": "完成摘要（不传则不改）"}},
+                                   "required": ["task_id"]}
+                }},
+                {"type": "function", "function": {
+                    "name": "delete_task",
+                    "description": "删除一条任务（用于清掉不再需要的残留项）。删除后其它任务对它的依赖引用会被自动移除，"
+                                   "避免留下悬空依赖。有子任务时会被拒绝 —— 先删子任务。"
+                                   "已做完的活不要删：用 complete_task 留痕。",
                     "parameters": {"type": "object",
                                    "properties": {"task_id": {"type": "string"}},
                                    "required": ["task_id"]}

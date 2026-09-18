@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, ModelSwitch, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ContextStats, HistoryMessage, ModelSwitch, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -158,6 +158,9 @@ export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /** 消息记录时间：回放来自 jsonl created_at，实时消息在创建时本地打点
+   *  （秒级 ISO 本地时间，与后端 _now_iso 同构；老会话行缺省不显示） */
+  created_at?: string
   thinking: string
   /** 思考过程是否正在流式输出：thinking_delta 期间 true，正文/工具调用/turn_end 后 false */
   thinkingActive: boolean
@@ -187,8 +190,6 @@ interface AgentState {
   runningSessions: string[]
   /** turn 已结束但后台任务（如后台子智能体）仍在执行的会话 id 集合（脉冲运行指示，无停止按钮） */
   bgSessions: string[]
-  /** 后台完成且尚未查看的会话 id 集合（侧边栏绿点未读） */
-  completedBg: string[]
   /** 新建任务（activeSession==null）首条消息的临时草稿缓冲，后端回发 session id 后迁移 */
   pendingFresh: Message[] | null
   sessions: SessionMeta[]
@@ -204,6 +205,11 @@ interface AgentState {
   /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
    *  圆圈 tooltip 数据源，按会话 id 键控，多会话互不覆盖） */
   sessionUsageBySession: Record<string, UsageStats>
+  /** 每个会话当前的任务面板快照（task_board 事件**整份替换**，键控会话 id）。
+   *  null = 该会话当前没有未完成任务组（面板不显示）。
+   *  注意 session_history 到来时会先置 null 再等随后的 task_board 覆盖 ——
+   *  否则"切走再切回"会残留上一轮那版 done 快照。 */
+  taskBoardBySession: Record<string, TaskBoardSnapshot | null>
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -223,6 +229,7 @@ interface AgentState {
   refreshTrash: () => Promise<void>
   newSession: () => Promise<void>
   switchSession: (sessionId: string) => Promise<void>
+  setSessionUnread: (sessionId: string, unread?: boolean) => Promise<void>
   clearSession: () => Promise<void>
   renameSession: (sessionId: string, title: string) => Promise<void>
   trashSession: (sessionId: string) => Promise<void>
@@ -249,9 +256,23 @@ interface AgentState {
 let msgSeq = 0
 const mid = (): string => `m${++msgSeq}`
 
+/** 本地时间秒级 ISO（与后端 _now_iso 同构：2026-09-18T10:30:00），
+ *  实时消息创建时打点；回放时以 jsonl created_at 为准 */
+function nowLocalIso(): string {
+  const d = new Date()
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 /** 去重追加（不可变数组） */
 function addUnique(arr: string[], n: string): string[] {
   return arr.includes(n) ? arr : [...arr, n]
+}
+
+/** 就地更新某会话的 unread 标记（值无变化时返回原数组，避免触发重渲染） */
+function patchSessionUnread(sessions: SessionMeta[], sessionId: string, unread: boolean): SessionMeta[] {
+  if (!sessions.some((x) => x.id === sessionId && x.unread !== unread)) return sessions
+  return sessions.map((x) => (x.id === sessionId ? { ...x, unread } : x))
 }
 
 function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
@@ -295,6 +316,8 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       id: `h${sid}_${i}`,
       role: m.role,
       content: m.content ?? '',
+      // 回放：消息记录时间来自 jsonl created_at（老行缺省 → 右下角不显示）
+      created_at: m.created_at ?? undefined,
       thinking: m.thinking ?? '',
       thinkingActive: false,
       toolCalls: normalCalls.map((t, j) => ({
@@ -364,7 +387,7 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso() }
     ]
     return id
   }
@@ -488,7 +511,7 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso() }
     ]
     return id
   }
@@ -655,7 +678,6 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   messagesBySession: {},
   runningSessions: [],
   bgSessions: [],
-  completedBg: [],
   pendingFresh: null,
   sessions: [],
   trashSessions: [],
@@ -667,6 +689,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   llmSaving: false,
   currentContextStats: null,
   sessionUsageBySession: {},
+  taskBoardBySession: {},
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
@@ -694,10 +717,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const modelId = get().sessionModelId
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
     const userMsg: Message = {
-      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null
+      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso()
     }
     const assMsg: Message = {
-      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null
+      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso()
     }
     set((s) => {
       // 新建任务（尚无会话 id）：首条消息进临时草稿缓冲，等后端 session 信封迁移
@@ -821,9 +844,16 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       }
       case 'session_status': {
         const p = ev.payload as { session_id: string; status: SessionRunStatus }
+        // 会话完整结束（done/stopped）：用户当前不在查看它 → 标记未读并持久化；
+        // 正在查看它 → 保持/置为已读（未读语义 = 「有新产出但还没点到它」）。
+        if (p.status === 'done' || p.status === 'stopped') {
+          const unread = p.session_id !== get().activeSession
+          void get().setSessionUnread(p.session_id, unread)
+        }
         set((s) => {
           // running：turn 执行中（脉冲点 + 停止按钮）；background：turn 已结束
-          // 但后台任务仍在执行（脉冲点，无停止按钮）；done/stopped：全部复位
+          // 但后台任务仍在执行（脉冲点，无停止按钮）；done/stopped：全部复位。
+          // 未读/已读状态由元数据（sessions[].unread）持久化驱动，不做前端内存态。
           const runningSessions =
             p.status === 'running'
               ? addUnique(s.runningSessions, p.session_id)
@@ -834,17 +864,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
               : p.status === 'done' || p.status === 'stopped'
                 ? s.bgSessions.filter((n) => n !== p.session_id)
                 : s.bgSessions
-          let completedBg = s.completedBg
-          if (p.status === 'done' || p.status === 'stopped') {
-            // 执行完成（后台任务也结束后）且当前显示的不是它 → 绿点未读；切到该会话即清除
-            if (p.session_id !== s.activeSession) completedBg = addUnique(completedBg, p.session_id)
-            else completedBg = completedBg.filter((n) => n !== p.session_id)
-          }
           return {
             ...s,
             runningSessions,
             bgSessions,
-            completedBg,
             isSending: s.activeSession !== null && runningSessions.includes(s.activeSession)
           }
         })
@@ -869,13 +892,18 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
           const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null }
+          // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
+          // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
+          // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
+          // 违反"会话切换/复现时仅显示正在执行的组"。
+          const taskBoardBySession = { ...s.taskBoardBySession, [p.session_id]: null }
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
           const buf = s.messagesBySession[p.session_id] ?? []
           const hasLive =
             (s.runningSessions.includes(p.session_id) || s.bgSessions.includes(p.session_id)) &&
             buf.length > 0
-          if (hasLive) return s
+          if (hasLive) return { ...s, taskBoardBySession }
           const histBuf = historyToMessage(p.session_id, p.messages)
           const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
           const messages = s.activeSession === p.session_id ? histBuf : s.messages
@@ -890,7 +918,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
           if (s.activeSession !== p.session_id) {
-            return { ...s, messagesBySession, messages, sessionUsageBySession }
+            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession }
           }
           return {
             ...s,
@@ -899,6 +927,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             sessionUsageBySession,
             sessionModelId: p.model_id || s.sessionModelId,
             overridesByModel,
+            taskBoardBySession,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
             lastOverridesByModel: overridesByModel,
           }
@@ -927,6 +956,22 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             used_percent: p.used_percent,
             max_label: p.max_label,
           }
+        })
+        break
+      }
+      case 'task_board': {
+        const p = ev.payload as { session_id?: string; board?: TaskBoardSnapshot | null } | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const prev = s.taskBoardBySession[sid]
+          const next = p?.board ?? null
+          // 同组内丢弃乱序/过期快照：后台子智能体在 daemon 线程里改任务，
+          // 多线程推送可能乱序到达；revision 组内单调递增，更小的直接丢。
+          if (prev && next && prev.group_id === next.group_id && next.revision < prev.revision) {
+            return s
+          }
+          return { ...s, taskBoardBySession: { ...s.taskBoardBySession, [sid]: next } }
         })
         break
       }
@@ -973,17 +1018,28 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     return Promise.resolve()
   },
   switchSession: async (sid) => {
+    // 进入会话 = 已读。先本地即时置已读（即时反馈），再持久化到后端元数据。
+    void get().setSessionUnread(sid, false)
     // 立即高亮 + 切换到该会话缓冲（后台会话继续执行不受影响，仅换投影）。
     // 模型/参数不在此处清空：由后端回发的 session_history 按元数据异步恢复。
     set((s) => ({
       activeSession: sid,
       pendingFresh: null,
-      completedBg: s.completedBg.filter((n) => n !== sid),
       messages: s.messagesBySession[sid] ?? [],
       isSending: s.runningSessions.includes(sid)
     }))
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
     await window.agent.switchSession(sid)
+  },
+  /** 标记某会话未读/已读：本地即时生效 + 后端写入元数据持久化（跨窗口/重启随 sessions 同步）。
+   *  进入会话=已读；非当前查看的会话完整结束后置未读。调用各处通过 get().setSessionUnread 触发。 */
+  setSessionUnread: async (sessionId: string, unread?: boolean) => {
+    set((s) => ({ sessions: patchSessionUnread(s.sessions, sessionId, Boolean(unread)) }))
+    try {
+      await window.agent.setSessionUnread({ session_id: sessionId, unread: Boolean(unread) })
+    } catch {
+      /* 后端未就绪时忽略；sessions 重播时会以元数据为准校准 */
+    }
   },
   clearSession: async () => {
     const sid = get().activeSession

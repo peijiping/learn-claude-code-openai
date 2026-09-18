@@ -6,8 +6,11 @@ import { flog } from './logger'
 
 const WS_PORT = Number(process.env.AGENT_WS_PORT || '8765')
 
-// 应用图标：机器人头像（dev 下位于工程根 build/icon.jpg；打包后位于安装资源目录）
-const APP_ICON = join(app.getAppPath(), 'build/icon.jpg')
+// 应用名称：macOS Dock / 菜单栏 / Cmd+Tab 等所有系统展示处统一命名为「个人AI助手」
+app.setName('个人AI助手')
+
+// 应用图标：透明背景的浅蓝机器人头像（dev 下位于工程根 build/icon.png；打包后位于安装资源目录）
+const APP_ICON = join(app.getAppPath(), 'build/icon.png')
 
 // macOS Dock 图标：nativeImage 可直接用该路径加载（PNG/JPG 均可）
 function ensureAppIcon(): void {
@@ -83,7 +86,7 @@ function resolvePending(envelope: unknown): void {
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1380,
-    height: 800,
+    height: 900,
     minWidth: 860,
     minHeight: 600,
     show: false,
@@ -148,6 +151,11 @@ function createWindow(): void {
     if (!isTrustedSender(e)) return
     ws.send(JSON.stringify({ kind: 'session_clear' }))
     return { ok: true }
+  })
+
+  ipcMain.handle('agent:setSessionUnread', (e, payload: { session_id?: string; unread?: boolean }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    return request('session_set_unread', 'sessions', { session_id: payload.session_id, unread: Boolean(payload.unread) })
   })
 
   ipcMain.handle('agent:listSessions', (e) =>

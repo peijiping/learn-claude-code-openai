@@ -78,6 +78,24 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 # 任务目录
 TASKS_DIR = DATA_ROOT / ".tasks"
 
+# ── 任务文件：一个会话一个 JSON，文件内以「组」为 key（2026-09-16 第二次改造）──
+# 布局（替代原「每任务一文件 .tasks/task_<scope>_<ts>_<rand>.json」）：
+#
+#   ~/.aigent/projects/default/.tasks/<scope>.json
+#   {
+#     "version": 1,
+#     "scope": "session_Kx7mQ2vT8p",
+#     "updated_at": 1758000000.123,
+#     "groups": {
+#       "g_1758000000_0001": [ {任务}, {任务} ],   ← 一次"派活"= 一个 key
+#       "g_1758000123_0002": [ {任务} ]
+#     }
+#   }
+#
+# 好处：文件数 = 会话数（原方案是任务数）；面板/回放一次读盘拿到整组，
+# 多组历史天然共存于同一文件，不再靠文件名排序去"猜"分组。
+GLOBAL_TASK_SCOPE_KEY = "_global"
+
 # 持久化路径：所有 durable=True 的任务会被序列化到该文件，重启后自动恢复
 DURABLE_PATH = DATA_ROOT / ".scheduler" / "scheduled_tasks.json"
 
@@ -142,6 +160,9 @@ def todo_file_for_session(session_id: str) -> Path:
     """
     返回指定会话对应的 todo 文件路径。
 
+    ⚠️ todo 已于 2026-09-16 下线（见 agents/todo_manager.py）。本函数保留仅为
+    兼容存量数据与 tests/test_session_id_naming.py 的断言，**不应被新代码调用**。
+
     todo 是会话内轻量级任务看板，与 chat history 一一绑定：
     每个 session 有独立 todo 文件，会话切换时同步切换。
 
@@ -149,6 +170,43 @@ def todo_file_for_session(session_id: str) -> Path:
     id 为短随机串（新会话）或存量编号字符串（"6"），调用方统一传 str。
     """
     return TODO_DIR / f"session_{session_id}.todo.json"
+
+
+# ── 任务文件路径（一个会话一个 JSON，组为 key）──────────────────────────
+# 布局与设计理由见 TASKS_DIR 上方注释；实现细节见 agents/task_manager.py。
+
+
+def task_scope_key(scope: str | None) -> str:
+    """scope → 任务文件名（不含 `.json` 后缀）。scope 为空（旧全局看板）用哨兵名。"""
+    return scope or GLOBAL_TASK_SCOPE_KEY
+
+
+def task_scope_file(scope: str | None, tasks_dir: Path | None = None) -> Path:
+    """scope → 该作用域**唯一**的任务文件路径。
+
+    ⚠️ **这是 scope ↔ 文件名口径的唯一出处**（`task_manager` 直接 import 本函数，
+    读写与 `SessionManager` 的级联清理必须同源）：原先两处各持一份 glob 规则，
+    任何一边漂移都会导致"清理静默失效"。
+    守护测试：`tests/test_session_task_cascade.py`。
+    """
+    base = tasks_dir if tasks_dir is not None else TASKS_DIR
+    return base / f"{task_scope_key(scope)}.json"
+
+
+def task_file_for_session(session_id: str, session_prefix: str = "session_") -> Path:
+    """指定会话对应的任务文件路径（会话 id 是短随机串或存量编号字符串）。"""
+    return task_scope_file(f"{session_prefix}{session_id}")
+
+
+def task_files_for_session(session_id: str, session_prefix: str = "session_") -> list[Path]:
+    """返回指定会话的任务文件：0 或 1 个（文件不存在 → 空列表）。
+
+    一个会话只有一个文件，但仍返回 list：调用方（`session_manage` 的两处级联
+    清理）按列表遍历删除，改签名会牵动无关代码；且「不存在 → 空列表」对
+    删除语义完全等价。回收站（trash/restore）**不动**这些文件 —— 还原后任务还在。
+    """
+    path = task_file_for_session(session_id, session_prefix)
+    return [path] if path.exists() else []
 
 
 # 模块导入即保证目录存在（保持原 tool_base.py 的导入期副作用）。

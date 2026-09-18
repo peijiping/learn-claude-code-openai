@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
-from paths import DEFAULT_PROJECT_SLUG, todo_file_for_session
+from paths import DEFAULT_PROJECT_SLUG, task_files_for_session
 from logger import get_logger
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
@@ -293,7 +293,11 @@ class SessionManager:
             if msg_role == "system":
                 normalized.append({"role": "system", "content": content})
             elif msg_role == "user":
-                normalized.append({"role": "user", "content": content})
+                norm = {"role": "user", "content": content}
+                # 消息记录时间（UI 展示元数据，不进模型上下文），老行缺省
+                if msg_data.get("created_at"):
+                    norm["created_at"] = msg_data["created_at"]
+                normalized.append(norm)
             elif msg_role == "assistant":
                 norm = {
                     "role": "assistant",
@@ -301,6 +305,8 @@ class SessionManager:
                     "reasoning_content": msg_data.get("reasoning_content", ""),
                     "tool_calls": msg_data.get("tool_calls", []),
                 }
+                if msg_data.get("created_at"):
+                    norm["created_at"] = msg_data["created_at"]
                 # usage 为 UI 展示元数据（轮级 token 消耗），不进模型上下文
                 #（Agent 侧发送 LLM 前会做白名单投影剔除）
                 if msg_data.get("usage"):
@@ -552,7 +558,11 @@ class SessionManager:
         if role == "system":
             return {"role": "system", "content": message.get("content", "")}
         elif role == "user":
-            return {"role": "user", "content": message.get("content", "")}
+            row = {"role": "user", "content": message.get("content", "")}
+            # 消息记录时间（前端右下角展示）：新消息落盘时打点，
+            # 重写（compact/自愈）时保留行内已有值，避免老行被误改时间
+            row["created_at"] = message.get("created_at") or _now_iso()
+            return row
         elif role == "assistant":
             row = {
                 "role": "assistant",
@@ -560,6 +570,7 @@ class SessionManager:
                 "reasoning_content": message.get("reasoning_content", ""),
                 "tool_calls": message.get("tool_calls", []),
             }
+            row["created_at"] = message.get("created_at") or _now_iso()
             # 轮级 token 消耗（UI 展示元数据），存在才写入
             if message.get("usage"):
                 row["usage"] = message["usage"]
@@ -1097,6 +1108,7 @@ class SessionManager:
             "project": DEFAULT_PROJECT_SLUG,
             "model_id": None,
             "overrides": None,
+            "unread": False,
         }
 
     def _meta_entry_for(self, session_file: Path) -> dict:
@@ -1194,6 +1206,7 @@ class SessionManager:
                 "status": "active",
                 "trashed_at": None,
                 "project": DEFAULT_PROJECT_SLUG,
+                "unread": False,
             }
             changed = True
         for key in [k for k in entries if k not in existing and k not in metas]:
@@ -1287,6 +1300,14 @@ class SessionManager:
         except FileNotFoundError:
             pass
 
+    def set_unread(self, session_id: str, unread: bool = False) -> dict:
+        """记录会话的未读/已读状态（写入元数据，兼容新 meta 文件/存量 index）。
+
+        语义由前端驱动：会话完整结束且用户当前不在查看它 → unread=True；
+        用户进入（切换/点击查看）该会话 → unread=False。跨窗口/重启持久化。
+        """
+        return self._update_entry(session_id, lambda e: e.update({"unread": bool(unread)}))
+
     def set_session_model(self, session_id: str, model_id: str | None = None,
                           overrides: dict | None = None) -> dict:
         """记录会话最后选择的模型与其参数（写入元数据，兼容新 meta 文件/存量 index）。
@@ -1338,7 +1359,7 @@ class SessionManager:
         )
 
     def delete_session_permanent(self, session_id: str) -> bool:
-        """永久删除会话：jsonl + 绑定的 todo 文件 + 元数据。
+        """永久删除会话：jsonl + 任务板文件 + 子智能体旁路 + 元数据。
 
         新方案会话（存在独立 meta 文件）删除单文件 O(1)；
         存量会话回退移除 index.jsonl 中对应条目。
@@ -1354,13 +1375,14 @@ class SessionManager:
         # 子智能体旁路记录与主文件同生共死（不残留、不串台）
         if self.subagent_store is not None:
             self.subagent_store.delete(session_file)
-        # todo 与 chat history 同生共死（tools.set_todo_manager 创建的路径）
-        try:
-            todo_file = todo_file_for_session(session_id)
-            if todo_file.exists():
-                todo_file.unlink()
-        except OSError:
-            pass
+        # 任务板与 chat history 同生共死：删除本会话作用域下的全部 task 文件。
+        # （原此处删除 todo 文件；todo 已于 2026-09-16 下线，改由 task 承接）
+        # 单个删除失败不阻断会话删除 —— 与子智能体旁路文件的处理策略一致。
+        for task_file in task_files_for_session(session_id, self.session_prefix):
+            try:
+                task_file.unlink()
+            except OSError as e:
+                log.error("删除任务文件失败 %s: %s", task_file.name, e)
         with self._index_lock:
             if self.meta_file(session_id).exists():
                 try:
@@ -1383,7 +1405,7 @@ class SessionManager:
 
         Returns:
             [{id, title, title_source, status, created_at, updated_at,
-              trashed_at, message_count, file}, ...]
+              trashed_at, file, model_id, project, usage_totals, unread}, ...]
             按「最后修改时间」（元数据 updated_at，mtime 兜底）降序 —— 最近使用的在前
         """
         self.backfill_index()
@@ -1391,11 +1413,6 @@ class SessionManager:
         for f in self._iter_session_files():
             sid = self._sid_from_stem(f.stem)
             if sid is None:
-                continue
-            try:
-                with open(f, "r", encoding="utf-8") as file:
-                    msg_count = sum(1 for line in file if line.strip())
-            except (ValueError, IOError):
                 continue
             # 优先独立 meta 文件（新方案会话），否则回退 index.jsonl（存量会话）
             meta = self._meta_entry_for(f)
@@ -1407,9 +1424,12 @@ class SessionManager:
                 "created_at": meta.get("created_at"),
                 "updated_at": meta.get("updated_at"),
                 "trashed_at": meta.get("trashed_at"),
-                "message_count": msg_count,
                 "file": f.name,
                 "model_id": meta.get("model_id"),
+                # 悬停卡片展示用：所属项目（工作空间）与会话级 token 累计
+                "project": meta.get("project", DEFAULT_PROJECT_SLUG),
+                "usage_totals": meta.get("usage_totals"),
+                "unread": bool(meta.get("unread", False)),
             })
         sessions = [s for s in sessions if s.get("status") == status]
         # 排序键与会话列表展示解耦：list_sessions 内单独算 key（含 mtime 兜底），
@@ -1452,8 +1472,18 @@ class SessionManager:
             if self.subagent_store is not None:
                 self.subagent_store.clear(session_file)
 
-            # token 累计统计随会话内容同生共死：元数据 usage_totals 一并清零
+            # 任务板随会话内容同生共死：删除本会话作用域下的全部 task 文件。
+            # 注意必须放在这一层（而不是 Agent.clear_session）：ws_bridge 的
+            # session_clear 分支是**直接调 sm.clear_session** 的，不经过 Agent。
             sid = self._sid_from_stem(session_file.stem)
+            if sid:
+                for task_file in task_files_for_session(sid, self.session_prefix):
+                    try:
+                        task_file.unlink()
+                    except OSError as e:
+                        log.error("删除任务文件失败 %s: %s", task_file.name, e)
+
+            # token 累计统计随会话内容同生共死：元数据 usage_totals 一并清零
             if sid:
                 try:
                     self._update_entry(sid, lambda e: e.pop("usage_totals", None))

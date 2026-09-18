@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { MouseEvent } from 'react'
 import { Icon } from '@components/common/Icon'
 import SessionMenu from './SessionMenu'
+import SessionTooltip from './SessionTooltip'
 import { sessionDisplayName, useAgentStore } from '@store/agentStore'
 import type { SessionMeta } from '@protocols/agentProtocol'
 
@@ -12,7 +13,6 @@ export default function TaskTree(): JSX.Element {
   const isSending = useAgentStore((s) => s.isSending)
   const runningSessions = useAgentStore((s) => s.runningSessions)
   const bgSessions = useAgentStore((s) => s.bgSessions)
-  const completedBg = useAgentStore((s) => s.completedBg)
   const switchSession = useAgentStore((s) => s.switchSession)
   const newSession = useAgentStore((s) => s.newSession)
   const renameSession = useAgentStore((s) => s.renameSession)
@@ -20,6 +20,8 @@ export default function TaskTree(): JSX.Element {
 
   // 弹出菜单（三点按钮与右键菜单共用）：null = 关闭
   const [menu, setMenu] = useState<{ x: number; y: number; s: SessionMeta } | null>(null)
+  // 悬停信息卡：null = 不显示（打开菜单时清掉，避免与菜单叠层）
+  const [tip, setTip] = useState<{ x: number; y: number; s: SessionMeta } | null>(null)
   // 行内重命名中的会话 id
   const [renaming, setRenaming] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -27,7 +29,15 @@ export default function TaskTree(): JSX.Element {
   const openMenu = (e: MouseEvent, s: SessionMeta): void => {
     e.preventDefault()
     e.stopPropagation()
+    setTip(null)
     setMenu({ x: e.clientX, y: e.clientY, s })
+  }
+
+  /** 悬停会话行：信息卡定位于该行右缘右侧（菜单/右键不触发） */
+  const showTip = (e: MouseEvent, s: SessionMeta): void => {
+    if (menu) return
+    const r = e.currentTarget.getBoundingClientRect()
+    setTip({ x: r.right + 10, y: r.top - 4, s })
   }
 
   const startRename = (s: SessionMeta): void => {
@@ -70,16 +80,20 @@ export default function TaskTree(): JSX.Element {
             onClick={() => {
               if (renaming === null) void switchSession(s.id)
             }}
+            onMouseEnter={(e) => showTip(e, s)}
+            onMouseLeave={() => setTip(null)}
             onContextMenu={(e) => openMenu(e, s)}
           >
-            <Icon name="chevronRight" size={12} className="tree-chevron" />
             {runningSessions.includes(s.id) ? (
               <span className="tree-dot running" title="执行中" />
             ) : bgSessions.includes(s.id) ? (
               <span className="tree-dot running" title="后台任务执行中" />
-            ) : completedBg.includes(s.id) ? (
-              <span className="tree-dot done" title="已完成，点击查看" />
-            ) : null}
+            ) : (
+              <span
+                className={`tree-dot ${s.unread ? 'unread' : ''}`}
+                title={s.unread ? '有新消息，未读' : '已读'}
+              />
+            )}
             {renaming === s.id ? (
               <input
                 className="tree-rename-input"
@@ -98,7 +112,6 @@ export default function TaskTree(): JSX.Element {
                 {sessionDisplayName(s)}
               </span>
             )}
-            <span className="tree-count">{s.message_count}</span>
             {renaming !== s.id && (
               <button
                 title="更多操作"
@@ -111,6 +124,8 @@ export default function TaskTree(): JSX.Element {
           </div>
         ))}
       </div>
+
+      {tip && <SessionTooltip x={tip.x} y={tip.y} session={tip.s} />}
 
       {menu && (
         <SessionMenu

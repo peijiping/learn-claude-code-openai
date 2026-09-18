@@ -5,6 +5,8 @@ export interface AgentApi {
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>
+  /** 标记会话未读/已读（进入会话=已读，后端写入元数据持久化） */
+  setSessionUnread: (payload: { session_id?: string; unread?: boolean }) => Promise<unknown>
   renameSession: (sessionId: string, title: string) => Promise<unknown>
   trashSession: (sessionId: string) => Promise<unknown>
   restoreSession: (sessionId: string) => Promise<unknown>

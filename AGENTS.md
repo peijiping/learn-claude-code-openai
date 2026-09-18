@@ -32,7 +32,7 @@ agent.init_session(resume=False)   # 新会话（cron 用）
 agent.run_turn("[Scheduled] ...")  # 非交互单轮
 ```
 
-同级模块：`tools.py` / `agent_cli.py` / `subagent.py` / `skills.py` / `todo_manager.py` / `task_manager.py` / `background_manager.py` / `compact.py` / `session_manage.py` / `message_bus.py` / `teammate_manager.py` / `llm_manage.py` / `llm_config.py`
+同级模块：`tools.py` / `agent_cli.py` / `subagent.py` / `skills.py` / `todo_manager.py`（**已下线，2026-09-16，勿新增引用**） / `task_manager.py` / `background_manager.py` / `compact.py` / `session_manage.py` / `message_bus.py` / `teammate_manager.py` / `llm_manage.py` / `llm_config.py`
 
 ## 核心模式
 
@@ -115,7 +115,7 @@ agent_loop(messages):
 
 - **路径定义统一管理**：所有工作目录相关常量（`WORKDIR`、`TODO_DIR`、`TEAM_DIR`、`INBOX_DIR`、`CHAT_HISTORY_DIR`、`TRANSCRIPT_DIRNAME`、`TOOL_RESULTS_DIRNAME` 等）一律在 `agents/paths.py` 顶部集中定义，其他模块通过 `from paths import ...` 引用，禁止在业务模块内重复声明。应用 home 常量（`AIGENT_HOME`、`CONFIG_FILE`、`CREDENTIALS_FILE`）在 `agents/config.py` 定义，`paths.py` 单向依赖 `config.py`（`config.py` 不 import `paths.py`）。
 
-- **工具统一走 ToolRegistry（实例，无全局单例）**：`agents/tools.py` 的 `ToolRegistry` 类统一管理所有工具（原 `tool_base.py` 已合并删除），由 `Agent`（`agent_full_v2.py`）实例化并持有为 `self.tools`。**不再提供全局单例** **`TOOL_REGISTRY`**，多实例各持一份。工具定义用 `self.tools.main_agent_tools`（子智能体用 `self.tools.base_tools`）、处理器用 `self.tools.handlers`、执行用 `self.tools.execute(name, **args)`；基础工具方法（`run_bash` / `run_read` / `run_write` / `run_edit` / `run_glob` / `safe_path`）与 todo/background holder（`set_todo_manager` / `get_todo_manager` / `set_background_manager`）均通过该实例调用。其他模块（如 `teammate_manager` / `system_prompt`）需要工具时，由调用方注入 `ToolRegistry` 实例（构造参数），禁止再 import 被删除的 `tool_base` 或全局单例。
+- **工具统一走 ToolRegistry（实例，无全局单例）**：`agents/tools.py` 的 `ToolRegistry` 类统一管理所有工具（原 `tool_base.py` 已合并删除），由 `Agent`（`agent_full_v2.py`）实例化并持有为 `self.tools`。**不再提供全局单例** **`TOOL_REGISTRY`**，多实例各持一份。工具定义用 `self.tools.main_agent_tools`（子智能体用 `self.tools.base_tools`）、处理器用 `self.tools.handlers`、执行用 `self.tools.execute(name, **args)`；基础工具方法（`run_bash` / `run_read` / `run_write` / `run_edit` / `run_glob` / `safe_path`）与 background holder（`set_background_manager`）均通过该实例调用（原 todo holder `set_todo_manager` / `get_todo_manager` 已于 2026-09-16 随 todo 工具下线一并停用，定义保留但不再被引用）。其他模块（如 `teammate_manager` / `system_prompt`）需要工具时，由调用方注入 `ToolRegistry` 实例（构造参数），禁止再 import 被删除的 `tool_base` 或全局单例。
 
 - **可调参数走** **`~/.aigent/config.json`**：纯路径之外的运行时可调参数（如 `context_compact.py` 中的 `CONTEXT_LIMIT_CHARS`、`SNIP_MAX_MESSAGES`、`SUMMARY_TRIGGER_RATIO`、`MAX_REACTIVE_RETRIES` 等）一律声明在用户级配置 `~/.aigent/config.json`（扁平键，键名与 `.env` 一致，默认值同时给到 `.env.example` 的注释示例）；密钥（`*_API_KEY`/`*_TOKEN`/`*_SECRET` 结尾）放 `~/.aigent/credentials.json`（权限 0600）。启动时由 `agents/config.py` 的 `load()` 按「真实环境变量 > 项目级 `[项目根]/.aigent/config.json` > 用户级 `~/.aigent/config.json` > `.env` > 默认值」合并进 `os.environ`。代码中通过 `os.environ.get(KEY) or default`（整数用 `int(...)`、浮点用 `float(...)`，与 `llm_manage.py` 风格保持一致）内联读取；新增/修改这类参数时，必须同步更新 `.env.example` 的注释示例，并可在 `~/.aigent/config.json` 补录。`.env` 仅为遗留兜底，不再作为主配置源。
 

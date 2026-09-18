@@ -29,6 +29,7 @@ from paths import CHAT_HISTORY_DIR
 from session_manage import SessionManager
 from session_runtime import SessionRuntimeRegistry
 from subagent_store import SubagentStore
+from task_manager import current_board
 
 # 启动即自举配置（Electron spawn 的 cwd 为仓库根，config.py 按 cwd 解析项目级配置）
 load_config()
@@ -100,17 +101,43 @@ class ConnectionHub:
 
 
 hub = ConnectionHub()
-# 事件循环句柄：deliver 从任意工作线程（run_turn / 后台子智能体 / 标题线程）
+# 事件循环句柄：deliver 从任意工作线程（run_turn / 后台子智能体）
 # 调度广播回事件循环；main() 启动时捕获。
 _loop: Optional[asyncio.AbstractEventLoop] = None
 # 全局唯一会话运行时注册表（所有连接共享；main() 里构建）
 registry: Optional["SessionRuntimeRegistry"] = None
 
 
+# 会话列表刷新去重：usage_stats（携带 turn）与标题精炼等可能同时触发 reply_sessions，
+# 同一事件循环里只排一次队（全量重建列表，幂等）。
+_sessions_refresh_pending = False
+
+
+async def _refresh_sessions_once() -> None:
+    global _sessions_refresh_pending
+    _sessions_refresh_pending = False
+    await reply_sessions()
+
+
 def deliver(kind: str, payload: dict) -> None:
     """线程安全的事件投递入口：广播到所有活跃连接。"""
     if _loop is not None:
         _loop.call_soon_threadsafe(hub.broadcast, kind, payload)
+        # 轮级 usage 定稿（每轮一次）后同步刷新会话列表：add_usage_totals 刚把
+        # 本轮用量写进会话元数据，悬停信息卡（SessionTooltip）读 sessions 载荷的
+        # usage_totals，若不刷新会停留在创建/上次刷新时的旧快照（显示 —）。
+        # 迟到子智能体补发的 usage_stats（仅 session、无 turn）不触发。
+        if (
+            kind == "event"
+            and isinstance(payload, dict)
+            and payload.get("type") == "usage_stats"
+            and isinstance(payload.get("usage"), dict)
+            and bool(payload["usage"].get("turn"))
+        ):
+            global _sessions_refresh_pending
+            if not _sessions_refresh_pending:
+                _sessions_refresh_pending = True
+                asyncio.run_coroutine_threadsafe(_refresh_sessions_once(), _loop)
 
 
 async def safe_send(ws, line: str) -> None:
@@ -134,25 +161,21 @@ def _session_meta(item: dict) -> dict:
     return dict(item)
 
 
-# ── 会话标题生成（独立 daemon 线程，先于主对话请求发出） ──────────────
+# ── 会话标题生成（简单时序：先默认标题，首轮结束后再 LLM 精炼） ────────
 
 TITLE_SYSTEM_PROMPT = (
-    "你是会话标题生成器。根据用户的首条消息生成一个不超过16个字的简短标题，"
+    "你是会话标题生成器。根据用户的首条消息生成一个不超过20个字的简短标题，"
     "概括用户意图。直接输出标题文本：不要引号、不要句号、不要任何解释。"
 )
 
 # 标题请求专用短超时：独立小客户端，不与主对话共用连接池/超时/重试策略。
-# 若服务端串行排队，标题请求也要在 TITLE_TIMEOUT 秒内出结果或降级兜底，
-# 绝不悬挂到主 turn 结束（主客户端 timeout=1200s + 3 次重试，绝不复用）。
+# 首轮结束后的标题总结请求也要在 TITLE_TIMEOUT 秒内出结果，超时则保留默认标题，
+# 绝不悬挂到主对话流程（主客户端 timeout=1200s + 3 次重试，绝不复用）。
 TITLE_TIMEOUT = 30
 # max_tokens 必须给足：推理模型（如 deepseek-v4-flash）的思考过程也计入
 # completion 预算，预算太小会被 reasoning_tokens 吃光导致 content 为空/
-# 只挤出单字。1000 对"思考 + 16 字标题"足够，成本可忽略。
+# 只挤出单字。1000 对"思考 + 20 字标题"足够，成本可忽略。
 TITLE_MAX_TOKENS = 1000
-
-# 同一会话的标题线程去重（clear 后重发首条消息等场景），防止并发重复写索引
-_title_threads_lock = threading.Lock()
-_title_inflight: set = set()
 
 
 def _generate_session_title(first_user_text: str) -> Optional[str]:
@@ -183,64 +206,40 @@ def _generate_session_title(first_user_text: str) -> Optional[str]:
         # 合法性校验：单字/空串拒绝（如推理模型预算被吃光只挤出"写"），走降级兜底
         if len(title) < 2:
             return None
-        return title[:24]
+        return title[:20]
     except Exception:
         return None
 
 
-def _fallback_title(first_user_text: str) -> Optional[str]:
-    """标题请求失败/不合法时的兜底：按标点切分取首个语义片段。
-
-    例："帮我写一个简单的python程序，越简单越好…" → "帮我写一个简单的python程序"，
-    而不是盲目截断 20 字（可能在词中间断开或只剩半句话）。
-    """
-    text = re.sub(r"\s+", " ", (first_user_text or "").strip())
-    if not text:
+def _default_session_title(text: str) -> Optional[str]:
+    """默认标题：首条用户消息前 30 字符（空白归一为单行），创建会话元数据时立即可读。"""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
         return None
-    first_clause = re.split(r"[，,。．.！!？?；;：:、\n]", text, maxsplit=1)[0].strip()
-    if len(first_clause) < 4:  # 首个标点出现太早，整句兜底
-        first_clause = text
-    return first_clause[:16] or None
+    return t[:30]
 
 
-def _title_worker(loop, session_id: str, first_user_text: str) -> None:
-    """标题线程主体：生成 → 写索引 → 回发会话列表。任何异常静默吞掉，绝不影响主对话。"""
+async def _finalize_title_after_turn(turn_task, session_id: str,
+                                     first_user_text: str) -> None:
+    """第一轮 run_turn 结束后，用大模型总结生成标题（≤20 字）并写回会话元数据。
+
+    标题生成不再与首轮并行抢跑（旧 _start_title_thread 方案）：创建会话时已有
+    "首条消息前 30 字"的默认标题可读，第一轮执行完后再调一次 LLM 精炼。
+    LLM 失败/不合法则保留默认标题；任何异常都不影响主流程。
+    """
     try:
-        title = _generate_session_title(first_user_text)
-        source = "auto"
-        if not title:
-            title = _fallback_title(first_user_text)
-            source = "trunc"
-        if title:
-            sm = _ensure_session_manager()
-            sm.set_auto_title(session_id, title, source)
-            # 从工作线程安全地把"刷新会话列表"调度回事件循环（广播到所有活跃连接）
-            asyncio.run_coroutine_threadsafe(reply_sessions(), loop)
+        await turn_task
     except Exception:
-        pass
-    finally:
-        with _title_threads_lock:
-            _title_inflight.discard(session_id)
-
-
-def _start_title_thread(session_id: str, first_user_text: str) -> None:
-    """收到首条消息立即启动独立 daemon 标题线程。
-
-    必须在 run_turn 线程提交之前调用：标题请求先于主对话请求到达服务端，
-    即使服务端串行排队（本地模型/单并发代理），标题也能最先被处理。
-    线程完全独立于会话的 run_turn/agent_loop 生命周期，turn 中途完成即回发。
-    """
-    loop = asyncio.get_running_loop()
-    with _title_threads_lock:
-        if session_id in _title_inflight:
-            return  # 同会话已有标题线程在跑，跳过
-        _title_inflight.add(session_id)
-    threading.Thread(
-        target=_title_worker,
-        args=(loop, session_id, first_user_text),
-        name=f"session-title-{session_id}",
-        daemon=True,
-    ).start()
+        pass  # turn 异常也照常生成标题，不阻断
+    try:
+        title = await asyncio.to_thread(_generate_session_title, first_user_text)
+        if not title:
+            return  # 保留创建时的默认标题（首条消息前 30 字）
+        sm = _ensure_session_manager()
+        await asyncio.to_thread(sm.set_auto_title, session_id, title, "auto")
+        await reply_sessions()
+    except Exception:
+        log.warning("session_%s 标题生成失败，保留默认标题", session_id)
 
 
 def _has_real_user_turn(messages: list) -> bool:
@@ -252,6 +251,33 @@ def _has_real_user_turn(messages: list) -> bool:
             continue
         return True
     return False
+
+
+async def _reply_task_board(ws, sm, sid: str) -> None:
+    """补发某会话当前的任务板快照（重放用；纯读磁盘，无副作用）。
+
+    **只发「未完成组」**（`task_manager.current_board`）—— 已结束的组不回放。
+    这正是"会话切换 / 复现时仅显示正在执行的组，已经结束的不显示"的实现点：
+    配合前端在收到 session_history 时先把该会话 board 置 null，切走再切回
+    就不会残留上一轮那版 `done` 快照。
+
+    与实时通道的分工：实时推 `latest_board`（**包含**最后一版 status=done，
+    前端据此自动收起并显示「全部完成」），重放推 `current_board`（无未完成组
+    就发 board=null）。
+
+    注意：运行中的会话也必须补发这一封 —— 既有守卫禁止的是
+    `load_session_history` 的**落盘重写**，而这里只读该会话的**一个**任务文件
+    （`.tasks/<scope>.json`，2026-09-16 起一会话一文件），
+    没有任何副作用；不补发的话切到"正在跑长任务"的会话会看到空面板，
+    要等下一次任务状态变化才出现。
+    """
+    try:
+        scope = f"{sm.session_prefix}{sid}"
+        board = await asyncio.to_thread(current_board, scope)
+    except Exception as e:
+        log.error("读取任务板失败 session_%s: %s: %s", sid, type(e).__name__, e)
+        board = None
+    await safe_send(ws, _envelope("task_board", {"session_id": sid, "board": board}))
 
 
 def _ensure_session_manager():
@@ -350,7 +376,7 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
     """session 历史 → 前端可渲染消息列表。
 
     - 跳过 system / tool 消息（前者无展示价值，后者已聚合进 assistant 工具条）
-    - 跳过系统注入的 user 消息（<system-reminder> 开头的 todo reminder 等）
+    - 跳过系统注入的 user 消息（<system-reminder> 开头的 memory/env/task_board 注入等）
     - assistant 保留 reasoning_content → thinking、tool_calls → 工具条
     - 子智能体执行过程：主源为**旁路记录**（`session_<id>.subagents.jsonl`，
       经 subagent_records 传入）；messages 里若仍残留 `role=subagent` 行
@@ -364,7 +390,11 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
             content = _text_of(m.get("content"))
             if content.startswith("<system-reminder>"):
                 continue
-            ui.append({"role": "user", "content": content})
+            ui_msg = {"role": "user", "content": content}
+            # 消息记录时间（jsonl created_at，秒级 ISO 本地时间；老行缺省）
+            if m.get("created_at"):
+                ui_msg["created_at"] = m["created_at"]
+            ui.append(ui_msg)
         elif role == "assistant":
             tool_calls = []
             tc_ids: list[str] = []
@@ -381,6 +411,8 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
                 "_tc_ids": tc_ids,
                 "toolCalls": tool_calls,
             }
+            if m.get("created_at"):
+                ui_msg["created_at"] = m["created_at"]
             # 轮级 token 消耗 + 本轮模型快照 + 会话级累计快照（UI 展示元数据，
             # turn 收尾时写入末条 assistant 行的 usage / model_info / usage_session 节点）
             if m.get("usage"):
@@ -468,6 +500,13 @@ async def handle(ws):
                         sm.set_session_model, new_sid,
                         model_id=payload.get("model_id"),
                     )
+                    # 默认标题：创建会话元数据时即用首条消息前 30 字，列表立刻可读；
+                    # 首轮结束后再由 _finalize_title_after_turn 用 LLM 总结精炼（≤20 字）。
+                    default_title = _default_session_title(text)
+                    if default_title:
+                        await asyncio.to_thread(
+                            sm.set_auto_title, new_sid, default_title, "trunc"
+                        )
                     await reply_sessions()
                 rt = registry.get_or_create(sid)
                 if rt.busy:
@@ -476,12 +515,14 @@ async def handle(ws):
                         "msg": f"该会话 (session_{sid}) 正在执行，请先用停止按钮结束后再发送",
                     }))
                     continue
-                # 标题：全新会话，或该会话此前从无真实 user 消息（旧会话首轮）
+                # 首轮判定：全新会话，或该会话此前从无真实 user 消息（旧会话首轮）。
+                # 标题不在首轮并行抢跑（旧 _start_title_thread 方案）：新建会话时已有
+                # 默认标题（首条消息前 30 字）可读，这里只标记首轮，待 run_turn 结束后
+                # 再调用一次 LLM 总结生成精炼标题（≤20 字）并写回。
                 history = await asyncio.to_thread(
                     sm.load_session_history, sm.get_session_file(sid)
                 )
-                if not _has_real_user_turn(history):
-                    _start_title_thread(sid, text)
+                first_turn = not _has_real_user_turn(history)
                 # 会话级请求覆盖：思考强度 / 更大上下文（本轮生效，内存态，不写配置）。
                 # 前端下拉悬浮面板改动后随 chat 命令带上来。
                 ov = payload.get("overrides") or {}
@@ -492,10 +533,13 @@ async def handle(ws):
                 max_context = str(max_context_raw) if max_context_raw else None
                 # 后台线程跑 turn；事件循环继续处理其它命令（切换 / 其它会话 / stop）
                 log.info("chat 派发: session_%s text=%r", sid, text[:80])
-                asyncio.create_task(
+                turn_task = asyncio.create_task(
                     rt.start_turn(text, reasoning_effort=reasoning_effort,
                                   max_context=max_context)
                 )
+                if first_turn:
+                    # 第一轮 run_turn 执行完之后，再调用一次大模型总结生成标题（≤20 字）
+                    asyncio.create_task(_finalize_title_after_turn(turn_task, sid, text))
 
             elif kind == "stop":
                 # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响
@@ -537,6 +581,8 @@ async def handle(ws):
                         "overrides": meta.get("overrides") or {},
                         "usage_totals": meta.get("usage_totals"),
                     }))
+                    # 任务板照常补发：只读 .tasks/，不触碰会话文件，无重写风险
+                    await _reply_task_board(ws, sm, sid)
                     await reply_sessions()
                     continue
                 try:
@@ -559,6 +605,8 @@ async def handle(ws):
                         "overrides": meta.get("overrides") or {},
                         "usage_totals": meta.get("usage_totals"),
                     }))
+                    # 任务板补发：只发未完成组 → 已结束的组切回来不显示
+                    await _reply_task_board(ws, sm, sid)
                     # 切换会话后推送该会话的上下文统计（供前端圆圈指示器按会话展示）；
                     # 窗口按会话元数据（绑定模型 + 参数覆盖）解析，不用共享
                     # SessionManager 的全局默认（见 _resolve_session_window 注释）
@@ -571,6 +619,19 @@ async def handle(ws):
                     except Exception:
                         pass
                     await reply_sessions()
+
+            elif kind == "session_set_unread":
+                # 标记会话未读/已读（读/未读由前端判定：进入会话=已读，非当前查看会话
+                # 完整结束=未读）。写入元数据持久化后重播会话列表，跨窗口/重启生效。
+                sm = _ensure_session_manager()
+                sid = str(payload.get("session_id") or "")
+                if not sid:
+                    continue
+                if not sm.get_session_file(sid).exists():
+                    continue
+                unread = bool(payload.get("unread", False))
+                await asyncio.to_thread(sm.set_unread, sid, unread)
+                await reply_sessions()
 
             elif kind == "session_model":
                 # 记录会话最后选择的模型 + 参数到会话元数据（会话级独立绑定）；
@@ -710,13 +771,15 @@ async def handle(ws):
                 await safe_send(ws, _envelope("goal_status", {"text": text}))
 
             elif kind == "tasks":
-                # 惰性会话下可能尚未绑定 todo manager，无激活会话时给占位文本
+                # todo 已下线（2026-09-16）：本命令改为返回当前会话的 task 看板文本。
+                # 无激活会话时仍给占位文本 —— 此时 task_manager 尚未 set_scope，
+                # list_tasks 会退化成列出全局任务（旧全局看板兼容语义），必须拦住。
                 if agent.session_id is None:
-                    await safe_send(ws, _envelope("tasks", {"text": "(当前会话暂无待办)"}))
+                    await safe_send(ws, _envelope("tasks", {"text": "(当前会话暂无任务)"}))
                     continue
                 text = await asyncio.to_thread(agent.show_tasks)
                 if not text.strip():
-                    text = "(当前会话暂无待办)"
+                    text = "(当前会话暂无任务)"
                 await safe_send(ws, _envelope("tasks", {"text": text}))
 
             elif kind == "skills":

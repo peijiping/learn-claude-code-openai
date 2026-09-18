@@ -26,7 +26,7 @@
 
 | | `TodoManager`（`agents/todo_manager.py`） | `TaskManager`（`agents/task_manager.py`） |
 |---|---|---|
-| 存储 | 单文件 `.todo/session_<id>.todo.json` | 每任务一文件 `.tasks/task_<scope>_<ts>_<rand>.json` |
+| 存储 | 单文件 `.todo/session_<id>.todo.json` | 每任务一文件 `.tasks/task_<scope>_<ts>_<rand>.json`（**第二轮已改为**每会话一文件、文件内以组为 key，见 §16） |
 | 结构 | 扁平列表，`{id,text,status}` | `{id,subject,description,status,owner,blockedBy}` |
 | 状态 | pending / in_progress / completed（同时仅 1 个 in_progress） | pending / in_progress / completed |
 | 更新语义 | **整表替换**（`update(items, fresh_start)`） | 逐条 CRUD |
@@ -73,7 +73,7 @@
 | 「执行完之前不能关闭」 | `status==='running'` 时不渲染任何 dismiss 入口 | DOM 里找不到关闭按钮 |
 | 「直到全部执行完」 | 最后一个任务 completed 时组关闭、面板转 `done` | 面板显示 `N/N 完成` |
 | 「不跨会话」 | 任务文件名含会话 scope；`session_history` 不携带其它会话任务 | 切会话看到的组只属于该会话 |
-| 「会话删除时 json 一起删」 | `delete_session_permanent` 内按 scope glob 删除 | 删除后 `.tasks/` 无该会话残留 |
+| 「会话删除时 json 一起删」 | `delete_session_permanent` 内删该会话的任务文件（第二轮起就是那**一个** `paths.task_scope_file(scope)`，不再 glob） | 删除后 `.tasks/` 无该会话残留 |
 | 「多组只显示最后执行中」 | 存在唯一未完成组（见 4.2） | 连续派 3 组活，面板只显示第 3 组 |
 | 「切换/复现只显示运行中的」 | 重放只补发未完成组 | 已完成的组切回来不显示 |
 
@@ -269,7 +269,7 @@ def _bind_task_board(self, agent: Agent) -> None:
 ```python
 # task_manager.py
 def build_task_board(scope: str, tasks_dir: Path = TASKS_DIR) -> dict | None:
-    """只读 .tasks/ 下该 scope 的文件，算出当前未完成组快照；无则 None。"""
+    """只读该 scope 的任务文件，算出当前未完成组快照；无则 None。"""
 ```
 
 于是重放路径与实时路径产出**同一份结构**，前端无需区分。
@@ -380,7 +380,8 @@ case 'session_history': {
 
 ```python
 def task_files_for_session(session_id: str, session_prefix: str) -> list[Path]:
-    """返回该会话 scope 下的全部 task 文件（task_<prefix><id>_*.json）。"""
+    """返回该会话的任务文件：0 或 1 个（第二轮起一个会话只有一个文件）。
+    路径口径唯一出处是 paths.task_scope_file，task_manager 直接 import 它。"""
 ```
 
 `session_manage.delete_session_permanent` 中，把原 todo 文件删除段替换为：
@@ -489,7 +490,7 @@ cd frontend && npm run typecheck
 - [ ] 全部完成 → 自动收起 + 显示 `全部完成 N/N`，出现「关闭」
 - [ ] 连续派 3 组活 → 面板只显示最后一组
 - [ ] 切到别会话再切回 → 已完成的组不显示
-- [ ] 删除会话 → `.tasks/task_<scope>_*.json` 全消失
+- [ ] 删除会话 → `.tasks/<scope>.json` 消失
 - [ ] 旧会话（含旧 task 文件、旧 todo 文件）打开无报错
 - [ ] 回归测试全绿 + `npm run typecheck` 通过
 
@@ -527,3 +528,240 @@ cd frontend && npm run typecheck
 - 4 步：UI 是纯增量组件，从 `ChatPanel` 摘掉挂载即回退。
 
 **推荐灰度**：先落 1-3（后端能力完整、前端无变化），确认任务写入/清理正常，再上 UI。这样任一步出问题都不会同时影响"模型行为"和"用户界面"两个面。
+
+---
+
+## 14. 中断续跑（审核阶段追加，已实施）
+
+> 审核时用户追问：「task 在本会话内，执行中断后，可以继续执行吧？」
+> 取证结论：**数据层能，语义层原方案有三个断层**。本节记录补齐设计。
+
+### 14.1 取证结论（可复现）
+
+| 事实 | 证据 |
+| --- | --- |
+| 用户点停止 = **协作式干净收尾**；工具执行段**不检查** `stop_evt` → 已发出的工具会跑完并把结果落盘，因此正常停止**不产生孤儿 tool_calls** | `agent_full_v2.py` agent_loop 的两个检查点（迭代边界 / 流式途中 `should_stop`）；工具三阶段执行段无 stop 判断 |
+| 硬中断（关窗 → `SIGTERM`，后端**无** signal handler）→ `assistant(tool_calls)` 已落盘、tool 结果未落盘 → jsonl 出现孤儿 | 落盘顺序：assistant 先于 tool |
+| task 文件每次状态变更**立即落盘**（仅 3 个写入点）；唯一删除路径要求"本会话全部 completed" → **残留 pending/in_progress 必定保留** | `task_manager._save_task` 及其调用点 |
+| 孤儿自愈**不删整轮**，只给缺失的 tool 响应补占位 | `session_manage._sanitize_orphan_tool_calls`（docstring 明写"绝不静默删除整轮对话"） |
+| 压缩只硬保护 `messages[0]`；tool 消息**换占位不删除** | `context_compact.py` |
+| 原提醒机制**只读 TodoManager**，且只在 `init_session` / `switch_session` 触发 → **同会话续轮根本不注入** | 原 `_inject_todo_reminder`（已下线） |
+| `_claim_task` 前置要求 `status == "pending"`，且全仓**无任何** reset / release / 超时通道 | `task_manager._claim_task` |
+
+### 14.2 三处断层 → 对应设计
+
+**断层一：提醒断层** → `Agent._sync_task_board()`
+
+替代原 `_inject_todo_reminder`（尾注：原实现有两个硬伤 —— 只认 todo、
+且同会话续轮不经过它的触发点）。采用与 `<memory_index>` / `<env>` 相同的
+「尾部注入 + 指纹去重」模式：
+
+- 注入条件：**存在未完成组** 且 **历史里找不到该 `group_id` 的 `<task_board>` 注入**
+- 调用点：`init_session` 末尾、`switch_session` 末尾、**`agent_loop` 每轮开头**
+- 效果：进会话 / 重启 resume → 注入一次；同会话中断后再发消息 → 旧注入还在 → 不重复；
+  压缩把注入段裁掉 → 自动补注
+- 必须 `<system-reminder>` 包裹（前端按前缀过滤）
+
+> **判据是"是否存在未完成组"，不是"是否发生过中断"** —— 前端切换会话并不会中断会话
+> （每会话独立运行时），而"模型自己收尾时留了尾巴"同样需要续跑。
+
+**断层二：可见性断层** → 同一注入 + 提示词规范
+
+任务板原本不进 system prompt、不自动注入，模型必须主动 `list_tasks` 才看得到。
+现由 `_sync_task_board()` 兜住，并在提示词里写明"看到 `<task_board>` 提醒就接着把
+未完成项做完，不要另起一套新计划"。
+
+**断层三：状态机断层** → `TaskManager.release_stale_in_progress()`
+
+中断会留下**无人持有**的 `in_progress`：既不能重新 `claim`（要求 pending），
+也没有释放通道。现在在 **`Agent.run_turn()` 开头**做一次归一（→ pending）：
+
+- 放在本轮任何工具调用之前 —— 此处看到的 `in_progress` 必然属于上一轮
+- 守卫 1：`background_manager.has_running()` 为真时不动（后台子智能体可能正合法持有）
+- 守卫 2：只归一 `owner` 为空或 `agent` 的任务；队友（`owner=<队友名>`）可能真还在跑
+
+> 遗留（不在本期）：队友崩溃留下的 `owner=<队友名>` 孤儿 `in_progress` 无回收通道，
+> 属 teammate 生命周期问题，单独立项。
+
+### 14.3 「继续执行」按钮 —— 已删除（2026-09-16）
+
+原设计：按钮判据为
+
+```
+board.status === 'running' && !runningSessions.includes(sid) && !bgSessions.includes(sid)
+```
+
+即"**有活 + 现在没人在跑**"，**不检测"是否中断"**（理由见 02 篇 3.4），
+点击复用既有 `send()` 通路发一条「继续完成未完成的任务」，零协议增量。
+
+**该按钮已从前端删除**，两条理由：
+
+1. **冗余**：本节 14.2 的两个后端机制（`_sync_task_board()` 尾部注入、
+   `release_stale_in_progress()` 归一）都在 `Agent.run_turn()` 里，**与触发者无关**；
+   用户手打「请继续」与点按钮走同一条 `send()` → `run_turn()` 通路，行为完全一致。
+   故 UI 上不再提供按钮，也**不新增任何协议字段**（`runningSessions` / `bgSessions` 前端不再被本组件订阅）。
+2. **渲染故障**：按钮误用了侧边栏的 `.mini-btn`（固定 `24×24` 纯图标样式），
+   4 个汉字被压成竖向单列并溢出面板。
+
+> 14.3 的判据思路（不检测"是否中断"）在恢复任何形式的续跑入口时仍然适用。
+
+---
+
+## 15. 实施记录（2026-09-16）
+
+### 15.1 落地清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `agents/todo_manager.py` | 文件头加「已下线，禁止新增引用」并写明两条下线理由；代码保留 |
+| `agents/tools.py` | 注释 `todo` 工具定义与 handler；`create_task` 加 `parent_id`、`complete_task` 加 `result` |
+| `agents/system_prompt.py` | 尾部整段改写为单套 Task 说明，并写入"中断后继续"的规范 |
+| `agents/agent_full_v2.py` | 注释 todo 绑定（3 处）与 `_inject_todo_reminder`；**整段删除 `rounds_since_todo` nag**；`clear_session`/`show_tasks` 改 task；新增 `_sync_task_board` / `_history_has_task_board`；`run_turn` 开头调 `release_stale_in_progress` |
+| `agents/task_manager.py` | 扩 `Task` 字段（全带默认值）；`group_id` 分组语义；`current_board` / `latest_board` / `build_board` / `load_scope_tasks` / `scope_prefix_for`；`set_emitter` + `_emit_board`；`release_stale_in_progress`；`clear_scope`；**停用 `_gc_scoped_tasks`** |
+| `agents/paths.py` | 新增 `task_files_for_session`；`todo_file_for_session` 标注已下线（**第二轮已改写**，见 §16.4：口径收敛到 `task_scope_file`，`scope_prefix_for` 删除） |
+| `agents/session_manage.py` | `delete_session_permanent` / `clear_session` 连带删除本会话 task 文件 |
+| `agents/session_runtime.py` | 新增 `_bind_task_board`（在 `build_agent` 内 `switch_session` 之后接线） |
+| `agents/ws_bridge.py` | 新增 `_reply_task_board`，会话切换两个分支各补发一次；`tasks` kind 改读 task 看板 |
+| 前端 `protocols/agentProtocol.ts` | 新增 `TaskItemStatus` / `TaskItem` / `TaskBoardSnapshot` + `UiEvent.task_board` |
+| 前端 `store/agentStore.ts` | 新增 `taskBoardBySession`；`task_board` 分支（按 revision 丢弃乱序）；`session_history` 先置 `null` |
+| 前端 `components/Chat/TaskBoard.tsx` | **新增**（固定高度 168px + 滚动 + 折叠 + 不可关闭 + 继续执行〔按钮已于 2026-09-16 删除〕） |
+| 前端 `components/Chat/ChatPanel.tsx` / `styles/chat.css` | 挂载 + `.task-card*` 样式 |
+
+### 15.2 相对原方案的偏差（3 处）
+
+1. **快照信封改为嵌套**：`payload = { session_id, board }`，`board` 可为 `null`。
+   原方案把字段平铺在 payload 里，但 `session_id` 由 `SessionRuntime` 注入、
+   `board` 可能整体为 `null`，嵌套更干净。
+2. **拆成两个快照入口**：新增 `latest_board`（实时推送用，含最后一版 `done`）与
+   `current_board`（重放 / 提醒用，只看未完成组）。原方案只有一个
+   `current_board` —— 会导致"最后一笔完成时前端收不到终态快照"。
+3. **`clear_scope` 不再由 `Agent.clear_session` 调用**：下沉到 `SessionManager.clear_session`，
+   因为 `ws_bridge` 的 `session_clear` 分支直接调它、不经过 Agent。
+
+### 15.3 验证结果
+
+- **回归**：`156 tests OK`（改造前基线 88 例；新增 `test_task_board_snapshot.py` 34 例、
+  `test_session_task_cascade.py` 8 例、注入契约 4 例）
+- **编译/导入**：`py_compile` 8 个后端文件通过；`import ws_bridge, session_runtime,
+  task_manager, session_manage` 通过
+- **前端**：`npm run typecheck` 通过
+
+### 15.4 顺手修掉的两个既有测试故障（与本次改造无关）
+
+跑回归时发现基线**本来就是红的**（16 个 ERROR/FAILURE），逐条取证后确认与本次改动无关，
+一并修复以恢复回归信号：
+
+1. **凭据环境缺失（13 例）**：`SessionManager → ContextCompact → LLMClient()` 要求
+   `OPENAI_API_KEY` 与 `OPENAI_BASE_URL` 同时存在，否则抛"未配置 LLM 密钥/地址"。
+   跑测试前需注入这两个环境变量。**建议后续在测试夹具里显式提供 dummy 值**，
+   不要依赖外部环境（本次未改动，留作跟进项）。
+2. **测试桩过期（2 个文件加载失败 + 3 例失败）**：
+   - `test_subagent_sidecar.py` / `test_system_injection_contract.py` 用「截取
+     `ws_bridge.py` 源码片段 exec」的手法取 `_history_to_ui`，而该片段随 ws_bridge
+     演进引入了 `Optional[...]` 类型标注 → 注解在 `def` 处即求值 → `NameError`。
+     已在两处**预置 `typing` 命名空间**修掉（恢复 22 例）。
+   - `test_promise_guard.py` 的离线 Agent 桩缺 `_turn_usage` / `usage_totals` /
+     `_in_turn` / `_turn_model_id` / `_turn_switches`（随引擎新增用量统计段而过期）
+     → `agent_loop` 抛 `AttributeError` 后提前收尾。已补齐（恢复 3 例）。
+
+> 教训：**桩直连 `agent_loop` 时必须手工补齐 `Agent.__init__` 的记账字段** ——
+> 新增引擎字段时同步检查 `tests/test_promise_guard.py::_make_offline_agent`。
+
+### 15.5 后续修订：删除「继续执行」按钮（2026-09-16）
+
+| 文件 | 改动 |
+| --- | --- |
+| 前端 `components/Chat/TaskBoard.tsx` | 删除 `showResume` 判据与其按钮；顺带摘掉本组件对 `runningSessions` / `bgSessions` / `send` 的订阅（仅它用过）；文件头写明删除理由与"别复用 `.mini-btn`"的坑 |
+| 前端 `styles/chat.css` | 删除 `.task-card__resume`；在 `.task-card*` 区块注释与 `.mini-btn` 使用处补注"该按钮类固定 24×24，只能放图标" |
+| 文档 | 02 篇 3.4 / 10 篇 14.3 / 10 篇 15.1 / 00 篇清单 / 03 篇交叉引用同步改写 |
+
+**动机**：① 用户实测在手打「请继续」与点按钮效果一致 → 按钮冗余；
+② 按钮复用了 `.mini-btn`（固定 `24×24` 纯图标）导致中文被压成竖排、溢出面板。
+
+**协议面零变化**：`task_board` 事件、`runningSessions` / `bgSessions` 状态本身都保留
+（侧边栏脉冲点、输入框发送/停止按钮仍在用）。
+
+---
+
+## 16. 第二轮改造：存储布局改为「每会话一文件 + 组为 key」（2026-09-16）
+
+### 16.1 动机
+
+第一轮是**每任务一文件**（`.tasks/task_<scope>_<ts>_<rand>.json`）。任务一多，
+`.tasks/` 迅速膨胀成几百个小文件，且：
+
+- **分组只能从文件名"猜"**：组 id 写在每个任务体内，列表要全量读盘后按 `group_id` 归并
+- **一次快照要开 N 个文件**：`current_board` / `latest_board` 是面板与中断提醒的
+  数据源，每次推快照都 glob 一整轮
+- 任务 id 里还得编码 scope（`task_session_Kx7mQ2vT8p_...`），每次 claim/complete
+  都把这个长串送进模型上下文
+
+### 16.2 新布局
+
+```
+~/.aigent/projects/default/.tasks/<scope>.json
+{
+  "version": 1,
+  "scope": "session_Kx7mQ2vT8p",
+  "updated_at": 1758000000.123,
+  "groups": {
+    "g_1758000000_0001": [ {任务}, {任务} ],   ← 一次"派活"= 一个 key
+    "g_1758000123_0002": [ {任务} ]
+  }
+}
+```
+
+`scope` 为空（旧全局看板）落到 `_global.json`。**文件数 = 会话数**，
+组id → 任务列表的映射就是 JSON 本身，不再需要"读全部再归并"。
+
+### 16.3 三条必须守住的硬约束
+
+1. **`group_id` 不落进任务体**：组归属由文件里的 key 承载，读盘时回填
+   （`load_scope_tasks` → `task.group_id = gid`），写盘时剥离（`task_payload` 内
+   `data.pop("group_id")`）。磁盘上只有一份组信息 → 不存在"体内值 ≠ 组 key"的静默不一致。
+   任务体内若残留 `group_id`（手工改坏），一律**以 key 为准**。
+2. **读-改-写必须持路径级可重入锁 `file_lock(path)` + 原子写**
+   （同目录临时文件 + `os.replace`）：一份文件承载整会话任务，非原子写被并发读者
+   撞见半截 → `read_doc` 降级为空文档 → **面板与任务板整块消失**（原方案最多丢一条，
+   量级完全不同）。锁按**路径**共享，因此同一会话的多个 `TaskManager` 实例也互斥。
+3. **`_save_task` 只改组内那一条**（组内按 id 替换/追加），不整份重建 →
+   并发修改**不同**任务不会互相覆盖，隔离度与原「每任务一文件」等价。
+   唯一的例外是 `_create_task`：整个「算组 id → 算序号 → 落盘」被放进同一把锁，
+   否则主智能体与后台子智能体并发派活会开出**两个未完成组**，
+   直接破坏 `current_board` 的确定性。
+
+### 16.4 附带的两处简化
+
+| 项 | 改动 |
+| --- | --- |
+| 任务 id | `task_<scope>_<ts>_<rand>` → **`t_<ts>_<rand>`**（scope 已由文件承载）。同秒内连续创建会重掷随机后缀，保证文件内唯一（上限 100 次后退化为 8 位随机数） |
+| 路径口径 | 删除 `task_manager.scope_prefix_for`；新增 `paths.task_scope_file(scope, tasks_dir)` 作为**唯一**出处，`task_manager` 直接 import —— 原先两处各持一份规则，任一边漂移都会导致"清理静默失效" |
+| 野 task_id | `_claim_task` / `_complete_task` 对不存在的 id 返回 `Task xxx not found`（原为抛 `FileNotFoundError`）。id 由模型给出，野 id 应是它看得懂的反馈，而不是一次工具异常 |
+
+### 16.5 兼容与迁移
+
+**不做迁移脚本**。第一轮方案的存量文件（`.tasks/task_<scope>_<ts>_<rand>.json`）
+**不再被读取** —— 因为新代码只按 `task_scope_file` 精确读一个路径，不做 glob。
+属可删的历史数据（用户在改造时确认会自行清理）。
+
+被守护的"零迁移"约定**依然成立且含义收窄**：`Task` 新增字段一律带默认值，
+缺字段的**条目**仍能直接加载（`Task(**条目)`）—— 这是结构内字段演进的兼容底线。
+
+### 16.6 落地清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `agents/paths.py` | 新增 `GLOBAL_TASK_SCOPE_KEY` / `task_scope_key` / `task_scope_file` / `task_file_for_session`；`task_files_for_session` 改为返回 0..1 个路径 |
+| `agents/task_manager.py` | 新增存储层 `file_lock` / `empty_doc` / `read_doc` / `write_doc` / `iter_group_tasks` / `task_payload`；`load_scope_tasks` 改读单文件；删除 `scope_prefix_for`；`_task_path` → `_find_task`（按 id 在文件内查）；`_save_task` 改为组内替换 + 原子写；`_create_task` 全程持锁 + 新 id 规则；`clear_scope` 返回任务条数；`_gc_scoped_tasks` 适配单文件（仍停用） |
+| `tests/test_task_board_snapshot.py` | 新增 `TaskFileLayoutTests`（单文件/组 key/组 id 不落盘/原子写/id 唯一）、`UnknownTaskIdTests`、`ConcurrencyTests`（20 线程并发改任务不丢更新）；历史兼容用例改为「缺字段条目」与「损坏文件/损坏条目」 |
+| `tests/test_session_task_cascade.py` | `seed_tasks` 播新布局；`NamingContractTests` 改为**用真实 TaskManager 写入**来验证口径一致（不再复述字符串） |
+| `docs/frontend/07` | §2.3.3 改写为单文件布局 + 三条硬约束 |
+| 前端 | **零改动**（`task_board` 事件与快照结构未变） |
+
+### 16.7 验证
+
+- **回归**：`169 tests OK`（第一轮落地后为 156 例，本次新增 13 例）
+- **编译/导入**：`py_compile` + `import ws_bridge / session_runtime / session_manage / task_manager / tools / teammate_manager` 通过
+- **手工验证**：单文件内三组共存；`group_id` 不在任务体；无临时文件残留；
+  20 线程 × (claim+complete) 后 20 条任务全为 `completed`（无丢更新）
+

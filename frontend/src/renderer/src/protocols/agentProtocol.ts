@@ -103,6 +103,56 @@ export interface AgentEvent {
   switch?: ModelSwitch
 }
 
+/** 任务项展示状态。pending / in_progress / completed 是**落盘**状态；
+ *  blocked 是**派生**状态 —— 由 blockedBy 实时算出，不写进任务文件
+ *  （避免"依赖状态"与"任务状态"双写不一致）。 */
+export type TaskItemStatus = 'pending' | 'in_progress' | 'completed' | 'blocked'
+
+/** 任务面板里的一行 */
+export interface TaskItem {
+  id: string
+  subject: string
+  /** 落盘状态 */
+  status: 'pending' | 'in_progress' | 'completed'
+  /** 展示用状态（含派生的 blocked） */
+  derived_status: TaskItemStatus
+  /** 认领者；主智能体为 "agent"，队友为队友名，null 表示未认领 */
+  owner: string | null
+  /** 父任务 id（拆子树用，最多 3 层） */
+  parentId: string | null
+  depth: number
+  orderIndex: number
+  blockedBy: string[]
+  /** 完成摘要（complete_task 的 result） */
+  result: string
+  started_at: number | null
+  updated_at: number
+  /** 子项进度（由子项派生，父任务自身 status 不受影响） */
+  child_total: number
+  child_completed: number
+}
+
+/** 任务面板快照：后端每次任务状态变化都推**整份**快照（幂等替换，不做增量）。
+ *
+ *  - `status`: running = 组内还有未完成任务（面板常驻、不可关闭）；
+ *              done    = 本组已全部完成（面板自动收起 + 出现「关闭」）
+ *  - `revision`: 组内单调递增，用于丢弃多线程（后台子智能体）乱序到达的旧快照
+ *  - `counts.blocked`: 派生口径，与 tasks[].derived_status 一致
+ */
+export interface TaskBoardSnapshot {
+  group_id: string
+  revision: number
+  status: 'running' | 'done'
+  counts: {
+    total: number
+    completed: number
+    in_progress: number
+    pending: number
+    blocked: number
+  }
+  tasks: TaskItem[]
+}
+
 /** 会话执行状态（后端 → 前端）：驱动侧边栏运行指示 / 完成绿点 / 停止按钮。
  *  background：turn 已结束但该会话的后台任务（如后台子智能体）仍在执行，
  *  侧边栏同样亮运行脉冲点，但不显示停止按钮（stop 只能停 turn）。 */
@@ -125,6 +175,10 @@ export type UiEvent =
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   | { kind: 'llm_config'; payload: LlmConfigResult }
   | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
+  /** 任务面板快照（整份替换，不做增量）。
+   *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
+   *  会话切换/回放时后端只发未完成组，故已结束的组切回来不会显示。 */
+  | { kind: 'task_board'; payload: { session_id: string; board: TaskBoardSnapshot | null } }
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
 export interface HistoryToolCall {
@@ -152,6 +206,9 @@ export interface HistorySubAgent {
 export interface HistoryMessage {
   role: 'user' | 'assistant'
   content: string
+  /** 消息记录时间（jsonl created_at，秒级 ISO 本地时间如 2026-09-18T10:30:00；
+   *  老会话行缺省 → 右下角不显示时间） */
+  created_at?: string
   thinking?: string
   toolCalls?: HistoryToolCall[]
   /** 本 assistant 消息下调用过的子智能体执行块（后端由 role=subagent 行挂载，回放展示用） */
@@ -312,10 +369,15 @@ export interface SessionMeta {
   created_at?: string
   updated_at?: string
   trashed_at?: string | null
-  message_count: number
   file?: string
   /** 会话绑定的模型 id（记录进会话元数据）；null = 未绑定（用全局） */
   model_id?: string | null
+  /** 所属项目 slug（工作空间）；单项目阶段固定 "default"（悬停卡片展示用） */
+  project?: string
+  /** 会话累计 token 消耗（后端 add_usage_totals 写入元数据；无消耗会话缺省） */
+  usage_totals?: UsageStats | null
+  /** 未读标记：会话完整结束且用户尚未进入查看时为 true（后端元数据持久化，跨重启/多窗口同步） */
+  unread?: boolean
 }
 
 /** 会话元数据里记录的模型参数（UI 级：后端不参与窗口换算，仅保存已选档位） */
@@ -333,6 +395,7 @@ export interface SessionModelOverridesMap {
 export type ControlKind =
   | 'chat'
   | 'session_switch'
+  | 'session_set_unread'
   | 'session_clear'
   | 'session_model'
   | 'sessions_list'

@@ -1,7 +1,8 @@
 {
   "name": "frontend",
+  "productName": "个人AI助手",
   "version": "0.1.0",
-  "description": "TraeWork 复刻桌面端 - Claude Code 学习项目前端壳",
+  "description": "个人 AI 助手 - TraeWork 复刻桌面端（Claude Code 学习项目前端壳）",
   "main": "./out/main/index.js",
   "author": "pei'ji'ping",
   "scripts": {

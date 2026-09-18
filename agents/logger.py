@@ -16,8 +16,8 @@ logger.py - 统一日志模块
 - 级别经 LOG_LEVEL 控制（~/.aigent/config.json / 环境变量，默认 INFO）；
 - 不打印到 stdout/stderr：CLI/桌面端 stdout 是交互输出通道，
   print 已承担控制台职责，日志走文件互不干扰；
-- logging 模块自带 handler 锁，多线程（run_turn 工作线程 / 后台子智能体 /
-  标题线程）并发写安全；
+- logging 模块自带 handler 锁，多线程（run_turn 工作线程 / 后台子智能体）
+  并发写安全；
 - install_excepthooks() 兜底捕获未处理异常（含线程内异常），
   进程崩溃时日志里有完整 traceback，不再依赖 stdout 捞 print。
 """
