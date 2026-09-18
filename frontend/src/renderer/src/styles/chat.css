@@ -732,6 +732,16 @@
   color: var(--color-ok);
   background: rgba(52, 168, 83, 0.1);
 }
+/* 停滞（有未完成项但没有任何 in_progress）：刻意用中性灰 —— 既不是"在跑"，
+   也不是"完成"，避免用户误读成"还有东西在执行"（2026-09-18 事故后新增） */
+.task-card__badge--stalled {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-hover);
+}
+/* 停滞时进度条也不再高亮（没有东西在推进） */
+.task-card--stalled .task-card__bar-fill {
+  background: var(--color-border);
+}
 /* 执行中的脉冲点：与侧边栏 .tree-dot.running 同语义（"还有活没干完"） */
 .task-card__pulse {
   width: 6px;

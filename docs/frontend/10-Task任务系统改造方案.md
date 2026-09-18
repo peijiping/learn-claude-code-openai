@@ -178,7 +178,11 @@ def current_board(scope) -> dict | None:
 
 - `create_task` 参数新增 `parent_id`（可选）、`description` 语义收紧为"含验收标准"。
 - `claim_task` / `complete_task`：`complete_task` 新增可选 `result`（完成摘要）。
-- **不新增** `update_task` / `fail_task`：先不加工具，避免工具膨胀；确有需要再单独立项。
+- ~~**不新增** `update_task` / `fail_task`：先不加工具，避免工具膨胀；确有需要再单独立项。~~
+  → **已被推翻（2026-09-18，见第 17 节）**：新增 `update_task` / `delete_task`。
+  原判断错在把"工具面膨胀"当主要成本，忽略了**没有清理出口**的真实代价 ——
+  模型写错一条 `blockedBy` 就再也改不回来，只能另建"修正版"新任务，
+  旧任务永久留在板上把面板钉死在「执行中」。
 - `list_tasks` 返回增加层级缩进与派生阻塞标记。
 
 ---
@@ -764,4 +768,75 @@ board.status === 'running' && !runningSessions.includes(sid) && !bgSessions.incl
 - **编译/导入**：`py_compile` + `import ws_bridge / session_runtime / session_manage / task_manager / tools / teammate_manager` 通过
 - **手工验证**：单文件内三组共存；`group_id` 不在任务体；无临时文件残留；
   20 线程 × (claim+complete) 后 20 条任务全为 `completed`（无丢更新）
+
+---
+
+## 17. 第三轮修复：悬空依赖把整组锁死，面板假「执行中」（2026-09-18）
+
+### 17.1 现象与用户归因
+
+会话 `session_F2xNqhpm0t`（标题「测试任务列表并生成PDF综述大纲」）：**会话早已完成**，
+任务面板却一直显示「执行中」（`2/3 · 执行中 · 等待依赖 1`），且**没有关闭入口**；
+切走再切回依旧如此。用户自己的归因是"频繁点停止 + 发'请继续'导致的"。
+
+### 17.2 取证：日志与磁盘数据（结论与归因不符）
+
+| 时刻 | 证据（`~/.aigent/logs/agent_2026-09-16.log`） |
+| --- | --- |
+| 19:19:11 | `create_task` 第二个任务 `blockedBy: ["1"]` ← **祸根** |
+| 19:19:25 | 模型自己排了 `bash: sleep 60 && echo waited` |
+| 19:19:49 | 用户点停止 → 但工具已在跑，19:20:25 才返回（60.03s） |
+| 19:20:25 | turn 以 `stopped` 结束，`t_…_7306` 留在 `in_progress` |
+| 19:20:40 | 用户发「请继续」→ `[resume] 归一 1 个 in_progress → pending` → 重新 claim → complete **成功** |
+| 19:20:49 | `claim_task(t_…_3474)` → `Blocked by: ['1']`；19:20:52 只好建"修正依赖版"新任务 |
+
+**停止/请继续那条链路是健康的**：中断残留的 `in_progress` 在下一轮开头由
+`release_stale_in_progress()` 归一，脚本重跑正常。它不产生"永久卡死"。
+
+磁盘数据（`.tasks/session_F2xNqhpm0t.json`）里 `t_1789557551_3474` 的
+`blockedBy: ["1"]`，而文件内根本没有 `id="1"` 的任务 → 永久 `blocked`。
+
+### 17.3 根因（四层叠加，缺一不成）
+
+1. **运行期语义**：`_can_start` / `build_board.derived` 把"依赖缺失"当阻塞
+   （防悬空引用误执行，本意没错）→ 写错一次 = 该任务**永久**无法认领；
+2. **工具面缺失**：只有 create/list/get/claim/complete，**没有 update/delete** →
+   模型无法修复，只能另建"修正版"，残留项再也清不掉（且它当时在 `pending`，
+   `complete_task` 只认 `in_progress`，够不到）；
+3. **看板状态语义**：`build_board.status = running if any(非 completed)` ——
+   "有待办"被当成"正在执行"，一条没人认领的残留也让徽标说「执行中」；
+4. **交互无出口**：面板非 `done` 不渲染关闭入口 → 用户被永久钉在假「执行中」上。
+
+回放通道把问题放大成"每次切回都复现"：`_reply_task_board` → `current_board`
+按"存在未完成组"回放，该组永远未完成（2026-09-18 15:57:58 切回即复现）。
+
+### 17.4 修复（三条出口，缺一不可）
+
+| 层 | 改动 | 文件 |
+| --- | --- | --- |
+| 入口拒绝 | `_validate_blocked_by`：`blockedBy` 每个 id 必须是**本会话文件内真实存在**的 task id，否则拒绝创建/修改，报错里列出可用 id 并点明"同批并行创建的多个 `create_task` 互相拿不到 id，要先建后建" | `task_manager.py` |
+| 防环 | `_reject_cycle`：改依赖时沿 `blockedBy` 遍历，命中自身即拒绝（A↔B 互等 = 双方永久死锁） | `task_manager.py` |
+| 就地自愈 | 新增 `update_task`（subject / description / blockedBy / result，`blockedBy=[]` 清空依赖）+ `delete_task`（删除并**剥离别处对它的引用**；有子任务时拒绝；删空即移除整组 key）。**status 与 parentId 不可改**（不绕状态机 / 不移动子树） | `task_manager.py` / `tools.py` |
+| 阻塞反馈 | `claim_task` 被拒时若命中**悬空**依赖，追加 `⚠️ 依赖不存在（悬空引用）… 请用 update_task / delete_task 收尾`（模型看不到出口只会继续另建新任务） | `task_manager.py` |
+| 面板说实话 | `build_board` 增派生字段 `has_in_progress`；徽标三态（执行中／待继续／全部完成）；**停滞时开放关闭入口**（逃生阀） | `task_manager.py` / `TaskBoard.tsx` / `chat.css` |
+| 提示词 | 任务看板规范补"`blockedBy` 必须是真实 id""禁止另建修正版""收工不留 pending/blocked"；`<task_board>` 尾部注入里那句自相矛盾的"用 `complete_task` 说明原因收尾"（`complete_task` 只认 `in_progress`，够不到 pending）改为 update/delete | `system_prompt.py` / `agent_full_v2.py` |
+
+> `blockedBy` 的 id 校验**只在入口**做；运行期"依赖缺失视作阻塞"的兜底**保留不动**
+> —— 存量数据里可能已有悬空引用，兜底至少不会让它误执行。
+
+### 17.5 存量数据收尾
+
+`session_F2xNqhpm0t.json` 的 `t_1789557551_3474` 手工收尾（备份后原地改）：
+`status=completed`、`blockedBy` 修正为真实前序 id、`result` 说明"无效依赖，
+已由 t_1787652_9216 修正依赖版取代"。收尾后该组闭合，`current_board` 回 `None`，
+面板不再出现（已结束的组不回放）。
+
+### 17.6 验证
+
+- **回归**：`181 tests OK`（原 169 例；新增 `DependencyHygieneTests` 12 例 +
+  改写 3 例旧断言，把"入口拒绝悬空依赖 / update 自愈 / delete 剥离引用 /
+  `has_in_progress` 区分待办与执行"全部固化为契约）
+- **编译/导入**：`py_compile`（task_manager / tools / system_prompt / agent_full_v2）+ `import ws_bridge` 通过
+- **前端**：`npm run typecheck` 通过
+- **快照**：`docs/system-prompt.snapshot.md` 已重新生成（3782 → 4250 字符）
 

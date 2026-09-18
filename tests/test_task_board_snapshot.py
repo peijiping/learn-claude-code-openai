@@ -74,6 +74,20 @@ class _BoardTestCase(unittest.TestCase):
             "version": 1, "scope": scope, "updated_at": 0.0, "groups": groups,
         }, ensure_ascii=False), encoding="utf-8")
 
+    def patch_raw(self, task_id: str, **fields) -> None:
+        """就地改一条**落盘**条目的字段（模拟改造前落下的坏数据，如悬空依赖）。
+
+        与 `write_groups` 的区别：只动目标条目，不覆盖整份文件 ——
+        自愈类用例需要"正常任务 + 一条坏数据"同时在场。
+        """
+        doc = json.loads(self.task_file().read_text(encoding="utf-8"))
+        for items in doc["groups"].values():
+            for item in items:
+                if item.get("id") == task_id:
+                    item.update(fields)
+        self.task_file().write_text(
+            json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
 
 # ── 0. 存储布局契约 ───────────────────────────────────────────────
 
@@ -305,10 +319,17 @@ class DerivedStatusTests(_BoardTestCase):
 
         self.assertEqual(row["derived_status"], "pending")
 
-    def test_missing_dependency_counts_as_blocked(self):
-        """依赖 ID 悬空（文件不存在）也视作阻塞，与 _can_start 一致。"""
-        t = self.mk("悬空依赖", blockedBy=["task_does_not_exist"])
-        row = next(r for r in self.board()["tasks"] if r["id"] == t.id)
+    def test_missing_dependency_counts_as_blocked_for_legacy_data(self):
+        """**存量**数据里已有的悬空依赖 → 运行期仍视作阻塞（兜底，故意保留）。
+
+        新数据不会再产生悬空依赖：`create_task` 直接拒绝（见 DependencyHygieneTests），
+        这里手写文件模拟改造前落下的坏数据。
+        """
+        self.write_groups({LEGACY_GROUP_ID: [{
+            "id": "t_1700000000_9001", "subject": "悬空依赖", "description": "",
+            "status": "pending", "owner": None, "blockedBy": ["task_does_not_exist"],
+        }]})
+        row = next(r for r in self.board()["tasks"] if r["id"] == "t_1700000000_9001")
         self.assertEqual(row["derived_status"], "blocked")
 
     def test_counters(self):
@@ -323,6 +344,126 @@ class DerivedStatusTests(_BoardTestCase):
         self.assertEqual(counts["pending"], 1)   # C
         self.assertEqual(counts["blocked"], 1)   # B
         self.assertEqual(counts["completed"], 0)
+
+
+# ── 3b. 依赖卫生与残留清理（2026-09-18 事故修复）────────────────────
+
+class DependencyHygieneTests(_BoardTestCase):
+    """守护三件事：入口拒绝悬空依赖 / 残留可就地自愈 / 面板不再把"待办残留"当"执行中"。
+
+    事故复盘（`session_F2xNqhpm0t`）：模型 `create_task(blockedBy=["1"])`
+    写了个不存在的 id → 该任务被永久判定 blocked → 组永不闭合 →
+    「会话已完成」而面板永久显示「执行中」，且当时没有 update/delete 可清理。
+    下面每条用例对应这条链路的一环。
+    """
+
+    def test_create_rejects_dangling_dependency(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.mk("依赖写错", blockedBy=["1"])
+        self.assertIn("依赖 id 不存在", str(ctx.exception))
+        self.assertEqual(load_scope_tasks(SCOPE, self.dir), [], "拒绝创建时不得落盘")
+
+    def test_create_rejects_blank_dependency(self):
+        with self.assertRaises(ValueError):
+            self.mk("空依赖", blockedBy=["  "])
+
+    def test_create_accepts_real_id_and_dedups(self):
+        dep = self.mk("依赖")
+        downstream = self.mk("下游", blockedBy=[dep.id, dep.id])
+        self.assertEqual(downstream.blockedBy, [dep.id])
+
+    def test_legacy_dangling_task_is_healed_by_update_task(self):
+        """事故现场的自愈路径：update 改依赖 → claim → complete，无需另建新任务。"""
+        residual = self.mk("残留任务")
+        self.patch_raw(residual.id, blockedBy=["1"])
+
+        blocked = self.tm.run_claim_task(residual.id)
+        self.assertTrue(blocked.startswith("Blocked by: ['1']"), blocked)
+        self.assertIn("悬空引用", blocked, "阻塞反馈必须点明出口，否则模型只会另建修正版")
+
+        self.assertTrue(self.tm.run_update_task(residual.id, blockedBy=[])
+                        .startswith("Updated"))
+        self.assertTrue(self.tm.run_claim_task(residual.id).startswith("Claimed"))
+        self.assertTrue(self.tm.run_complete_task(residual.id, "已修正依赖并完成")
+                        .startswith("Completed"))
+        self.assertIsNone(self.board(), "组闭合后 current_board 必须回到 None")
+
+    def test_update_task_rejects_cycle(self):
+        a = self.mk("A")
+        b = self.mk("B", blockedBy=[a.id])
+        out = self.tm.run_update_task(a.id, blockedBy=[b.id])
+        self.assertTrue(out.startswith("Error:"), out)
+        self.assertIn("成环", out)
+        self.assertEqual(self.tm._load_task(a.id).blockedBy, [], "成环修改必须整体回滚")
+
+    def test_update_task_rejects_dangling_and_unknown_id(self):
+        t = self.mk("A")
+        self.assertIn("依赖 id 不存在",
+                      self.tm.run_update_task(t.id, blockedBy=["nope"]))
+        self.assertIn("not found", self.tm.run_update_task("t_ghost", subject="x"))
+
+    def test_update_task_cannot_bypass_state_machine(self):
+        """只开放字段级修正：status 绕不过 claim → complete。"""
+        t = self.mk("A")
+        self.assertTrue(self.tm.run_update_task(t.id, subject="A'", result="备注")
+                        .startswith("Updated"))
+        loaded = self.tm._load_task(t.id)
+        self.assertEqual(loaded.subject, "A'")
+        self.assertEqual(loaded.result, "备注")
+        self.assertEqual(loaded.status, "pending")
+
+    def test_delete_task_closes_group_and_strips_reference(self):
+        stale = self.mk("卡死残留")
+        after = self.mk("引用它的任务", blockedBy=[stale.id])
+        self.tm._claim_task(stale.id)
+
+        out = self.tm.run_delete_task(stale.id)
+
+        self.assertTrue(out.startswith("Deleted"), out)
+        self.assertIn("引用它的任务", out)
+        # 引用被剥离 → 引用方不再悬空，可以直接认领
+        self.assertEqual(self.tm._load_task(after.id).blockedBy, [])
+        self.assertTrue(self.tm.run_claim_task(after.id).startswith("Claimed"))
+        self.tm.run_complete_task(after.id)
+        self.assertIsNone(self.board())
+
+    def test_delete_last_task_removes_empty_group(self):
+        t = self.mk("唯一任务")
+        self.tm.run_delete_task(t.id)
+        doc = read_doc(SCOPE, self.dir)
+        self.assertEqual(doc["groups"], {}, "删空后不得留空组（会闪出空气泡）")
+        self.assertEqual(len(list(self.dir.glob("*.json"))), 1, "文件本身留给会话级清理")
+
+    def test_delete_task_refuses_when_children_exist(self):
+        parent = self.mk("父")
+        self.mk("子", parent_id=parent.id)
+        out = self.tm.run_delete_task(parent.id)
+        self.assertTrue(out.startswith("Error:"), out)
+        self.assertIn("子任务", out)
+
+    def test_delete_unknown_id_is_readable(self):
+        self.assertIn("not found", self.tm.run_delete_task("t_ghost"))
+
+    def test_has_in_progress_separates_backlog_from_execution(self):
+        """核心语义：**有活但没人跑 ≠ 执行中** —— 面板假「执行中」的根因就在这一位。"""
+        dep = self.mk("A")
+        downstream = self.mk("B", blockedBy=[dep.id])
+
+        board = self.board()
+        self.assertEqual(board["status"], "running")     # 组没干完
+        self.assertFalse(board["has_in_progress"])       # 但没人真在跑
+
+        self.tm._claim_task(dep.id)
+        self.assertTrue(self.board()["has_in_progress"])
+
+        self.tm._complete_task(dep.id)
+        self.assertFalse(self.board()["has_in_progress"])
+        self.tm._claim_task(downstream.id)
+        self.tm._complete_task(downstream.id)
+
+        done = self.latest()
+        self.assertEqual(done["status"], "done")
+        self.assertFalse(done["has_in_progress"])
 
 
 # ── 4. 层级 ───────────────────────────────────────────────────────
@@ -535,20 +676,15 @@ class PureFunctionContractTests(_BoardTestCase):
         self.mk("A")
         board = self.board()
         self.assertEqual(
-            {"group_id", "revision", "status", "counts", "tasks"}, set(board))
+            {"group_id", "revision", "status", "counts", "tasks", "has_in_progress"},
+            set(board))
         self.assertEqual(
             {"total", "completed", "in_progress", "pending", "blocked"},
             set(board["counts"]))
 
 
-class UnknownTaskIdTests(unittest.TestCase):
+class UnknownTaskIdTests(_BoardTestCase):
     """野 task_id（模型自己编的）必须变成可读反馈，而不是工具异常。"""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.tm = TaskManager(Path(self._tmp.name))
-        self.tm.set_scope(SCOPE)
 
     def test_claim_unknown_id_returns_readable_error(self):
         self.assertEqual(self.tm.run_claim_task("t_does_not_exist"),
@@ -562,8 +698,13 @@ class UnknownTaskIdTests(unittest.TestCase):
         self.assertTrue(self.tm.run_get_task("t_does_not_exist").startswith("Error:"))
 
     def test_claim_blocked_reports_missing_dependency(self):
-        t = self.tm._create_task("悬空依赖", blockedBy=["t_ghost"])
-        self.assertEqual(self.tm.run_claim_task(t.id), "Blocked by: ['t_ghost']")
+        """悬空依赖的阻塞反馈必须点名"悬空"+给出口（否则模型会另建修正版）。"""
+        t = self.tm._create_task("残留")
+        self.patch_raw(t.id, blockedBy=["t_ghost"])
+        out = self.tm.run_claim_task(t.id)
+        self.assertTrue(out.startswith("Blocked by: ['t_ghost']"), out)
+        self.assertIn("悬空引用", out)
+        self.assertIn("update_task", out)
 
 
 class ConcurrencyTests(_BoardTestCase):

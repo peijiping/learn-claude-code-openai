@@ -143,6 +143,12 @@ export interface TaskBoardSnapshot {
   group_id: string
   revision: number
   status: 'running' | 'done'
+  /** 派生字段（后端算，不落盘）：组内**是否真有一条 in_progress**。
+   *  与 `status` 是两件事 —— `status` 只回答"活干完没有"，回答不了"现在有人跑吗"：
+   *  一条没人认领的 pending/blocked 残留会让 status 长期停在 running。
+   *  面板徽标必须以本字段为准，否则会出现"会话已完成但显示执行中"（2026-09-18 修）。
+   *  可选：缺字段（旧版后端）时面板回退用 counts.in_progress 近似。 */
+  has_in_progress?: boolean
   counts: {
     total: number
     completed: number

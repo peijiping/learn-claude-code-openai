@@ -4,11 +4,11 @@
 
 | 项 | 值 |
 | --- | --- |
-| 生成时间 | 2026-09-16 18:38:47 |
+| 生成时间 | 2026-09-18 16:18:48 |
 | 工作空间（工具沙盒 & 指令文件来源） | `/Users/peijiping/Documents/Codes/AiCodes/learn-claude-code-main/WorkSpace/task1` |
 | 指令文件候选（按序，全部存在则都加载） | `AGENTS.md`, `CLAUDE.md`, `AGENT.md` |
 | SKILL_DESC_MAX_CHARS | 120 |
-| 字符数 | 3782 |
+| 字符数 | 4250 |
 
 > 注意 1：工作区指令来自**用户的 workspace**（本例 `WorkSpace/task1/` 下的
 > `CLAUDE.md` + `AGENT.md`，两者并存则都加载）。本仓库根的 `AGENTS.md` 是
@@ -77,11 +77,21 @@ PYTHONPATH=agents .venv/bin/python -c "import sys; sys.path.insert(0,'agents'); 
 
 **规范**：
 - 动手前先 `create_task` 把计划铺开；有从属关系用 `parent_id` 拆成子树
-- 有依赖的任务在创建时声明 `blockedBy`；被阻塞的任务在依赖完成前无法认领，这是预期行为，**不要绕过**
+- 有依赖的任务在创建时声明 `blockedBy`，**必须填真实 task id**（从工具返回里复制
+  `t_<时间戳>_<随机数>`）。写序号（`"1"`、`"任务1"`）会被直接拒绝创建 ——
+  运行期只能把"依赖未完成"当阻塞，区分不了"依赖写错了"，所以写错就等于该任务
+  **永久**无法认领。要依赖同批新建的前序任务时：先建它、拿到 id 后再建本任务
+  （同一次响应里并行发出的多个 `create_task` 互相拿不到 id）
+- 被阻塞的任务在依赖完成前无法认领，这是预期行为，**不要绕过**
+- 任务写错、依赖填错、或已不再照原计划做 → 用 `update_task` **就地改**
+  （`blockedBy` 传 `[]` 可清空依赖）、`delete_task` 删除。
+  **禁止另建"修正版"新任务**：旧任务会永久留在面板上，整组永远回不到「全部完成」
 - 派 subagent 前先拆好任务 → 让 subagent 用 `claim_task` 认领 → 完成后 `complete_task` 回填
 - **中断后继续**：若上下文里出现 `<task_board>` 提醒，说明本会话有未完成的任务，
-  先接着把它们做完（剩下的项会标成 pending，直接 claim 即可），不要另起一套新计划
-- 收尾用 `list_tasks` 汇总一次
+  先接着把它们做完（剩下的项会标成 pending，直接 claim 即可），不要另起一套新计划；
+  提醒里出现"悬空引用"字样时，先用 `update_task` 修依赖或 `delete_task` 收尾
+- 收尾用 `list_tasks` 汇总一次。**收工时板上不该留 pending / blocked 项** ——
+  留下的每一项都会让面板继续停在进行中/待继续状态
 
 **跨会话**：跨会话的"干到哪、下一步"一律用 `write_memory` 落盘（`project` 类），
 不要依赖任务板，也不要直接改记忆文件。

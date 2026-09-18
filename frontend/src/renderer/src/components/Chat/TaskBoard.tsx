@@ -10,8 +10,16 @@ import type { TaskItem } from '@protocols/agentProtocol'
  *
  * 交互约定（需求）：
  * - 有未完成任务组时才出现；固定高度（超出滚动）
- * - 可收起 / 展开；**执行完之前不能关闭**（running 态不渲染任何关闭入口）
+ * - 可收起 / 展开；**有人真在跑时不能关闭**（不给关闭入口）
  * - 全部完成后自动收起，并出现「关闭」
+ * - **停滞时也出现「关闭」**（2026-09-18 新增）：有未完成项但没有任何 in_progress
+ *   （无人认领的残留 / 依赖卡住），此时没有任何东西在跑，若还锁着关闭入口，
+ *   用户就被永久困在"执行中"面板里 —— 这正是本次事故的观感
+ *
+ * 徽标必须以 `board.has_in_progress` 为准，不能只看 `board.status`：
+ * `status === 'running'` 只表示"这组活没干完"，里面可能一条 in_progress 都没有
+ * （残留未认领项），直接显示「执行中」就是在说假话。三态：
+ *   有人跑 → 执行中（脉冲）／有活没人跑 → 待继续（灰）／全干完 → 全部完成（对勾）
  *
  * 已移除「继续执行」按钮（2026-09-16，用户拍板）：面板在有活 + 没人跑时不再提供续跑入口，
  * 用户直接在输入框发一条消息（如「请继续」）即可续跑 —— 后端 `_sync_task_board()` 的尾部注入
@@ -74,6 +82,10 @@ export default function TaskBoard(): JSX.Element | null {
 
   const groupId = board?.group_id ?? null
   const done = board?.status === 'done'
+  // 「有没有人真在跑」：以后端派生字段为准；缺字段（旧版后端）回退用 counts 近似
+  const active = !!board && !done && (board.has_in_progress ?? board.counts.in_progress > 0)
+  // 有活但没人跑 = 停滞（残留未认领项 / 依赖卡死）：可以关闭，不再把用户锁死
+  const stalled = !!board && !done && !active
 
   // 折叠状态按「组」记忆：快照是整份替换且每轮任务变化都会重推，
   // 不按组重置的话用户手动展开/收起会被反复打断。
@@ -101,7 +113,7 @@ export default function TaskBoard(): JSX.Element | null {
     <div
       className={`task-card${collapsed ? ' task-card--collapsed' : ''}${
         done ? ' task-card--done' : ''
-      }`}
+      }${stalled ? ' task-card--stalled' : ''}`}
     >
       <div className="task-card__head" onClick={() => setCollapsed((v) => !v)}>
         <Icon name={collapsed ? 'chevronRight' : 'chevronDown'} size={14} />
@@ -109,26 +121,35 @@ export default function TaskBoard(): JSX.Element | null {
         <span className="task-card__count">
           {counts.completed}/{counts.total}
         </span>
-        {board.status === 'running' ? (
+        {active ? (
           <span className="task-card__badge task-card__badge--running">
             <span className="task-card__pulse" />
             执行中
           </span>
-        ) : (
+        ) : done ? (
           <span className="task-card__badge task-card__badge--done">
             <Icon name="check" size={12} />
             全部完成
+          </span>
+        ) : (
+          <span
+            className="task-card__badge task-card__badge--stalled"
+            title="有未完成的任务，但当前没有任何任务在执行（发一条消息即可继续）"
+          >
+            待继续
           </span>
         )}
         {counts.blocked > 0 && (
           <span className="task-card__meta">等待依赖 {counts.blocked}</span>
         )}
         <span className="task-card__spacer" />
-        {/* 关闭入口只在 done 时渲染 —— 需求要求"执行完之前不能关闭" */}
-        {done && (
+        {/* 关闭入口：全部完成，或**没人跑**（停滞）时提供。
+            有人真在跑时不给 —— 需求要求"执行完之前不能关闭"，
+            但"停滞"不等于"在执行"，那时锁着入口只会把用户永久困住。 */}
+        {(done || stalled) && (
           <button
             className="mini-btn"
-            title="关闭"
+            title={done ? '关闭' : '关闭（任务仍未完成，可稍后发消息继续）'}
             onClick={(e) => {
               e.stopPropagation()
               setDismissedGroup(board.group_id)
