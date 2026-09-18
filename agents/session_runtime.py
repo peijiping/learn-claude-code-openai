@@ -43,6 +43,11 @@ log = get_logger("runtime")
 # 上限防御"续轮又派后台 → 再续轮"的极端连环派发，避免后台守望无限循环。
 MAX_BG_FOLLOWUPS = 10
 
+# 续轮**异常**后的额外重试次数（2026-09-18 事故新增）：续轮本身抛异常时，
+# 把本批已消费的后台结果回滚后最多再试 1 次，仍失败才收尾回 done。
+# 不设这个上限会变成"异常 → 回滚 → 再异常 → 再回滚"的死循环。
+MAX_BG_FOLLOWUP_RETRIES = 1
+
 # deliver(kind, payload) -> 把信封投递回事件循环队列（线程安全，由 ws_bridge 提供）
 Deliver = Callable[[str, dict], None]
 # 会话结束时刷新会话列表的协程（由 ws_bridge 提供，依赖当前 ws 连接）
@@ -341,6 +346,7 @@ class SessionRuntime:
         started = time.monotonic()
         log.info("session_%s bg watch start", self.sid)
         followups = 0
+        followup_failures = 0
         try:
             while True:
                 while self.agent is not None and self.agent.background_manager.has_running():
@@ -357,13 +363,37 @@ class SessionRuntime:
                 log.info("session_%s bg followup turn #%d", self.sid, followups)
                 self.busy = True
                 self._push_status("running")
+                # 续轮前抓快照：本轮即将被消费的那批后台结果 id。
+                # 续轮异常时按这批 id 精确回滚（见下方失败分支）。
+                pending_ids = self.agent.background_manager.snapshot_completed_ids()
+                failed = False
                 try:
                     await asyncio.to_thread(self._run_followup_worker)
                 except Exception as e:
+                    failed = True
+                    # exc_info=True：事故取证时"只有类型+消息、没有堆栈"会让定位
+                    # 变慢（2026-09-18 事故复盘）；堆栈必须落盘。
                     log.error("session_%s bg followup 异常: %s: %s",
-                              self.sid, type(e).__name__, e)
+                              self.sid, type(e).__name__, e, exc_info=True)
                 finally:
                     self.busy = False
+                if failed:
+                    # 关键：续轮在 agent_loop 起点已把本批结果标记为 notified
+                    # （已消费）。若直接回循环顶，has_completed_pending() 恒为
+                    # False → 会话被静默判 done：用户看到"会话结束了，但最终
+                    # 总结没出来、任务板停在半路"（2026-09-18 事故现象）。
+                    # 故把本批结果退回 pending，让守望再给一次机会；上限
+                    # MAX_BG_FOLLOWUP_RETRIES 防死循环，仍失败才收尾。
+                    restored = self.agent.background_manager.restore_completed(pending_ids)
+                    followup_failures += 1
+                    log.warning(
+                        "session_%s bg followup 失败，回滚 %d/%d 条后台结果待重试"
+                        "（第 %d 次失败，上限 %d）",
+                        self.sid, restored, len(pending_ids), followup_failures,
+                        MAX_BG_FOLLOWUP_RETRIES)
+                    if restored == 0 or followup_failures > MAX_BG_FOLLOWUP_RETRIES:
+                        break
+                    continue
                 # 续轮结束后：若用户在这期间点了停止，保留停止信号并退出循环；
                 # 否则清掉信号进入下一轮判断（避免把停止误当正常信号吞掉）
                 if self.stop_evt.is_set():

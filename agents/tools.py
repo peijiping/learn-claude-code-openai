@@ -37,6 +37,10 @@ from todo_manager import TodoManager
 from task_manager import TaskManager
 from message_bus import MessageBus, VALID_MSG_TYPES
 from memories import MemoryStore
+from logger import get_logger
+
+# 统一日志：run_bash 等工具层的异常兜底打点（见 run_bash 的 except 分支）
+log = get_logger("tools")
 
 
 # ── 团队工具名集合（s17 自主智能体）────────────────────────────────
@@ -283,6 +287,13 @@ class ToolRegistry:
                 cwd=base or os.getcwd(),
                 capture_output=True,
                 text=True,
+                # 显式 utf-8 + errors="replace"：**绝不能**用默认的严格解码。
+                # 2026-09-18 事故根因：模型执行 `sed -n '1,40p' x.md | head -c 4200`，
+                # head -c 按**字节**切割，把中文字符切成半个，尾部落下不完整 UTF-8
+                # 序列 → text=True（strict）在解码 stdout 时抛 UnicodeDecodeError。
+                # 这类命令是合法用法，不能让它炸掉整轮对话，故用 U+FFFD 替换非法字节。
+                encoding="utf-8",
+                errors="replace",
                 timeout=120
             )
             out = (r.stdout + r.stderr).strip()
@@ -294,6 +305,15 @@ class ToolRegistry:
         except subprocess.TimeoutExpired:
             # 命令执行超时（超过120秒）
             return "Error: Timeout (120s)"
+        except Exception as e:
+            # 兜底：任何意外异常都降级成一条工具结果返回给模型，绝不向上抛。
+            # 工具层的契约是"返回字符串"，一旦让异常穿透 agent_loop，本轮的
+            # tool_result 就缺一条（历史留下孤儿 tool_call），整轮对话被当场打死。
+            log.error(
+                "run_bash 异常: %s: %s | command=%r", type(e).__name__, e, command[:200],
+                exc_info=True,
+            )
+            return f"Error: {type(e).__name__}: {e}"
 
     def run_read(self, path: str, limit: int | None = None, base: Path | None = None) -> str:
         """

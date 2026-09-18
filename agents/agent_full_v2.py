@@ -1334,7 +1334,24 @@ class Agent:
         else:
             # 同步路径：直接走原逻辑
             executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
-            tool_output = executor()
+            # 单条工具失败绝不能杀死整轮对话（2026-09-18 事故）。
+            # 反例：bash 输出解码抛 UnicodeDecodeError → 异常穿透 agent_loop →
+            # 本轮剩余 tool_call 的 tool_result 一条都没写回 → 会话文件留下
+            # "有 tool_calls 无 tool_result" 的孤儿 assistant；若发生在后台续轮里，
+            # 还会连带把整个后台守望打断、会话被静默判 done（用户看不到最终总结、
+            # 任务面板永久停摆）。工具层契约是"永远返回字符串"，这里补齐最后一道闸：
+            # 把异常转成模型可见的 Error 结果，让它自己看到失败并换命令重试。
+            try:
+                tool_output = executor()
+            except Exception as e:
+                log.error("工具执行异常: %s%s %s: %s: %s",
+                          self.session_prefix, self.session_id, tool_name,
+                          type(e).__name__, e, exc_info=True)
+                tool_output = (
+                    f"Error: {type(e).__name__}: {e}\n"
+                    f"（该工具调用自身失败，本轮其余调用与对话继续；"
+                    f"请据此调整命令或换用其他工具。）"
+                )
             log.info("工具执行完成: %s%s %s (%.2fs, 输出 %d 字符)",
                      self.session_prefix, self.session_id, tool_name,
                      time.monotonic() - started, len(str(tool_output)))

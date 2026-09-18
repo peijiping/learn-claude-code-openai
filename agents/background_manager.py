@@ -176,6 +176,33 @@ class BackgroundManager:
                 for t in self.background_tasks.values()
             )
 
+    # ── 续轮失败的"精确回滚"（2026-09-18 事故新增）────────────────────
+    # 场景：后台续轮（run_background_followup）在 agent_loop 起点就把本批结果
+    # 消费成 notified，随后执行期抛异常。若无人回滚，回循环顶时
+    # has_completed_pending() 恒为 False → 守望直接收尾回 done，会话被静默
+    # 判定结束：用户看不到最终总结、任务面板永久停摆。这两个方法让
+    # SessionRuntime 能按"本轮要消费的那一批 id"精确退回，而非全量重放。
+    def snapshot_completed_ids(self) -> list[str]:
+        """快照当前尚未被消费（status=completed）的后台任务 id。"""
+        with self.background_lock:
+            return [bid for bid, t in self.background_tasks.items()
+                    if t["status"] == "completed"]
+
+    def restore_completed(self, ids: list[str]) -> int:
+        """把这批 id 中已被消费（notified）的退回 completed，返回恢复条数。
+
+        只动传进来的 id：已在上几轮成功注入过的历史结果不受影响，
+        不会导致旧通知重复进入新上下文。
+        """
+        restored = 0
+        with self.background_lock:
+            for bid in ids:
+                t = self.background_tasks.get(bid)
+                if t is not None and t["status"] == "notified":
+                    t["status"] = "completed"
+                    restored += 1
+        return restored
+
     # 收集所有已完成的后台任务，生成 task_notification 通知列表。
     # 设计要点（与教程版不同）：
     # - 通知里同时给 <summary>（200 字符预览）+ <full_output>（完整结果）：
