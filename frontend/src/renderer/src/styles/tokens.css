@@ -15,6 +15,9 @@
   --color-thinking-bg: #f0f7ff;      /* thinking 框底色（浅蓝） */
   --color-danger: #e0533d;
   --color-ok: #34a853;
+  /* 琥珀：介于成功与失败之间的"降级"态（附件解析不完整、可发送但需用户知情）。
+     与 danger 明确区分 —— 降级不是错误，别用红色吓人。 */
+  --color-warn: #c8860d;
 
   /* 圆角 */
   --radius-sm: 6px;

@@ -194,10 +194,34 @@ export type UiEvent =
 /** 附件种类（与后端 attachments.KIND_* 对齐） */
 export type AttachmentKind = 'image' | 'document' | 'text'
 
+/** 附件解析统计（2026-09-20）。
+ *
+ *  草稿、实时消息、回放消息**三条路径共用同一形状** —— UI 由它算出
+ *  「2.1MB · 12 页 · 5 图 · 3 表」以及"已降级"状态，避免三处各写一套文案。
+ *
+ *  字段名保持后端的 snake_case（与 `created_at` / `model_info` 等既有约定一致）。
+ *  旧 jsonl 行 / 老后端没有这些键时，前端一律取默认值（0 / '' / []）。 */
+export interface AttachmentStats {
+  /** 已抽取的文本字符数（文档类才有） */
+  text_chars: number
+  text_truncated: boolean
+  /** PDF 总页数（其它类型为 null） */
+  pages: number | null
+  /** 随附的图片数量（PDF 页图等） */
+  images: number
+  /** 识别到的表格数。`find_tables` 对无框线表格命中 0，是**下界** */
+  tables: number
+  /** 走的哪条转换路径：`pymupdf` / `fallback_text` / `text_layer` / `''` */
+  converter: string
+  /** 「诚实失败」通道：**非空即表示该附件已降级**（UI 标琥珀 + tooltip 显示原因）。
+   *  例：「第 1 页无文本层，已按图像发送」「未提取到文本」「内容已截断」 */
+  warnings: string[]
+}
+
 /** 已发送附件（回放 / 实时消息上都用这个形状渲染）。
  *  字段名保持后端的 snake_case（与 created_at / model_info 等既有约定一致），
  *  避免每个渲染点都做一次 camel 转换。 */
-export interface AttachmentRef {
+export interface AttachmentRef extends AttachmentStats {
   id: string
   kind: AttachmentKind | ''
   name: string
@@ -213,7 +237,7 @@ export interface AttachmentRef {
 }
 
 /** 后端登记完成（`attachments_staged`）的一条附件 */
-export interface StagedAttachment {
+export interface StagedAttachment extends AttachmentStats {
   att_id: string
   kind: AttachmentKind | ''
   name: string
@@ -222,11 +246,6 @@ export interface StagedAttachment {
   size: number
   source_path: string
   project_id: string
-  /** 已抽取的文本字符数（文档类才有；UI 显示"已提取 N 字"） */
-  text_chars: number
-  text_truncated: boolean
-  /** PDF 总页数（其它类型为 null） */
-  pages: number | null
 }
 
 export interface StagedFailure {

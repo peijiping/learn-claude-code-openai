@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useAgentStore } from '@store/agentStore'
+import { isSendableAttachment, useAgentStore } from '@store/agentStore'
 import MessageList from './MessageList'
 import InputBox from './InputBox'
 import TaskBoard from './TaskBoard'
@@ -14,7 +14,9 @@ export default function ChatPanel(): JSX.Element {
   const [draft, setDraft] = useState('')
 
   const doSend = (): void => {
-    const ready = draftAttachments.filter((a) => a.status === 'ready')
+    // 用共享判据而不是 `status === 'ready'`：degraded（分析不完整但可用）也必须随
+    // payload 发出，否则扫描件会被静默丢掉（见 isSendableAttachment 的说明）。
+    const ready = draftAttachments.filter(isSendableAttachment)
     // 正文与附件都为空的发送没有意义；**只有附件不打字也必须能发**
     if (!draft.trim() && ready.length === 0) return
     send(draft, ready)

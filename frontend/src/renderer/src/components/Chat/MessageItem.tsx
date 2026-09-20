@@ -5,7 +5,7 @@ import { Icon } from '@components/common/Icon'
 import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
 import { attachmentUrl, useAgentStore, type Message, type SubAgentMsg, type ToolCallMsg } from '@store/agentStore'
 import MessageMenu from './MessageMenu'
-import AttachmentBar from './AttachmentBar'
+import AttachmentBar, { isDegraded } from './AttachmentBar'
 
 /** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
 function fmtTokens(n: number): string {
@@ -187,12 +187,26 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
                 compact
                 items={msg.attachments.map((a) => ({
                   key: a.id,
-                  status: a.missing ? ('failed' as const) : ('ready' as const),
+                  // 解析不完整 → degraded（琥珀）。旧 jsonl 行的统计字段缺失，
+                  // 取默认值后不会误标降级。
+                  status: a.missing
+                    ? ('failed' as const)
+                    : isDegraded(a)
+                      ? ('degraded' as const)
+                      : ('ready' as const),
                   kind: a.kind,
                   name: a.name,
                   size: a.size,
                   url: a.kind === 'image' ? attachmentUrl(projectId, a.id) : null,
-                  meta: a.kind === 'image' ? '图片' : '',
+                  stats: {
+                    text_chars: a.text_chars ?? 0,
+                    text_truncated: a.text_truncated ?? false,
+                    pages: a.pages ?? null,
+                    images: a.images ?? 0,
+                    tables: a.tables ?? 0,
+                    converter: a.converter ?? '',
+                    warnings: a.warnings ?? []
+                  },
                   missing: a.missing,
                   sourcePath: a.source_path,
                   storedPath: a.stored_path

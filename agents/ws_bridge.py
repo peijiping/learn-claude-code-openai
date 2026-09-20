@@ -32,8 +32,8 @@ from attachments import (
 )
 from config import load as load_config
 from llm_config import (
-    fetch_remote_models, get_config, get_model_by_id, load_llm_config,
-    resolve_model_window, save_config,
+    caps_allow_image, fetch_remote_models, get_config, get_model_by_id,
+    load_llm_config, resolve_model_window, save_config,
 )
 from logger import get_logger, install_excepthooks
 from paths import (
@@ -532,6 +532,9 @@ def _model_supports_image(model_id: str | None) -> bool:
 
     最后一条是刻意的：本地目录可能没收录用户新加的模型，**不能因为"我们不知道"
     就阻止使用**。宁可让 provider 回一个真实的错误，也不要本地误拦。
+
+    三态规则本身在 `llm_config.caps_allow_image`（纯函数，与引擎共用一个口径）；
+    这里保留 `get_model_by_id` 的模块级调用点 —— 测试在该名字上打桩。
     """
     if not model_id:
         return True
@@ -543,13 +546,7 @@ def _model_supports_image(model_id: str | None) -> bool:
         return True
     if not isinstance(model, dict):
         return True
-    caps = model.get("capabilities")
-    if not isinstance(caps, dict):
-        return True
-    inputs = caps.get("input")
-    if not isinstance(inputs, list) or not inputs:
-        return True
-    return "image" in inputs
+    return caps_allow_image(model.get("capabilities"))
 
 
 def _attachment_title_hint(payload: dict) -> str:

@@ -100,6 +100,78 @@ class _FixtureMixin:
         prs.save(str(p))
         return p
 
+    def _png_src(self, name: str = "inner.png", size=(60, 30)) -> Path:
+        """一张带可见内容的图，用来构造"只有图片"的文档。"""
+        from PIL import Image
+        p = self.src / name
+        im = Image.new("RGB", size, (255, 255, 255))
+        for x in range(0, size[0], 4):
+            for y in range(0, size[1], 4):
+                im.putpixel((x, y), (0, 0, 0))
+        im.save(p)
+        return p
+
+    def _docx_image_only(self, name: str = "onlyimg.docx") -> Path:
+        """只含一张图、没有任何段落文字的 docx。"""
+        import docx
+        p = self.src / name
+        d = docx.Document()
+        d.add_picture(str(self._png_src()))
+        d.save(str(p))
+        return p
+
+    def _pptx_image_only(self, name: str = "onlyimg.pptx") -> Path:
+        """只含一张图、没有任何文本框的 pptx。"""
+        from pptx import Presentation
+        from pptx.util import Inches
+        p = self.src / name
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide.shapes.add_picture(str(self._png_src()), Inches(1), Inches(1))
+        prs.save(str(p))
+        return p
+
+    def _xlsx_sheets_only(self, name: str = "blank.xlsx") -> Path:
+        """只有工作表骨架、没有任何单元格内容的工作簿。"""
+        import openpyxl
+        p = self.src / name
+        openpyxl.Workbook().save(str(p))
+        return p
+
+    def _pdf_image_only(self, name: str = "scan.pdf") -> Path:
+        """只有图片、**没有文本层**的 PDF —— 本次事故的形态。"""
+        import fitz
+        p = self.src / name
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_image(fitz.Rect(50, 50, 250, 250),
+                          filename=str(self._png_src()))
+        doc.save(str(p))
+        doc.close()
+        return p
+
+    def _pdf_mixed(self, name: str = "mixed.pdf", pages: int = 3) -> Path:
+        """交替的「密集文本页 / 纯图片页」。文本页不该渲染页图，图片页必须渲染。"""
+        import fitz
+        p = self.src / name
+        doc = fitz.open()
+        for i in range(pages):
+            page = doc.new_page()
+            if i % 2 == 0:
+                page.insert_textbox(fitz.Rect(40, 40, 560, 700),
+                                    "Body text paragraph. " * 20, fontsize=10)
+            else:
+                page.insert_image(fitz.Rect(40, 40, 400, 300),
+                                  filename=str(self._png_src()))
+        doc.save(str(p))
+        doc.close()
+        return p
+
+    def _pages_dir(self, item: dict, sid: str | None = None) -> Path:
+        base = (self.ws.attachments_dir / sid) if sid else \
+            (self.ws.attachments_dir / "_draft" / item["att_id"])
+        return base / f"{item['att_id']}.pages"
+
     def _stage_ok(self, path: Path) -> dict:
         result = A.stage(self.ws, [str(path)])
         self.assertEqual(result["failed"], [], f"登记应当成功：{result['failed']}")
@@ -220,6 +292,227 @@ class StageTests(_FixtureMixin, unittest.TestCase):
         self.assertEqual(result["items"], [])
         self.assertEqual(len(result["failed"]), 1)
         self.assertEqual(result["failed"][0]["path"], "/no/such/path")
+
+
+# ══════════════════════════════════════════════════════════════════
+class EmptyContentHonestyTests(_FixtureMixin, unittest.TestCase):
+    """抽不到内容时必须**显式留痕**，而不是静默变成空正文。
+
+    本次事故的原始现象是"前端显示解析成功（text_chars=23）"—— 占位串本身的字符数。
+    所以 `text_chars > 0` 从来不是"解析成功"的证据，必须另有 warnings 与占位串
+    本身作为判据。
+
+    批次 2 之后要分清**两种"抽不到"**，它们不是一回事：
+
+    - 扫描件 / 纯图片 PDF：内容**已经**通过页图交付给模型了 → 不是失败；
+    - docx / xlsx / pptx 抽空：**什么都没交付** → 才是失败，必须给占位。
+    """
+
+    def _draft_body(self, item: dict) -> str:
+        return (self.ws.attachments_dir / "_draft" / item["att_id"]
+                / f"{item['att_id']}.txt").read_text(encoding="utf-8")
+
+    def _assert_nothing_delivered(self, item: dict, needle: str) -> None:
+        """真正的失败：正文只有占位串，且没有任何图片随附。"""
+        self.assertEqual(item["warnings"], ["未提取到文本"])
+        self.assertEqual(item["converter"], "fallback_text")
+        self.assertEqual(item["images"], 0)
+        body = self._draft_body(item)
+        self.assertIn("未提取到文本", body)
+        self.assertIn(needle, body)
+        self.assertTrue(A.text_is_empty_note(body))
+        # 占位串本身贡献了 text_chars —— 单看这个数会被误导
+        self.assertEqual(item["text_chars"], len(body))
+
+    def test_docx_with_only_an_image_is_marked(self):
+        self._assert_nothing_delivered(self._stage_ok(self._docx_image_only()), "文档")
+
+    def test_pptx_with_only_an_image_is_marked(self):
+        self._assert_nothing_delivered(self._stage_ok(self._pptx_image_only()), "幻灯片")
+
+    def test_xlsx_with_no_cell_content_is_marked(self):
+        """工作表标题不算内容：否则会抽到 `--- 工作表: Sheet ---` 被判成有内容。"""
+        self._assert_nothing_delivered(self._stage_ok(self._xlsx_sheets_only()), "工作簿")
+
+    def test_scanned_pdf_is_delivered_as_image_not_marked_empty(self):
+        """扫描件**不再是**"未提取到文本"：无文本层 → 渲染整页图随附，模型看得到。
+
+        这条正是本次改造的靶心 —— 改前它只抽到一句占位串，模型什么都拿不到。
+        """
+        item = self._stage_ok(self._pdf_image_only())
+        self.assertEqual(item["converter"], "pymupdf")
+        self.assertEqual(item["images"], 1)
+        self.assertNotIn("未提取到文本", self._draft_body(item))
+        self.assertTrue(any("无文本层" in w for w in item["warnings"]),
+                        item["warnings"])
+        assets = (self.ws.attachments_dir / "_draft" / item["att_id"]
+                  / f"{item['att_id']}.pages")
+        self.assertEqual(sorted(p.name for p in assets.iterdir()), ["p1.jpg"])
+
+    def test_documents_with_content_have_no_warning(self):
+        for maker, converter in ((self._pdf, "pymupdf"),
+                                 (self._docx, "fallback_text"),
+                                 (self._xlsx, "fallback_text"),
+                                 (self._pptx, "fallback_text")):
+            with self.subTest(maker=maker.__name__):
+                item = self._stage_ok(maker())
+                self.assertEqual(item["warnings"], [])
+                self.assertEqual(item["converter"], converter)
+                self.assertFalse(A.text_is_empty_note(self._draft_body(item)))
+
+    def test_text_is_empty_note_only_matches_placeholders(self):
+        self.assertTrue(A.text_is_empty_note("（未提取到文本）"))
+        self.assertTrue(A.text_is_empty_note("  （未提取到文本：幻灯片可能只含图片）"))
+        self.assertFalse(A.text_is_empty_note("正常正文里提到未提取到文本这个词"))
+        self.assertFalse(A.text_is_empty_note(""))
+        self.assertFalse(A.text_is_empty_note(None))
+
+    def test_new_meta_fields_default_on_old_records(self):
+        """旧 meta.json 没有新增字段 → public_item 取默认值，存量零迁移。"""
+        out = A.public_item({"att_id": "att_old0000001", "kind": "document",
+                             "name": "a.pdf"})
+        self.assertEqual(out["images"], 0)
+        self.assertEqual(out["tables"], 0)
+        self.assertEqual(out["converter"], "")
+        self.assertEqual(out["warnings"], [])
+
+
+# ══════════════════════════════════════════════════════════════════
+class DocumentPageImageTests(_FixtureMixin, unittest.TestCase):
+    """文档随附页图：登记 → 迁移 → 展开的全链路契约。
+
+    这是改造的产出面：模型不再只拿到文本层，而是"文本 + 该页的图"。三件事必须
+    成立：① 页图资产跟着附件迁移；② 展开时按锚点位置**交错**排块；③ 模型无视觉
+    能力时页图位置降级为占位，既不静默消失、也不让 provider 报错。
+    """
+
+    def _prepare(self, item: dict, sid: str) -> tuple[dict, Path]:
+        records = A.migrate_to_session(
+            self.ws, [{"att_id": item["att_id"], "kind": item["kind"],
+                       "name": item["name"], "ext": item["ext"]}], sid)
+        return ({"role": "user", "content": A.build_user_content("看", records)},
+                self.ws.attachments_dir / sid)
+
+    def test_page_assets_survive_draft_to_session_migration(self):
+        """页图资产目录必须跟着附件搬家 —— 漏了它展开发不出图（踩过的坑）。"""
+        item = self._stage_ok(self._pdf_image_only())
+        self.assertEqual(sorted(p.name for p in self._pages_dir(item).iterdir()),
+                         ["p1.jpg"])
+        self._prepare(item, "SIDP00001")
+        moved = self._pages_dir(item, "SIDP00001")
+        self.assertEqual(sorted(p.name for p in moved.iterdir()), ["p1.jpg"])
+        self.assertFalse(self._pages_dir(item).exists(), "草稿区的资产应已搬走")
+
+    def test_scan_pdf_expands_to_text_then_image(self):
+        item = self._stage_ok(self._pdf_image_only())
+        msg, session_dir = self._prepare(item, "SIDP00002")
+        out = A.expand_content_for_model(msg, session_dir)
+        self.assertEqual([b["type"] for b in out["content"]],
+                         ["text", "text", "image_url"])
+        header = out["content"][1]["text"]
+        self.assertIn(f"[附件: {item['name']}]", header)
+        self.assertIn("含 1 张图片，已随附", header)
+        self.assertTrue(out["content"][2]["image_url"]["url"]
+                        .startswith("data:image/jpeg;base64,"))
+
+    def test_page_image_carries_detail_hint(self):
+        item = self._stage_ok(self._pdf_image_only())
+        msg, session_dir = self._prepare(item, "SIDP00003")
+        out = A.expand_content_for_model(msg, session_dir)
+        img = [b for b in out["content"] if b["type"] == "image_url"][0]
+        self.assertEqual(img["image_url"]["detail"], "high")
+
+    def test_user_image_has_no_detail_field(self):
+        """用户上传的图片不加 detail：那是给我们自己生成的页图做的保真取舍；
+        用户图片的尺寸已由 `prepare_image` 定过，多一个字段只会给不认识它的
+        兼容端点制造 400 风险。"""
+        item = self._stage_ok(self._png())
+        msg, session_dir = self._prepare(item, "SIDP00004")
+        out = A.expand_content_for_model(msg, session_dir)
+        img = [b for b in out["content"] if b["type"] == "image_url"][0]
+        self.assertNotIn("detail", img["image_url"])
+
+    def test_interleaved_blocks_keep_page_order(self):
+        """图片块必须落在**它那一页的文本之后、下一页文本之前** ——
+        这正是"交错"与"把图全堆在末尾"的本质区别。"""
+        item = self._stage_ok(self._pdf_mixed(pages=4))
+        self.assertEqual(item["images"], 2)          # 只有第 2、4 页需要渲染
+        msg, session_dir = self._prepare(item, "SIDP00005")
+        out = A.expand_content_for_model(msg, session_dir)
+        blocks = out["content"]
+        img_idx = [i for i, b in enumerate(blocks) if b["type"] == "image_url"]
+        self.assertEqual(len(img_idx), 2)
+        p2 = next(i for i, b in enumerate(blocks)
+                  if b["type"] == "text" and "第 2 页" in b.get("text", ""))
+        p3 = next(i for i, b in enumerate(blocks)
+                  if b["type"] == "text" and "第 3 页" in b.get("text", ""))
+        self.assertLess(p2, img_idx[0])
+        self.assertLess(img_idx[0], p3)
+        self.assertLess(p3, img_idx[1])
+
+    def test_page_images_degrade_to_placeholder_without_vision(self):
+        item = self._stage_ok(self._pdf_image_only())
+        msg, session_dir = self._prepare(item, "SIDP00006")
+        out = A.expand_content_for_model(msg, session_dir, supports_image=False)
+        self.assertNotIn("image_url", [b["type"] for b in out["content"]])
+        self.assertTrue(any("未发送" in b.get("text", "") for b in out["content"]))
+        self.assertNotIn("base64", json.dumps(out["content"]))
+
+    def test_missing_asset_degrades_without_raising(self):
+        """资产文件被手工删掉 → 明确占位；不抛，也不静默少一张图。"""
+        item = self._stage_ok(self._pdf_image_only())
+        msg, session_dir = self._prepare(item, "SIDP00007")
+        for leftover in self._pages_dir(item, "SIDP00007").iterdir():
+            leftover.unlink()
+        A.clear_expand_cache()
+        out = A.expand_content_for_model(msg, session_dir)      # 不抛即通过
+        self.assertTrue(any("缺失" in b.get("text", "") for b in out["content"]),
+                        [b.get("text", "") for b in out["content"]])
+
+    def test_meta_records_converter_and_counts(self):
+        item = self._stage_ok(self._pdf_mixed(pages=4))
+        self.assertEqual(item["images"], 2)
+        self.assertEqual(item["converter"], "pymupdf")
+        self.assertGreaterEqual(item["tables"], 0)
+
+
+# ══════════════════════════════════════════════════════════════════
+class HistoryAttachmentScanTests(unittest.TestCase):
+    """`history_has_attachments` —— 发送边界的短路判据。
+
+    它决定无附件会话是否完全绕开能力查询与展开逻辑，所以对**畸形输入必须保守**
+    （返回 False = 不做展开），否则一个异常形状会白白把整条链路拉起来。
+    """
+
+    def _block(self) -> dict:
+        return {"type": A.ATTACHMENT_BLOCK_TYPE,
+                "attachment": {"id": "att_x", "kind": "image", "name": "a.png"}}
+
+    def test_detects_attachment_blocks(self):
+        self.assertTrue(A.history_has_attachments(
+            [{"role": "user",
+              "content": [{"type": "text", "text": "x"}, self._block()]}]))
+        self.assertTrue(A.history_has_attachments(
+            [{"role": "user", "content": "纯文本"},
+             {"role": "user", "content": [self._block()]}]))
+
+    def test_ignores_everything_else(self):
+        cases = [
+            [],
+            None,
+            [{"role": "user", "content": "纯文本"}],
+            [{"role": "user", "content": [{"type": "text", "text": "x"}]}],
+            [{"role": "user", "content": [{"type": A.ATTACHMENT_BLOCK_TYPE,
+                                           "attachment": "not-a-dict"}]}],
+            [{"role": "user", "content": None}],
+            [{"role": "user"}],
+            ["not-a-message"],
+            [{"role": "user",
+              "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]}],
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertFalse(A.history_has_attachments(case))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -356,6 +649,34 @@ class ExpandTests(_FixtureMixin, unittest.TestCase):
         self.assertEqual(out["content"][0]["type"], "text")
         self.assertIn("缺失", out["content"][0]["text"])
 
+    def test_image_without_vision_capability_degrades_not_dropped(self):
+        """text-only 模型：图片降级为**明确的占位**，而不是原样发出去让 provider
+        报错，更不是静默丢弃 —— 模型必须知道自己没看到东西。"""
+        item = self._stage_ok(self._png())
+        msg, session_dir = self._prepare(item, "SID0000009")
+        out = A.expand_content_for_model(msg, session_dir, supports_image=False)
+        types = [b["type"] for b in out["content"]]
+        self.assertNotIn("image_url", types)
+        self.assertTrue(any("未发送" in b.get("text", "") for b in out["content"]))
+        self.assertNotIn("base64", json.dumps(out["content"]))
+
+    def test_image_still_sent_when_capability_unknown(self):
+        """supports_image=None（未识别模型）→ 按支持处理，不本地误拦。"""
+        item = self._stage_ok(self._png())
+        msg, session_dir = self._prepare(item, "SID000000A")
+        out = A.expand_content_for_model(msg, session_dir, supports_image=None)
+        self.assertIn("image_url", [b["type"] for b in out["content"]])
+
+    def test_vision_capability_does_not_affect_documents(self):
+        """文档走文本内联，与图片能力无关 —— text-only 模型完全可用。"""
+        item = self._stage_ok(self._file("note.txt", "正文"))
+        msg, session_dir = self._prepare(item, "SID000000B")
+        out = A.expand_content_for_model(msg, session_dir, supports_image=False)
+        # 两块：用户正文 + 附件文本块（都不是图片，故能力门控不该动它们）
+        self.assertEqual([b["type"] for b in out["content"]], ["text", "text"])
+        self.assertIn("[附件: note.txt]", out["content"][1]["text"])
+        self.assertIn("正文", out["content"][1]["text"])
+
     def test_document_expands_to_text_block_with_header(self):
         item = self._stage_ok(self._pdf())
         msg, session_dir = self._prepare(item, "SID0000009")
@@ -444,6 +765,42 @@ class LedgerShapeTests(_FixtureMixin, unittest.TestCase):
         self.assertEqual(A.harvest_attachments([{"type": "text", "text": "x"}]), [])
         self.assertEqual(
             A.harvest_attachments([{"type": "attachment", "attachment": {}}]), [])
+
+    def test_ledger_and_harvest_carry_parse_stats(self):
+        """解析统计要走到回放路径 —— 否则气泡里的 chip 显示不出
+        「12 页 · 5 图 · 3 表」，也标不出"已降级"。"""
+        records = [{"att_id": "att_abcd1234", "kind": "document", "name": "r.pdf",
+                    "ext": ".pdf", "size": 100, "pages": 12, "text_chars": 900,
+                    "text_truncated": False, "images": 5, "tables": 3,
+                    "converter": "pymupdf",
+                    "warnings": ["第 1、2 页无文本层，已按图像发送"]}]
+        blocks = A.build_user_content("看", records)
+        att = blocks[1]["attachment"]
+        self.assertEqual(att["pages"], 12)
+        self.assertEqual(att["images"], 5)
+        self.assertEqual(att["tables"], 3)
+        self.assertEqual(att["converter"], "pymupdf")
+        self.assertEqual(att["warnings"], ["第 1、2 页无文本层，已按图像发送"])
+
+        harvested = A.harvest_attachments(blocks)[0]
+        self.assertEqual(harvested["pages"], 12)
+        self.assertEqual(harvested["images"], 5)
+        self.assertEqual(harvested["tables"], 3)
+        self.assertEqual(harvested["converter"], "pymupdf")
+        self.assertEqual(harvested["text_chars"], 900)
+        self.assertEqual(harvested["warnings"],
+                         ["第 1、2 页无文本层，已按图像发送"])
+
+    def test_old_ledger_rows_yield_default_stats(self):
+        """旧 jsonl 行没有这些键 → 一律取默认值，存量零迁移。"""
+        blocks = A.build_user_content("看", [{"att_id": "att_abcd1234",
+                                             "kind": "document", "name": "a.pdf"}])
+        harvested = A.harvest_attachments(blocks)[0]
+        self.assertEqual(harvested["images"], 0)
+        self.assertEqual(harvested["tables"], 0)
+        self.assertEqual(harvested["converter"], "")
+        self.assertEqual(harvested["warnings"], [])
+        self.assertIsNone(harvested["pages"])
 
     def test_text_view_reads_attachments_without_bytes(self):
         content = A.build_user_content("看看这个", [

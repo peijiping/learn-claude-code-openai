@@ -3,9 +3,11 @@
 attachments.py - 会话附件（图片 / 文件）：登记、解析、发送前展开（新增）
 
 设计见 docs/frontend/12-附件与文件输入.md。本模块是桌面端「添加文件或图片」
-功能的后端实现，**叶子模块**：只依赖标准库 + `paths` + `logger`，第三方解析库
-（pymupdf / python-docx / openpyxl / python-pptx / Pillow）全部**函数内懒加载**
-—— 缺库只降级对应格式，不影响其它格式与整个后端启动。
+功能的后端实现，**叶子模块**：只依赖标准库 + `paths` + `logger` + `doc_convert`，
+第三方解析库（pymupdf / python-docx / openpyxl / python-pptx / Pillow）全部
+**函数内懒加载** —— 缺库只降级对应格式，不影响其它格式与整个后端启动。
+文档转换（页图渲染 + 文本层）在 `doc_convert` 里做，本模块负责**编排降级链**
+（转换层失败 → 回落纯文本抽取）与发送边界展开。
 
 **禁止 import agent_full_v2 / session_manage**（会与引擎形成循环依赖）。
 
@@ -17,7 +19,8 @@ attachments.py - 会话附件（图片 / 文件）：登记、解析、发送前
   只有元数据与来源，**不含文件字节**。落盘由 ws_bridge 组装（`build_user_content`），
   历史回放时 `ws_bridge._history_to_ui` 从中 harvest 出 UI 需要的附件列表。
 - **请求体形态**（发给 LLM）：图片 → `{"type":"image_url","image_url":{"url":"data:..."}}`；
-  文档/文本 → `{"type":"text","text":"[附件: x.pdf]\\n<正文>"}`。由
+  文档 → **多个块**：头部说明文本 + 正文文本，并在正文里按 `<!--img:pN-->` 锚点
+  的位置**交错**插入图片块（不是把图全堆在末尾）。由
   `expand_content_for_model` 在**发送边界**（`Agent._model_messages`）现算。
 
 为什么不在磁盘上直接存线格式（image_url + base64）：jsonl 会被整文件原子重写
@@ -30,7 +33,10 @@ attachments.py - 会话附件（图片 / 文件）：登记、解析、发送前
 
     .attachments/_draft/<att_id>/          ← 尚未发送（新会话此刻还没有 session_id）
         meta.json  <att_id>.<ext>  [<att_id>.txt]  [<att_id>.send.jpg]
+        [<att_id>.pages/p1.jpg ...]         ← 转换层产出的页图资产（PDF）
     .attachments/<session_id>/             ← 已发送（发送时原子迁移）
+        <att_id>.<ext>  <att_id>.meta.json  [<att_id>.txt]  [<att_id>.send.jpg]
+        [<att_id>.pages/p1.jpg ...]
 
 附件一律**复制**（原文件不动，只记 source_path）：只引用原路径的话，原文件被
 移动/改名/删除后该条历史消息永久失效且无法自愈。
@@ -54,6 +60,9 @@ from paths import (
     PROJECTS_ROOT,
     WorkspacePaths,
 )
+# doc_convert 是叶子模块（只依赖标准库 + logger），模块级导入安全；pymupdf 本身
+# 仍然是函数内懒加载。锚点语法与资产目录名让转换层做**唯一定义**，避免两处各写一份。
+from doc_convert import ASSETS_DIR_SUFFIX, IMAGE_ANCHOR_RE
 
 log = get_logger("attachments")
 
@@ -181,6 +190,57 @@ def inline_max_bytes() -> int:
     return _int_env("ATTACHMENT_INLINE_MAX_BYTES", 15 * 1024 * 1024, minimum=1024)
 
 
+def doc_max_pages() -> int:
+    """单文档最多渲染多少页**页图**（默认 20）；0 = 不限。
+
+    只约束页图数量，**文本层永远是全量的** —— 文本是检索与无视觉模型兜底的主
+    通道，不该被图像预算砍掉。
+    """
+    raw = os.environ.get("ATTACHMENT_DOC_MAX_PAGES")
+    if raw is None or str(raw).strip() == "":
+        return 20
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 20
+    return value if value >= 0 else 20
+
+
+def doc_max_images() -> int:
+    """单文档随附的图片总数上限（默认 20）；0 = 不限。
+
+    DeepSeek 的硬限是 600 张/请求，20 是 UX 值：再多也读不过来，只会撑大请求体。
+    """
+    return _int_env("ATTACHMENT_DOC_MAX_IMAGES", 20, minimum=1)
+
+
+def doc_page_image_min_text() -> int:
+    """页文本短于此值时判定"文本层不足以代表本页"→ 渲染页图（默认 200 字符）。
+
+    这是页图渲染的**主判据**：文本层够密又没有图/表时，页图提供不了额外信息，
+    渲染它纯属浪费请求体。调大 = 更保守地渲染（更贵、覆盖更全）。
+    """
+    raw = os.environ.get("ATTACHMENT_DOC_PAGE_IMAGE_MIN_TEXT")
+    if raw is None or str(raw).strip() == "":
+        return 200
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 200
+    return value if value >= 0 else 200
+
+
+def image_detail() -> str:
+    """页图/内嵌图的 `detail` 档位（默认 `high`）。
+
+    DeepSeek 的三档：`low` 推理前缩到 512×512、`high`（=`original`）保留原图、
+    `auto` 自动。默认 `high` —— 保真优先，而服务端本来就把每张图的 token 封在
+    1024 以内，选 `low` 省不到 token 只省请求体。留空 = 不发该字段。
+    """
+    value = str(os.environ.get("ATTACHMENT_IMAGE_DETAIL") or "").strip().lower()
+    return value if value in ("low", "high", "original", "auto") else "high"
+
+
 # ══════════════════════════════════════════════════════════════════
 #  基础工具
 # ══════════════════════════════════════════════════════════════════
@@ -269,6 +329,90 @@ def _clip(text: str, limit: int) -> tuple[str, bool, int | None]:
     return text, False, None
 
 
+# ── 「未提取到文本」占位 ────────────────────────────────────────────
+# 抽空时正文只可能是这样一句占位（各格式措辞不同，前缀统一）。它同时是**哨兵**：
+#   ① 给模型 —— 明确知道"这里本该有内容但没读到"，不会基于残缺上下文硬答；
+#   ② 给 stage/UI —— 据此记 warning、显示"已降级"，而不是把空内容当"解析成功"。
+# 在此之前只有 PDF 有占位，docx/xlsx/pptx 抽空会返回空串，前端照样显示
+# "已提取 0 字"，用户与模型都不知道内容丢了。
+EMPTY_NOTE_PREFIX = "（未提取到文本"
+
+
+def _empty_note(ext: str) -> str:
+    if ext == ".pdf":
+        return "（未提取到文本，可能是扫描件或纯图片 PDF）"
+    if ext == ".docx":
+        return "（未提取到文本：文档可能只含图片、图表或文本框）"
+    if ext == ".xlsx":
+        return "（未提取到文本：工作簿可能只含图片或图表）"
+    if ext == ".pptx":
+        return "（未提取到文本：幻灯片可能只含图片）"
+    return "（未提取到文本）"
+
+
+def text_is_empty_note(text: str) -> bool:
+    """正文是否只是「未提取到文本」占位（stage / UI 据此判定"已降级"）。"""
+    return str(text or "").lstrip().startswith(EMPTY_NOTE_PREFIX)
+
+
+def _convert_document(src: Path, ext: str, dest: Path, att_id: str) -> dict:
+    """文档 → 统一中间表示（Markdown + 页图资产）。
+
+    **优先走 `doc_convert` 的统一转换层**（PDF 页图 + 文本层双路），不可用或失败时
+    回落今天的纯文本抽取 —— 降级链保证"最差情况等于现状"，不引入回归。
+
+    返回 `{"body","text_truncated","pages","warnings","images","tables","converter"}`。
+    `images` 是**页图资产个数**（int）；资产明细靠目录约定 `<att_id>.pages/pN.jpg`
+    恢复，不进 meta —— 省 jsonl 体积，也不怕 meta 丢失。
+    """
+    limit = text_max_chars()
+    try:
+        import doc_convert
+        if ext == ".pdf":
+            out = doc_convert.convert_pdf(
+                src, dest, att_id,
+                max_edge=image_max_edge(),
+                max_pages=doc_max_pages(),
+                max_images=doc_max_images(),
+                min_text=doc_page_image_min_text(),
+            )
+            markdown = str(out.get("markdown") or "")
+            truncated = len(markdown) > limit
+            warnings = list(out.get("warnings") or [])
+            if not markdown.strip():
+                warnings.append("未提取到文本")
+            elif truncated:
+                warnings.append("内容已截断")
+            return {
+                "body": markdown[:limit],
+                "text_truncated": truncated,
+                "pages": out.get("pages"),
+                "warnings": warnings,
+                "images": len(out.get("images") or []),
+                "tables": int(out.get("tables") or 0),
+                "converter": str(out.get("converter") or "doc_convert"),
+            }
+    except Exception as exc:  # noqa: BLE001 - 降级链：转换层坏了必须还能用
+        log.warning("统一转换层不可用，回落纯文本抽取（%s）: %s: %s",
+                    ext, type(exc).__name__, exc)
+
+    body, truncated, pages = extract_text(src, ext)
+    warnings = []
+    if text_is_empty_note(body):
+        warnings.append("未提取到文本")
+    elif truncated:
+        warnings.append("内容已截断")
+    return {
+        "body": body,
+        "text_truncated": truncated,
+        "pages": pages,
+        "warnings": warnings,
+        "images": 0,
+        "tables": 0,
+        "converter": "fallback_text",
+    }
+
+
 def read_text_file(path: Path, byte_cap: int | None = None) -> str:
     """按「编码探测」读纯文本：utf-8-sig → utf-8 → gbk → big5 → 有损替换。
 
@@ -319,7 +463,7 @@ def _extract_pdf(path: Path, limit: int) -> tuple[str, bool, int | None]:
         truncated = read_pages < total or len(body) > limit
         if not body.strip():
             # 与 tools.run_read_pdf 同一口径的提示，避免用户以为"文件坏了"
-            body = "（未提取到文本，可能是扫描件或纯图片 PDF）"
+            body = _empty_note(".pdf")
         return body[:limit], truncated, total
     finally:
         doc.close()
@@ -337,7 +481,9 @@ def _extract_docx(path: Path) -> str:
             cells = [c.text.strip() for c in row.cells]
             if any(cells):
                 parts.append(" | ".join(cells))
-    return "\n".join(parts)
+    body = "\n".join(parts)
+    # 抽空必须留痕：否则一行表格都没有的 docx 会静默变成空正文
+    return body if body.strip() else _empty_note(".docx")
 
 
 def _extract_xlsx(path: Path) -> str:
@@ -348,13 +494,20 @@ def _extract_xlsx(path: Path) -> str:
     wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
     try:
         parts: list[str] = []
+        data_rows = 0
         for sheet in wb.worksheets:
-            parts.append(f"--- 工作表: {sheet.title} ---")
+            rows: list[str] = []
             for row in sheet.iter_rows(values_only=True):
                 cells = ["" if v is None else str(v) for v in row]
                 if any(c.strip() for c in cells):
-                    parts.append("\t".join(cells))
-        return "\n".join(parts)
+                    rows.append("\t".join(cells))
+            # 工作表标题**不算内容** —— 否则一个只有空表的工作簿也会抽出
+            # "--- 工作表: Sheet1 ---"，看起来"解析成功"实则什么都没读到
+            parts.append(f"--- 工作表: {sheet.title} ---")
+            parts.extend(rows)
+            data_rows += len(rows)
+        body = "\n".join(parts)
+        return body if data_rows else _empty_note(".xlsx")
     finally:
         wb.close()
 
@@ -366,13 +519,19 @@ def _extract_pptx(path: Path) -> str:
         raise RuntimeError("未安装 python-pptx，无法解析 .pptx") from exc
     prs = Presentation(str(path))
     parts: list[str] = []
+    text_shapes = 0
     for idx, slide in enumerate(prs.slides, start=1):
-        parts.append(f"--- 第 {idx} 页 ---")
+        bodies: list[str] = []
         for shape in slide.shapes:
             frame = getattr(shape, "text_frame", None)
             if frame is not None and (frame.text or "").strip():
-                parts.append(frame.text.strip())
-    return "\n".join(parts)
+                bodies.append(frame.text.strip())
+        # 同 xlsx：「--- 第 N 页 ---」标题不算内容，否则纯图片幻灯片会被当成有正文
+        parts.append(f"--- 第 {idx} 页 ---")
+        parts.extend(bodies)
+        text_shapes += len(bodies)
+    body = "\n".join(parts)
+    return body if text_shapes else _empty_note(".pptx")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -480,10 +639,19 @@ def _stage_one(ws: WorkspacePaths, draft_root: Path,
         shutil.copy2(src, stored)
         text_chars, text_truncated, pages = 0, False, None
         has_send_image = False
+        warnings: list[str] = []
+        images, tables, converter = 0, 0, ""
         if kind == KIND_IMAGE:
             has_send_image = prepare_image(stored, dest / f"{att_id}{SEND_IMAGE_SUFFIX}")
         elif kind == KIND_DOCUMENT:
-            body, text_truncated, pages = extract_text(stored, ext)
+            out = _convert_document(stored, ext, dest, att_id)
+            body = out["body"]
+            text_truncated = out["text_truncated"]
+            pages = out["pages"]
+            warnings = out["warnings"]
+            images = out["images"]
+            tables = out["tables"]
+            converter = out["converter"]
             (dest / f"{att_id}{TEXT_SUFFIX}").write_text(body, encoding="utf-8")
             text_chars = len(body)
         meta = {
@@ -498,6 +666,13 @@ def _stage_one(ws: WorkspacePaths, draft_root: Path,
             "text_chars": text_chars,
             "text_truncated": bool(text_truncated),
             "pages": pages,
+            # images = 随附的页图资产个数（明细靠 `<att_id>.pages/pN.jpg` 目录约定
+            # 恢复，不进 meta）；tables = find_tables 命中数（无框线表格会漏）；
+            # converter 记录走的哪条转换路径，出问题一眼可见。
+            "images": int(images),
+            "tables": int(tables),
+            "converter": converter,
+            "warnings": warnings,
             "has_send_image": bool(has_send_image),
             "created_at": time.time(),
         }
@@ -525,6 +700,11 @@ def public_item(meta: dict) -> dict:
         "text_chars": int(meta.get("text_chars") or 0),
         "text_truncated": bool(meta.get("text_truncated")),
         "pages": meta.get("pages"),
+        # 旧 meta.json 没有这四个字段 → 一律取默认值，存量附件零迁移
+        "images": int(meta.get("images") or 0),
+        "tables": int(meta.get("tables") or 0),
+        "converter": str(meta.get("converter") or ""),
+        "warnings": list(meta.get("warnings") or []),
     }
 
 
@@ -629,15 +809,19 @@ def _move_dir_contents(src_dir: Path, dst_dir: Path, att_id: str) -> None:
     同名先删：重发同一批附件时目标可能已存在。
     """
     for item in src_dir.iterdir():
-        if item.is_dir():
-            continue
         name = f"{att_id}.meta.json" if item.name == META_FILENAME else item.name
         dst = dst_dir / name
         if dst.exists():
-            dst.unlink()
+            # 目录要 rmtree：`unlink` 对目录抛 IsADirectoryError。
+            # 页图资产目录（`<att_id>.pages/`）就是这一路。
+            if dst.is_dir():
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.unlink()
         try:
             os.replace(item, dst)
         except OSError:
+            # 跨分区：shutil.move 对目录是递归搬移
             shutil.move(str(item), str(dst))
 
 
@@ -674,6 +858,8 @@ def resolve_files(session_dir: Path | None, att: dict) -> dict:
     else:
         # meta 缺失 / ext 线索不对时按前缀兜底，排除派生文件
         for cand in sorted(session_dir.glob(f"{att_id}.*")):
+            if not cand.is_file():
+                continue          # 跳过 `<att_id>.pages/`（页图资产目录）
             if cand.name == f"{att_id}.meta.json":
                 continue
             if cand.name.endswith(SEND_IMAGE_SUFFIX):
@@ -739,6 +925,13 @@ def build_user_content(text: str, records: list) -> object:
                 "text_chars": int(record.get("text_chars") or 0),
                 "text_truncated": bool(record.get("text_truncated")),
                 "pages": record.get("pages"),
+                # 解析统计 + 「诚实失败」通道（2026-09-20）：UI 靠它显示
+                # 「N 页 · M 图 · K 表」并把解不出来的部分标成已降级。
+                # 旧 jsonl 行没有这四个键 → 前端一律取默认值，存量零迁移。
+                "images": int(record.get("images") or 0),
+                "tables": int(record.get("tables") or 0),
+                "converter": str(record.get("converter") or ""),
+                "warnings": list(record.get("warnings") or []),
                 "missing": bool(record.get("missing")),
             },
         })
@@ -780,6 +973,10 @@ def harvest_attachments(content) -> list[dict]:
     返回的每项是**给前端渲染**的形状：id/kind/name/mime/ext/size/source_path/
     stored_path（前端用 stored_path 经 `aigent-att://` 显示缩略图、
     用 source_path 在 Finder 里定位原文件）。非 list content 与普通块一律跳过。
+
+    同时带上解析统计（`pages` / `images` / `tables` / `warnings` / `converter`），
+    让**回放出来的气泡**与发送前的 chip 显示同一套「N 页 · M 图 · K 表 / 已降级」。
+    旧 jsonl 行没有这些键 → 一律取默认值，存量零迁移。
     """
     if not isinstance(content, list):
         return []
@@ -802,6 +999,13 @@ def harvest_attachments(content) -> list[dict]:
             "size": int(att.get("size") or 0),
             "source_path": str(att.get("source_path") or ""),
             "stored_path": str(att.get("stored_path") or ""),
+            "text_chars": int(att.get("text_chars") or 0),
+            "text_truncated": bool(att.get("text_truncated")),
+            "pages": att.get("pages"),
+            "images": int(att.get("images") or 0),
+            "tables": int(att.get("tables") or 0),
+            "converter": str(att.get("converter") or ""),
+            "warnings": list(att.get("warnings") or []),
             "missing": bool(att.get("missing")),
         })
     return found
@@ -840,7 +1044,25 @@ def clear_expand_cache() -> None:
         _EXPAND_CACHE.clear()
 
 
-def expand_content_for_model(message, session_dir: Path | None):
+def history_has_attachments(messages) -> bool:
+    """这批消息里是否含有待展开的附件块。
+
+    发送边界用它做**结构化短路**：无附件会话不去读模型能力、不做任何额外工作，
+    "无附件请求体逐字节等价"就由结构保证，而不是靠"新增代码恰好没副作用"。
+    """
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") == ATTACHMENT_BLOCK_TYPE
+                    and isinstance(block.get("attachment"), dict)):
+                return True
+    return False
+
+
+def expand_content_for_model(message, session_dir: Path | None, *,
+                             supports_image: bool | None = None):
     """把一条待发送消息里的附件块展开为 provider 线格式。
 
     **契约**：
@@ -849,6 +1071,13 @@ def expand_content_for_model(message, session_dir: Path | None):
     - 任何单个附件展开失败 → 降级为占位文本块，**绝不抛异常**
       （异常穿透会打死整轮 agent_loop，本轮 tool_result 全缺）。
     - 展开结果**不回写** `history_messages`：内存与 jsonl 恒为账本形态。
+    - **块数会变**：一个附件块可能展开成多个结果块（文档 = 头部文本 + 正文 +
+      按锚点交错的页图）。内容数组缩放了，但顺序仍是"该附件产出的块"聚集在一起。
+
+    `supports_image`：当前生效模型是否支持图片输入（三态）。
+    `False` 时图片降级为占位文本块而不是原样发出去让 provider 报错；`True`/`None`
+    （未知模型）一律按支持处理。调用方 `Agent._model_messages` 负责查能力 ——
+    本模块是叶子模块，不 import llm_config。
     """
     if not isinstance(message, dict):
         return message
@@ -860,7 +1089,9 @@ def expand_content_for_model(message, session_dir: Path | None):
     for block in content:
         if (isinstance(block, dict) and block.get("type") == ATTACHMENT_BLOCK_TYPE
                 and isinstance(block.get("attachment"), dict)):
-            expanded.append(_expand_one(block["attachment"], session_dir))
+            # extend 而非 append：文档可能展开成「文本 + 图片 + 文本…」多块
+            expanded.extend(_expand_one(block["attachment"], session_dir,
+                                        supports_image=supports_image))
             changed = True
         else:
             expanded.append(block)
@@ -871,46 +1102,187 @@ def expand_content_for_model(message, session_dir: Path | None):
     return out
 
 
-def _expand_one(att: dict, session_dir: Path | None) -> dict:
-    """单个附件块 → 线格式块。任何异常都收束成占位文本块。"""
+def _page_assets(session_dir: Path | None, att: dict, files: dict) -> dict[str, Path]:
+    """该附件的页图资产：锚点 id（`p1`）→ 文件路径。
+
+    靠**目录约定**恢复（`<att_id>.pages/pN.jpg`），不读 meta —— meta 丢了、
+    或附件是从别处拷来的，只要目录在就能恢复。锚点写在 markdown 里，文件名与
+    锚点 id 一一对应，位置信息不会错乱。
+    """
+    att_id = str(att.get("att_id") or att.get("id") or "")
+    if not _ATT_ID_RE.match(att_id):
+        return {}
+    dirs = []
+    if session_dir is not None:
+        dirs.append(session_dir / f"{att_id}{ASSETS_DIR_SUFFIX}")
+    original = files.get("original")
+    if original is not None:
+        dirs.append(original.parent / f"{att_id}{ASSETS_DIR_SUFFIX}")
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        out: dict[str, Path] = {}
+        try:
+            for path in sorted(directory.iterdir()):
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTS:
+                    out[path.stem] = path
+        except OSError:
+            continue
+        if out:
+            return out
+    return {}
+
+
+def _image_block(url: str, detail: str | None = None) -> dict:
+    """provider 线格式的图片块（Chat Completions）。
+
+    `detail` 只对**我们生成的页图**传：那是我们主动做的保真取舍。用户上传的图片
+    一概不带（`prepare_image` 已经决定过尺寸），避免给不认识该字段的兼容端点
+    制造 400 风险。
+    """
+    image_url: dict = {"url": url}
+    if detail:
+        image_url["detail"] = detail
+    return {"type": "image_url", "image_url": image_url}
+
+
+def _document_blocks(body: str, assets: dict[str, Path],
+                     supports_image: bool | None) -> list[dict]:
+    """Markdown（含 `<!--img:pN-->` 锚点）→ **交错**的文本块与图片块。
+
+    交错而不是把图堆在末尾：图片块在 content 数组里的**物理位置**就是它该在的
+    位置，模型看到的是"这段文字旁边是这张图"，而不是"一大堆字，然后一大堆图"。
+    锚点注释只是存储层的可读载体，位置由块顺序表达。
+    """
+    text = body or ""
+    blocks: list[dict] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            chunk = "\n".join(pending).strip()
+            if chunk:
+                blocks.append(_text_block(chunk))
+            pending.clear()
+
+    pos = 0
+    for match in IMAGE_ANCHOR_RE.finditer(text):
+        pending.append(text[pos:match.start()])
+        pos = match.end()
+        flush()
+        anchor = match.group(1)
+        path = assets.get(anchor)
+        if path is None:
+            blocks.append(_text_block(f"[图片 {anchor} 缺失：资产文件未找到]"))
+            continue
+        if supports_image is False:
+            blocks.append(_text_block(
+                f"[图片 {anchor}]（未发送：当前模型不支持图片输入，"
+                f"请切换到带「图片」能力的模型）"))
+            continue
+        url = _data_url(path, _image_mime(path, {}))
+        if url is None:
+            size = human_size(path.stat().st_size) if path.exists() else "未知大小"
+            blocks.append(_text_block(
+                f"[图片 {anchor} 未能发送：{size}，超过内联上限]"))
+            continue
+        blocks.append(_image_block(url, detail=image_detail()))
+    pending.append(text[pos:])
+    flush()
+    return blocks
+
+
+def _expand_one(att: dict, session_dir: Path | None, *,
+                supports_image: bool | None = None) -> list[dict]:
+    """单个附件块 → **一组**线格式块。任何异常都收束成占位文本块。
+
+    返回列表而非单块：文档现在可能随附页图，要按锚点位置把文本块与图片块交错
+    排开。图片/文本附件仍是单元素列表 —— 调用方统一 `extend` 即可。
+    """
     name = str(att.get("name") or "附件")
     kind = str(att.get("kind") or "")
     try:
         files = resolve_files(session_dir, att)
         if kind == KIND_IMAGE:
-            path = files.get("send_image") or files.get("original")
-            url = _data_url(path, _image_mime(path, att)) if path else None
-            if url:
-                return {"type": "image_url", "image_url": {"url": url}}
-            if path is not None:
-                # 文件在，但体积超内联上限：明确告知，而不是让 provider 报错
-                return _text_block(
-                    f"[图片: {name}]（图片过大未能发送："
-                    f"{human_size(path.stat().st_size)}）"
-                )
-            return _text_block(f"[图片缺失: {name}]（原文件已被移动或删除）")
-
-        body = _attachment_text(att, files)
-        if body is None:
-            return _text_block(f"[附件缺失: {name}]（原文件已被移动或删除）")
-        body, total_truncated = _fit_total(att, body)
-        header = f"[附件: {name}]"
-        notes = []
-        if att.get("text_truncated") or total_truncated:
-            notes.append("内容已截断")
-        if att.get("pages"):
-            notes.append(f"共 {att['pages']} 页")
-        if notes:
-            header += "（" + "，".join(notes) + "）"
-        tail = ""
-        original = files.get("original")
-        if (att.get("text_truncated") or total_truncated) and original is not None:
-            tail = f"\n…（上方为节选，完整文件：{original}，可用工具继续读取）"
-        return _text_block(f"{header}\n{body}{tail}")
+            return [_expand_image(att, files, name, supports_image)]
+        return _expand_document(att, files, session_dir, name, supports_image)
     except Exception as exc:  # noqa: BLE001 - 发送边界绝不能抛
         log.warning("附件展开失败 att_id=%s name=%s: %s: %s",
                     att.get("id"), name, type(exc).__name__, exc, exc_info=True)
-        return _text_block(f"[附件读取失败: {name}]")
+        return [_text_block(f"[附件读取失败: {name}]")]
+
+
+def _expand_image(att: dict, files: dict, name: str,
+                  supports_image: bool | None) -> dict:
+    """图片附件 → `image_url` 块；发不出去时降级为说清原因的占位文本块。"""
+    if supports_image is False:
+        # 能力不符 → 占位。**必须在读盘/编码之前判**：既省掉一次 base64，
+        # 也保证"模型看不到的图"会明确说出来而不是静默消失。
+        return _text_block(
+            f"[图片: {name}]（未发送：当前模型不支持图片输入，"
+            f"请切换到带「图片」能力的模型）"
+        )
+    path = files.get("send_image") or files.get("original")
+    url = _data_url(path, _image_mime(path, att)) if path else None
+    if url:
+        return {"type": "image_url", "image_url": {"url": url}}
+    if path is not None:
+        # 文件在，但体积超内联上限：明确告知，而不是让 provider 报错
+        return _text_block(
+            f"[图片: {name}]（图片过大未能发送：{human_size(path.stat().st_size)}）"
+        )
+    return _text_block(f"[图片缺失: {name}]（原文件已被移动或删除）")
+
+
+def _expand_document(att: dict, files: dict, session_dir: Path | None,
+                     name: str, supports_image: bool | None) -> list[dict]:
+    """文档/文本附件 → 头部说明 +（按锚点交错的正文与图片）。
+    无页图时收成**单块**，与改造前的形状一致。"""
+    body = _attachment_text(att, files)
+    if body is None:
+        return [_text_block(f"[附件缺失: {name}]（原文件已被移动或删除）")]
+    body, total_truncated = _fit_total(att, body)
+    assets = _page_assets(session_dir, att, files)
+    header = _document_header(att, name, total_truncated, len(assets))
+    tail = ""
+    original = files.get("original")
+    if (att.get("text_truncated") or total_truncated) and original is not None:
+        tail = f"\n…（上方为节选，完整文件：{original}，可用工具继续读取）"
+
+    blocks = _document_blocks(body, assets, supports_image)
+    # 头部说明并入首块、续读提示并入末块 —— 无页图的文档因此仍是单块，
+    # 存量消息的展开形状不变。
+    if blocks and blocks[0]["type"] == "text":
+        blocks[0] = _text_block(f"{header}\n{blocks[0]['text']}")
+    else:
+        blocks.insert(0, _text_block(header))
+    if tail:
+        if blocks[-1]["type"] == "text":
+            blocks[-1] = _text_block(f"{blocks[-1]['text']}{tail}")
+        else:
+            blocks.append(_text_block(tail))
+    return blocks
+
+
+def _document_header(att: dict, name: str, total_truncated: bool,
+                     image_count: int) -> str:
+    """`[附件: x.pdf]（共 12 页，含 5 张图片，已随附）` —— 让模型知道收到了什么。
+
+    `image_count` 由**磁盘上的资产目录**现数，不读 meta：目录才是真相，meta 丢了
+    也能说出正确的数量。表格数刻意**不写进头部** —— `find_tables` 对无框线表格
+    命中 0，说一个偏小的数字会让模型以为表格已尽收眼底；表格的视觉真相在页图里。
+    """
+    header = f"[附件: {name}]"
+    notes = []
+    if att.get("text_truncated") or total_truncated:
+        notes.append("内容已截断")
+    if att.get("pages"):
+        notes.append(f"共 {att['pages']} 页")
+    if image_count:
+        notes.append(f"含 {image_count} 张图片，已随附")
+    if notes:
+        header += "（" + "，".join(notes) + "）"
+    return header
 
 
 def _text_block(text: str) -> dict:

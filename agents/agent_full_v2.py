@@ -33,7 +33,11 @@ from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
 from paths import (SKILLS_DIR, WORKTREE_DIR, MCP_CONFIG, DEFAULT_PROJECT_ID,
                    WorkspacePaths, workspace_paths)
-from attachments import expand_content_for_model, text_view
+from attachments import (
+    expand_content_for_model,
+    history_has_attachments,
+    text_view,
+)
 from tools import ToolRegistry
 from task_manager import TaskManager, current_board
 from memories import MemoryStore
@@ -48,7 +52,7 @@ from goal import (
 )
 from skills import SkillLoader
 from llm_manage import LLMClient
-from llm_config import get_model_by_id
+from llm_config import get_model_by_id, model_supports_image
 from logger import get_logger
 from system_prompt import SystemPromptBuilder
 from error_recovery import ErrorRecovery, RecoveryAction
@@ -799,11 +803,32 @@ class Agent:
         账本形态，base64 只在这一刻存在。无附件消息由 expand 原样返回，
         因此无附件会话的请求体与改造前逐字节一致（见
         tests/test_agent_model_messages.py 的回归断言）。
+
+        **图片能力门控（2026-09-20）**：按本轮生效模型的能力决定图片是否真的发出。
+        在此之前只有 ws_bridge 的 chat 预检（且只扫当轮新附件），会话中途换模型、
+        历史回放、以及任何把图带进新轮的路径都不校验 —— 图片会被原样发给不支持
+        图片的模型。门控放在这里覆盖全部路径；`ws_bridge` 的预检保留，职责是
+        "迁移之前就报错"，避免草稿白搬到会话目录。
         """
         session_dir = self._attachment_session_dir()
+        # 无附件 → 短路：不读模型能力、不做任何额外工作，请求体与改造前等价。
+        # 有附件 → 查本轮生效模型的能力，text-only 模型下图片降级为占位。
+        # 查询必须包 try/except：本方法位于 retry lambda 内，异常会穿透到
+        # agent_loop 打死整轮（与 _expand_one 的"绝不抛异常"同一契约）。
+        # 空 _turn_model_id → 回落全局 active 模型，与 _turn_model_snapshot 同口径。
+        supports_image = True
+        if history_has_attachments(self.history_messages):
+            try:
+                supports_image = model_supports_image(
+                    getattr(self, "_turn_model_id", None) or "")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("查询模型图片能力失败（按支持图片处理）: %s: %s",
+                            type(exc).__name__, exc)
+                supports_image = True
         return [
             expand_content_for_model(
-                {k: m[k] for k in MODEL_MSG_FIELDS if k in m}, session_dir
+                {k: m[k] for k in MODEL_MSG_FIELDS if k in m}, session_dir,
+                supports_image=supports_image,
             )
             for m in self.history_messages
         ]

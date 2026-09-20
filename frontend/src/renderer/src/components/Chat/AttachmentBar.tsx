@@ -1,7 +1,26 @@
 import { useState } from 'react'
 import { Icon } from '@components/common/Icon'
 import { humanSize } from '@store/agentStore'
-import type { AttachmentKind } from '@protocols/agentProtocol'
+import type { AttachmentKind, AttachmentStats } from '@protocols/agentProtocol'
+
+/** 后端"什么都没抽到"时写入的 warning 字面量。
+ *
+ *  与 `agents/attachments.py` 的 `_stage_one` / `_convert_document` 里那一处**逐字对应**
+ *  —— 改后端文案必须同步改这里（doc 12 §3.2 有记录）。用**精确相等**而不是 includes：
+ *  子串匹配会把"某些页无文本层，已按图像发送"误判成未交付。
+ */
+const WARN_NO_TEXT = '未提取到文本'
+
+/** staging 期的空统计（占位项没有真实解析结果） */
+export const EMPTY_STATS: AttachmentStats = {
+  text_chars: 0,
+  text_truncated: false,
+  pages: null,
+  images: 0,
+  tables: 0,
+  converter: '',
+  warnings: []
+}
 
 /**
  * 附件在 UI 上的**统一视图**：草稿项（输入区）与消息附件（气泡内）都先映射到
@@ -9,14 +28,14 @@ import type { AttachmentKind } from '@protocols/agentProtocol'
  */
 export interface AttachmentView {
   key: string
-  status: 'staging' | 'ready' | 'failed'
+  status: 'staging' | 'ready' | 'degraded' | 'failed'
   kind: AttachmentKind | ''
   name: string
   size: number
   /** 图片缩略图 URL（`aigent-att://…`）；非图片 / 未就绪为 null */
   url: string | null
-  /** 副标题（体积 / 已提取字数）；失败时不用它 */
-  meta: string
+  /** 解析统计（见 `AttachmentStats`）；副标题与降级提示都由它算 */
+  stats: AttachmentStats
   /** 失败原因（status=failed 时展示） */
   error?: string
   /** 后端归位时发现文件已不在 → 显示「文件已缺失」占位 */
@@ -59,12 +78,21 @@ export default function AttachmentBar({
         const failed = v.status === 'failed'
         const missing = !!v.missing || broken[v.key]
         const thumb = v.url && !missing && !failed ? v.url : null
-        const subtitle = failed ? (v.error || '添加失败') : missing ? '文件已缺失' : v.meta
+        const degraded = v.status === 'degraded'
+        const subtitle = failed
+          ? v.error || '添加失败'
+          : missing
+            ? '文件已缺失'
+            : attachmentMeta(v)
         const title = [
           v.name,
           v.status === 'staging' ? '读取中…' : '',
           failed ? subtitle : '',
           missing ? '文件已缺失（可能被手工删除）' : '',
+          // 降级原因可能很长（"第 1、2、3 页无文本层 等 24 页，已按图像发送"），
+          // 塞进单行副标题只会被省略号吃掉 —— 放 tooltip 里完整给出。
+          ...(degraded ? v.stats.warnings : []),
+          degraded && v.stats.converter ? `解析方式：${v.stats.converter}` : '',
           v.sourcePath ? `原始路径：${v.sourcePath}` : ''
         ]
           .filter(Boolean)
@@ -91,7 +119,9 @@ export default function AttachmentBar({
             )}
             <span className="att-text">
               <span className="att-name">{v.name}</span>
-              <span className={`att-meta ${failed ? 'err' : ''}`}>{subtitle}</span>
+              <span className={`att-meta ${failed ? 'err' : degraded ? 'warn' : ''}`}>
+                {subtitle}
+              </span>
             </span>
             {onRemove && (
               <button
@@ -113,11 +143,47 @@ export default function AttachmentBar({
   )
 }
 
-/** 体积 / 提取结果的副标题文案（草稿与消息共用同一口径） */
-export function attachmentMeta(size: number, kind: AttachmentKind | '', textChars = 0): string {
+/** 附件是否"什么都没交付"：后端明确说了没抽到文本，且没有图片随附。
+ *
+ *  注意与"扫描件"区分：扫描件的 warning 是「第 N 页无文本层，**已按图像发送**」，
+ *  内容其实通过页图交付了，副标题照常显示「1 页 · 1 图」。
+ */
+export function nothingDelivered(stats: AttachmentStats): boolean {
+  const warnings = stats?.warnings ?? []
+  return warnings.includes(WARN_NO_TEXT) && (stats?.images ?? 0) === 0
+}
+
+/** 该附件是否已降级（后端给过任何 warning） */
+export function isDegraded(stats: AttachmentStats): boolean {
+  return (stats?.warnings ?? []).length > 0
+}
+
+/**
+ * 副标题文案（草稿与消息共用同一口径 —— 这是"发送前看到的"与"回放看到的"一致的保证）。
+ *
+ * 口径要点：**不再拿 `text_chars > 0` 当"解析成功"的证据**。本次事故里前端显示的
+ * "已提取 23 字"就是占位串本身的长度，用户与模型都被误导。现在：
+ *
+ * - 什么都没交付 → 直说「未能完整解析」（chip 同时标琥珀，原因在 tooltip）；
+ * - 有交付 → 显示 `2.1MB · 12 页 · 5 图 · 3 表`，让用户一眼看到"这一份里有图/表"；
+ * - 图片附件 → 只显示体积 + 「图片」。
+ */
+export function attachmentMeta(v: AttachmentView): string {
+  if (v.status === 'staging') return '读取中…'
   const parts: string[] = []
-  if (size > 0) parts.push(humanSize(size))
-  if (kind === 'image') parts.push('图片')
-  else if (textChars > 0) parts.push(`已提取 ${textChars.toLocaleString()} 字`)
+  if (v.size > 0) parts.push(humanSize(v.size))
+  if (v.kind === 'image') {
+    parts.push('图片')
+    return parts.join(' · ')
+  }
+  const s = v.stats ?? EMPTY_STATS
+  if (nothingDelivered(s)) {
+    parts.push('未能完整解析')
+    return parts.join(' · ')
+  }
+  if (s.pages) parts.push(`${s.pages} 页`)
+  else if (s.text_chars > 0) parts.push(`已提取 ${s.text_chars.toLocaleString()} 字`)
+  if (s.images > 0) parts.push(`${s.images} 图`)
+  if (s.tables > 0) parts.push(`${s.tables} 表`)
   return parts.join(' · ')
 }

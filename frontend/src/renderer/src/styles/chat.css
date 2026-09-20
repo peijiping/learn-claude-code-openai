@@ -1130,6 +1130,11 @@
   color: var(--color-danger);
 }
 
+/* 降级文案（琥珀）：完整原因在 tooltip 里，这里只显示一句短提示 */
+.att-meta.warn {
+  color: var(--color-warn);
+}
+
 /* 图片缩略图：固定方形 + object-fit，避免长图撑破输入区 */
 .att-thumb {
   flex: none;
@@ -1159,6 +1164,16 @@
 
 .att-chip.failed {
   border-color: var(--color-danger);
+}
+
+/* 已降级（2026-09-20）：解析不完整，但**可以发送** —— 用琥珀而不是红色，
+   因为"降级"不是"失败"（扫描件已按图像发送、内容被截断都算降级）。 */
+.att-chip.degraded {
+  border-color: var(--color-warn);
+}
+
+.att-chip.degraded .att-name {
+  color: var(--color-warn);
 }
 
 .att-chip.failed .att-name,

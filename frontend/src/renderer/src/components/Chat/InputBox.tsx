@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '@components/common/Icon'
 import { hasImageInput } from '@components/Settings/llmShared'
-import { attachmentUrl, showToast, useAgentStore, resolveModelMeta, providerDot, projectDisplayName, type DraftAttachment } from '@store/agentStore'
+import { attachmentUrl, isSendableAttachment, showToast, useAgentStore, resolveModelMeta, providerDot, projectDisplayName, type DraftAttachment } from '@store/agentStore'
 import PlusMenu, { PLUS_MENU_LABELS, type PlusMenuKey } from './PlusMenu'
-import AttachmentBar, { attachmentMeta, type AttachmentView } from './AttachmentBar'
+import AttachmentBar, { type AttachmentView } from './AttachmentBar'
 import DropOverlay from './DropOverlay'
 
 interface InputBoxProps {
@@ -34,7 +34,15 @@ function draftToView(a: DraftAttachment): AttachmentView {
       a.kind === 'image' && a.attId
         ? attachmentUrl(a.projectId, a.attId)
         : null,
-    meta: a.status === 'staging' ? '读取中…' : attachmentMeta(a.size, a.kind, a.textChars),
+    stats: {
+      text_chars: a.textChars,
+      text_truncated: a.textTruncated,
+      pages: a.pages,
+      images: a.images,
+      tables: a.tables,
+      converter: a.converter,
+      warnings: a.warnings
+    },
     error: a.error,
     sourcePath: a.sourcePath,
     storedPath: a.storedPath
@@ -201,7 +209,10 @@ export default function InputBox({
   // 后端在 chat 分支还会再判一次（前端隐藏/禁用只是交互层，后端才是最终守卫）。
   const hasImageDraft = attachments.some((a) => a.kind === 'image')
   const imageUnsupported = hasImageDraft && !hasImageInput(active?.capabilities)
-  const readyCount = attachments.filter((a) => a.status === 'ready').length
+  // 按钮可用性与 ChatPanel 构造 payload 共用同一判据（`isSendableAttachment`）：
+  // degraded 也算"可发送"—— 解析不完整不等于不能用。两处各写一遍正是附件被
+  // 静默丢掉的原因，别再拆开。
+  const readyCount = attachments.filter(isSendableAttachment).length
   const stagingCount = attachments.filter((a) => a.status === 'staging').length
   // 发送可用：有正文，或至少有一个就绪附件；且没有"正在读取"的附件（避免半成品发出去）
   const canSend = (value.trim().length > 0 || readyCount > 0) && stagingCount === 0 && !imageUnsupported

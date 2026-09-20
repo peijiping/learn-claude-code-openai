@@ -227,7 +227,12 @@ export interface Message {
 export interface DraftAttachment {
   /** 列表 key：staging 期用本地 id（同一文件选两次不会撞），就绪后换成 att_id */
   key: string
-  status: 'staging' | 'ready' | 'failed'
+  /** staging = 已提交给后端、等 `attachments_staged` 回填（用 pendingPath 配对）；
+   *  ready = 后端已复制并解析完成，可随消息发送；
+   *  degraded = 同样可发送，但后端给了 `warnings`（扫描件 / 截断 / 渲染失败…）
+   *             → chip 标琥珀并说明原因，避免发出"解析成功"的假信号；
+   *  failed = 该文件被拒（不可发送）。 */
+  status: 'staging' | 'ready' | 'degraded' | 'failed'
   attId: string
   kind: AttachmentKind | ''
   name: string
@@ -242,8 +247,30 @@ export interface DraftAttachment {
   storedPath: string
   textChars: number
   textTruncated: boolean
+  /** 解析统计（见 `AttachmentStats`）：chip 文案与降级提示都用它 */
+  pages: number | null
+  images: number
+  tables: number
+  converter: string
+  /** 非空 = 已降级（status 为 'degraded'） */
+  warnings: string[]
   /** failed 原因（UI 直接展示，不吞掉） */
   error?: string
+}
+
+/** 该草稿附件是否可随消息发送。
+ *
+ *  只有 `ready` 与 `degraded` 可发：`degraded` = "解析不完整但能用"（扫描件已按图像
+ *  发送、内容被截断…），用户看过琥珀提示后仍应能发出；`staging` 还是半成品、
+ *  `failed` 已被后端拒绝，两者都不能进 payload。
+ *
+ *  **这个判据必须只有一处** —— 曾经 InputBox（按钮可用性）与 ChatPanel（真正构造
+ *  payload）各写了一遍，加 `degraded` 之后只改了前者，于是附件被**静默**从 payload
+ *  里丢掉（后端日志表现为 `chat 派发 … attachments=0`）。这正是本项目要消灭的
+ *  "附件没到模型手里、却没有任何提示"。
+ */
+export function isSendableAttachment(a: DraftAttachment): boolean {
+  return a.status === 'ready' || a.status === 'degraded'
 }
 
 let draftSeq = 0
@@ -441,15 +468,26 @@ function draftToRef(a: DraftAttachment): AttachmentRef {
     ext: a.ext,
     size: a.size,
     source_path: a.sourcePath,
-    stored_path: a.storedPath
+    stored_path: a.storedPath,
+    text_chars: a.textChars,
+    text_truncated: a.textTruncated,
+    pages: a.pages,
+    images: a.images,
+    tables: a.tables,
+    converter: a.converter,
+    warnings: a.warnings
   }
 }
 
 /** `attachments_staged` 的一条成功项 → 草稿项 */
 function stagedToDraft(it: StagedAttachment): DraftAttachment {
+  // 后端给了 warnings 就是"能发，但解析不完整" —— 标 degraded 而不是 ready，
+  // 否则 chip 会显示成"解析成功"，正是本次事故里误导性反馈的来源。
+  // 兼容没有该字段的老后端：`?? []`。
+  const warnings = it.warnings ?? []
   return {
     key: it.att_id,
-    status: 'ready',
+    status: warnings.length > 0 ? 'degraded' : 'ready',
     attId: it.att_id,
     kind: it.kind,
     name: it.name,
@@ -460,7 +498,12 @@ function stagedToDraft(it: StagedAttachment): DraftAttachment {
     projectId: it.project_id,
     storedPath: '',
     textChars: it.text_chars,
-    textTruncated: it.text_truncated
+    textTruncated: it.text_truncated,
+    pages: it.pages ?? null,
+    images: it.images ?? 0,
+    tables: it.tables ?? 0,
+    converter: it.converter ?? '',
+    warnings
   }
 }
 
@@ -970,7 +1013,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       projectId: pid,
       storedPath: '',
       textChars: 0,
-      textTruncated: false
+      textTruncated: false,
+      pages: null,
+      images: 0,
+      tables: 0,
+      converter: '',
+      warnings: []
     }))
     set((s) => ({ ...s, draftAttachments: [...s.draftAttachments, ...placeholders] }))
     try {

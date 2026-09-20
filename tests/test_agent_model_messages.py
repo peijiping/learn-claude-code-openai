@@ -18,12 +18,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = ROOT / "agents"
 if str(AGENTS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENTS_DIR))
 
+import agent_full_v2  # noqa: E402
 import attachments as A  # noqa: E402
 from agent_full_v2 import MODEL_MSG_FIELDS, Agent  # noqa: E402
 from paths import WorkspacePaths  # noqa: E402
@@ -183,6 +185,93 @@ class ModelMessagesExpandTests(unittest.TestCase):
         out = agent._model_messages()
         self.assertEqual(out[0]["content"], "普通消息")     # 原样
         self.assertIsInstance(out[1]["content"], list)      # 已展开
+
+
+class VisionCapabilityGateTests(unittest.TestCase):
+    """图片能力门控必须落在发送边界。
+
+    改前唯一的校验是 ws_bridge 的 chat 预检，且只扫**当轮新上传**的图片：
+    会话中途换成 text-only 模型、或历史回放时，图片会被原样发给不支持图片的模型
+    （provider 报错，或内容被静默忽略）。`_model_messages` 是全部路径的必经之处。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.ws = WorkspacePaths("default", self.root, self.root, bash_cwd=self.root)
+        self.sid = "SESS000003"
+        A.clear_expand_cache()
+        self.addCleanup(A.clear_expand_cache)
+        self.src = self.root / "src"
+        self.src.mkdir(parents=True, exist_ok=True)
+
+    def _record(self, path: Path) -> dict:
+        result = A.stage(self.ws, [str(path)])
+        self.assertEqual(result["failed"], [])
+        item = result["items"][0]
+        return A.migrate_to_session(
+            self.ws, [{"att_id": item["att_id"], "kind": item["kind"],
+                       "name": item["name"], "ext": item["ext"]}], self.sid)
+
+    def _image_agent(self, text: str = "看图") -> Agent:
+        from PIL import Image
+        p = self.src / "shot.png"
+        Image.new("RGB", (20, 20), (0, 80, 160)).save(p)
+        msg = {"role": "user", "content": A.build_user_content(text, self._record(p))}
+        return _stub_agent([msg], self.ws, self.sid)
+
+    def test_image_degrades_when_model_has_no_vision(self):
+        agent = self._image_agent()
+        with mock.patch.object(agent_full_v2, "model_supports_image",
+                               lambda mid: False):
+            sent = agent._model_messages()[0]
+        types = [b["type"] for b in sent["content"]]
+        self.assertNotIn("image_url", types)
+        self.assertTrue(any("未发送" in b.get("text", "") for b in sent["content"]))
+
+    def test_image_sent_when_model_has_vision(self):
+        agent = self._image_agent()
+        with mock.patch.object(agent_full_v2, "model_supports_image",
+                               lambda mid: True):
+            sent = agent._model_messages()[0]
+        self.assertIn("image_url", [b["type"] for b in sent["content"]])
+
+    def test_capability_lookup_failure_does_not_kill_turn(self):
+        """能力查询抛异常 → 按"支持"放过。本方法在 retry lambda 内，
+        异常穿透会打死整轮（本轮 tool_result 全缺）。"""
+        agent = self._image_agent()
+
+        def boom(mid):
+            raise RuntimeError("配置读坏了")
+
+        with mock.patch.object(agent_full_v2, "model_supports_image", boom):
+            sent = agent._model_messages()[0]           # 不抛即通过
+        self.assertIn("image_url", [b["type"] for b in sent["content"]])
+
+    def test_documents_unaffected_by_image_capability(self):
+        """文档走文本内联，与图片能力无关 —— text-only 模型完全可用。"""
+        p = self.src / "notes.txt"
+        p.write_text("文档正文", encoding="utf-8")
+        msg = {"role": "user", "content": A.build_user_content("看看", self._record(p))}
+        agent = _stub_agent([msg], self.ws, self.sid)
+        with mock.patch.object(agent_full_v2, "model_supports_image",
+                               lambda mid: False):
+            sent = agent._model_messages()[0]
+        self.assertEqual([b["type"] for b in sent["content"]], ["text", "text"])
+        self.assertIn("文档正文", sent["content"][1]["text"])
+
+    def test_no_attachment_history_never_consults_capability(self):
+        """无附件时不该去查能力（也就不会因它出问题）—— 逐字节等价仍成立。"""
+        history = [{"role": "user", "content": "纯文本"}]
+        agent = _stub_agent(history, None, None)
+
+        def boom(mid):
+            raise AssertionError("无附件会话不应查询模型能力")
+
+        with mock.patch.object(agent_full_v2, "model_supports_image", boom):
+            out = agent._model_messages()
+        self.assertEqual(out, _legacy_model_messages(history))
 
 
 if __name__ == "__main__":
