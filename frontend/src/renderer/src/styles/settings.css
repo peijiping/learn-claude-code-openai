@@ -437,6 +437,28 @@
   justify-content: space-between;
   gap: var(--sp-3);
 }
+/* 工作空间筛选行：位于全选按钮上方（2026-09-20 归档页新增） */
+.trash-filter-row {
+  display: flex;
+  align-items: center;
+}
+.trash-ws-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.trash-ws-filter select {
+  font-size: var(--fs-sm);
+  color: var(--color-text);
+  background: var(--color-bg-secondary, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  outline: none;
+  cursor: pointer;
+}
 .trash-check-all {
   display: flex;
   align-items: center;

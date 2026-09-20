@@ -229,9 +229,10 @@ class Agent:
         self.tools = tools if tools is not None else ToolRegistry(
             skills=self.skills, cron_scheduler=cron_scheduler,
             workdir=self.workspace.workdir,
-            # default 空间 bash 沿用进程 cwd（历史行为，见 ToolRegistry.bash_cwd）；
-            # 自定义空间 bash 与文件工具都落在选定的真实目录。
-            bash_cwd=None if self.workspace.is_default else self.workspace.workdir,
+            # bash 缺省 cwd 也由路径束携带（2026-09-20 规则收口，Agent 不再自行
+            # 推导）：default(CLI/存量回退) = None → 进程 cwd（历史行为）；
+            # 自定义空间 = 选定目录；桌面端新建 default 会话 = scratch 草稿目录。
+            bash_cwd=self.workspace.bash_cwd,
             memory=MemoryStore(self.workspace.memory_dir),
             task_manager=TaskManager(self.workspace.tasks_dir),
             bus=MessageBus(self.workspace.inbox_dir),

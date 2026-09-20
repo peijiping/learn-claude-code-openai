@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '@components/common/Icon'
 import { useAgentStore, resolveModelMeta, providerDot, projectDisplayName } from '@store/agentStore'
@@ -83,6 +83,14 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
     activeSession === null ? (pendingProjectId ?? activeProject) : activeProject
   const currentProjectPath = projects.find((p) => p.id === currentProjectId)?.path ?? null
 
+  const hasSession = activeSession !== null
+
+  // 会话建成即锁空间（2026-09-20）：工作空间选择只属于「新会话」。已有会话
+  // 一律不可改归属 —— 下拉隐藏，chip 退化为只读展示；后端同样拒绝改归属，
+  // 前端隐藏只是交互层的第一道门。
+  useEffect(() => {
+    if (hasSession) setWsOpen(false)
+  }, [hasSession])
   const autoGrow = (el: HTMLTextAreaElement): void => {
     el.style.height = 'auto'
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`
@@ -97,7 +105,6 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
 
   // 上下文圆圈：仅当有选中会话时才显示；数据来自后端 context_stats 事件
   const stats = currentContextStats
-  const hasSession = activeSession !== null
   const usedPct = stats ? stats.used_percent : 0
   const indicatorColor = usedPct >= 90 ? '#e5484d' : usedPct >= 70 ? '#f5a623' : '#2ea043'
   // 本会话 token 消耗累计（usage_stats 事件 / 切会话 usage_totals 恢复）：tooltip 后三行数据源
@@ -133,6 +140,66 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
           <button className="tool-btn access">
             完全访问 <Icon name="chevronDown" size={12} />
           </button>
+          <span className="ws-select">
+            <span
+              className={`ctx-chip ${!hasSession && wsOpen ? 'open' : ''} ${hasSession ? '' : 'clickable'}`}
+              title={
+                currentProjectPath
+                  ? `工作空间目录：${currentProjectPath}`
+                  : hasSession
+                    ? '默认工作空间 · 临时草稿目录 ~/.aigent/projects/default/scratch'
+                    : '默认工作空间（新会话将使用临时草稿目录 scratch）'
+              }
+              onClick={hasSession ? undefined : () => setWsOpen((v) => !v)}
+            >
+              <Icon name="folder" size={13} />
+              <span className="ctx-chip-label">{projectDisplayName(projects, currentProjectId)}</span>
+              {!hasSession && <Icon name="chevronDown" size={11} />}
+            </span>
+            {/* 工作空间下拉：**仅新会话（无激活会话）可开** —— 已有会话的归属在
+                创建时锁定，不可迁移（会话建成即锁空间）。上部分 = 已打开过的空间
+                （点即切到该空间并新建会话），末尾固定项 = 选择文件夹。 */}
+            {wsOpen && !hasSession && (
+              <>
+                <div className="ws-picker-mask" onClick={() => setWsOpen(false)} />
+                <div className="ws-picker">
+                  <div className="ws-picker-group">已打开的工作空间</div>
+                  {projects.map((p) => (
+                    <div
+                      key={p.id}
+                      role="menuitem"
+                      className={`ws-picker-item ${p.id === currentProjectId ? 'active' : ''} ${p.exists ? '' : 'missing'}`}
+                      title={p.path ?? '默认工作空间'}
+                      onClick={() => {
+                        setWsOpen(false)
+                        if (p.exists) void openProject(p.id)
+                        void newSession(p.id)
+                      }}
+                    >
+                      <Icon name="folder" size={13} />
+                      <span className="ws-picker-name">{p.name}</span>
+                      {p.id === currentProjectId && <Icon name="check" size={13} />}
+                    </div>
+                  ))}
+                  {projects.length === 0 && (
+                    <div className="ws-picker-empty">暂无工作空间</div>
+                  )}
+                  <div className="ws-picker-sep" />
+                  <div
+                    role="menuitem"
+                    className="ws-picker-item pick"
+                    onClick={() => {
+                      setWsOpen(false)
+                      void addProjectFromPicker()
+                    }}
+                  >
+                    <Icon name="plus" size={13} />
+                    <span className="ws-picker-name">选择文件夹…</span>
+                  </div>
+                </div>
+              </>
+            )}
+          </span>
         </div>
 
         <div className="toolbar-right">
@@ -270,65 +337,6 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
             </button>
           )}
         </div>
-      </div>
-
-      <div className="composer-context">
-        <span className="ctx-chip">
-          <Icon name="terminal" size={13} /> 本地 <Icon name="chevronDown" size={11} />
-        </span>
-        <span className="ws-select">
-          <span
-            className={`ctx-chip clickable ${wsOpen ? 'open' : ''}`}
-            title={currentProjectPath ? `工作空间目录：${currentProjectPath}` : '默认工作空间（无真实目录）'}
-            onClick={() => setWsOpen((v) => !v)}
-          >
-            <Icon name="folder" size={13} />
-            <span className="ctx-chip-label">{projectDisplayName(projects, currentProjectId)}</span>
-            <Icon name="chevronDown" size={11} />
-          </span>
-          {/* 工作空间下拉：上部分 = 已打开过的空间（点即切到该空间并新建任务），
-              末尾固定项 = 选择文件夹（登记新工作空间并打开）。 */}
-          {wsOpen && (
-            <>
-              <div className="ws-picker-mask" onClick={() => setWsOpen(false)} />
-              <div className="ws-picker">
-                <div className="ws-picker-group">已打开的工作空间</div>
-                {projects.map((p) => (
-                  <div
-                    key={p.id}
-                    role="menuitem"
-                    className={`ws-picker-item ${p.id === currentProjectId ? 'active' : ''} ${p.exists ? '' : 'missing'}`}
-                    title={p.path ?? '默认工作空间'}
-                    onClick={() => {
-                      setWsOpen(false)
-                      if (p.exists) void openProject(p.id)
-                      void newSession(p.id)
-                    }}
-                  >
-                    <Icon name="folder" size={13} />
-                    <span className="ws-picker-name">{p.name}</span>
-                    {p.id === currentProjectId && <Icon name="check" size={13} />}
-                  </div>
-                ))}
-                {projects.length === 0 && (
-                  <div className="ws-picker-empty">暂无工作空间</div>
-                )}
-                <div className="ws-picker-sep" />
-                <div
-                  role="menuitem"
-                  className="ws-picker-item pick"
-                  onClick={() => {
-                    setWsOpen(false)
-                    void addProjectFromPicker()
-                  }}
-                >
-                  <Icon name="plus" size={13} />
-                  <span className="ws-picker-name">选择文件夹…</span>
-                </div>
-              </div>
-            </>
-          )}
-        </span>
       </div>
     </div>
   )

@@ -165,7 +165,11 @@ class WorkspaceRegistry:
         info = self.require(project_id)
         if info.id == DEFAULT_PROJECT_ID:
             return workspace_paths(DEFAULT_PROJECT_ID)
-        return WorkspacePaths(info.id, self.projects_root / info.id, Path(info.path or ""))
+        # bash 与文件工具同根（2026-09-20 规则收口进路径束，原在 Agent 推导）
+        root = Path(info.path or "")
+        return WorkspacePaths(
+            info.id, self.projects_root / info.id, root, bash_cwd=root
+        )
 
     def active_id(self) -> str:
         """当前活动工作空间（前端 chip 默认值 / 无 project_id 的 chat 归属）。"""

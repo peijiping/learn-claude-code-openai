@@ -43,6 +43,8 @@ const paths: Record<string, ReactNode> = {
   filter: <path d="M4 6h16M7 12h10M10 18h4" />,
   chevronDown: <path d="m6 9 6 6 6-6" />,
   chevronRight: <path d="m9 6 6 6-6 6" />,
+  /* 折叠全部：双箭头向上收拢（内容折叠收拢的通用语义） */
+  diagonalCollapse: <path d="m7 11 5-5 5 5M7 17l5-5 5 5" />,
   folder: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />,
   send: <path d="M22 2 11 13M22 2l-7 20-4-9-9-4z" />,
   paperclip: <path d="M21 12A9 9 0 0 1 7.3 12L14 5.3a5.7 5.7 0 0 1 8 8L13 22.5" />,
@@ -86,6 +88,13 @@ const paths: Record<string, ReactNode> = {
     </>
   ),
   check: <path d="m4 12.5 5 5L20 6.5" />,
+  archive: (
+    <>
+      <rect x="3" y="3" width="18" height="5" rx="1" />
+      <path d="M5 8v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" />
+      <path d="M10 12h4" />
+    </>
+  ),
   trash: (
     <>
       <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />

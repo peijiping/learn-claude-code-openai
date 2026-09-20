@@ -68,6 +68,14 @@ WORKSPACE_SUBDIRS = (
     ".chathistory", ".tasks", ".memory", ".inbox", ".team", ".workflow", ".scheduler",
 )
 
+# default 工作空间的**草稿目录**（2026-09-20）：
+# default 不再绑定仓库内 `ROOT_DIR/WorkSpace/task1`（该常量仅作存量会话回退），
+# 桌面端**新建**的 default 会话统一落到这个固定草稿区 —— 文件工具与 run_bash
+# 同根（此前"文件工具走 WORKDIR、bash 走进程 cwd"的两个落点就此收口）。
+# 放元数据目录下（而非某个真实目录）：default 没有"自己的目录"，scratch 就是
+# 它的落点 —— Finder 可直达（`在 Finder 中打开`）、整体可随时清空。
+DEFAULT_SCRATCH_DIR = DATA_ROOT / "scratch"
+
 
 @dataclass(frozen=True)
 class WorkspacePaths:
@@ -85,6 +93,12 @@ class WorkspacePaths:
     id: str
     data_root: Path
     workdir: Path
+    # run_bash 的缺省工作目录（None = 进程 cwd，历史行为）。规则收口在路径束上
+    # （2026-09-20，原在 Agent.__init__ 里推导）：
+    # - default（CLI / 存量会话回退）= None → 进程 cwd；
+    # - 自定义空间 = 选定的真实目录（bash 与文件工具同根）；
+    # - 桌面端新建 default 会话 = DEFAULT_SCRATCH_DIR（草稿区，同根）。
+    bash_cwd: Path | None = None
 
     @property
     def is_default(self) -> bool:
@@ -139,16 +153,30 @@ def workspace_paths(project_id: str, root: Path | str | None = None) -> Workspac
     """构造某工作空间的路径束。
 
     - `project_id == "default"`：`root` 忽略（可省），沙箱根取遗留沙盒 `WORKDIR`
-      —— 存量行为一字不变。
+      —— 存量行为一字不变（CLI 与存量会话的回退口径；桌面端新建 default 会话
+      走 `default_scratch_paths()`，见 2026-09-20）。
     - 自定义空间：**必须**给 `root`（其真实目录，由 `project_registry` 从
       projects.json 解出）。缺失即抛 `ValueError`：宁可响亮失败，也不要静默
-      把沙箱根落到元数据目录上（那是数据灾难级错误）。
+      把沙箱根落到元数据目录上（那是数据灾难级错误）。bash 与文件工具同根。
     """
     if project_id == DEFAULT_PROJECT_ID:
         return WorkspacePaths(DEFAULT_PROJECT_ID, DATA_ROOT, WORKDIR)
     if root is None:
         raise ValueError(f"自定义工作空间 {project_id!r} 缺少真实目录 root")
-    return WorkspacePaths(project_id, PROJECTS_ROOT / project_id, Path(root))
+    return WorkspacePaths(
+        project_id, PROJECTS_ROOT / project_id, Path(root), bash_cwd=Path(root)
+    )
+
+
+def default_scratch_paths() -> WorkspacePaths:
+    """桌面端**新建** default 会话的路径束：沙箱根 = 草稿目录（bash 同根）。
+
+    只在"桌面端新建会话"路径使用（ws_bridge）；CLI 与 `Agent(workspace=None)`
+    仍走 `workspace_paths("default")` 的遗留语义，零迁移。
+    """
+    return WorkspacePaths(
+        DEFAULT_PROJECT_ID, DATA_ROOT, DEFAULT_SCRATCH_DIR, bash_cwd=DEFAULT_SCRATCH_DIR
+    )
 
 # 待办目录（与每个 session 绑定的轻量级任务看板）
 TODO_DIR = DATA_ROOT / ".todo"
@@ -221,6 +249,8 @@ def ensure_dirs() -> None:
     # 自定义工作空间完全同构的同一份口径），再补各自的落点。
     for name in WORKSPACE_SUBDIRS:
         (DATA_ROOT / name).mkdir(parents=True, exist_ok=True)
+    # default 草稿目录：桌面端新建 default 会话的沙箱根（2026-09-20）
+    DEFAULT_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)

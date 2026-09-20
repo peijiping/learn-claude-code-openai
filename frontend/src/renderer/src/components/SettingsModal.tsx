@@ -6,11 +6,12 @@ import TrashSettings from './Settings/TrashSettings'
 const NAV: { key: SettingsTab; label: string }[] = [
   { key: 'general', label: '通用' },
   { key: 'model', label: '模型' },
-  { key: 'trash', label: '回收站' },
+  { key: 'trash', label: '归档' },
   { key: 'about', label: '关于' }
 ]
 
-/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/回收站/关于）。 */
+/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/归档/关于）。
+ *  「归档」（key 仍为 trash）= 原回收站：软删除会话在此还原 / 彻底删除。 */
 export default function SettingsModal(): JSX.Element {
   const tab = useAgentStore((s) => s.settingsTab)
   const openSettings = useAgentStore((s) => s.openSettings)

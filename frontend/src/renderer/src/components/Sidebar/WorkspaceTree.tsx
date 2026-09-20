@@ -17,7 +17,7 @@ import { useAgentStore } from '@store/agentStore'
 export default function WorkspaceTree(): JSX.Element {
   const projects = useAgentStore((s) => s.projects)
   const sessions = useAgentStore((s) => s.sessions)
-  const newSession = useAgentStore((s) => s.newSession)
+  const collapseAllProjects = useAgentStore((s) => s.collapseAllProjects)
   const renameProject = useAgentStore((s) => s.renameProject)
   const removeProject = useAgentStore((s) => s.removeProject)
   const revealProject = useAgentStore((s) => s.revealProject)
@@ -42,11 +42,8 @@ export default function WorkspaceTree(): JSX.Element {
       <div className="tasktree-header">
         <span className="tasktree-title">任务列表</span>
         <div className="tasktree-actions">
-          <button title="新建任务" className="mini-btn" onClick={() => void newSession()}>
-            <Icon name="asterisk" size={14} />
-          </button>
-          <button title="筛选/排序" className="mini-btn">
-            <Icon name="filter" size={14} />
+          <button title="折叠全部工作空间" className="mini-btn" onClick={collapseAllProjects}>
+            <Icon name="diagonalCollapse" size={14} />
           </button>
         </div>
       </div>

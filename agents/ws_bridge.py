@@ -13,6 +13,8 @@ import os
 import re
 import threading
 import time
+from dataclasses import replace as dc_replace
+from pathlib import Path
 from typing import Optional
 
 import websockets
@@ -25,7 +27,12 @@ from llm_config import (
     save_config,
 )
 from logger import get_logger, install_excepthooks
-from paths import CHAT_HISTORY_DIR, DEFAULT_PROJECT_ID, WorkspacePaths
+from paths import (
+    CHAT_HISTORY_DIR,
+    DEFAULT_PROJECT_ID,
+    WorkspacePaths,
+    default_scratch_paths,
+)
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
 from session_runtime import SessionRuntimeRegistry
@@ -386,6 +393,23 @@ def _workspace_of(project_id: str) -> WorkspacePaths:
     return get_registry().paths(project_id)
 
 
+def _workspace_for_session(project_id: str, meta: dict | None) -> WorkspacePaths:
+    """会话级沙箱根解析（work_root 快照，2026-09-20）。
+
+    meta 记了 work_root（桌面端新建的会话）→ 以**快照**为准：「会话建成即锁
+    空间」的姊妹规则，空间目录后续变化 / default 沙箱策略调整都不影响已有
+    会话的相对路径落点，bash 与文件工具也随快照同根。
+    没记（存量会话 / CLI）→ 按空间现值：default = 遗留 WORKDIR + 进程 cwd
+    bash（零迁移），自定义空间 = 选定目录。
+    """
+    ws = _workspace_of(project_id)
+    wr = (meta or {}).get("work_root")
+    if not wr:
+        return ws
+    p = Path(wr)
+    return dc_replace(ws, workdir=p, bash_cwd=p)
+
+
 def _list_infos() -> list:
     """全部工作空间元数据（注册表异常时退化为空列表，只影响列表展示）。"""
     try:
@@ -688,8 +712,22 @@ async def handle(ws):
                     sid = new_sid
                     # 会话归属一建立就入缓存：后续 _load_meta / 管理操作都靠它定位空间
                     _SID_PROJECT[sid] = pid
-                    log.info("新会话创建: session_%s (project=%s, model=%s)",
-                             sid, pid, payload.get("model_id") or "global-default")
+                    # 沙箱根在**新建时**解析一次并固化进元数据（work_root 快照，
+                    # 「会话建成即锁空间」的姊妹规则）：
+                    # - default → ~/.aigent/projects/default/scratch（草稿区，
+                    #   文件工具与 bash 同根；不再用仓库内 WorkSpace/task1）；
+                    # - 自定义空间 → 选定的真实目录。
+                    ws_session = (
+                        default_scratch_paths()
+                        if pid == DEFAULT_PROJECT_ID
+                        else _workspace_of(pid)
+                    )
+                    await asyncio.to_thread(
+                        sm.set_session_work_root, new_sid, str(ws_session.workdir)
+                    )
+                    log.info("新会话创建: session_%s (project=%s, work_root=%s, model=%s)",
+                             sid, pid, ws_session.workdir,
+                             payload.get("model_id") or "global-default")
                     # 带上 project_id：前端据此把"活动空间"对齐到新会话的归属
                     #（点空间 B 的「+」新建时，活动空间可能还停在 A）
                     await safe_send(ws, _envelope("session", {
@@ -710,12 +748,29 @@ async def handle(ws):
                             sm.set_auto_title, new_sid, default_title, "trunc"
                         )
                     await reply_sessions()
-                # 已有会话：按该会话**所属空间**取管理器（不能用 default 的实例，
-                # 否则会读写错空间的同名文件 / 报"会话不存在"）
-                pid = _SID_PROJECT.get(sid) or want_pid or _project_of_session(sid)
-                _SID_PROJECT[sid] = pid
+                else:
+                    # 会话建成即锁空间（2026-09-20）：已有会话的归属只认缓存与
+                    # 磁盘探测；请求里的 project_id 仅对「新建」生效 —— 带了不一致
+                    # 的值直接忽略并记日志。后端是锁的最终守卫，不能只靠前端把
+                    # 下拉框藏起来。
+                    pid = _SID_PROJECT.get(sid) or _project_of_session(sid)
+                    if want_pid and want_pid != pid:
+                        log.warning(
+                            "chat 忽略 project_id=%s：会话 %s 已归属 %s"
+                            "（会话建成即锁空间，归属不可变）", want_pid, sid, pid)
+                    _SID_PROJECT[sid] = pid
+                    ws_session = None  # 下方按 meta 的 work_root 快照解析
+                # 按该会话**所属空间**取管理器（不能用 default 的实例，否则会
+                # 读写错空间的同名文件 / 报"会话不存在"）
                 sm = _ensure_session_manager(pid)
-                rt = registry.get_or_create(sid, workspace=_workspace_of(pid))
+                # 沙箱根按会话快照解析：运行时首次构造时固化在 SessionRuntime 上
+                # （get_or_create 对已存在的运行时忽略新值），热路径不重复读 meta。
+                rt = registry.get(sid)
+                if rt is None:
+                    if ws_session is None:
+                        meta = await asyncio.to_thread(sm.load_meta, sid)
+                        ws_session = _workspace_for_session(pid, meta)
+                    rt = registry.get_or_create(sid, workspace=ws_session)
                 if rt.busy:
                     # 同会话并发 turn 拒绝：避免两线程同时写同一会话 jsonl
                     await safe_send(ws, _envelope("error", {

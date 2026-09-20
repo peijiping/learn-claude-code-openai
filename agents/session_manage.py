@@ -1161,6 +1161,9 @@ class SessionManager:
             "status": "active",
             "trashed_at": None,
             "project": self.project_id,
+            # 会话级沙箱根快照（2026-09-20）：新建时解析一次写死，之后不可变。
+            # None = 存量会话/CLI 创建（读侧回退遗留 WORKDIR，零迁移）。
+            "work_root": None,
             "model_id": None,
             "overrides": None,
             "unread": False,
@@ -1362,6 +1365,18 @@ class SessionManager:
         用户进入（切换/点击查看）该会话 → unread=False。跨窗口/重启持久化。
         """
         return self._update_entry(session_id, lambda e: e.update({"unread": bool(unread)}))
+
+    def set_session_work_root(self, session_id: str, work_root: str | Path) -> dict:
+        """固化会话的沙箱根（work_root 会话级快照，2026-09-20）。
+
+        「会话建成即锁空间」的姊妹规则：沙箱根在**新建时**解析一次并写进元
+        数据，之后**不可变** —— 空间目录后续变化、default 沙箱策略调整都不
+        影响已有会话的相对路径落点。仅在会话创建路径调用一次；
+        存量 meta 无该字段（None）→ 读侧回退遗留 WORKDIR。
+        """
+        return self._update_entry(
+            session_id, lambda e: e.update({"work_root": str(work_root)})
+        )
 
     def set_session_model(self, session_id: str, model_id: str | None = None,
                           overrides: dict | None = None) -> dict:

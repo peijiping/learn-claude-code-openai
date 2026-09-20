@@ -283,6 +283,8 @@ interface AgentState {
   newSession: (projectId?: string) => Promise<void>
   /** 展开/折叠某工作空间的会话列表 */
   toggleProject: (projectId: string) => void
+  /** 折叠全部工作空间的会话列表（任务列表头部「收起」） */
+  collapseAllProjects: () => void
   /** 展开/收起某工作空间"超过 15 条折叠"的完整会话列表 */
   toggleSessionPreview: (projectId: string) => void
   /** 切换活动工作空间（后端持久化 + 广播 projects） */
@@ -1150,6 +1152,18 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     })
   },
 
+  /** 一键收起：把所有工作空间节点都置为折叠态并持久化 */
+  collapseAllProjects: () => {
+    const ids = get().projects.map((p) => p.id)
+    if (ids.length === 0) return
+    set((s) => {
+      const next = { ...s.expandedProjects }
+      for (const id of ids) next[id] = false
+      saveFlagMap(EXPANDED_KEY, next)
+      return { expandedProjects: next }
+    })
+  },
+
   toggleSessionPreview: (projectId) => {
     set((s) => {
       const next = { ...s.previewExpanded, [projectId]: !s.previewExpanded[projectId] }
@@ -1286,13 +1300,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     try {
       await window.agent.trashSession(sid)
     } catch {
-      showToast('删除失败', 'error', 4000)
+      showToast('归档失败', 'error', 4000)
       return
     }
     if (get().activeSession === sid) await get().newSession()
     await get().refreshSessions()
     await get().refreshTrash()
-    showToast('已移入回收站', 'info')
+    showToast('已归档，可在设置 → 归档中还原', 'info')
   },
   restoreSession: async (sid) => {
     try {

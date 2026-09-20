@@ -4,7 +4,12 @@ import { sessionDisplayName, useAgentStore } from '@store/agentStore'
 
 const pad = (n: number): string => String(n).padStart(2, '0')
 
-/** iso 时间 → "MM-DD HH:mm"（回收站列表展示用） */
+/** 「全部工作空间」筛选项的哨兵值（真实空间 id 以 'ws' 开头，不会撞） */
+const FILTER_ALL = '__all__'
+/** 筛选默认值：默认工作空间（2026-09-20 需求：归档页默认只看 default） */
+const FILTER_DEFAULT = 'default'
+
+/** iso 时间 → "MM-DD HH:mm"（归档列表展示用） */
 function fmtTime(iso?: string | null): string {
   if (!iso) return ''
   const d = new Date(iso)
@@ -12,13 +17,19 @@ function fmtTime(iso?: string | null): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** 回收站：已软删除会话列表，支持单选/多选彻底删除与还原。 */
+/** 归档页（原回收站，key 仍为 trash）：已归档会话列表，支持按工作空间筛选、
+ *  单选/多选彻底删除与还原。归档≠删除：还原即回到原工作空间的会话列表；
+ *  彻底删除不可恢复。这里**只有会话级操作，不能删除工作空间** —— 工作空间的
+ *  删除在侧边栏空间菜单（只删元数据目录），两者互不可达。 */
 export default function TrashSettings(): JSX.Element {
   const trashSessions = useAgentStore((s) => s.trashSessions)
   const refreshTrash = useAgentStore((s) => s.refreshTrash)
   const restoreSession = useAgentStore((s) => s.restoreSession)
   const deleteSessions = useAgentStore((s) => s.deleteSessions)
+  const projects = useAgentStore((s) => s.projects)
 
+  // 工作空间筛选：默认「默认工作空间」；切筛选清空勾选，避免跨空间批量误删
+  const [wsFilter, setWsFilter] = useState<string>(FILTER_DEFAULT)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   // 永久删除二次确认：首次点击记录目标并进入确认态，3 秒内再点执行，超时恢复
   const [confirming, setConfirming] = useState<string[] | null>(null)
@@ -29,12 +40,26 @@ export default function TrashSettings(): JSX.Element {
     return () => window.clearTimeout(confirmTimer.current)
   }, [refreshTrash])
 
-  const selectedArr = useMemo(
-    () => trashSessions.filter((s) => selected.has(s.id)).map((s) => s.id),
-    [trashSessions, selected]
+  // 当前筛选下可见的归档会话（后端每条都带 project；存量缺省视为 default）
+  const visible = useMemo(
+    () =>
+      trashSessions.filter(
+        (s) => wsFilter === FILTER_ALL || (s.project ?? 'default') === wsFilter
+      ),
+    [trashSessions, wsFilter]
   )
-  const allChecked = trashSessions.length > 0 && selectedArr.length === trashSessions.length
 
+  const selectedArr = useMemo(
+    () => visible.filter((s) => selected.has(s.id)).map((s) => s.id),
+    [visible, selected]
+  )
+  const allChecked = visible.length > 0 && selectedArr.length === visible.length
+
+  const changeFilter = (v: string): void => {
+    setConfirming(null)
+    setSelected(new Set())
+    setWsFilter(v)
+  }
   const toggle = (id: string): void => {
     setConfirming(null)
     setSelected((prev) => {
@@ -46,7 +71,7 @@ export default function TrashSettings(): JSX.Element {
   }
   const toggleAll = (): void => {
     setConfirming(null)
-    setSelected(allChecked ? new Set() : new Set(trashSessions.map((s) => s.id)))
+    setSelected(allChecked ? new Set() : new Set(visible.map((s) => s.id)))
   }
 
   const armConfirm = (ids: string[]): void => {
@@ -68,6 +93,20 @@ export default function TrashSettings(): JSX.Element {
 
   return (
     <div className="trash-page">
+      {/* 工作空间筛选：位于全选按钮上方（2026-09-20 需求），默认「默认工作空间」 */}
+      <div className="trash-filter-row">
+        <label className="trash-ws-filter">
+          <span>工作空间</span>
+          <select value={wsFilter} onChange={(e) => changeFilter(e.target.value)}>
+            <option value={FILTER_ALL}>全部工作空间</option>
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.id === 'default' ? '默认工作空间' : p.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
       <div className="trash-header">
         <label className="trash-check-all">
           <input type="checkbox" checked={allChecked} onChange={toggleAll} />
@@ -82,11 +121,11 @@ export default function TrashSettings(): JSX.Element {
         </button>
       </div>
 
-      {trashSessions.length === 0 ? (
-        <div className="trash-empty">回收站为空</div>
+      {visible.length === 0 ? (
+        <div className="trash-empty">暂无归档会话</div>
       ) : (
         <div className="trash-list">
-          {trashSessions.map((s) => (
+          {visible.map((s) => (
             <div key={s.id} className="trash-row">
               <input
                 type="checkbox"
@@ -97,7 +136,7 @@ export default function TrashSettings(): JSX.Element {
                 {sessionDisplayName(s)}
               </span>
               <span className="trash-meta">
-                删除于 {fmtTime(s.trashed_at ?? s.created_at) || '—'}
+                归档于 {fmtTime(s.trashed_at ?? s.created_at) || '—'}
               </span>
               <button
                 className="btn trash-restore-btn"
