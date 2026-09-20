@@ -1,5 +1,20 @@
+/** chat 携带的附件线索（结构与 renderer 侧 ChatAttachmentInput 一致；
+ *  这里内联声明而非 import —— preload 属 node 侧 tsconfig，不跨到 renderer 取类型） */
+export interface ChatAttachmentInput {
+  att_id: string
+  kind: '' | 'image' | 'document' | 'text'
+  name: string
+  mime?: string
+  ext: string
+  size?: number
+  project_id?: string
+}
+
 export interface AgentApi {
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null) => Promise<void>
+  /** 发起一次对话。
+   *  attachments=本轮附件（`attachment_stage` 登记得到的 att_id 列表）；
+   *  **只有附件没有正文时 text 传空串**（后端据此只插附件块，不插空文本块）。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
@@ -14,6 +29,21 @@ export interface AgentApi {
   listTrash: () => Promise<unknown[]>
   /** 弹原生目录选择框（工作空间新增）；取消返回 null */
   pickFolder: () => Promise<string | null>
+  /** ── 会话附件（「添加文件或图片」）───────────────────────────────────
+   *  三类入口最终都收敛成"本地绝对路径"，由后端同机读取 —— **不过 WS 传字节**
+   *  （websockets 默认帧上限 1 MiB，base64 内联图片必然超限）。 */
+  /** 弹原生文件选择框（多选 + 类型白名单）；取消返回空数组 */
+  pickFiles: () => Promise<string[]>
+  /** 拖拽取路径：Electron 32+ 已移除 `File.path`，只此一法。
+   *  ⚠️ 必须在渲染层（preload）内调用 —— DOM `File` 无法通过 IPC 传给主进程。 */
+  getPathForFile: (file: File) => string
+  /** 读系统剪贴板里的图片并落成临时文件，返回该文件路径；无图片/失败返回 null。
+   *  截图没有磁盘路径，这是「粘贴截图」的唯一通路（Electron 44 主进程 Clipboard
+   *  不再提供 readImage，故由渲染层把粘贴事件的字节交过来）。 */
+  saveClipboardImage: (payload: { bytes: ArrayBuffer | Uint8Array; mime?: string }) => Promise<string | null>
+  /** 把一批本地路径登记为草稿附件（后端复制 + 解析），结果经
+   *  `attachments_staged` 信封异步回来 */
+  stageAttachments: (payload: { paths: string[]; projectId?: string | null }) => Promise<unknown>
   /** 在系统文件管理器中定位目录（工作空间右键菜单） */
   openInFinder: (path: string) => Promise<{ ok: boolean; error?: string }>
   /** 工作空间列表（主要数据源是 `projects` 广播信封，这里是主动拉取的兜底） */

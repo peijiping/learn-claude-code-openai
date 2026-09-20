@@ -251,8 +251,21 @@ class SystemInjectionContractTests(unittest.TestCase):
         # 片段内已出现类型标注（Optional[...] 等）；exec 命名空间为裸 dict，
         # 注解在 def 处即求值会 NameError，故预置整个 typing 命名空间。
         # （2026-09-16 修复，与 test_subagent_sidecar 同因）
+        #
+        # 切片内的其它模块级引用也必须显式预置（ws_bridge 演进时在此补名）：
+        # SessionManager / WorkspacePaths 是附件辅助函数的参数注解；
+        # harvest_attachments 由 `_history_to_ui` 实际调用。
+        # （2026-09-20 修复：附件功能上线，与 test_subagent_sidecar 再次同因）
         import typing
+        from attachments import harvest_attachments
+        from paths import WorkspacePaths
+        from session_manage import SessionManager
         ns: dict = {n: getattr(typing, n) for n in dir(typing) if not n.startswith("_")}
+        ns.update({
+            "SessionManager": SessionManager,
+            "WorkspacePaths": WorkspacePaths,
+            "harvest_attachments": harvest_attachments,
+        })
         exec(compile(seg, "ws_bridge_hist", "exec"), ns)  # noqa: S102 - 测试内自用
         history_to_ui = ns["_history_to_ui"]
 

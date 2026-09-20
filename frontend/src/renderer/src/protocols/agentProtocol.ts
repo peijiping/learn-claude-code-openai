@@ -182,12 +182,65 @@ export type UiEvent =
   | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
+  /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
+  | { kind: 'attachments_staged'; payload: AttachmentsStagedPayload }
   | { kind: 'llm_config'; payload: LlmConfigResult }
   | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
   /** 任务面板快照（整份替换，不做增量）。
    *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
    *  会话切换/回放时后端只发未完成组，故已结束的组切回来不会显示。 */
   | { kind: 'task_board'; payload: { session_id: string; board: TaskBoardSnapshot | null } }
+
+/** 附件种类（与后端 attachments.KIND_* 对齐） */
+export type AttachmentKind = 'image' | 'document' | 'text'
+
+/** 已发送附件（回放 / 实时消息上都用这个形状渲染）。
+ *  字段名保持后端的 snake_case（与 created_at / model_info 等既有约定一致），
+ *  避免每个渲染点都做一次 camel 转换。 */
+export interface AttachmentRef {
+  id: string
+  kind: AttachmentKind | ''
+  name: string
+  mime: string
+  ext: string
+  size: number
+  /** 用户的**原始**文件路径（「在 Finder 中显示」用它） */
+  source_path: string
+  /** 会话内副本的绝对路径（图片缩略图 / 打开文件用它） */
+  stored_path: string
+  /** 后端归位时发现文件已不在（手工删过）→ UI 显示「文件已缺失」占位 */
+  missing?: boolean
+}
+
+/** 后端登记完成（`attachments_staged`）的一条附件 */
+export interface StagedAttachment {
+  att_id: string
+  kind: AttachmentKind | ''
+  name: string
+  mime: string
+  ext: string
+  size: number
+  source_path: string
+  project_id: string
+  /** 已抽取的文本字符数（文档类才有；UI 显示"已提取 N 字"） */
+  text_chars: number
+  text_truncated: boolean
+  /** PDF 总页数（其它类型为 null） */
+  pages: number | null
+}
+
+export interface StagedFailure {
+  path: string
+  reason: string
+}
+
+/** `attachments_staged` 信封载荷：items=成功项，failed=逐条失败原因。
+ *  单条失败不影响整批（用户选了 5 个文件不能因为 1 个不支持就全失败）。 */
+export interface AttachmentsStagedPayload {
+  items: StagedAttachment[]
+  failed: StagedFailure[]
+  project_id: string
+}
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
 export interface HistoryToolCall {
@@ -229,6 +282,9 @@ export interface HistoryMessage {
   /** turn 收尾时的会话级累计快照（轮末 assistant 行 usage_session 节点；
    *  回放恢复 footer 第二段「本会话累计」，与实时 usage_stats.session 同构） */
   usage_session?: UsageStats
+  /** user 消息携带的附件（后端 `_history_to_ui` 从 content 的引用块 harvest 而来；
+   *  无附件的老消息不带这个字段） */
+  attachments?: AttachmentRef[]
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -453,6 +509,8 @@ export type ControlKind =
   | 'skills'
   | 'stop'
   | 'status_query'
+  /** 附件登记（「添加文件或图片」）：前端把本地绝对路径交给后端复制+解析 */
+  | 'attachment_stage'
   | 'llm_config_get'
   | 'llm_config_save'
   | 'llm_models_fetch'
@@ -464,6 +522,7 @@ export interface WsOutbound {
 
 /** 前端 → 后端 chat 命令载荷：session_id 指明目标会话（新建任务无激活会话时省略，由后端生成短 id） */
 export interface ChatPayload {
+  /** 正文。**带附件时可以为空串**（纯附件消息）—— 后端据此判定是否插入文本块。 */
   text: string
   session_id?: string
   fresh?: boolean
@@ -477,6 +536,22 @@ export interface ChatPayload {
   }
   /** 当前会话绑定/选择的模型 id（新建任务随首条消息持久化） */
   model_id?: string | null
+  /** 本轮的附件（`attachment_stage` 登记后拿到的 att_id 列表）。
+   *  **只传 id 与少量线索，不传文件内容**：后端按 att_id 从草稿区把文件归位到
+   *  会话目录，并在发送边界展开成模型线格式。 */
+  attachments?: ChatAttachmentInput[]
+}
+
+/** chat 携带的附件线索（真实元数据以磁盘上的 meta.json 为准，前端字段只是线索） */
+export interface ChatAttachmentInput {
+  att_id: string
+  kind: AttachmentKind | ''
+  name: string
+  mime?: string
+  ext: string
+  size?: number
+  /** 登记时所属工作空间（跨空间场景下后端据此找回草稿） */
+  project_id?: string
 }
 
 export function parseWsLine(raw: string): UiEvent {

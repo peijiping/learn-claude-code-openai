@@ -1,13 +1,44 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '@components/common/Icon'
-import { useAgentStore, resolveModelMeta, providerDot, projectDisplayName, showToast } from '@store/agentStore'
+import { hasImageInput } from '@components/Settings/llmShared'
+import { attachmentUrl, showToast, useAgentStore, resolveModelMeta, providerDot, projectDisplayName, type DraftAttachment } from '@store/agentStore'
 import PlusMenu, { PLUS_MENU_LABELS, type PlusMenuKey } from './PlusMenu'
+import AttachmentBar, { attachmentMeta, type AttachmentView } from './AttachmentBar'
+import DropOverlay from './DropOverlay'
 
 interface InputBoxProps {
   value: string
   onChange: (v: string) => void
   onSend: () => void
+  /** 附件草稿（三条入口都写入 store，这里只读展示） */
+  attachments: DraftAttachment[]
+  /** 把一批本地绝对路径登记为附件（原生对话框 / 拖拽 / 粘贴共用） */
+  onStagePaths: (paths: string[]) => void
+  /** 移除一个草稿附件 */
+  onRemoveAttachment: (key: string) => void
+  /** 在系统文件管理器中定位附件原文件 */
+  onOpenAttachment: (sourcePath: string) => void
+}
+
+/** 草稿附件 → 统一视图（图片走自定义协议显示缩略图） */
+function draftToView(a: DraftAttachment): AttachmentView {
+  return {
+    key: a.key,
+    status: a.status,
+    kind: a.kind,
+    name: a.name,
+    size: a.size,
+    // 就绪后才有 att_id（staging 期无法寻址，显示 clock 占位）
+    url:
+      a.kind === 'image' && a.attId
+        ? attachmentUrl(a.projectId, a.attId)
+        : null,
+    meta: a.status === 'staging' ? '读取中…' : attachmentMeta(a.size, a.kind, a.textChars),
+    error: a.error,
+    sourcePath: a.sourcePath,
+    storedPath: a.storedPath
+  }
 }
 
 // 思考强度档位展示映射（与后端 PROVIDERS thinking_strengths 对齐）
@@ -17,8 +48,16 @@ const THINKING_LABELS: Record<string, string> = {
   very_high: '极高'
 }
 
-/** 中央核心输入区：textarea + 工具栏 + 上下文条 */
-export default function InputBox({ value, onChange, onSend }: InputBoxProps): JSX.Element {
+/** 中央核心输入区：textarea + 附件条 + 工具栏 + 上下文条 */
+export default function InputBox({
+  value,
+  onChange,
+  onSend,
+  attachments,
+  onStagePaths,
+  onRemoveAttachment,
+  onOpenAttachment
+}: InputBoxProps): JSX.Element {
   const isSending = useAgentStore((s) => s.isSending)
   const stop = useAgentStore((s) => s.stop)
   const llmConfig = useAgentStore((s) => s.llmConfig)
@@ -102,15 +141,82 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
   const onKeyDown = (e: React.KeyboardEvent): void => {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
-      if (!isSending) onSend()
+      if (!isSending && canSend) onSend()
     }
   }
 
+  // ── 附件：拖拽 + 粘贴（两个入口都收敛到 onStagePaths）────────────────
+  // 拖拽计数：dragenter/dragleave 会在进入子元素时成对冒泡，只用布尔量会让遮罩
+  // 疯狂闪断 —— 用深度计数，归零才收起。
+  const dragDepth = useRef(0)
+  const [dragging, setDragging] = useState(false)
+
+  /** 文件列表 → 本地路径列表（三条入口共用的收敛函数）。
+   *  能拿到路径的直接用；拿不到的（截图等剪贴板图片没有磁盘路径）把**字节**交给
+   *  主进程落成临时文件，再按路径走同一条后端流程。 */
+  const pathsFromFiles = async (files: File[]): Promise<string[]> => {
+    const paths: string[] = []
+    const pathlessImages: File[] = []
+    for (const f of files) {
+      const p = window.agent.getPathForFile(f)
+      if (p) paths.push(p)
+      else if (f.type.startsWith('image/')) pathlessImages.push(f)
+    }
+    for (const f of pathlessImages) {
+      try {
+        const bytes = await f.arrayBuffer()
+        const tmp = await window.agent.saveClipboardImage({ bytes, mime: f.type })
+        if (tmp) paths.push(tmp)
+      } catch {
+        /* 单张失败不影响其它文件 */
+      }
+    }
+    return paths
+  }
+
+  const onDrop = async (e: React.DragEvent): Promise<void> => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragDepth.current = 0
+    setDragging(false)
+    const files = Array.from(e.dataTransfer?.files ?? [])
+    if (files.length === 0) return
+    const paths = await pathsFromFiles(files)
+    if (paths.length) onStagePaths(paths)
+    else showToast('未能读取拖入的内容', 'error', 3000)
+  }
+
+  const onPaste = async (e: React.ClipboardEvent): Promise<void> => {
+    const files = Array.from(e.clipboardData?.files ?? [])
+    // 只在确实粘贴了文件/图片时才拦截默认行为，否则会把纯文本粘贴吃掉
+    if (files.length === 0) return
+    e.preventDefault()
+    const paths = await pathsFromFiles(files)
+    if (paths.length) onStagePaths(paths)
+    else showToast('未能读取剪贴板内容', 'error', 3000)
+  }
+
+  // ── 附件能力预检（前后端双重守卫里的第一道）────────────────────────
+  // 图片走 vision，需要模型声明 image 输入能力；文本/文档类不受限（走文本内联）。
+  // 后端在 chat 分支还会再判一次（前端隐藏/禁用只是交互层，后端才是最终守卫）。
+  const hasImageDraft = attachments.some((a) => a.kind === 'image')
+  const imageUnsupported = hasImageDraft && !hasImageInput(active?.capabilities)
+  const readyCount = attachments.filter((a) => a.status === 'ready').length
+  const stagingCount = attachments.filter((a) => a.status === 'staging').length
+  // 发送可用：有正文，或至少有一个就绪附件；且没有"正在读取"的附件（避免半成品发出去）
+  const canSend = (value.trim().length > 0 || readyCount > 0) && stagingCount === 0 && !imageUnsupported
+
   // 加号「添加内容」菜单条目点击：先收起菜单，再分发。
-  // 本期只交付**弹框 + 菜单项外壳**，各条目功能待逐项确认后实现（见 docs/frontend/02 §3.3）；
-  // 这里是后续接线各条功能的唯一落点 —— 按 key 分支即可，不必再改菜单组件。
-  const handlePlusPick = (key: PlusMenuKey): void => {
+  // 逐项接线的唯一落点 —— 按 key 分支即可（见 docs/frontend/02 §3.3）：
+  //   attachFile → 已接线（原生文件对话框，2026-09-20）
+  //   其余四项仍为占位 toast（各自是独立特性，见 docs/frontend/04 后续增量）
+  const handlePlusPick = async (key: PlusMenuKey): Promise<void> => {
     setPlusOpen(false)
+    if (key === 'attachFile') {
+      const paths = await window.agent.pickFiles().catch(() => [] as string[])
+      if (paths.length) onStagePaths(paths)
+      return
+    }
     showToast(`「${PLUS_MENU_LABELS[key]}」功能待开发`, 'info', 2000)
   }
 
@@ -129,7 +235,33 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
       : '—'
 
   return (
-    <div className="composer">
+    <div
+      className={`composer ${dragging ? 'dragover' : ''}`}
+      onDragEnter={(e) => {
+        // 必须 preventDefault：否则 Electron 会把 drop 当"导航到 file://"，
+        // 整个窗口被替换成一个文件内容页面（白屏事故）。
+        e.preventDefault()
+        dragDepth.current += 1
+        setDragging(true)
+      }}
+      onDragOver={(e) => {
+        e.preventDefault()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault()
+        dragDepth.current = Math.max(0, dragDepth.current - 1)
+        if (dragDepth.current === 0) setDragging(false)
+      }}
+      onDrop={(e) => void onDrop(e)}
+    >
+      {/* 附件条：草稿项（可删 + 点开原文件位置） */}
+      <AttachmentBar
+        items={attachments.map(draftToView)}
+        onRemove={onRemoveAttachment}
+        onOpen={(v) => v.sourcePath && onOpenAttachment(v.sourcePath)}
+      />
+
       <textarea
         ref={taRef}
         className="composer-input"
@@ -141,7 +273,16 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
           autoGrow(e.target)
         }}
         onKeyDown={onKeyDown}
+        onPaste={(e) => void onPaste(e)}
       />
+
+      {/* 附件相关的内联提示（比 toast 更贴近操作点） */}
+      {imageUnsupported && (
+        <div className="composer-hint error">
+          当前模型「{active?.display_name ?? active?.id ?? '未配置'}」不支持图片输入，
+          请切换到带「图片」能力的模型，或移除图片附件
+        </div>
+      )}
 
       <div className="composer-toolbar">
         <div className="toolbar-left">
@@ -353,12 +494,26 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
               <span>停止</span>
             </button>
           ) : (
-            <button className="send-btn" onClick={onSend} disabled={!value.trim()} title="发送">
+            <button
+              className="send-btn"
+              onClick={onSend}
+              disabled={!canSend}
+              title={
+                stagingCount > 0
+                  ? '附件正在读取…'
+                  : imageUnsupported
+                    ? '当前模型不支持图片输入'
+                    : '发送'
+              }
+            >
               <Icon name="send" size={15} />
             </button>
           )}
         </div>
       </div>
+
+      {/* 拖拽遮罩：pointer-events:none，不能挡住 drop 的落点 */}
+      <DropOverlay visible={dragging} />
     </div>
   )
 }

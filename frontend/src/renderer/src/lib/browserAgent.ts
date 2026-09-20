@@ -149,7 +149,8 @@ class BrowserAgentBridge implements AgentApi {
     sessionId?: string | null,
     overrides?: { thinking_strength?: string; max_context?: string } | null,
     modelId?: string | null,
-    projectId?: string | null
+    projectId?: string | null,
+    attachments?: Parameters<AgentApi['send']>[5]
   ): Promise<void> {
     this.sendRaw(JSON.stringify({
       kind: 'chat',
@@ -158,7 +159,8 @@ class BrowserAgentBridge implements AgentApi {
         ...(typeof sessionId === 'string' && sessionId ? { session_id: sessionId } : {}),
         ...(typeof projectId === 'string' && projectId ? { project_id: projectId } : {}),
         ...(overrides ? { overrides } : {}),
-        ...(modelId ? { model_id: modelId } : {})
+        ...(modelId ? { model_id: modelId } : {}),
+        ...(attachments?.length ? { attachments } : {})
       }
     }))
     return Promise.resolve()
@@ -228,6 +230,38 @@ class BrowserAgentBridge implements AgentApi {
   openInFinder(_path: string): Promise<{ ok: boolean; error?: string }> {
     console.warn('[browserAgent] openInFinder 仅在 Electron 宿主中可用')
     return Promise.resolve({ ok: false, error: 'not supported in browser' })
+  }
+
+  // ── 会话附件（浏览器无宿主能力，降级为可用的最小实现）──────────────
+  /** 浏览器拿不到本地文件路径（File 对象没有 path，也不允许 JS 读取磁盘）：
+   *  与 pickFolder 同款降级 —— 让用户直接输入绝对路径，后端仍在同机读盘。 */
+  pickFiles(): Promise<string[]> {
+    const raw = window.prompt('输入要添加的文件绝对路径（多个用换行或逗号分隔，多个文件不可点击添加）：')
+    if (!raw || !raw.trim()) return Promise.resolve([])
+    return Promise.resolve(
+      raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
+    )
+  }
+  /** 浏览器里 DOM File 没有磁盘路径 → 恒为空串（调用方会改走 readClipboardImage 兜底） */
+  getPathForFile(_file: File): string {
+    return ''
+  }
+  /** 浏览器无法把字节写成临时文件（无 fs 权限）→ 明确降级 */
+  saveClipboardImage(_payload: { bytes: ArrayBuffer | Uint8Array; mime?: string }): Promise<string | null> {
+    console.warn('[browserAgent] 粘贴图片仅在 Electron 宿主中可用')
+    return Promise.resolve(null)
+  }
+  async stageAttachments(payload: { paths: string[]; projectId?: string | null }): Promise<unknown> {
+    if (!Array.isArray(payload?.paths) || payload.paths.length === 0) return null
+    return this.request(
+      'attachment_stage',
+      'attachments_staged',
+      {
+        paths: payload.paths,
+        ...(payload.projectId ? { project_id: payload.projectId } : {})
+      },
+      20000
+    )
   }
   async listProjects(): Promise<unknown> {
     return this.request('projects_list', 'projects')

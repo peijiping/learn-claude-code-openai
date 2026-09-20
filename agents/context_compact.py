@@ -156,7 +156,16 @@ class ContextCompact:
     # ── 3a. 消息工具：content 归一化、类型判断、序列化 ──────────────
 
     def content_to_str(self, content) -> str:
-        """把 LangChain 消息的 content 归一化为 str。"""
+        """把 LangChain 消息的 content 归一化为 str。
+
+        **附件（2026-09-20）**：多模态 content 里可能带附件块。这里只做
+        "降级成可读文本"，**绝不把块本身序列化进结果** —— 图片 block 里
+        可能内联着 base64（几十万字符），一旦被 `str(block)` 拼进来：
+        ① L4 摘要会把它整段塞进摘要 prompt（摘要预算 4000 token，直接报废）；
+        ② token 估算会按字符数暴涨 → 上下文圆圈提前触顶 → 反复触发压缩。
+        无附件块的消息（str / 普通 dict / 未知 type）走原分支，行为与改造前
+        逐字相同（见 tests/test_context_compact_attachment_str.py）。
+        """
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -165,11 +174,28 @@ class ContextCompact:
                 if isinstance(block, str):
                     parts.append(block)
                 elif isinstance(block, dict):
-                    parts.append(str(block.get("text", block)))
+                    btype = block.get("type")
+                    if btype == "attachment":
+                        parts.append(self._attachment_label(block))
+                    elif btype in ("image_url", "image", "input_image"):
+                        # 已是线格式（历史数据 / 手工构造）：同样不能外泄
+                        parts.append("[图片]")
+                    else:
+                        parts.append(str(block.get("text", block)))
                 else:
                     parts.append(getattr(block, "text", str(block)))
             return "\n".join(parts)
         return str(content)
+
+    @staticmethod
+    def _attachment_label(block: dict) -> str:
+        """附件块 → `[图片: 名字]` / `[附件: 名字]`（供摘要与 token 估算）。"""
+        att = block.get("attachment")
+        att = att if isinstance(att, dict) else {}
+        kind = att.get("kind")
+        label = "图片" if kind == "image" else "附件"
+        name = str(att.get("name") or "").strip()
+        return f"[{label}: {name}]" if name else f"[{label}]"
 
     def message_to_text(self, msg) -> str:
         """从 LangChain 消息 / dict / 其他对象里取出文本 content（统一为 str）。"""

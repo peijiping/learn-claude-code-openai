@@ -1,4 +1,15 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+
+/** chat 携带的附件线索（与 renderer 侧 ChatAttachmentInput 同构） */
+interface ChatAttachmentInput {
+  att_id: string
+  kind: '' | 'image' | 'document' | 'text'
+  name: string
+  mime?: string
+  ext: string
+  size?: number
+  project_id?: string
+}
 
 /**
  * preload - 渲染进程与主进程之间唯一的"合规通道"。
@@ -8,9 +19,10 @@ const agent = {
   /** 发起一次对话；sessionId=目标会话 id（新建任务时传 null/缺省，后端惰性生成短 id 建会话）。
    * overrides=当前会话请求级覆盖（思考强度/更大上下文），随本轮请求带上。
    * modelId=当前会话绑定模型，新建任务随首条消息持久化。
-   * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}) }),
+   * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。
+   * attachments=本轮附件（附件登记得到的 att_id 列表）；**只有附件无正文时 text 传空串**。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}) }),
 
   /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
    * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
@@ -45,6 +57,33 @@ const agent = {
    * 目录选择与"在 Finder 中打开"是宿主能力，必须走主进程原生对话框/文件管理器。 */
   /** 弹原生目录选择框；用户取消返回 null */
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('agent:pickFolder'),
+
+  /** ── 会话附件（「添加文件或图片」，2026-09-20）─────────────────────
+   * 三类入口（原生对话框 / 拖拽 / 粘贴）最终都收敛成"本地绝对路径列表"，交给
+   * 后端（同机进程）自己读盘：**不经 IPC/WS 传文件字节**。
+   * 设计见 docs/frontend/12-附件与文件输入.md。 */
+  /** 弹原生文件选择框（多选 + 类型白名单）；取消返回空数组 */
+  pickFiles: (): Promise<string[]> => ipcRenderer.invoke('agent:pickFiles'),
+  /** 拖拽取路径。Electron 32+ 移除了 `File.path`，`webUtils.getPathForFile` 是唯一
+   * 途径，且**必须在渲染层调用**（DOM `File` 不能通过 IPC 序列化给主进程）。
+   * 截图/剪贴板图片没有磁盘路径 → 返回空串，调用方改走 readClipboardImage。 */
+  getPathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file) || ''
+    } catch {
+      return ''
+    }
+  },
+  /** 把剪贴板图片的字节落成临时文件，返回该文件路径；失败返回 null。
+   *  截图没有磁盘路径，且 Electron 44 的主进程 Clipboard 已改为 W3C 风格异步 API
+   *  （不再提供 readImage）→ 由渲染层从粘贴事件取到 File 后把**字节**交过来。
+   *  ArrayBuffer/Uint8Array 都是 IPC 可结构化克隆的类型，不受"File 不能过 IPC"限制。 */
+  saveClipboardImage: (payload: { bytes: ArrayBuffer | Uint8Array; mime?: string }): Promise<string | null> =>
+    ipcRenderer.invoke('agent:saveClipboardImage', payload),
+  /** 把一批本地路径登记为草稿附件（后端复制 + 解析）；结果经 `attachments_staged`
+   *  信封异步回来，渲染层按 source_path 与本地占位项配对 */
+  stageAttachments: (payload: { paths: string[]; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:stageAttachments', payload),
   /** 在系统文件管理器中定位该目录 */
   openInFinder: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('agent:openInFinder', { path }),

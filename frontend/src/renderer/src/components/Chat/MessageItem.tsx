@@ -3,8 +3,9 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
 import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
-import type { Message, SubAgentMsg, ToolCallMsg } from '@store/agentStore'
+import { attachmentUrl, useAgentStore, type Message, type SubAgentMsg, type ToolCallMsg } from '@store/agentStore'
 import MessageMenu from './MessageMenu'
+import AttachmentBar from './AttachmentBar'
 
 /** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
 function fmtTokens(n: number): string {
@@ -155,6 +156,13 @@ function fmtMsgTime(iso?: string): string {
 
 export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  // 附件缩略图按 (空间, att_id) 寻址：空间从当前会话的元数据取（会话建成即锁空间，
+  // 归属不会变）。新会话尚未进 sessions 列表时回落到当前活动空间。
+  const projectId = useAgentStore((s) => {
+    const sid = s.activeSession
+    if (!sid) return s.pendingProjectId ?? s.activeProject
+    return s.sessions.find((x) => x.id === sid)?.project ?? s.activeProject
+  })
 
   /** 右键打开消息菜单 */
   const openMenu = (e: ReactMouseEvent): void => {
@@ -172,6 +180,26 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
       <>
         <div className="msg-row user" onContextMenu={openMenu}>
           <div className="msg-bubble user">
+            {/* 附件（2026-09-20）：实时消息来自草稿项、回放消息来自后端 harvest，
+                形状一致 → 图片显示缩略图、其它显示文件 chip；点击在 Finder 中定位原文件 */}
+            {msg.attachments && msg.attachments.length > 0 && (
+              <AttachmentBar
+                compact
+                items={msg.attachments.map((a) => ({
+                  key: a.id,
+                  status: a.missing ? ('failed' as const) : ('ready' as const),
+                  kind: a.kind,
+                  name: a.name,
+                  size: a.size,
+                  url: a.kind === 'image' ? attachmentUrl(projectId, a.id) : null,
+                  meta: a.kind === 'image' ? '图片' : '',
+                  missing: a.missing,
+                  sourcePath: a.source_path,
+                  storedPath: a.stored_path
+                }))}
+                onOpen={(v) => v.sourcePath && void window.agent.openInFinder(v.sourcePath)}
+              />
+            )}
             {msg.content}
             <div className="msg-meta">
               {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}

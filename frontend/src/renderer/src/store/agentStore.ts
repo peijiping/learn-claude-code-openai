@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, ModelSwitch, ProjectMeta, ProjectsPayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryMessage, ModelSwitch, ProjectMeta, ProjectsPayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -216,7 +216,37 @@ export interface Message {
   /** 模型切换提示（空闲期 model_switch 事件 / 本轮 usage_stats.model.switch /
    *  回放 model_info.switch），挂到「切换发生时」那条 assistant 消息上 */
   switch?: ModelSwitch
+  /** user 消息携带的附件（实时由草稿项转成，回放由后端 harvest 而来）。
+   *  图片经 `attachmentUrl()` 转成自定义协议 URL 显示缩略图。 */
+  attachments?: AttachmentRef[]
 }
+
+/** 输入区的附件草稿项。
+ *  staging = 已提交给后端、等 `attachments_staged` 回填（用 pendingPath 配对）；
+ *  ready = 后端已复制并解析完成，可随消息发送；failed = 该文件被拒（不可发送）。 */
+export interface DraftAttachment {
+  /** 列表 key：staging 期用本地 id（同一文件选两次不会撞），就绪后换成 att_id */
+  key: string
+  status: 'staging' | 'ready' | 'failed'
+  attId: string
+  kind: AttachmentKind | ''
+  name: string
+  mime: string
+  ext: string
+  size: number
+  /** 用户原始路径（staging 期是本地路径，就绪后仍是原始路径） */
+  sourcePath: string
+  /** 后端登记时所属工作空间（发送时带上，跨空间也能找回草稿） */
+  projectId: string
+  /** 会话内副本路径（就绪后才有；图片缩略图 / 打开文件用它） */
+  storedPath: string
+  textChars: number
+  textTruncated: boolean
+  /** failed 原因（UI 直接展示，不吞掉） */
+  error?: string
+}
+
+let draftSeq = 0
 
 interface AgentState {
   connection: ConnState
@@ -269,10 +299,23 @@ interface AgentState {
   lastOverridesByModel: SessionOverridesMap
   toast: string | null
   toastType: 'info' | 'error'
+  /** 输入区附件草稿（三条入口都汇入这里；随消息发送后清空）。
+   *  「仅附件无正文」是合法发送，判定依据就是这里有没有 ready 项。 */
+  draftAttachments: DraftAttachment[]
 
   setConnection: (c: ConnState) => void
   setPython: (p: PythonState) => void
-  send: (text: string) => void
+  /** 发送一轮消息。`attachments` = 本轮随消息发出的**已就绪**草稿附件
+   *  （调用方从 draftAttachments 里筛 status==='ready'）；缺省 = 无附件，
+   *  存量调用不受影响。正文与附件不能同时为空（调用方先判）。 */
+  send: (text: string, attachments?: DraftAttachment[]) => void
+  /** 把本地绝对路径登记为草稿附件（原生对话框 / 拖拽 / 粘贴三条入口的唯一汇合点）。
+   *  结果经 `attachments_staged` 信封回填（本函数只放占位项，不等回包）。 */
+  stageAttachments: (paths: string[], projectId?: string | null) => Promise<void>
+  /** 移除一个草稿附件（staging 期也可移除；后端草稿由 GC 兜底回收） */
+  removeDraftAttachment: (key: string) => void
+  /** 清空附件草稿（发送后 / 切会话 / 新建任务时调用） */
+  clearDraftAttachments: () => void
   stop: () => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
@@ -343,6 +386,84 @@ function patchSessionUnread(sessions: SessionMeta[], sessionId: string, unread: 
   return sessions.map((x) => (x.id === sessionId ? { ...x, unread } : x))
 }
 
+/**
+ * 会话内附件副本 → 渲染层可用的 URL。
+ *
+ * 渲染层拿不到 `file://`（contextIsolation + CSP），所以走主进程注册的
+ * `aigent-att://` 自定义协议。**按 (空间, att_id) 寻址而不是按路径**：附件在发送
+ * 时会从 `.attachments/_draft/` 迁到 `.attachments/<会话>/`，路径会变；按 id 检索
+ * 由主进程负责，缩略图因此跨越迁移稳定。主进程只放行 `.attachments` 目录内的
+ * 真实文件（形状白名单 + 符号链接解引后复检），非法一律 404。
+ */
+export function attachmentUrl(projectId: string, attId: string): string | null {
+  if (!projectId || !attId) return null
+  return `aigent-att://local/?pid=${encodeURIComponent(projectId)}&id=${encodeURIComponent(attId)}`
+}
+
+/** 附件大小显示（与后端 attachments.human_size 口径一致） */
+export function humanSize(size: number): string {
+  if (!size || size < 0) return ''
+  let v = size
+  for (const unit of ['B', 'KB', 'MB', 'GB']) {
+    if (v < 1024 || unit === 'GB') {
+      return unit === 'B' ? `${Math.round(v)}B` : `${v.toFixed(1)}${unit}`
+    }
+    v /= 1024
+  }
+  return `${v.toFixed(1)}GB`
+}
+
+/** 路径 → 文件名（错误提示用；不判平台，两种分隔符都切） */
+function fileBaseName(p: string): string {
+  return p.split(/[/\\]/).pop() || p
+}
+
+/** 草稿附件 → 发送用的最小线索（后端以磁盘上的 meta.json 为准，这些只是线索） */
+function draftToInput(a: DraftAttachment): ChatAttachmentInput {
+  return {
+    att_id: a.attId,
+    kind: a.kind,
+    name: a.name,
+    mime: a.mime,
+    ext: a.ext,
+    size: a.size,
+    ...(a.projectId ? { project_id: a.projectId } : {})
+  }
+}
+
+/** 草稿附件 → 消息附件（乐观渲染用：发送时立刻把缩略图显示出来，不等回放） */
+function draftToRef(a: DraftAttachment): AttachmentRef {
+  return {
+    id: a.attId,
+    kind: a.kind,
+    name: a.name,
+    mime: a.mime,
+    ext: a.ext,
+    size: a.size,
+    source_path: a.sourcePath,
+    stored_path: a.storedPath
+  }
+}
+
+/** `attachments_staged` 的一条成功项 → 草稿项 */
+function stagedToDraft(it: StagedAttachment): DraftAttachment {
+  return {
+    key: it.att_id,
+    status: 'ready',
+    attId: it.att_id,
+    kind: it.kind,
+    name: it.name,
+    mime: it.mime,
+    ext: it.ext,
+    size: it.size,
+    sourcePath: it.source_path,
+    projectId: it.project_id,
+    storedPath: '',
+    textChars: it.text_chars,
+    textTruncated: it.text_truncated
+  }
+}
+
 function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
   return hist.map((m, i) => {
     // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
@@ -408,7 +529,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
           }
         : null,
       // 回放：空闲期/本轮切换提示，落到「切换发生时」的 assistant 消息上
-      switch: m.model_info?.switch ?? undefined
+      switch: m.model_info?.switch ?? undefined,
+      // 回放：user 消息携带的附件（后端从 content 引用块 harvest；无附件不带该字段）
+      ...(m.attachments && m.attachments.length ? { attachments: m.attachments } : {})
     }
   })
 }
@@ -429,8 +552,7 @@ function subAgentNameFromArgs(args: string): string {
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 
 /** 显示 Toast 并自动消失（info 默认 3s，error 默认 4s）。函数声明提升，运行时 useAgentStore 已初始化 */
-export function showToast(msg: string, type: 'info' | 'error' = 'info', ms = 3000): void {
-  if (toastTimer) clearTimeout(toastTimer)
+export function showToast(msg: string, type: 'info' | 'error' = 'info', ms = 3000): void {  if (toastTimer) clearTimeout(toastTimer)
   useAgentStore.setState({ toast: msg, toastType: type })
   toastTimer = setTimeout(() => {
     toastTimer = null
@@ -769,6 +891,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   lastOverridesByModel: {},
   toast: null,
   toastType: 'info',
+  draftAttachments: [],
 
   setConnection: (c) =>
     set((s) => {
@@ -783,35 +906,94 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }),
   setPython: (p) => set({ python: p }),
 
-  send: (text) => {
+  send: (text, attachments) => {
     const t = text.trim()
-    if (!t || get().isSending) return
+    const atts = attachments ?? []
+    // 「仅附件无正文」是合法发送：正文与附件**同时**为空才拦下。
+    // （历史 bug：后端 main/index.ts 曾用 !payload.text 直接丢弃这类消息。）
+    if ((!t && atts.length === 0) || get().isSending) return
     const sid = get().activeSession
     const modelId = get().sessionModelId
     // 新建任务的归属工作空间（点「+」/ chip 选定；未指定 = 后端当前活动空间）
     const projectId = sid === null ? (get().pendingProjectId ?? get().activeProject) : null
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
+    // 乐观渲染：把本轮附件直接挂到 user 消息上（缩略图立即出现）。
+    // 缩略图按 (空间, att_id) 寻址 → 草稿区→会话目录的迁移不会让它失效；
+    // 后端回放时的 AttachmentRef 形状一致，切走再切回不跳变。
+    const refs = atts.map(draftToRef)
     const userMsg: Message = {
-      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso()
+      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso(),
+      ...(refs.length ? { attachments: refs } : {})
     }
     const assMsg: Message = {
       id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso()
     }
     set((s) => {
+      const cleared = { draftAttachments: [] as DraftAttachment[] }
       // 新建任务（尚无会话 id）：首条消息进临时草稿缓冲，等后端 session 信封迁移
       if (sid === null) {
         const pendingFresh = [userMsg, assMsg]
-        return { ...s, pendingFresh, messages: pendingFresh, isSending: true }
+        return { ...s, ...cleared, pendingFresh, messages: pendingFresh, isSending: true }
       }
       const buf = s.messagesBySession[sid] ?? []
       const messagesBySession = { ...s.messagesBySession, [sid]: [...buf, userMsg, assMsg] }
       const messages = messagesBySession[sid]
-      return { ...s, messagesBySession, messages, isSending: true }
+      return { ...s, ...cleared, messagesBySession, messages, isSending: true }
     })
     // 发送实际交给后端：fresh 时后端生成短 id 并回发 session 信封，前端据此迁移草稿；
-    // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）
-    window.agent.send(t, sid, ov, modelId, projectId).catch(() => set({ isSending: false }))
+    // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）；
+    // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位
+    window.agent
+      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput))
+      .catch(() => set({ isSending: false }))
   },
+
+  stageAttachments: async (paths, projectId) => {
+    const list = (paths ?? []).map((p) => String(p || '').trim()).filter(Boolean)
+    if (list.length === 0) return
+    // 目标工作空间口径与发送一致：已有会话跟随其归属，新建任务用「+」/chip 选定值
+    const sid = get().activeSession
+    const pid =
+      projectId ??
+      (sid === null ? (get().pendingProjectId ?? get().activeProject) : get().activeProject)
+    // 占位项：让用户立刻看到"正在读取…"，后端回包按 source_path 配对替换
+    const placeholders: DraftAttachment[] = list.map((p) => ({
+      key: `d${++draftSeq}`,
+      status: 'staging',
+      attId: '',
+      kind: '',
+      name: fileBaseName(p),
+      mime: '',
+      ext: '',
+      size: 0,
+      sourcePath: p,
+      projectId: pid,
+      storedPath: '',
+      textChars: 0,
+      textTruncated: false
+    }))
+    set((s) => ({ ...s, draftAttachments: [...s.draftAttachments, ...placeholders] }))
+    try {
+      await window.agent.stageAttachments({ paths: list, projectId: pid })
+    } catch {
+      // IPC 层就失败了：把这批占位项就地标失败（否则永远转圈）
+      const failedPaths = new Set(list)
+      set((s) => ({
+        ...s,
+        draftAttachments: s.draftAttachments.map((a) =>
+          a.status === 'staging' && failedPaths.has(a.sourcePath)
+            ? { ...a, status: 'failed' as const, error: '添加失败：后端无响应' }
+            : a
+        )
+      }))
+      showToast('添加附件失败：后端无响应', 'error', 4000)
+    }
+  },
+
+  removeDraftAttachment: (key) =>
+    set((s) => ({ ...s, draftAttachments: s.draftAttachments.filter((a) => a.key !== key) })),
+
+  clearDraftAttachments: () => set({ draftAttachments: [] }),
 
   stop: () => {
     const sid = get().activeSession
@@ -996,6 +1178,33 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (failed > 0) showToast(`${failed} 个会话删除失败`, 'error', 4000)
         break
       }
+      case 'attachments_staged': {
+        // 附件登记结果（应答 attachment_stage）：按 source_path 与本地占位项配对。
+        // 单条失败不影响整批 —— 成功项照常可用，失败项就地标红并给出原因，
+        // 用户不必猜"为什么这个文件没了"。
+        const p = ev.payload as AttachmentsStagedPayload | null
+        if (!p || !Array.isArray(p.items)) break
+        const okByPath = new Map(p.items.map((it) => [it.source_path, it]))
+        const failByPath = new Map((p.failed ?? []).map((f) => [f.path, f.reason]))
+        set((s) => ({
+          ...s,
+          draftAttachments: s.draftAttachments.map((a) => {
+            if (a.status !== 'staging') return a
+            const it = okByPath.get(a.sourcePath)
+            if (it) return stagedToDraft(it)
+            const reason = failByPath.get(a.sourcePath)
+            if (reason !== undefined) {
+              return { ...a, status: 'failed' as const, error: reason }
+            }
+            // 不属于本批（另一批仍在途中）→ 保持 staging 等自己的回包
+            return a
+          })
+        }))
+        for (const f of p.failed ?? []) {
+          showToast(`无法添加「${fileBaseName(f.path)}」：${f.reason}`, 'error', 5000)
+        }
+        break
+      }
       case 'session_history': {
         const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
@@ -1137,7 +1346,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       currentContextStats: null,
       sessionModelId: s.lastSessionModelId,
       overridesByModel: s.lastOverridesByModel,
-      pendingProjectId: projectId ?? s.pendingProjectId ?? s.activeProject
+      pendingProjectId: projectId ?? s.pendingProjectId ?? s.activeProject,
+      // 新建任务 = 换一条消息，附件草稿必须跟着清（否则会把上一个任务的附件带过去）。
+      // 未发送的草稿文件由后端 GC 兜底回收。
+      draftAttachments: []
     }))
     return Promise.resolve()
   },
@@ -1255,7 +1467,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       pendingFresh: null,
       messages: s.messagesBySession[sid] ?? [],
       isSending: s.runningSessions.includes(sid),
-      ...(pid ? { activeProject: pid, pendingProjectId: pid } : {})
+      ...(pid ? { activeProject: pid, pendingProjectId: pid } : {}),
+      // 切会话清空附件草稿：草稿属于"正在编辑的这条消息"，不能跨会话漂移
+      //（文本草稿沿用既有行为不清，差异见 docs/frontend/12 的取舍一节）
+      draftAttachments: []
     }))
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
     // 切到别的空间时同步后端"活动空间"：否则下一次 projects 广播会把 chip 拉回去

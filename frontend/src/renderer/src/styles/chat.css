@@ -1028,3 +1028,180 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   会话附件（「添加文件或图片」，2026-09-20）
+   见 docs/frontend/12-附件与文件输入.md。
+   输入区的附件条（可删）与消息气泡内的附件条共用 .att-* 类，只有尺寸差异。
+   ══════════════════════════════════════════════════════════════════ */
+
+/* 拖拽遮罩的定位上下文（各下拉菜单仍锚在各自的 .xxx-select 上，不受影响） */
+.composer {
+  position: relative;
+}
+
+/* 拖拽进入态：整块输入区高亮，明确"松手即添加到这里" */
+.composer.dragover {
+  border-color: var(--color-accent);
+  background: var(--color-bg-hover);
+}
+
+/* 拖拽遮罩：**必须 pointer-events:none** —— 否则 drop 会落在遮罩上而不是
+   composer，投放直接失效（拖拽交互最经典的坑）。 */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radii-btn);
+  background: color-mix(in srgb, var(--color-bg-main) 82%, transparent);
+  border: 1px dashed var(--color-accent);
+}
+
+.drop-overlay-inner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--color-accent);
+  font-size: var(--fs-sm);
+}
+
+/* ── 附件条 ────────────────────────────────────────────────────── */
+.att-bar {
+  display: flex;
+  flex-wrap: wrap;
+  /* 同行 chip 顶部对齐 + 各自有 min-height：文案行数变化不会让整行高度抖动 */
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+/* 消息气泡内：紧凑、右对齐（user 气泡本身靠右） */
+.att-bar.compact {
+  padding: 0 0 var(--sp-2);
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.att-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 260px;
+  min-height: 34px;
+  padding: 4px 6px 4px 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  font-size: var(--fs-xs);
+}
+
+/* chip 在输入区可由父级宽度约束，长文件名必须能省略号截断而不是撑破输入框 */
+.att-chip .att-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.att-name {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-primary);
+}
+
+.att-meta {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* 失败原因往往很长：chip 里单行省略（否则会把同行 chip 撑得高低不齐）。
+   完整原因在 tooltip 与原生 toast 里给全，信息不丢。 */
+.att-meta.err {
+  color: var(--color-danger);
+}
+
+/* 图片缩略图：固定方形 + object-fit，避免长图撑破输入区 */
+.att-thumb {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+  background: var(--color-bg-hover);
+}
+
+.att-icon {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+
+.att-chip.staging {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.att-chip.failed {
+  border-color: var(--color-danger);
+}
+
+.att-chip.failed .att-name,
+.att-chip.missing .att-name {
+  color: var(--color-danger);
+}
+
+.att-chip.clickable {
+  cursor: pointer;
+}
+
+.att-chip.clickable:hover {
+  background: var(--color-bg-hover);
+}
+
+/* 固定 20×20 只放 Icon（与 .mini-btn 同一约定） */
+.att-remove {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.att-remove:hover {
+  background: var(--color-bg-active);
+  color: var(--color-danger);
+}
+
+/* ── 输入区内的附件提示（比 toast 更贴近操作点）────────────────── */
+.composer-hint {
+  padding: 0 var(--sp-4) var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+.composer-hint.error {
+  color: var(--color-danger);
+}

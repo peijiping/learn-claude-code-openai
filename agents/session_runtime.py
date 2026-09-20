@@ -284,10 +284,14 @@ class SessionRuntime:
             return "background"
         return None
 
-    async def start_turn(self, text: str,
+    async def start_turn(self, text: str | list,
                          reasoning_effort: Optional[str] = None,
                          max_context: Optional[str] = None) -> None:
         """派发一轮对话：后台线程跑 run_turn，事件循环保持可读。
+
+        `text` 为**用户消息的 content**：无附件时是纯字符串（与改造前一致），
+        带附件时是 `[文本块 + 附件引用块...]` 的多模态数组（由 ws_bridge 组装）。
+        本层只做透传，不解释内容 —— 展开成语义线格式发生在 Agent 的发送边界。
 
         先发 running，结束后按终态发**一条**状态：
         - stopped：用户主动停止；
@@ -450,7 +454,7 @@ class SessionRuntime:
             pass
         agent.run_background_followup()
 
-    def _run_turn_worker(self, text: str) -> None:
+    def _run_turn_worker(self, text: str | list) -> None:
         agent = self.build_agent()
         reasoning_effort, max_context = self._pending_overrides
         agent.set_request_overrides(

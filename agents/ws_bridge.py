@@ -21,10 +21,19 @@ import websockets
 from openai import OpenAI
 
 from agent_full_v2 import Agent
+from attachments import (
+    build_user_content,
+    gc_drafts,
+    gc_orphan_session_dirs,
+    harvest_attachments,
+    migrate_to_session,
+    remove_session_attachments,
+    stage as stage_attachments,
+)
 from config import load as load_config
 from llm_config import (
-    fetch_remote_models, get_config, load_llm_config, resolve_model_window,
-    save_config,
+    fetch_remote_models, get_config, get_model_by_id, load_llm_config,
+    resolve_model_window, save_config,
 )
 from logger import get_logger, install_excepthooks
 from paths import (
@@ -32,6 +41,7 @@ from paths import (
     DEFAULT_PROJECT_ID,
     WorkspacePaths,
     default_scratch_paths,
+    workspace_paths,
 )
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
@@ -506,6 +516,131 @@ def _text_of(content) -> str:
     return str(content or "")
 
 
+# ── 附件（2026-09-20，桌面端「添加文件或图片」）────────────────────────
+# 协议与存储布局见 docs/frontend/12-附件与文件输入.md。桥层职责：
+#   ① attachment_stage 命令：把本地路径登记成草稿附件（复制 + 解析）；
+#   ② chat 携带 attachments 时：草稿归位到会话目录 + 组多模态 content；
+#   ③ 回放时 harvest 出附件列表；④ 会话清空/删除时级联回收。
+
+def _model_supports_image(model_id: str | None) -> bool:
+    """该模型是否声明支持图片输入。
+
+    三态（与前端 `modelSupportsImage` 同口径）：
+    - 明确声明 input 含 image → True；
+    - 明确声明了 input 列表但不含 image → False（拦下并提示切模型）；
+    - 未知模型 / 元数据缺失 / 读取异常 → True。
+
+    最后一条是刻意的：本地目录可能没收录用户新加的模型，**不能因为"我们不知道"
+    就阻止使用**。宁可让 provider 回一个真实的错误，也不要本地误拦。
+    """
+    if not model_id:
+        return True
+    try:
+        model = get_model_by_id(model_id)
+    except Exception as exc:  # noqa: BLE001 - 能力查询失败不阻断对话
+        log.warning("读取模型能力失败（按支持图片处理）: %s: %s",
+                    type(exc).__name__, exc)
+        return True
+    if not isinstance(model, dict):
+        return True
+    caps = model.get("capabilities")
+    if not isinstance(caps, dict):
+        return True
+    inputs = caps.get("input")
+    if not isinstance(inputs, list) or not inputs:
+        return True
+    return "image" in inputs
+
+
+def _attachment_title_hint(payload: dict) -> str:
+    """首条消息没有正文只有附件时的标题素材：`[附件] 文件名`。
+
+    没有它，纯附件的首轮会得到一个空标题（`_default_session_title("")` → None）。
+    """
+    for att in (payload.get("attachments") or []):
+        if isinstance(att, dict) and str(att.get("name") or "").strip():
+            return f"[附件] {att['name']}"
+    return ""
+
+
+def _effective_model_id(sm: SessionManager, sid: str, payload: dict) -> str | None:
+    """会话当前生效的模型 id（图片能力校验用）。
+
+    优先级：会话元数据（既有会话，以及新建时刚落盘的绑定）> 本轮 payload
+    > 全局默认。读元数据失败不阻断（返回 None → 能力校验按"未知=放过"处理）。
+    """
+    try:
+        meta = sm.load_meta(sid) or {}
+        if meta.get("model_id"):
+            return str(meta["model_id"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("读取会话模型失败 session=%s: %s: %s", sid, type(exc).__name__, exc)
+    return payload.get("model_id") or os.environ.get("OPENAI_MODEL_ID") or None
+
+
+def _all_workspaces() -> list[WorkspacePaths]:
+    """所有工作空间的路径束（附件 GC 要跨空间扫 —— 每个空间一份 `.attachments/`）。"""
+    out: list[WorkspacePaths] = []
+    try:
+        out.append(workspace_paths(DEFAULT_PROJECT_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("default 空间路径解析失败: %s", exc)
+    try:
+        for info in get_registry().list_infos():
+            if info.id == DEFAULT_PROJECT_ID:
+                continue
+            try:
+                out.append(get_registry().paths(info.id))
+            except Exception as exc:  # noqa: BLE001 - 单个空间坏掉不影响其它
+                log.warning("空间 %s 路径解析失败: %s", info.id, exc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("列出工作空间失败（附件 GC 只扫 default）: %s", exc)
+    return out
+
+
+def _startup_attachment_gc() -> None:
+    """启动清理：超期草稿 + 孤儿会话附件目录（跨全部工作空间）。"""
+    for ws in _all_workspaces():
+        try:
+            gc_drafts(ws)
+            gc_orphan_session_dirs(ws)
+        except Exception as exc:  # noqa: BLE001 - 清理失败绝不拦启动
+            log.warning("附件清理失败 project=%s: %s: %s", ws.id, type(exc).__name__, exc)
+
+
+# 节流状态。**刻意不加锁、不引 threading**：这里只是"别每次登记都全盘扫一遍"的
+# 尽力而为节流，两个并发登记同时触发一次 GC 完全无害（gc_* 全是
+# `rmtree(ignore_errors=True)` + 按文件存在性判定，重复执行幂等）。
+# 另外这段代码落在 tests 里被 exec 的源码切片范围内（`_text_of` → `handle`），
+# 模块级语句会在 exec 时直接执行 —— 引入 threading/time 之外的模块级调用会让
+# 那两个守卫测试加载失败（2026-09-20 踩过一次）。
+_ATTACH_GC_LAST = 0.0
+_ATTACH_GC_INTERVAL_SECONDS = 600
+
+
+def _gc_attachments_throttled(ws: WorkspacePaths) -> None:
+    global _ATTACH_GC_LAST
+    now = time.monotonic()
+    if now - _ATTACH_GC_LAST < _ATTACH_GC_INTERVAL_SECONDS:
+        return
+    _ATTACH_GC_LAST = now
+    gc_drafts(ws)
+    gc_orphan_session_dirs(ws)
+
+
+async def _drop_session_attachments(sid: str) -> None:
+    """删除某会话的附件目录（「清空会话」/「永久删除会话」调用）。
+
+    空间按会话归属解析 —— 与其它按 sid 的操作同一条口径。
+    清理失败只记日志：回收是附带动作，**绝不能反过来打断会话删除主流程**。
+    """
+    try:
+        ws = _workspace_of(_project_of_session(sid))
+        await asyncio.to_thread(remove_session_attachments, ws, sid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("删除会话附件失败 session=%s: %s: %s", sid, type(exc).__name__, exc)
+
+
 def _status_snapshot_lines() -> list[str]:
     """所有仍在运行（running/background）会话的 session_status 信封列表。
     连接建立重放与 status_query 命令共用，保证两处行为一致。"""
@@ -596,6 +731,13 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
             if content.startswith("<system-reminder>"):
                 continue
             ui_msg = {"role": "user", "content": content}
+            # 附件（2026-09-20）：jsonl 存的是中性引用块，`_text_of` 只取文本块，
+            # 这里额外 harvest 出附件元数据挂到 UI 消息上 —— 前端据此渲染
+            # 缩略图 / 文件 chip。**不改变 content 的取值口径**（无附件的消息
+            # 与改造前完全一致，连字段都不多一个）。
+            attachments = harvest_attachments(m.get("content"))
+            if attachments:
+                ui_msg["attachments"] = attachments
             # 消息记录时间（jsonl created_at，秒级 ISO 本地时间；老行缺省）
             if m.get("created_at"):
                 ui_msg["created_at"] = m["created_at"]
@@ -742,7 +884,9 @@ async def handle(ws):
                     )
                     # 默认标题：创建会话元数据时即用首条消息前 30 字，列表立刻可读；
                     # 首轮结束后再由 _finalize_title_after_turn 用 LLM 总结精炼（≤20 字）。
-                    default_title = _default_session_title(text)
+                    # 纯附件消息（正文为空）用 `[附件] 文件名` 兜底，否则首轮无标题。
+                    default_title = _default_session_title(
+                        text or _attachment_title_hint(payload))
                     if default_title:
                         await asyncio.to_thread(
                             sm.set_auto_title, new_sid, default_title, "trunc"
@@ -777,6 +921,36 @@ async def handle(ws):
                         "msg": f"该会话 (session_{sid}) 正在执行，请先用停止按钮结束后再发送",
                     }))
                     continue
+                # 沙箱根兜底：运行中运行时已固化自己的路径束（会话建成即锁空间），
+                # 附件等按会话解析的目录都必须用它 —— 不能用模块级常量。
+                if ws_session is None:
+                    ws_session = getattr(rt, "workspace", None) or _workspace_for_session(
+                        pid, await asyncio.to_thread(sm.load_meta, sid))
+                # ── 附件归位（2026-09-20）────────────────────────────────
+                # 前端只传 att_id 列表；正文与附件分字段（`text` 恒为 str —— 标题
+                # 生成 / 首轮判定 / 日志切片全依赖这个前提）。草稿区 → 会话目录的
+                # 迁移在**派发 turn 之前**完成，供本轮的发送边界展开读取。
+                raw_atts = payload.get("attachments") or []
+                attachment_records: list[dict] = []
+                if raw_atts:
+                    # 图片能力校验放在**迁移之前**：否则草稿已搬到会话目录却没人
+                    # 引用，只能等 GC 回收，白占一份磁盘。
+                    if (any(str(a.get("kind") or "") == "image"
+                            for a in raw_atts if isinstance(a, dict))
+                            and not _model_supports_image(
+                                _effective_model_id(sm, sid, payload))):
+                        await safe_send(ws, _envelope("error", {
+                            "msg": "当前会话绑定的模型不支持图片输入，"
+                                   "请切换到带「图片」能力的模型，或移除图片附件后重发",
+                        }))
+                        continue
+                    try:
+                        attachment_records = await asyncio.to_thread(
+                            migrate_to_session, ws_session, raw_atts, sid)
+                    except Exception as exc:  # noqa: BLE001 - 归位失败不阻断对话
+                        log.error("附件归位失败（本轮按无附件继续）session=%s: %s: %s",
+                                  sid, type(exc).__name__, exc, exc_info=True)
+                        attachment_records = []
                 # 首轮判定：全新会话，或该会话此前从无真实 user 消息（旧会话首轮）。
                 # 标题不在首轮并行抢跑（旧 _start_title_thread 方案）：新建会话时已有
                 # 默认标题（首条消息前 30 字）可读，这里只标记首轮，待 run_turn 结束后
@@ -793,16 +967,60 @@ async def handle(ws):
                 # 前端发送的是叠加态（standard/extended 二选一），这里已由前端换算成
                 # 具体窗口字符串；若前端仅传开关位则回落到 None（走全局）。跳过空串。
                 max_context = str(max_context_raw) if max_context_raw else None
+                # 消息 content：**无附件时是纯字符串**（与改造前逐字节一致），
+                # 有附件时才变成 [文本块 + 附件引用块...] 的多模态数组。引用块只
+                # 记元数据，真正的文件字节由发送边界（_model_messages）展开。
+                user_query = build_user_content(text, attachment_records)
+                # 标题素材：正文优先；纯附件消息用 `[附件] 文件名` 兜底
+                title_src = text if text.strip() else _attachment_title_hint(payload)
                 # 后台线程跑 turn；事件循环继续处理其它命令（切换 / 其它会话 / stop）
-                log.info("chat 派发: session_%s text=%r", sid, text[:80])
+                log.info("chat 派发: session_%s text=%r attachments=%d",
+                         sid, text[:80], len(attachment_records))
                 turn_task = asyncio.create_task(
-                    rt.start_turn(text, reasoning_effort=reasoning_effort,
+                    rt.start_turn(user_query, reasoning_effort=reasoning_effort,
                                   max_context=max_context)
                 )
                 if first_turn:
                     # 第一轮 run_turn 执行完之后，再调用一次大模型总结生成标题（≤20 字）
                     asyncio.create_task(
-                        _finalize_title_after_turn(turn_task, sid, text, sm))
+                        _finalize_title_after_turn(turn_task, sid, title_src, sm))
+
+            elif kind == "attachment_stage":
+                # 附件登记（2026-09-20）：前端（原生对话框 / 拖拽 / 剪贴板）拿到
+                # 本地绝对路径后交到这里 —— **只传路径不传字节**。后端是与前端同机
+                # 的进程，直接读盘即可；同时也避开了 websockets 默认 1 MiB 帧上限
+                # （base64 内联图片必然超限）。
+                paths = payload.get("paths") or []
+                want_pid = str(payload.get("project_id") or "") or _active_project()
+                if not _project_ready(want_pid):
+                    await safe_send(ws, _envelope("error", {
+                        "msg": "该工作空间的目录当前不可用（已被移动或删除），无法添加附件",
+                    }))
+                    continue
+                if not paths:
+                    await safe_send(ws, _envelope("attachments_staged", {
+                        "items": [], "failed": [], "project_id": want_pid,
+                    }))
+                    continue
+                try:
+                    result = await asyncio.to_thread(
+                        stage_attachments, _workspace_of(want_pid), paths)
+                except Exception as exc:  # noqa: BLE001 - 桥层兜底，绝不打死连接
+                    log.error("附件登记失败: %s: %s", type(exc).__name__, exc,
+                              exc_info=True)
+                    await safe_send(ws, _envelope("error", {"msg": f"附件登记失败：{exc}"}))
+                else:
+                    # 顺手做一次节流 GC：长期开着的窗口也能回收超期草稿/孤儿目录
+                    try:
+                        await asyncio.to_thread(
+                            _gc_attachments_throttled, _workspace_of(want_pid))
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("附件 GC 跳过: %s: %s", type(exc).__name__, exc)
+                    await safe_send(ws, _envelope("attachments_staged", {
+                        "items": result["items"],
+                        "failed": result["failed"],
+                        "project_id": want_pid,
+                    }))
 
             elif kind == "stop":
                 # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响
@@ -944,6 +1162,8 @@ async def handle(ws):
                     await safe_send(ws, _envelope("error", {"msg": f"session {sid} not found"}))
                     continue
                 await asyncio.to_thread(sm.clear_session, sm.get_session_file(sid))
+                # 附件随清空一并回收（归档/还原**不动**附件 —— 那是软删除语义）
+                await _drop_session_attachments(sid)
                 log.info("会话清空: session_%s", sid)
                 await safe_send(ws, _envelope("session", {"session_id": sid, "message_count": 0}))
                 await reply_sessions()
@@ -1088,6 +1308,9 @@ async def handle(ws):
                     if ok:
                         deleted.append(sid)
                         registry.remove(sid)
+                        # 附件目录级联删除（**只能信这个出口**：归档不动附件，
+                        # 所以附件必须与"永久删除"同生共死，否则永久累积）
+                        await _drop_session_attachments(sid)
                     else:
                         failed.append(sid)
                 # 结果回发后不再全量广播 sessions：前端以 deleted[] 本地增量移除，
@@ -1224,6 +1447,12 @@ async def main():
         # 会话 → 所属空间的管理器（多工作空间：不能固定用 default 的那份）
         return _manager_for_session(sid).load_meta(sid)
     registry = SessionRuntimeRegistry(deliver, reply_sessions, _load_meta)
+    # 附件清理（启动一次，跨全部工作空间）：超期草稿 + 孤儿会话目录。
+    # 放进线程执行：目录可能很多，不能拖慢 WS 首连接就绪。
+    try:
+        await asyncio.to_thread(_startup_attachment_gc)
+    except Exception as exc:  # noqa: BLE001 - 清理失败绝不拦启动
+        log.warning("附件启动清理失败: %s: %s", type(exc).__name__, exc)
     async with websockets.serve(handle, "127.0.0.1", PORT):
         log.info("ws_bridge 后端启动: WS server listening on 127.0.0.1:%d "
                  "(pid=%s, model=%s)", PORT, os.getpid(),

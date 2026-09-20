@@ -33,6 +33,7 @@ from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
 from paths import (SKILLS_DIR, WORKTREE_DIR, MCP_CONFIG, DEFAULT_PROJECT_ID,
                    WorkspacePaths, workspace_paths)
+from attachments import expand_content_for_model, text_view
 from tools import ToolRegistry
 from task_manager import TaskManager, current_board
 from memories import MemoryStore
@@ -772,20 +773,49 @@ class Agent:
                    "model": model_info},
         ))
 
+    def _attachment_session_dir(self) -> Path | None:
+        """本会话的附件目录（`.attachments/<session_id>/`）；不可用时 None。
+
+        只服务于发送边界的附件展开。会话尚未建立（CLI 首轮前 / cron）或
+        workspace 缺失时返回 None —— 展开函数对这种情况原样透传，
+        因而**任何无附件场景的行为与改造前完全一致**。
+        """
+        sid = str(getattr(self, "session_id", "") or "")
+        workspace = getattr(self, "workspace", None)
+        if not sid or workspace is None:
+            return None
+        return workspace.attachments_dir / sid
+
     def _model_messages(self) -> list:
         """发给 LLM 的消息投影：白名单字段（见 MODEL_MSG_FIELDS）。
 
         history_messages 里的 usage 等展示元数据在这一边界统一剔除，
         jsonl 后续新增任何字段都不会漏进 API 请求。
+
+        **附件（2026-09-20）**：jsonl 里存的是中性的引用块
+        （`{"type":"attachment", ...}`，只有元数据、不含文件字节），在这里
+        展开为 provider 线格式（图片 → `image_url` + data URL；文档 → 提取文本）。
+        展开只作用于本次请求，**不回写 history_messages** —— 内存与 jsonl 恒为
+        账本形态，base64 只在这一刻存在。无附件消息由 expand 原样返回，
+        因此无附件会话的请求体与改造前逐字节一致（见
+        tests/test_agent_model_messages.py 的回归断言）。
         """
+        session_dir = self._attachment_session_dir()
         return [
-            {k: m[k] for k in MODEL_MSG_FIELDS if k in m}
+            expand_content_for_model(
+                {k: m[k] for k in MODEL_MSG_FIELDS if k in m}, session_dir
+            )
             for m in self.history_messages
         ]
 
-    def run_turn(self, user_query: str) -> str:
+    def run_turn(self, user_query: str | list) -> str:
         """
         跑一轮非交互对话（CLI / cron / TUI 共用）。返回最终回复文本。
+
+        `user_query` 为**用户消息的 content**：纯文本消息是 `str`（CLI / cron /
+        存量路径全是这一种，行为逐字节不变）；桌面端带附件时是
+        `[文本块 + 附件引用块...]` 的多模态数组（由 ws_bridge 组装，引用块里
+        只有元数据，文件字节由 `_model_messages` 在发送边界展开）。
 
         agent_loop 内部仍会打印 thinking / 本轮回复（保持现状 UX）；
         本方法额外返回历史最后一条消息的文本，供调用方打印。
@@ -805,9 +835,12 @@ class Agent:
             _tm = getattr(self.tools, "task_manager", None)
             if _tm is not None:
                 _tm.release_stale_in_progress()
-        self.hook_system.trigger("UserPromptSubmit", user_query)
+        # 钩子契约是「用户原始输入字符串」；日志同样按文本记。带附件时 content
+        # 已是多模态数组，故统一取文本视图（`[图片: x.png]` + 正文，不含字节）。
+        prompt_text = text_view(user_query)
+        self.hook_system.trigger("UserPromptSubmit", prompt_text)
         log.info("turn 开始: %s%s user_query=%r",
-                 self.session_prefix, self.session_id, user_query[:100])
+                 self.session_prefix, self.session_id, prompt_text[:100])
         self.history_messages.append({"role": "user", "content": user_query})
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]

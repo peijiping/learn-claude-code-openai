@@ -76,6 +76,19 @@ WORKSPACE_SUBDIRS = (
 # 它的落点 —— Finder 可直达（`在 Finder 中打开`）、整体可随时清空。
 DEFAULT_SCRATCH_DIR = DATA_ROOT / "scratch"
 
+# ── 会话附件目录（2026-09-20，桌面端「添加文件或图片」）────────────────────
+# 布局（设计见 docs/frontend/12-附件与文件输入.md）：
+#
+#   ~/.aigent/projects/<id>/.attachments/
+#       _draft/<att_id>/             ← 尚未发送（新会话此刻还没有 session_id）
+#           meta.json / <att_id>.<ext> / <att_id>.txt / <att_id>.send.jpg
+#       <session_id>/<att_id>.<ext>  ← 已发送（发送时原子迁移过来）
+#
+# 与 `.transcripts` / `.task_outputs` 一样由运行期按需创建（不进
+# WORKSPACE_SUBDIRS）：没有附件的用户永远不会有这个目录。
+ATTACHMENTS_DIRNAME = ".attachments"
+DRAFT_ATTACHMENTS_DIRNAME = "_draft"
+
 
 @dataclass(frozen=True)
 class WorkspacePaths:
@@ -147,6 +160,17 @@ class WorkspacePaths:
     @property
     def tool_results_dir(self) -> Path:
         return self.data_root / ".task_outputs" / "tool-results"
+
+    @property
+    def attachments_dir(self) -> Path:
+        """会话附件根（`.attachments/`）。
+
+        其下再按会话隔离：`<session_id>/` = 已发送的附件，
+        `_draft/` = 尚未发送（还没有 session_id）的草稿附件。
+        任何"附件在哪个空间"的解析都必须经本属性 —— 与其它运行期目录同一口径
+        （模块级常量只代表 default 空间）。
+        """
+        return self.data_root / ATTACHMENTS_DIRNAME
 
 
 def workspace_paths(project_id: str, root: Path | str | None = None) -> WorkspacePaths:
