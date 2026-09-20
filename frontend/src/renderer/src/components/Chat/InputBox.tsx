@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from '@components/common/Icon'
-import { useAgentStore, resolveModelMeta, providerDot, projectDisplayName } from '@store/agentStore'
+import { useAgentStore, resolveModelMeta, providerDot, projectDisplayName, showToast } from '@store/agentStore'
+import PlusMenu, { PLUS_MENU_LABELS, type PlusMenuKey } from './PlusMenu'
 
 interface InputBoxProps {
   value: string
@@ -37,6 +38,8 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
   const addProjectFromPicker = useAgentStore((s) => s.addProjectFromPicker)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const [modelOpen, setModelOpen] = useState(false)
+  // 加号「添加内容」菜单（2026-09-20）：本期只做外壳，各条目按 key 后续接线
+  const [plusOpen, setPlusOpen] = useState(false)
   // 工作空间下拉（chip 点开）：上部分 = 已打开过的空间，末尾固定项 = 选择文件夹
   const [wsOpen, setWsOpen] = useState(false)
   const [hoveredPanel, setHoveredPanel] = useState<{ id: string; x: number; y: number } | null>(null)
@@ -103,6 +106,14 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
     }
   }
 
+  // 加号「添加内容」菜单条目点击：先收起菜单，再分发。
+  // 本期只交付**弹框 + 菜单项外壳**，各条目功能待逐项确认后实现（见 docs/frontend/02 §3.3）；
+  // 这里是后续接线各条功能的唯一落点 —— 按 key 分支即可，不必再改菜单组件。
+  const handlePlusPick = (key: PlusMenuKey): void => {
+    setPlusOpen(false)
+    showToast(`「${PLUS_MENU_LABELS[key]}」功能待开发`, 'info', 2000)
+  }
+
   // 上下文圆圈：仅当有选中会话时才显示；数据来自后端 context_stats 事件
   const stats = currentContextStats
   const usedPct = stats ? stats.used_percent : 0
@@ -134,9 +145,19 @@ export default function InputBox({ value, onChange, onSend }: InputBoxProps): JS
 
       <div className="composer-toolbar">
         <div className="toolbar-left">
-          <button className="tool-btn" title="添加内容">
-            <Icon name="plus" size={16} />
-          </button>
+          {/* 加号 = 添加内容菜单：向上弹出的两段式面板（添加内容 / 执行方式） */}
+          <span className="plus-select">
+            <button
+              className={`tool-btn ${plusOpen ? 'open' : ''}`}
+              title="添加内容"
+              aria-haspopup="menu"
+              aria-expanded={plusOpen}
+              onClick={() => setPlusOpen((v) => !v)}
+            >
+              <Icon name="plus" size={16} />
+            </button>
+            {plusOpen && <PlusMenu onPick={handlePlusPick} onClose={() => setPlusOpen(false)} />}
+          </span>
           <button className="tool-btn access">
             完全访问 <Icon name="chevronDown" size={12} />
           </button>

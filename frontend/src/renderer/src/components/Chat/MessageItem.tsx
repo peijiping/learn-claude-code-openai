@@ -94,7 +94,7 @@ function ThinkingBox({ text, open, active }: { text: string; open: boolean; acti
  *（进程被强杀，仅剩启动占位记录）。子智能体返回给主智能体的正文不在此展示
  * ——那是给主智能体的结果，不是给用户的。 */
 function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(false)
   const state: 'running' | 'done' | 'error' | 'aborted' = block.error
     ? 'error'
     : block.status === 'aborted'
@@ -230,7 +230,20 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
           ))}
           <div className="markdown-body">
             {msg.content ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+              // 表格外包一层横向滚动框（.table-scroll）：列多时表格自身横向滚动，
+              // 不把整块对话区撑宽（外层 .msgscroll 为 overflow-x: hidden）。
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  table: ({ children }) => (
+                    <div className="table-scroll">
+                      <table>{children}</table>
+                    </div>
+                  )
+                }}
+              >
+                {msg.content}
+              </ReactMarkdown>
             ) : (
               msg.streaming && <span className="cursor" />
             )}

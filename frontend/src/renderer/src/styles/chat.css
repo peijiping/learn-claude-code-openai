@@ -28,25 +28,40 @@
   color: var(--color-text-primary);
 }
 
-/* 消息流：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩。
+/* 消息滚动视口：占满对话区**全部宽度**（不只是 940px 内容列）。
+ * 2026-09-20 由「.msglist 单层既滚动又限宽」改为「视口 / 内容列」两层：
+ * 单层时滚轮只落在 940px 内容列内才生效 —— 鼠标移到两侧空白（窗口宽于 940px 时的
+ * 留白）就滚不动对话记录，与主流智能体客户端的观感不符。视口层刻意**不设 max-width**。
+ * 滚动实现与贴底判定都挂在本层（MessageList 的 containerRef）。 */
+.msgscroll {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  /* 横向溢出（超宽表格 / 不换行长串）不在此层滚动：代码块、表格各自有横向滚动框，
+   * 正文长串由 .markdown-body 的 overflow-wrap 换行兜底 —— 避免整块对话区横向漂移。 */
+  overflow-x: hidden;
+  /* 显式声明链式滚动：内层滚动框（深度思考框）滚到边界后，继续滚轮可带动本视口 */
+  overscroll-behavior-y: auto;
+}
+
+/* 消息内容列：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩。
+ * 本层**不滚动**（滚动交给外层 .msgscroll），只负责限宽 / 居中 / 内边距。
  * 底部留 28px 滚动空间：消息右下角悬浮的「时间+复制」元信息（-26px）滚动到底时仍可见。 */
 .msglist {
-  flex: 1;
-  overflow-y: auto;
-  padding: var(--sp-5) var(--sp-5) calc(var(--sp-5) + var(--sp-1));
-  min-height: 0;
   width: 100%;
   max-width: 940px;
   margin: 0 auto;
+  padding: var(--sp-5) var(--sp-5) calc(var(--sp-5) + var(--sp-1));
 }
-/* 对话区域隐藏滚动条但保留滚动：消息列表 / 深度思考框 / 输入框 */
-.msglist,
+/* 对话区域隐藏滚动条但保留滚动：消息视口 / 深度思考框 / 输入框 */
+.msgscroll,
 .thinking-content,
 .composer-input {
   scrollbar-width: none;
   -ms-overflow-style: none;
 }
-.msglist::-webkit-scrollbar,
+.msgscroll::-webkit-scrollbar,
 .thinking-content::-webkit-scrollbar,
 .composer-input::-webkit-scrollbar {
   display: none;
@@ -397,6 +412,10 @@
   border: none;
   outline: none;
   resize: none;
+  /* textarea 的 UA 默认底色是白色（background-color: field）：它是 .composer 的第一个子元素，
+     会盖住父级 border-radius 的左上/右上圆角与顶边（子元素绘制在父级边框之上），
+     表现为"上方两角是方角、顶边线断掉"。置为透明，白底与圆角统一由 .composer 画。 */
+  background: transparent;
   padding: var(--sp-3) var(--sp-4);
   font-family: inherit;
   font-size: var(--fs-md);
@@ -935,4 +954,77 @@
   padding: var(--sp-3);
   font-size: 12px;
   color: var(--color-text-secondary);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   加号「添加内容」菜单（输入框底部左侧「+」，2026-09-20）
+   - .plus-select：定位容器（+ 按钮 + 弹出菜单的相对锚点）
+   - .plus-menu：向上弹出（与 .model-menu / .ws-picker 同款分层：mask 900 / 面板 901）
+   - 两段式分组：添加内容 / 执行方式，组间仅留白、不加分隔线（对齐设计稿）
+   ═══════════════════════════════════════════════════════════════ */
+.plus-select {
+  position: relative;
+  display: inline-flex;
+}
+/* + 按钮在菜单展开期间保持高亮（toggle 语义） */
+.tool-btn.open {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.plus-menu-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+}
+.plus-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 208px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.2));
+  z-index: 901;
+}
+/* 组间用留白分隔（无分割线，对齐设计稿） */
+.plus-menu-section + .plus-menu-section {
+  margin-top: var(--sp-2);
+}
+.plus-menu-group {
+  padding: var(--sp-1) var(--sp-2);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  user-select: none;
+}
+.plus-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: 7px var(--sp-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+.plus-menu-item:hover {
+  background: var(--color-bg-hover);
+}
+.plus-menu-item.active {
+  color: var(--color-accent);
+}
+.plus-menu-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

@@ -1301,11 +1301,15 @@ class SessionManager:
         except Exception:
             pass  # 刷新失败只影响排序精度，不阻断消息写入主流程
 
-    def _update_entry(self, session_id: str, mutate) -> dict:
+    def _update_entry(self, session_id: str, mutate, touch: bool = True) -> dict:
         """定位条目 → mutate(entry) → 刷新 updated_at → 原子写回。
 
         新方案会话（存在独立 meta 文件）直接读写单文件 O(1)；
         存量会话回退 index.jsonl 全量路径，作为兜底。
+
+        touch: 是否同步刷新 updated_at（「最后修改时间排序」的数据源）。默认 True；
+        纯元数据操作（标记已读、切换模型、重命名等）传 False，避免点击/选择会话
+        就把会话顶到列表最前——排序时间只应随会话内容变化（对话/重写/清空）推进。
 
         Raises:
             FileNotFoundError: 会话 jsonl 不存在
@@ -1318,7 +1322,8 @@ class SessionManager:
             if self.meta_file(session_id).exists():
                 entry = self.load_meta(session_id) or self._new_entry(session_id, key)
                 mutate(entry)
-                entry["updated_at"] = _now_iso()
+                if touch:
+                    entry["updated_at"] = _now_iso()
                 self.save_meta(entry)
             else:
                 # 存量会话：走 index.jsonl 全量路径
@@ -1334,7 +1339,8 @@ class SessionManager:
                     entry["created_at"] = entry["updated_at"] = ts
                     entries[key] = entry
                 mutate(entry)
-                entry["updated_at"] = _now_iso()
+                if touch:
+                    entry["updated_at"] = _now_iso()
                 self.save_index(entries)
         return entry
 
@@ -1344,7 +1350,9 @@ class SessionManager:
         if not title:
             raise ValueError("标题不能为空")
         return self._update_entry(
-            session_id, lambda e: e.update({"title": title[:60], "title_source": "user"})
+            session_id,
+            lambda e: e.update({"title": title[:60], "title_source": "user"}),
+            touch=False,
         )
 
     def set_auto_title(self, session_id: str, title: str, source: str = "auto") -> None:
@@ -1363,8 +1371,13 @@ class SessionManager:
 
         语义由前端驱动：会话完整结束且用户当前不在查看它 → unread=True；
         用户进入（切换/点击查看）该会话 → unread=False。跨窗口/重启持久化。
+
+        只标记状态，不改会话内容 → 不刷新 updated_at（touch=False）：
+        否则"一点击会话就顶到列表最前"，排序时间只随对话内容推进。
         """
-        return self._update_entry(session_id, lambda e: e.update({"unread": bool(unread)}))
+        return self._update_entry(
+            session_id, lambda e: e.update({"unread": bool(unread)}), touch=False,
+        )
 
     def set_session_work_root(self, session_id: str, work_root: str | Path) -> dict:
         """固化会话的沙箱根（work_root 会话级快照，2026-09-20）。
@@ -1375,7 +1388,9 @@ class SessionManager:
         存量 meta 无该字段（None）→ 读侧回退遗留 WORKDIR。
         """
         return self._update_entry(
-            session_id, lambda e: e.update({"work_root": str(work_root)})
+            session_id,
+            lambda e: e.update({"work_root": str(work_root)}),
+            touch=False,
         )
 
     def set_session_model(self, session_id: str, model_id: str | None = None,
@@ -1391,7 +1406,8 @@ class SessionManager:
                 e["model_id"] = model_id
             if overrides is not None:
                 e["overrides"] = overrides
-        return self._update_entry(session_id, mutate)
+        # 选模型/调参数是 UI 操作，不是对话内容变化 → 不刷新 updated_at。
+        return self._update_entry(session_id, mutate, touch=False)
 
     def add_usage_totals(self, session_id: str, delta: dict,
                          count_turn: bool = True) -> None:

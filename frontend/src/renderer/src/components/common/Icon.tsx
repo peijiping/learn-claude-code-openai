@@ -133,6 +133,41 @@ const paths: Record<string, ReactNode> = {
       <circle cx="12" cy="12" r="9" />
       <path d="M12 7v5l3 2" />
     </>
+  ),
+  /* ── 加号「添加内容」菜单（2026-09-20）── */
+  filePlus: (
+    <>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+      <path d="M12 12v6M9 15h6" />
+    </>
+  ),
+  at: (
+    <>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.9 7.9" />
+    </>
+  ),
+  hash: <path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18" />,
+  slash: <path d="M16.5 4 7.5 20" />,
+  listTodo: (
+    <>
+      <path d="M8.5 6h12M8.5 12h12M8.5 18h12" />
+      <path d="M3.5 6h.01M3.5 12h.01M3.5 18h.01" />
+    </>
+  ),
+  target: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="4.6" />
+      <circle cx="12" cy="12" r="0.9" />
+    </>
+  ),
+  shieldCheck: (
+    <>
+      <path d="M12 3l7 3v6.2c0 4.4-2.9 7.6-7 8.8-4.1-1.2-7-4.4-7-8.8V6z" />
+      <path d="m9.2 12 2 2 3.6-3.8" />
+    </>
   )
 }
 

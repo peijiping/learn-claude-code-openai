@@ -103,6 +103,10 @@ a {
 .markdown-body {
   line-height: 1.65;
   font-size: var(--fs-md);
+  /* 超长不可断行的内容（长 URL、长 token、无空格路径）在 940px 内容列内强制换行，
+   * 避免撑出横向溢出（外层 .msgscroll 为 overflow-x: hidden，撑出去会被裁掉）。
+   * 用 break-word 而非 anywhere：不改变 min-content 尺寸，表格列宽计算不受影响。 */
+  overflow-wrap: break-word;
 }
 .markdown-body p {
   margin: 0 0 8px;
@@ -125,12 +129,17 @@ a {
   padding: 2px 5px;
   border-radius: var(--radius-sm);
 }
+/* 代码块：**只**横向滚动（长代码行不换行，横向拖动查看）。
+ * overflow-y: hidden 是刻意的（2026-09-20）：它让代码块不再是纵向滚动容器，
+ * 纵向滚轮直接透传给外层 .msgscroll ——鼠标停在代码块上也能顺畅上下翻对话记录。
+ * 高度为 auto，内容不会被裁切。 */
 .markdown-body pre {
   background: #1e1e1e;
   color: #d4d4d4;
   padding: var(--sp-3);
   border-radius: var(--radius-md);
   overflow-x: auto;
+  overflow-y: hidden;
   margin: 0 0 10px;
 }
 .markdown-body pre code {
@@ -143,6 +152,16 @@ a {
   padding-left: var(--sp-3);
   color: var(--color-text-secondary);
   margin: 0 0 8px;
+}
+/* 表格：包在 .table-scroll（MessageItem 的 markdown components 注入的横向滚动框）里，
+ * 列多时表格自身横向滚动，不把对话区整体撑宽。 */
+.markdown-body .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0 0 10px;
+}
+.markdown-body .table-scroll table {
+  margin: 0;
 }
 .markdown-body table {
   border-collapse: collapse;
