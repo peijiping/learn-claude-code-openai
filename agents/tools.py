@@ -38,6 +38,23 @@ from task_manager import TaskManager
 from message_bus import MessageBus, VALID_MSG_TYPES
 from memories import MemoryStore
 from logger import get_logger
+# 工具读图与读文档（2026-09-21）：中性图片块的构造在 attachments 里定义（展开侧
+# 也在那），本模块只负责"读盘 + 判类型 + 造块"。**不引入循环依赖**：attachments
+# 只依赖标准库 + paths/config/doc_convert + logger，不 import tools。
+# 文档转换走 doc_convert（叶子模块）：PDF 的「文本层 + 页图」与 Office 的文本抽取
+# 都由它提供，附件通道与工具通道共用同一段代码。
+import doc_convert
+from attachments import (
+    IMAGE_EXTS,
+    build_tool_image_result,
+    build_tool_images_result,
+    doc_max_images,
+    doc_max_pages,
+    doc_page_image_min_text,
+    image_max_edge,
+    sniff_image_mime,
+    text_max_chars,
+)
 
 # 统一日志：run_bash 等工具层的异常兜底打点（见 run_bash 的 except 分支）
 log = get_logger("tools")
@@ -335,77 +352,202 @@ class ToolRegistry:
             )
             return f"Error: {type(e).__name__}: {e}"
 
-    def run_read(self, path: str, limit: int | None = None, base: Path | None = None) -> str:
-        """
-        读取文件内容
-        功能特性：
-        - 使用 safe_path 进行安全路径验证
-        - 支持行数限制：只读取前limit行，避免大文件撑爆内存
-        - 当文件被截断时，显示剩余行数提示
-        - 自动截断超长内容至50000字符
-        参数：
-            path: 要读取的文件路径（相对路径）
-            limit: 可选，限制读取的行数。默认None表示读取全部
-            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
-                  None 时用本实例的 `self.workdir`
-        返回：
-            成功：文件内容字符串（可能被截断）
-            失败：格式 "Error: {异常信息}"
-        """
-        try:
-            lines = self.safe_path(path, base).read_text().splitlines()
-            if limit and limit < len(lines):
-                lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error: {e}"
+    def run_read(self, path: str, limit: int | None = None,
+                 max_pages: int | None = None, base: Path | None = None):
+        """读取文件内容 —— **读取文件的唯一入口**，按类型自动分派。
 
-    def run_read_pdf(self, path: str, max_pages: int = 5, chars_per_page: int = 3000, base: Path | None = None) -> str:
-        """
-        使用 pymupdf 安全读取 PDF 文件，分页提取文本
-        功能特性：
-        - 使用 safe_path 进行安全路径验证
-        - 分页提取，每页限制字符数
-        - 限制最大读取页数
-        - 总输出截断至 30000 字符
+        | 输入 | 行为 |
+        | --- | --- |
+        | 文本 / 代码 | 返回文本（`limit` 限行数） |
+        | 图片 | 返回**中性图片块**（下一跳才编码成像素） |
+        | PDF | 返回**文本层 + 页图**（含图表/扫描页才渲染，见 `doc_convert`） |
+        | docx / xlsx / pptx | 返回文本 + 表格结构（无视觉版式，末尾如实声明） |
+        | 目录 | 报错并指路（`run_glob` / `ls`） |
+
+        **为什么要合并成一个名字（2026-09-21）**：此前是 `run_read` /
+        `run_read_pdf` / `view_image` 三个工具，"选错工具"是模型最常见的一类失败 ——
+        读 PDF 用了 `run_read` 拿到一句解码错误、读图片用了 `run_read` 拿到二进制
+        乱码，每次都要多花一轮。真实 Claude Code 同样是一个 Read 工具按类型分派，
+        模型没有选错的机会。合并后**提示词里不再需要任何格式→工具的映射表**。
+
+        判类型**魔数优先**（`sniff_image_mime`）、扩展名兜底：被改名成 `.txt` 的
+        图片也能正确走进图片分支（改造前它会报"二进制无法解码"）。
+
         参数：
-            path: PDF 文件路径（相对路径）
-            max_pages: 最大读取页数，默认5
-            chars_per_page: 每页最大字符数，默认3000
-            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
-                  None 时用本实例的 `self.workdir`
+            path: 文件路径（相对路径按 base / workdir 解析）
+            limit: 文本分支最多读多少行；Office 分支当作字符上限
+            max_pages: PDF 最多渲染多少张**页图**（默认 `doc_max_pages()`）
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）
         返回：
-            成功：PDF 文本内容
-            失败：格式 "Error: {异常信息}"
+            文本分支 → str；图片 / PDF 分支 → 中性图片块 dict —— 引擎按**形状**
+            识别（`is_tool_image_result`），**不会**把它 str() 掉。任何失败都收束为
+            `"Error: ..."` 字符串，**绝不抛异常**（异常穿透会打死整轮 agent_loop）。
         """
         try:
             fp = self.safe_path(path, base)
-            if not fp.exists():
-                return f"Error: File not found: {path}"
-            if not str(fp).lower().endswith('.pdf'):
-                return f"Error: Not a PDF file: {path}"
-            try:
-                import fitz
-            except ImportError:
-                return "Error: pymupdf 未安装。请运行: python3 -m pip install pymupdf"
-            doc = fitz.open(str(fp))
-            total_pages = len(doc)
-            results = [f"PDF: {path}, 总页数: {total_pages}"]
-            read_pages = min(max_pages, total_pages)
-            for i in range(read_pages):
-                text = doc[i].get_text().strip()
-                if text:
-                    results.append(f"--- 第 {i+1} 页 ---")
-                    results.append(text[:chars_per_page])
-                else:
-                    results.append(f"--- 第 {i+1} 页 --- (无可提取文本，可能为扫描件)")
-            if total_pages > read_pages:
-                results.append(f"... (还有 {total_pages - read_pages} 页未读取，可增大 max_pages 参数)")
-            doc.close()
-            return "\n".join(results)[:30000]
-
         except Exception as e:
             return f"Error: {e}"
+        try:
+            if fp.is_dir():
+                return (f"Error: {path} 是目录，run_read 只读文件。"
+                        f"查看目录内容请用 run_glob，或用 bash 的 ls。")
+            if not fp.exists():
+                return f"Error: File not found: {path}"
+            mime = sniff_image_mime(fp)
+            if mime:
+                return self._read_image(path, mime=mime, base=base)
+            ext = fp.suffix.lower()
+            if ext == ".pdf":
+                return self._read_pdf(fp, path, max_pages=max_pages, base=base)
+            if ext in doc_convert.OFFICE_EXTS:
+                return self._read_office(fp, path, limit)
+            return self._read_text(fp, path, limit)
+        except Exception as e:  # noqa: BLE001 - 工具层契约：绝不向上抛
+            log.error("run_read 异常: %s: %s | path=%r", type(e).__name__, e,
+                      str(path)[:200], exc_info=True)
+            return f"Error: {type(e).__name__}: {e}"
+
+    def _read_text(self, fp: Path, display: str, limit: int | None) -> str:
+        """文本分支：读全文 + 按行截断。
+
+        图片在这里**已经不可能出现**（`run_read` 用魔数先判走了），所以解码失败
+        就真的是"未知二进制"，提示面对准它，不再指向某个工具名。
+        """
+        try:
+            lines = fp.read_text().splitlines()
+        except UnicodeDecodeError:
+            return (f"Error: {display} 不是文本文件（二进制内容无法解码）。"
+                    f"可用 bash：`file \"{display}\"` 确认它的真实格式。")
+        if isinstance(limit, int) and limit > 0 and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)
+
+    def _read_office(self, fp: Path, display: str, limit: int | None) -> str:
+        """Office 分支：走统一转换层抽「文本 + 表格结构」。
+
+        图表、图片、版式**拿不到**（需要 LibreOffice，已被否决），转换层会在正文
+        末尾如实声明。库缺失 / 文件损坏由 `convert_office` 抛异常，交给 `run_read`
+        的外层兜底 —— 与本模块"不做静默降级"的既有约定一致。
+        """
+        cap = limit if isinstance(limit, int) and limit > 0 else text_max_chars()
+        out = doc_convert.convert_office(fp, fp.suffix.lower(), limit=cap)
+        body = str(out.get("markdown") or "")
+        return body if body.strip() else doc_convert.empty_note(fp.suffix.lower())
+
+    def _read_image(self, path: str, mime: str = "",
+                    base: Path | None = None):
+        """图片分支：把磁盘上的图片**读进上下文**，让模型用自己的视觉能力查看。
+
+        ⚠️ 本方法**不调用任何模型**，也不生成任何文字描述。它只做三件事：
+        `safe_path` 校验 → 魔数确认真是图片 → 返回一个**中性图片块**（只有
+        路径与 mime，**没有字节**）。真正的"看图"发生在下一跳请求里 ——
+        agent_loop 把该块聚合成一条合成 user 消息，`_model_messages` 在发送
+        边界把它编码成 `image_url`，同一个模型那时才看到像素。
+
+        为什么不做"转述"：让另一个模型描述图片再回填，等于让主模型拿着有损的
+        二手信息作答（子模型不知道用户到底想问什么，图表数值/UI 对齐/报错行号
+        必然丢），而且同一张图付两次钱。
+
+        参数：
+            path: 图片文件路径（`run_read` 已用魔数判过类型，这里再兜一次）
+            mime: 可选，调用方已探好的 mime（省一次读盘）
+        返回：
+            成功：`{"type":"tool_image","text":...,"images":[{...}]}` 中性块
+            失败：`"Error: ..."` 字符串（工具层契约：绝不向上抛）
+        """
+        try:
+            fp = self.safe_path(path, base)
+        except Exception as e:
+            return f"Error: {e}"
+        try:
+            if not fp.is_file():
+                return f"Error: File not found: {path}"
+        except OSError as e:
+            return f"Error: {type(e).__name__}: {e}"
+        resolved_mime = mime or sniff_image_mime(fp)
+        if not resolved_mime:
+            exts = "/".join(ext.lstrip(".") for ext in IMAGE_EXTS)
+            return (f"Error: 不是可识别的图片文件：{path}。可识别的图片格式为"
+                    f"（{exts}）。纯文本或代码直接传路径即可，PDF 与 Office"
+                    f"文档也走同一个 run_read。")
+        try:
+            return build_tool_image_result(fp, mime=resolved_mime)
+        except Exception as e:  # noqa: BLE001 - 工具层契约：绝不向上抛
+            log.error("构造图片块失败: %s: %s", type(e).__name__, e,
+                      exc_info=True)
+            return f"Error: {type(e).__name__}: {e}"
+
+    def _read_pdf(self, fp: Path, display: str, *, max_pages: int | None = None,
+                  base: Path | None = None):
+        """PDF 分支：**文本层 + 页图**一起交给模型（2026-09-21 重做）。
+
+        与附件通道**同源**（都走 `doc_convert.convert_pdf`：按「文本层是否足以
+        代表这一页」决定渲不渲页图），差别只有落盘位置 —— 附件落在
+        `.attachments/<sid>/`，这里落在**工作空间内**的
+        `<workdir>/.aigent/pages/<key>/`（理由见 `doc_convert.tool_cache_dir`）。
+
+        改造前这个分支只抽文本层（`fitz.get_text`），含图表的页与扫描件等于
+        什么都没给 —— 用户"@ 了一个带图表的 PDF，模型却答不出图表内容"就是
+        这么来的。现在图表的视觉真相随页图一起进上下文。
+
+        参数：
+            max_pages: 最多渲染多少张页图（默认 `doc_max_pages()`）。注意它约束的
+                       是**页图**，文本层永远全量 —— 文本是无视觉模型兜底的主通道。
+        返回：
+            有页图 → 中性图片块 dict；无页图 → 纯文本 str；失败 → `"Error: ..."`。
+        """
+        try:
+            import fitz  # noqa: F401 - 只为早失败；真正的转换在 doc_convert 里
+        except ImportError:
+            return "Error: pymupdf 未安装。请运行: python3 -m pip install pymupdf"
+
+        page_budget = (max_pages if isinstance(max_pages, int) and max_pages > 0
+                       else doc_max_pages())
+        max_edge = image_max_edge()
+        image_budget = doc_max_images()
+        min_text = doc_page_image_min_text()
+        workdir = base or self.workdir
+        cache_dir = doc_convert.tool_cache_dir(
+            workdir, fp, max_edge=max_edge, max_pages=page_budget,
+            max_images=image_budget, min_text=min_text)
+        if cache_dir is None:
+            # 只在"连路径都算不出来"时发生（workdir 为空 / 不可解析）。
+            # **目录不可写不算**：那种情况由 convert_pdf 内部转为纯文本模式，
+            # 正文照常拿到，只是没有页图。
+            return (f"Error: 无法解析页图缓存目录（workdir 为空或不可解析）。"
+                    f"可用 bash 直接读该 PDF。")
+
+        out = doc_convert.convert_pdf(
+            fp, cache_dir, "doc", max_edge=max_edge, max_pages=page_budget,
+            max_images=image_budget, min_text=min_text)
+        pages = int(out.get("pages") or 0)
+        assets = [a for a in (out.get("images") or []) if isinstance(a, dict)]
+        body = doc_convert.humanize_anchors(str(out.get("markdown") or "")).strip()
+        if not body and not assets:
+            return (f"[PDF: {display}] 共 {pages} 页，未提取到任何文本或可渲染内容"
+                    f"（可能为空白 / 加密 / 损坏）。")
+
+        head = f"PDF: {display}，共 {pages} 页。"
+        if assets:
+            page_list = "、".join(str(a.get("page")) for a in assets)
+            head += (f"随附页图 {len(assets)} 张（第 {page_list} 页），"
+                     f"正文中 `[第 N 页为图像，随附]` 处就是它。")
+        else:
+            head += ("本次未随附页图：该 PDF 的文本层足以代表各页内容，"
+                     "或页图渲染被跳过（见下方说明）。")
+        # warnings 是"诚实失败"通道（无文本层已按图发送 / 页图目录不可写 /
+        # 只渲染了前 N 页…）—— 必须让模型看到，否则它会以为已尽收眼底。
+        tail = [f"（{w}）" for w in (out.get("warnings") or []) if str(w).strip()]
+        text = "\n".join([head, body, *tail]).strip()[:text_max_chars()]
+        if not assets:
+            return text
+        images = [{
+            "path": str(a.get("path") or ""),
+            "name": f"{fp.name} 第 {a.get('page')} 页",
+            "mime": "image/jpeg",
+            "page": a.get("page"),
+        } for a in assets]
+        return build_tool_images_result(images, text=text, source=fp.name)
 
     def run_write(self, path: str, content: str, base: Path | None = None) -> str:
         """
@@ -506,9 +648,13 @@ class ToolRegistry:
         """
         return {
             "bash":        lambda **kw: self.run_bash(kw["command"]),
-            "run_read":    lambda **kw: self.run_read(kw["path"], kw.get("limit")),
-            "run_read_pdf": lambda **kw: self.run_read_pdf(
-                kw["path"], kw.get("max_pages", 5), kw.get("chars_per_page", 3000)),
+            # 读文件只有一个入口（2026-09-21）：文本 / 图片 / PDF / Office 由
+            # `run_read` 内部按类型分派（魔数优先）。返回值可能是 str，也可能是
+            # **中性图片块 dict**（读图片、读带页图的 PDF）—— 引擎侧按形状识别
+            # （`is_tool_image_result`）并装配成合成 user 消息，**不会**把它
+            # str()/json.dumps() 掉。全仓仅此一个工具会返回非 str。
+            "run_read":    lambda **kw: self.run_read(
+                kw["path"], kw.get("limit"), kw.get("max_pages")),
             "run_write":   lambda **kw: self.run_write(kw["path"], kw["content"]),
             "run_edit":    lambda **kw: self.run_edit(kw["path"], kw["old_text"], kw["new_text"]),
             "run_glob":    lambda **kw: self.run_glob(kw["pattern"]),
@@ -636,10 +782,7 @@ class ToolRegistry:
         scoped = self.handlers.copy()
         scoped["bash"] = lambda **kw: self.run_bash(kw["command"], base=cwd)
         scoped["run_read"] = lambda **kw: self.run_read(
-            kw["path"], kw.get("limit"), base=cwd)
-        scoped["run_read_pdf"] = lambda **kw: self.run_read_pdf(
-            kw["path"], kw.get("max_pages", 5), kw.get("chars_per_page", 3000),
-            base=cwd)
+            kw["path"], kw.get("limit"), kw.get("max_pages"), base=cwd)
         scoped["run_write"] = lambda **kw: self.run_write(
             kw["path"], kw["content"], base=cwd)
         scoped["run_edit"] = lambda **kw: self.run_edit(
@@ -677,27 +820,27 @@ class ToolRegistry:
                     }
                 },
                 {
+                    # 读文件**唯一入口**（2026-09-21）。描述措辞直接决定模型会不会用
+                    # 它、会不会绕路先试 strings/cat/hexdump，所以三件事必须说清：
+                    #   ① 文本 / 图片 / PDF / Office **都走它**（模型不必按格式换工具）
+                    #   ② 图片与 PDF 页图给的是**像素本身**，不是文字描述
+                    #   ③ PDF 同时给出文本层与页图（图表、扫描件的视觉真相在那）
                     "type": "function",
                     "function": {
-                        "name": "run_read", "description": "读取文件内容。",
+                        "name": "run_read",
+                        "description": "读取文件内容。**文本、图片、PDF、Word/Excel/PPT 都用这一个工具**，"
+                                       "它会按文件类型自动处理：文本/代码返回原文；"
+                                       "图片返回**图片本身**（你直接看到像素，而不是一段文字描述）；"
+                                       "PDF 返回**每页文本 + 含图表或扫描页的整页图**；"
+                                       "docx/xlsx/pptx 返回文本与表格内容（图表与版式不在其中，会明确说明）。"
+                                       "读 PDF、图片、Office 文档时**不要**改用 bash 的 cat/strings/hexdump —— "
+                                       "那些命令拿不到正确内容，只会白花一轮。",
                         "parameters": {"type": "object", "properties": {
-                            "path": {"type": "string"},
-                            "limit": {"type": "integer"},
+                            "path": {"type": "string", "description": "文件路径"},
+                            "limit": {"type": "integer", "description": "可选：文本文件最多读多少行；Office 文档当作字符上限"},
+                            "max_pages": {"type": "integer", "description": "可选：PDF 最多附带多少张整页图（默认 20）。页图是看清图表与扫描件的唯一途径"},
                             "parallel": {"type": "boolean", "default": False,
                                 "description": "True 时与同次响应中其他独立文件读取并行执行。多个互不依赖的 read 一起发可提速。"}
-                        }, "required": ["path"]}
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "run_read_pdf", "description": "使用 pymupdf 安全读取 PDF 文件，分页提取文本。读取 PDF 时必须使用此工具，不要使用 bash 的 strings/cat 等命令。",
-                        "parameters": {"type": "object", "properties": {
-                            "path": {"type": "string", "description": "PDF 文件路径"},
-                            "max_pages": {"type": "integer", "description": "最大读取页数，默认5"},
-                            "chars_per_page": {"type": "integer", "description": "每页最大字符数，默认3000"},
-                            "parallel": {"type": "boolean", "default": False,
-                                "description": "True 时与同次响应中其他独立 PDF 读取并行执行。批量读 PDF 时一起发可大幅提速。"}
                         }, "required": ["path"]}
                     }
                 },
@@ -730,6 +873,9 @@ class ToolRegistry:
                         }, "required": ["pattern"]}
                     }
                 },
+                # 原「view_image」工具定义已下线（2026-09-21）：读图片并入 run_read
+                # —— 模型不会再"该用 A 却用了 B"。图片依旧是**像素本身**进上下文
+                # （通道没变，见 docs/frontend/14 与 15），只是入口不再单独暴露。
             ]
         return self._base_tools_cache
 
@@ -1202,19 +1348,20 @@ class ToolRegistry:
            这种"必填但被禁止"的构造下模型偶尔会放弃工具调用、只回一句
            "我派一个子智能体去读"，本轮随即结束 —— 用户看到的就是"直接中断"。
         2. **示例里的工具名必须与 `base_tools` 完全一致**（bash / run_read /
-           run_read_pdf / run_write / run_edit / run_glob）。写成 read_file /
-           read_pdf 这类不存在的名字会污染 allowed_tools，子智能体直接拿不到
-           run_read_pdf，读 PDF 必然失败。
+           run_write / run_edit / run_glob）。写成 read_file / read_pdf 这类不
+           存在的名字会污染 allowed_tools，子智能体直接拿不到那件工具。
+           注意 `run_read` 是**读文件的唯一入口**（2026-09-21 起图片、PDF、
+           Office 都由它分派），所以示例里**不该再出现 run_read_pdf / view_image**。
         """
         return {"type": "function", "function": {
             "name": "sub_agent",
-            "description": "分发子任务给通用型子智能体。子智能体拥有独立上下文（不污染主对话），共享文件系统，只返回最终摘要。子智能体默认拥有执行工具权限，但不包含 task 系列工具；任务看板只由主智能体维护。当任务需要多步骤操作、读取多个文件、收集信息或可能产生大量工具调用时使用。\n\n⚠️ 决定派发就必须在**本轮同一条回复里立即发起本次工具调用**。只输出「我派一个子智能体去读」这类正文而不调用本工具，本轮会直接结束、子任务永远不会执行（实测事故：模型承诺派发但零工具调用 → turn 结束 → 用户侧表现为「直接中断、不往下执行」）。\n\n⚠️ 强制规则（必须遵守，违例会阻塞主循环浪费时间）：\n凡是「批量 / 全量 / 跨多个文件 / 跨整个目录 / 预计耗时 > 30 秒」的任务，**必须传 run_in_background=true** 丢到后台线程异步执行，立即返回任务 ID，结果通过后续轮次的 <task_notification> 收回。绝对不要同步等待这类任务完成。\n判断标准（命中任意一条就必须后台）：\n  - 涉及 ≥ 2 个文件 / 整个目录 / 全部 N 个 X\n  - prompt 含「全部 / 全量 / 批量 / 跑一遍 / 扫描 / 审计 / 构建 / 测试套件」等关键词\n  - 需要多步骤工具调用且总耗时可能 > 30 秒\n允许同步（不传 run_in_background）的场景：\n  - 单个文件的快速查询、单步工具调用\n  - 必须等前序结果才能继续的下一步操作\n\nparallel 只对**同步**子任务有意义：多个互不依赖的同步子任务设 parallel=true 可并发执行；不传按串行处理。run_in_background=true 时本字段无意义，可以完全不传（后台任务各自独立，不参与并行/串行分桶）。\n\n可通过 allowed_tools 限制子智能体的工具范围，例如只允许只读操作。**工具名必须与 API 下发的完全一致**（现有只读工具为 bash / run_read / run_read_pdf；名字写错会拿不到该工具）。\n\n示例：\n- sub_agent(prompt=\"读取 DRG_Docs 目录下全部 6 个 PDF 的标题和摘要\", run_in_background=true)  ← 批量全目录，必须后台\n- sub_agent(prompt=\"实现用户注册功能\", parallel=false)\n- sub_agent(prompt=\"分析当前代码架构并设计重构方案\", parallel=false)\n- sub_agent(prompt=\"只读方式搜索代码中的安全问题\", allowed_tools=[\"bash\",\"run_read\",\"run_read_pdf\"], parallel=true)\n- sub_agent(prompt=\"跑全量测试并报告失败用例\", run_in_background=true)",
+            "description": "分发子任务给通用型子智能体。子智能体拥有独立上下文（不污染主对话），共享文件系统，只返回最终摘要。子智能体默认拥有执行工具权限，但不包含 task 系列工具；任务看板只由主智能体维护。当任务需要多步骤操作、读取多个文件、收集信息或可能产生大量工具调用时使用。\n\n⚠️ 决定派发就必须在**本轮同一条回复里立即发起本次工具调用**。只输出「我派一个子智能体去读」这类正文而不调用本工具，本轮会直接结束、子任务永远不会执行（实测事故：模型承诺派发但零工具调用 → turn 结束 → 用户侧表现为「直接中断、不往下执行」）。\n\n⚠️ 强制规则（必须遵守，违例会阻塞主循环浪费时间）：\n凡是「批量 / 全量 / 跨多个文件 / 跨整个目录 / 预计耗时 > 30 秒」的任务，**必须传 run_in_background=true** 丢到后台线程异步执行，立即返回任务 ID，结果通过后续轮次的 <task_notification> 收回。绝对不要同步等待这类任务完成。\n判断标准（命中任意一条就必须后台）：\n  - 涉及 ≥ 2 个文件 / 整个目录 / 全部 N 个 X\n  - prompt 含「全部 / 全量 / 批量 / 跑一遍 / 扫描 / 审计 / 构建 / 测试套件」等关键词\n  - 需要多步骤工具调用且总耗时可能 > 30 秒\n允许同步（不传 run_in_background）的场景：\n  - 单个文件的快速查询、单步工具调用\n  - 必须等前序结果才能继续的下一步操作\n\nparallel 只对**同步**子任务有意义：多个互不依赖的同步子任务设 parallel=true 可并发执行；不传按串行处理。run_in_background=true 时本字段无意义，可以完全不传（后台任务各自独立，不参与并行/串行分桶）。\n\n可通过 allowed_tools 限制子智能体的工具范围，例如只允许只读操作。**工具名必须与 API 下发的完全一致**（现有只读工具为 bash / run_read / run_write；名字写错会拿不到该工具）。\n\n示例：\n- sub_agent(prompt=\"读取 DRG_Docs 目录下全部 6 个 PDF 的标题和摘要\", run_in_background=true)  ← 批量全目录，必须后台\n- sub_agent(prompt=\"实现用户注册功能\", parallel=false)\n- sub_agent(prompt=\"分析当前代码架构并设计重构方案\", parallel=false)\n- sub_agent(prompt=\"只读方式搜索代码中的安全问题\", allowed_tools=[\"bash\",\"run_read\"], parallel=true)\n- sub_agent(prompt=\"跑全量测试并报告失败用例\", run_in_background=true)",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "给子智能体的任务描述，应具体说明要做什么"},
                     "description": {"type": "string", "description": "任务的简短描述，用于日志记录"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "限制子智能体可用的工具名称列表。不设置则默认使用全部工具。例如 [\"bash\",\"run_read\",\"run_read_pdf\"] 限制为只读工具集"},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "限制子智能体可用的工具名称列表。不设置则默认使用全部工具。例如 [\"bash\",\"run_read\"] 限制为只读工具集"},
                     "parallel": {"type": "boolean", "default": False,
                         "description": "仅对同步子任务有意义：True 表示与其他同步 sub_agent 并行执行，"
                                        "不传按串行处理。run_in_background=true 时无意义，不必传。"},
@@ -1247,8 +1394,15 @@ class ToolRegistry:
             return self._mcp_manager.assemble_handlers().get(tool_name)
         return None
 
-    def execute(self, tool_name: str, **tool_args) -> str:
-        """按工具名执行一次工具调用；未知工具返回错误字符串。"""
+    def execute(self, tool_name: str, **tool_args):
+        """按工具名执行一次工具调用；未知工具返回错误字符串。
+
+        返回类型是 `str`，**唯一例外是 `run_read`** —— 读图片或读带页图的 PDF 时
+        它返回一个中性图片块（`{"type":"tool_image",...}`，见 `_read_image` /
+        `_read_pdf`）。工具层"永远返回东西、绝不抛异常"的契约不变：所有失败路径
+        仍然返回 `"Error: ..."` 字符串，调用方按形状分流即可
+        （`agent_full_v2._execute_tool_call`）。
+        """
         handler = self.resolve_handler(tool_name)
         if handler is None:
             return f"Error: Unknown tool {tool_name}"

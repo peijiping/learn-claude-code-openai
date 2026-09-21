@@ -27,6 +27,7 @@ if str(AGENTS_DIR) not in sys.path:
 
 import agent_full_v2  # noqa: E402
 import attachments as A  # noqa: E402
+import refs as R  # noqa: E402
 from agent_full_v2 import MODEL_MSG_FIELDS, Agent  # noqa: E402
 from paths import WorkspacePaths  # noqa: E402
 
@@ -84,6 +85,37 @@ class ModelMessagesEquivalenceTests(unittest.TestCase):
         history = self._history()
         agent = _stub_agent(list(history), None, None)
         self.assertEqual(agent._model_messages(), _legacy_model_messages(history))
+
+    def test_no_ref_history_is_identical_and_passes_through(self):
+        """引用（@-mention，2026-09-21）不得污染存量。
+
+        两道断言缺一不可：
+        - 等值：无引用历史的输出与旧实现完全一致；
+        - **透传（身份）**：引用展开这一步必须把附件展开的产物**原对象**交出去。
+          只要将来有人把它改成"总是返回新 dict"，等值断言照样通过，而"零复制、
+          无引用时逐字节等价"的结构保证就没了 —— 这条才是真正的保险丝。
+        """
+        history = self._history()
+        agent = _stub_agent(list(history), self.ws, "SESS000001")
+
+        seen: list = []
+        real_expand = agent_full_v2.expand_content_for_model
+
+        def _spy(msg, session_dir, **kw):
+            out = real_expand(msg, session_dir, **kw)
+            seen.append(out)
+            return out
+
+        with mock.patch.object(agent_full_v2, "expand_content_for_model", _spy):
+            projected = agent._model_messages()
+
+        self.assertEqual(projected, _legacy_model_messages(history))
+        self.assertEqual(len(seen), len(projected))
+        for got, mid in zip(projected, seen):
+            self.assertIs(got, mid,
+                          "无引用块时引用展开必须是恒等透传（返回同一对象）")
+        # 历史本身一字未改
+        self.assertEqual(agent.history_messages, list(history))
 
     def test_attachment_session_dir_none_without_session_id(self):
         self.assertIsNone(_stub_agent([], self.ws, None)._attachment_session_dir())
@@ -148,6 +180,24 @@ class ModelMessagesExpandTests(unittest.TestCase):
         self.assertEqual(agent.history_messages[0]["content"][1]["type"],
                          A.ATTACHMENT_BLOCK_TYPE)
         self.assertNotIn("base64", str(agent.history_messages))
+
+    def test_ref_blocks_expand_at_send_boundary_and_stay_out_of_history(self):
+        """引用（@-mention，2026-09-21）：jsonl 存中性路径块，请求体里变成说明文本块。"""
+        target = self.src / "a.ts"
+        target.write_text("export const a = 1", encoding="utf-8")
+        ledger = {"role": "user", "content": R.attach_ref_blocks(
+            "看看 @a.ts",
+            [R.normalize_ref(self.ws.workdir, {"path": str(target)})])}
+        agent = _stub_agent([ledger], self.ws, self.sid)
+
+        sent = agent._model_messages()[0]
+        self.assertEqual(sent["content"][0], {"type": "text", "text": "看看 @a.ts"})
+        self.assertEqual(sent["content"][1]["type"], "text")
+        self.assertIn(str(target), sent["content"][1]["text"])
+        self.assertIn("run_read", sent["content"][1]["text"])
+        # 不回写历史：账本形态里 ref 块还在，说明文本块没被写回
+        self.assertTrue(R.history_has_refs(agent.history_messages))
+        self.assertNotIn("run_read", str(agent.history_messages))
 
     def test_image_attachment_expands_to_image_url(self):
         from PIL import Image

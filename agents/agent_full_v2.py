@@ -34,10 +34,16 @@ from teammate_manager import TeammateManager
 from paths import (SKILLS_DIR, WORKTREE_DIR, MCP_CONFIG, DEFAULT_PROJECT_ID,
                    WorkspacePaths, workspace_paths)
 from attachments import (
+    build_tool_images_message,
     expand_content_for_model,
-    history_has_attachments,
+    history_has_images,
+    is_tool_image_result,
     text_view,
+    tool_image_text,
 )
+# 引用（@-mention，2026-09-21）：与附件同构的"账本块 + 发送边界展开"，但**零复制**，
+# 只在请求体里给出一条路径清单。叶子模块，无循环依赖。
+from refs import expand_ref_blocks_for_model
 from tools import ToolRegistry
 from task_manager import TaskManager, current_board
 from memories import MemoryStore
@@ -809,15 +815,30 @@ class Agent:
         历史回放、以及任何把图带进新轮的路径都不校验 —— 图片会被原样发给不支持
         图片的模型。门控放在这里覆盖全部路径；`ws_bridge` 的预检保留，职责是
         "迁移之前就报错"，避免草稿白搬到会话目录。
+
+        **引用（@-mention，2026-09-21）**：jsonl 里存的是中性的路径引用块
+        （`{"type":"ref","ref":{path,name,is_dir,project_id}}`，**零复制、无字节**），
+        在这一边界合并成一段说明文本（路径清单 + "内容不在上下文中，需 run_read"）。
+        与附件同一条策略：只作用于本次请求、不回写历史。无引用块时原样返回同一对象。
+
+        **工具读图（run_read 读到图片/页图，2026-09-21）**：`{"type":"tool_image"}` 块由
+        `run_read` 产出（一次读 PDF 可以带多张页图）、被 agent_loop 聚合成一条**
+        合成 user 消息**（marker
+        `_tool_images`）落盘。这里把它展开成 `image_url` + data URL（大图在内存里
+        先缩放，不落盘）。marker 字段不在 `MODEL_MSG_FIELDS` 白名单里，因此
+        只留在 jsonl 供回放辨认，**不会漏进请求体**。
         """
         session_dir = self._attachment_session_dir()
-        # 无附件 → 短路：不读模型能力、不做任何额外工作，请求体与改造前等价。
-        # 有附件 → 查本轮生效模型的能力，text-only 模型下图片降级为占位。
+        # 无附件无工具图片 → 短路：不读模型能力、不做任何额外工作，请求体与改造前等价。
+        # 有任一 → 查本轮生效模型的能力，text-only 模型下图片降级为占位。
+        # 判据是 `history_has_images`（附件图片 ∪ 工具图片）而不是只判附件：
+        # 读图的会话可能没有附件块，只判附件会拿到默认值 True，
+        # 于是图片被原样发给不支持图片的模型 —— 由 provider 报错。
         # 查询必须包 try/except：本方法位于 retry lambda 内，异常会穿透到
         # agent_loop 打死整轮（与 _expand_one 的"绝不抛异常"同一契约）。
         # 空 _turn_model_id → 回落全局 active 模型，与 _turn_model_snapshot 同口径。
         supports_image = True
-        if history_has_attachments(self.history_messages):
+        if history_has_images(self.history_messages):
             try:
                 supports_image = model_supports_image(
                     getattr(self, "_turn_model_id", None) or "")
@@ -825,13 +846,19 @@ class Agent:
                 log.warning("查询模型图片能力失败（按支持图片处理）: %s: %s",
                             type(exc).__name__, exc)
                 supports_image = True
-        return [
+        projected = [
             expand_content_for_model(
                 {k: m[k] for k in MODEL_MSG_FIELDS if k in m}, session_dir,
                 supports_image=supports_image,
             )
             for m in self.history_messages
         ]
+        # 引用（@-mention，2026-09-21）：把中性的 `{"type":"ref"}` 块合并成一段
+        # 「路径清单 + 内容不在上下文中、需要时用 run_read」的说明文本块。与附件同一
+        # 策略 —— **只在发送边界现算，不回写 history_messages**。无引用块时该函数
+        # 返回**传入的同一个对象**，所以"无附件无引用时请求体逐字节等价"这条保证
+        # 由结构成立（tests/test_agent_model_messages.py 有身份断言钉住这一点）。
+        return [expand_ref_blocks_for_model(m) for m in projected]
 
     def run_turn(self, user_query: str | list) -> str:
         """
@@ -1297,22 +1324,29 @@ class Agent:
         log.info("注入工作区指令更新: %s%s revision=%s",
                  self.session_prefix, self.session_id, revision)
 
-    def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = ""):
+    def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = "",
+                       stop_event=None):
         """
         把"执行一个工具调用"包成无参闭包，供 background_manager 在后台线程调用。
 
         tool_name / tool_args 是 _make_executor 的形参（独立作用域、每次调用绑一次），
         所以 lambda 直接闭包捕获即可，无须 def 嵌套，也不会出现 for 循环闭包共享
         变量导致所有闭包都引用最后一次迭代值的经典坑。
+
+        stop_event：协作式停止事件。后台路径由 _execute_tool_call 每任务新建一个
+        （随 start_background_task 登记，request_stop_all 置位）；同步路径传主
+        智能体自身的 _stop_evt（子智能体也能被"停止"打断）。仅 sub_agent 会读它。
         """
         if tool_name == "sub_agent":
-            return lambda: self._run_subagent(tool_args, tool_call_id)
+            return lambda: self._run_subagent(tool_args, tool_call_id,
+                                              stop_event=stop_event)
         elif self.tools.resolve_handler(tool_name) is not None:
             return lambda: self.tools.execute(tool_name, **tool_args)
         else:
             return lambda: f"Error: Unknown tool {tool_name}"
 
-    def _run_subagent(self, tool_args: dict, tool_call_id: str = "") -> str:
+    def _run_subagent(self, tool_args: dict, tool_call_id: str = "",
+                      stop_event=None) -> str:
         """派发 sub_agent。若传了 workdir（worktree 名称），解析为路径并注入。
 
         子智能体返回 (摘要, transcript)：摘要作为工具结果回传主上下文；
@@ -1331,12 +1365,14 @@ class Agent:
                 allowed_tools=tool_args.get("allowed_tools"),
                 workdir=wt,
                 tool_call_id=tool_call_id,
+                stop_event=stop_event,
             )
         else:
             summary, transcript = self.subagent_runner.spawn_subagent(
                 prompt,
                 allowed_tools=tool_args.get("allowed_tools"),
                 tool_call_id=tool_call_id,
+                stop_event=stop_event,
             )
         if tool_call_id:
             # 边通道暂存（供 _persist_pending_subagent_rows 兜底去重）
@@ -1402,9 +1438,13 @@ class Agent:
 
         # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式
         if self.background_manager.should_run_background(tool_name, tool_args):
-            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
+            # 每个后台任务一个停止事件：同时交给 executor（sub_agent 在迭代
+            # 边界读取）与 background_manager（request_stop_all 置位）。
+            bg_stop = threading.Event()
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id,
+                                           stop_event=bg_stop)
             bg_id = self.background_manager.start_background_task(
-                tool_name, tool_args, tool_id, executor
+                tool_name, tool_args, tool_id, executor, stop_event=bg_stop
             )
             cmd_text = (
                 tool_args.get("command")
@@ -1421,8 +1461,11 @@ class Agent:
                      self.session_prefix, self.session_id, tool_name, bg_id,
                      time.monotonic() - started)
         else:
-            # 同步路径：直接走原逻辑
-            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
+            # 同步路径：直接走原逻辑。同步子智能体也接入协作式停止：
+            # 传主智能体自身的 _stop_evt（request_stop 时被置位），
+            # 长时间执行的子智能体在迭代边界感知并收束为 aborted。
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id,
+                                           stop_event=self._stop_evt)
             # 单条工具失败绝不能杀死整轮对话（2026-09-18 事故）。
             # 反例：bash 输出解码抛 UnicodeDecodeError → 异常穿透 agent_loop →
             # 本轮剩余 tool_call 的 tool_result 一条都没写回 → 会话文件留下
@@ -1445,12 +1488,18 @@ class Agent:
                      self.session_prefix, self.session_id, tool_name,
                      time.monotonic() - started, len(str(tool_output)))
 
+        # 工具读图（run_read 读到图片/页图，2026-09-21）：这是**唯一**不返回字符串的
+        # 工具。必须原样保留它的中性图片块 —— 一旦被 str() 掉，模型只会看到一段
+        # Python dict 的 repr，图彻底丢失（而这正是它存在的全部意义）。
+        # 判定放在**形状**上（`is_tool_image_result`）而不是工具名：将来若有别的
+        # 工具也产出图片，这里无需再改。所有其它工具（含全部错误路径）仍是字符串。
+        content = tool_output if is_tool_image_result(tool_output) else str(tool_output)
         return {
             "role": "tool",
             "tool_name": tool_name,
             "tool_args": tool_args,
             "tool_call_id": tool_id,
-            "content": str(tool_output),
+            "content": content,
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -1778,6 +1827,20 @@ class Agent:
                 self.hook_system.trigger("PostToolUse", tool_call, tool_call_result)
 
             # 按 LLM 声明顺序回放 tool 消息(三桶结果合并, 严格保序)
+            #
+            # 工具读图（run_read 读到图片/页图，2026-09-21）：它返回的是**图片块**，而
+            # Chat Completions 的 `tool` 消息 `content` 只接受 text part ——
+            # 图片塞不进 tool 消息本身（只有 Anthropic Messages / OpenAI
+            # Responses 支持工具结果带图）。所以职责拆成两半：
+            #   · tool 消息只承载一句**元数据说明**（"已读取 x.png，128KB"），
+            #     用来回答 tool_call_id；
+            #   · 图片块收集起来，在**这一批 tool 消息全部落盘之后**，追加
+            #     **一条**聚合的合成 user 消息。
+            # ⚠️ 顺序是硬约束：绝不能把图片消息插在两条 tool 消息之间 ——
+            # 那会打断 assistant.tool_calls ↔ tool 消息链（协议风险）。
+            # 合成消息带 `_tool_images` marker：落 jsonl 供回放辨认，
+            # 但不在 MODEL_MSG_FIELDS 白名单里，**不会漏进请求体**。
+            tool_image_values: list = []
             for tc in response_tool_calls:
                 result = tool_call_results.get(tc.id)
                 if result is None:
@@ -1785,13 +1848,28 @@ class Agent:
                     result = {"role": "tool", "tool_call_id": tc.id,
                               "content": f"Error: no result for {tc.id}"}
                 content = result.get("content", "")
-                if not isinstance(content, str):
+                if is_tool_image_result(content):
+                    tool_image_values.append(content)
+                    content = tool_image_text(content)
+                elif not isinstance(content, str):
                     content = json.dumps(content, ensure_ascii=False)
                 tool_msg = {"role": "tool", "content": content, "tool_call_id": tc.id}
                 self.history_messages.append(tool_msg)
                 self.session_manager.append_message_to_session(
                     self.session_file, tool_msg
                 )
+
+            if tool_image_values:
+                image_msg = build_tool_images_message(tool_image_values)
+                if image_msg is not None:
+                    self.history_messages.append(image_msg)
+                    self.session_manager.append_message_to_session(
+                        self.session_file, image_msg
+                    )
+                    self._print(
+                        f"  \033[36m[run_read] {len(tool_image_values)} "
+                        f"张图片随下一跳请求发出\033[0m"
+                    )
 
             # 工具回放完成后落盘子智能体执行记录（role=subagent 行，不进 history_messages）
             self._persist_pending_subagent_rows()

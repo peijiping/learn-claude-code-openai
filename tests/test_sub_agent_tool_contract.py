@@ -118,9 +118,13 @@ class TestSubAgentToolSchema(unittest.TestCase):
         self.assertEqual(unknown, set(),
                          f"sub_agent 描述里出现不存在的工具名: {sorted(unknown)}；"
                          f"真实名为 {sorted(_real_tool_names())}")
-        # 只读示例必须给出真实的三件套
-        for name in ("bash", "run_read", "run_read_pdf"):
+        # 只读示例必须是真实存在的工具名。run_read 自 2026-09-21 起是**读文件
+        # 的唯一入口**（PDF / 图片 / Office 都由它分派），示例里不该再出现
+        # 已退役的 run_read_pdf / view_image。
+        for name in ("bash", "run_read"):
             self.assertIn(name, self.desc)
+        self.assertNotIn("run_read_pdf", self.desc)
+        self.assertNotIn("view_image", self.desc)
 
     def test_warns_against_promise_without_tool_call(self):
         """必须显式禁止"只回正文不调用工具"——这正是事故的直接触发动作。"""
@@ -135,7 +139,8 @@ class TestSubAgentSystemPrompt(unittest.TestCase):
         unknown = _unknown_tool_names(SubAgent.DEFAULT_SYSTEM_PROMPT)
         self.assertEqual(unknown, set(),
                          f"子智能体系统提示词里出现不存在的工具名: {sorted(unknown)}")
-        self.assertIn("run_read_pdf", SubAgent.DEFAULT_SYSTEM_PROMPT)
+        # 读文件的唯一入口是 run_read（PDF / 图片 / Office 都由它分派）
+        self.assertIn("run_read", SubAgent.DEFAULT_SYSTEM_PROMPT)
         # 必须明确纠正"read_pdf 这种名字不存在"，否则子智能体会照着幻觉的名字调用
         self.assertIn("没有", SubAgent.DEFAULT_SYSTEM_PROMPT)
         self.assertIn("read_pdf", SubAgent.DEFAULT_SYSTEM_PROMPT)

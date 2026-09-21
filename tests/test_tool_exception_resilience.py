@@ -38,6 +38,7 @@ import asyncio
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +125,14 @@ class ToolCallResilienceTests(unittest.TestCase):
         agent.session_id = "resilience_test"
         agent.background_manager = BackgroundManager()
         agent._print = lambda *a, **kw: None
+        # 协作式停止（2026-09-21 在途改动）：`_execute_tool_call` 的同步分支会把
+        # `self._stop_evt` 传给 `_make_executor`（在 try 之前，不受工具层兜底保护）。
+        # `__init__` 里必然有它，但本夹具走 `__new__` 跳过了 __init__ → 必须补上，
+        # 否则测试挂在 `AttributeError: '_stop_evt'`，掩盖了它真正要守的约定。
+        agent._stop_evt = threading.Event()
+        # 同步路径把 _stop_evt 传给 sub_agent 做协作式停止（2026-09-21 新契约字段，
+        # 桩必须同步补，否则 AttributeError 被上层 except 吞成"没注入"）
+        agent._stop_evt = threading.Event()
 
         class _ExplodingTools:
             """execute 必炸 —— 模拟 run_bash 之外仍可能出现的意外异常。"""

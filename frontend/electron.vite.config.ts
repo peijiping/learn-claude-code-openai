@@ -27,7 +27,8 @@ export default defineConfig({
         '@protocols': resolve('src/renderer/src/protocols'),
         '@components': resolve('src/renderer/src/components'),
         '@store': resolve('src/renderer/src/store'),
-        '@hooks': resolve('src/renderer/src/hooks')
+        '@hooks': resolve('src/renderer/src/hooks'),
+        '@lib': resolve('src/renderer/src/lib')
       }
     },
     plugins: [react(), stripCspInDev()]

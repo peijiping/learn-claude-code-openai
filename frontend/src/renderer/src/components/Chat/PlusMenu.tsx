@@ -59,12 +59,23 @@ interface PlusMenuProps {
    * 后续接后端时只需把会话当前模式传进来即可显示勾选。
    */
   activeKey?: PlusMenuKey | null
+  /** 置灰的条目（**先于操作的反馈**：比"点了再弹错误"好）。典型场景是
+   *  默认工作空间下「引用文件或文件夹」不可用（草稿目录没有可引用的文件）。 */
+  disabledKeys?: PlusMenuKey[]
+  /** 置灰原因（作为 title 提示；只传一个，因为当前只有一类置灰场景）。 */
+  disabledReason?: string
   onPick: (key: PlusMenuKey) => void
   onClose: () => void
 }
 
 /** 加号「添加内容」面板：向上弹出，两段式分组，点击条目即回调并收起 */
-export default function PlusMenu({ activeKey = null, onPick, onClose }: PlusMenuProps): JSX.Element {
+export default function PlusMenu({
+  activeKey = null,
+  disabledKeys = [],
+  disabledReason = '',
+  onPick,
+  onClose
+}: PlusMenuProps): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
 
   // 点击面板外部 / Esc 关闭（与 MessageMenu 同款；遮罩负责绝大多数外部点击）
@@ -90,19 +101,27 @@ export default function PlusMenu({ activeKey = null, onPick, onClose }: PlusMenu
         {PLUS_MENU_SECTIONS.map((sec) => (
           <div className="plus-menu-section" key={sec.title}>
             <div className="plus-menu-group">{sec.title}</div>
-            {sec.items.map((it) => (
-              // 用 div 而非 button：菜单项内容简单但也避免与父级 button 语义冲突
-              <div
-                key={it.key}
-                role="menuitem"
-                className={`plus-menu-item ${activeKey === it.key ? 'active' : ''}`}
-                onClick={() => onPick(it.key)}
-              >
-                <Icon name={it.icon} size={16} />
-                <span className="plus-menu-label">{it.label}</span>
-                {activeKey === it.key && <Icon name="check" size={13} />}
-              </div>
-            ))}
+            {sec.items.map((it) => {
+              const disabled = disabledKeys.includes(it.key)
+              return (
+                // 用 div 而非 button：菜单项内容简单但也避免与父级 button 语义冲突
+                <div
+                  key={it.key}
+                  role="menuitem"
+                  aria-disabled={disabled}
+                  className={`plus-menu-item ${activeKey === it.key ? 'active' : ''} ${disabled ? 'disabled' : ''}`}
+                  title={disabled ? disabledReason || '当前不可用' : undefined}
+                  onClick={() => {
+                    if (disabled) return
+                    onPick(it.key)
+                  }}
+                >
+                  <Icon name={it.icon} size={16} />
+                  <span className="plus-menu-label">{it.label}</span>
+                  {activeKey === it.key && <Icon name="check" size={13} />}
+                </div>
+              )
+            })}
           </div>
         ))}
       </div>

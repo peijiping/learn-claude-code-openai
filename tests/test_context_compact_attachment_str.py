@@ -39,6 +39,29 @@ class AttachmentDowngradeTests(unittest.TestCase):
     def setUp(self):
         self.c = ContextCompact()
 
+    # ── 工具图片块（view_image，2026-09-21）────────────────────────
+    def test_tool_image_block_becomes_label(self):
+        got = self.c.content_to_str([
+            {"type": "tool_image",
+             "image": {"path": "/Users/x/secret/shot.png", "name": "shot.png",
+                       "mime": "image/png"}}])
+        self.assertEqual(got, "[图片: shot.png]")
+
+    def test_tool_image_block_never_leaks_path_or_keys(self):
+        """绝对路径掉进 L4 摘要 = 把用户主目录结构写进每一版摘要。"""
+        got = self.c.content_to_str([
+            {"type": "tool_image",
+             "image": {"path": "/Users/x/secret/shot.png", "name": "shot.png"}}])
+        self.assertNotIn("/Users", got)
+        self.assertNotIn("path", got)
+        self.assertNotIn("tool_image", got)
+
+    def test_tool_image_without_name_does_not_fall_back_to_path(self):
+        """没名字宁可只给 `[图片]`，也别拿路径当名字。"""
+        got = self.c.content_to_str([
+            {"type": "tool_image", "image": {"path": "/Users/x/secret/shot.png"}}])
+        self.assertEqual(got, "[图片]")
+
     # ── 附件块 ────────────────────────────────────────────────────
     def test_image_attachment_becomes_label(self):
         got = self.c.content_to_str([
@@ -64,6 +87,35 @@ class AttachmentDowngradeTests(unittest.TestCase):
         self.assertNotIn("{", got)
         self.assertNotIn("source_path", got)
         self.assertNotIn("/x/a.png", got)
+
+    # ── 引用块（@-mention，2026-09-21）────────────────────────────
+    # 同一类污染，只是量级更小：引用块没有字节，但原样 str(block) 会把路径清单与
+    # JSON 键名（path / is_dir / project_id）拼进摘要与 token 估算。
+    def test_ref_block_becomes_label_without_json(self):
+        got = self.c.content_to_str([
+            {"type": "ref",
+             "ref": {"path": "/w/src/a.ts", "name": "a.ts",
+                     "is_dir": False, "project_id": "ws1"}},
+            {"type": "text", "text": "正文"}])
+        self.assertEqual(got, "[引用: a.ts]\n正文")
+
+    def test_ref_block_never_leaks_json_keys_or_path(self):
+        got = self.c.content_to_str([
+            {"type": "ref",
+             "ref": {"path": "/w/src/a.ts", "name": "a.ts", "is_dir": True}}])
+        for leaked in ("{", "}", "path", "is_dir", "/w/src/a.ts"):
+            self.assertNotIn(leaked, got)
+
+    def test_ref_block_without_name_falls_back_to_basename(self):
+        self.assertEqual(
+            self.c.content_to_str([{"type": "ref", "ref": {"path": "/w/a/b.ts"}}]),
+            "[引用: b.ts]")
+
+    def test_malformed_ref_blocks_are_still_labeled(self):
+        self.assertEqual(self.c.content_to_str([{"type": "ref", "ref": {}}]), "[引用]")
+        self.assertEqual(self.c.content_to_str([{"type": "ref"}]), "[引用]")
+        self.assertEqual(
+            self.c.content_to_str([{"type": "ref", "ref": "not-a-dict"}]), "[引用]")
 
     # ── 线格式图片块（历史数据 / 手工构造）────────────────────────
     def test_inline_image_url_becomes_placeholder_without_base64(self):

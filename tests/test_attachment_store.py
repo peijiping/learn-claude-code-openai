@@ -315,7 +315,9 @@ class EmptyContentHonestyTests(_FixtureMixin, unittest.TestCase):
     def _assert_nothing_delivered(self, item: dict, needle: str) -> None:
         """真正的失败：正文只有占位串，且没有任何图片随附。"""
         self.assertEqual(item["warnings"], ["未提取到文本"])
-        self.assertEqual(item["converter"], "fallback_text")
+        # Office 的抽取自 2026-09-21 起走统一转换层（doc 15），标签从"回落"
+        # （fallback_text）改成事实：office_text
+        self.assertEqual(item["converter"], "office_text")
         self.assertEqual(item["images"], 0)
         body = self._draft_body(item)
         self.assertIn("未提取到文本", body)
@@ -351,9 +353,9 @@ class EmptyContentHonestyTests(_FixtureMixin, unittest.TestCase):
 
     def test_documents_with_content_have_no_warning(self):
         for maker, converter in ((self._pdf, "pymupdf"),
-                                 (self._docx, "fallback_text"),
-                                 (self._xlsx, "fallback_text"),
-                                 (self._pptx, "fallback_text")):
+                                 (self._docx, "office_text"),
+                                 (self._xlsx, "office_text"),
+                                 (self._pptx, "office_text")):
             with self.subTest(maker=maker.__name__):
                 item = self._stage_ok(maker())
                 self.assertEqual(item["warnings"], [])

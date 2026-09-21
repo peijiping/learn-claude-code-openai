@@ -11,6 +11,13 @@ interface ChatAttachmentInput {
   project_id?: string
 }
 
+/** chat 携带的引用线索（与 renderer 侧 RefInput 同构）。**只有路径**，不含内容。 */
+interface RefInput {
+  path: string
+  name?: string
+  is_dir?: boolean
+}
+
 /**
  * preload - 渲染进程与主进程之间唯一的"合规通道"。
  * 只暴露白名单 API（不透出原始 ipcRenderer），contextIsolation 开启下安全。
@@ -20,9 +27,11 @@ const agent = {
    * overrides=当前会话请求级覆盖（思考强度/更大上下文），随本轮请求带上。
    * modelId=当前会话绑定模型，新建任务随首条消息持久化。
    * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。
-   * attachments=本轮附件（附件登记得到的 att_id 列表）；**只有附件无正文时 text 传空串**。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}) }),
+   * attachments=本轮附件（附件登记得到的 att_id 列表）；**只有附件无正文时 text 传空串**。
+   * refs=本轮引用的工作空间路径（**零复制**：只传路径，后端校验越界后挂中性引用块）；
+   * **只有引用无正文同样是合法发送**。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}), ...(refs?.length ? { refs } : {}) }),
 
   /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
    * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
@@ -87,6 +96,15 @@ const agent = {
   /** 在系统文件管理器中定位该目录 */
   openInFinder: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('agent:openInFinder', { path }),
+
+  /** ── 引用文件或文件夹（@-mention，2026-09-21）─────────────────────
+   * 与附件**完全独立**的一条通道：**不复制、不存储**，只把工作空间内的路径清单
+   * 交给模型，内容由模型自己用 run_read 按需读取。
+   * 设计见 docs/frontend/13-引用文件与文件夹（@-mention）.md。 */
+  /** 拉取当前工作空间的可引用条目（**扁平、一次全量**；打开 `@` 时拉一次，
+   *  之后按键在前端本地过滤）。返回 `RefsPayload`；主进程等待超时返回 null。 */
+  listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:listRefs', payload ?? {}),
   /** 工作空间列表（`projects` 信封为主要数据源，这里是主动拉取的兜底） */
   listProjects: (): Promise<unknown> => ipcRenderer.invoke('agent:listProjects'),
   /** 把选定目录登记为工作空间（已登记过则复用；后端同时把它设为活动空间） */

@@ -260,10 +260,12 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null; attachments?: unknown[] | null }) => {
-    // ⚠️ 不能只判 text：**纯附件消息（正文为空）是合法发送**。
-    // 历史 bug 就是这里把"只发了图片没打字"的消息静默丢掉。
-    if (!isTrustedSender(e) || (!payload?.text && !payload?.attachments?.length)) return
+  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null; attachments?: unknown[] | null; refs?: unknown[] | null }) => {
+    // ⚠️ 不能只判 text：**纯附件消息 / 纯引用消息（正文为空）都是合法发送**。
+    // 历史 bug 就是这里把"只发了图片没打字"的消息静默丢掉；引用上线时同样
+    // 必须把 `refs` 加进来，否则"只 @ 了一个文件就发送"会被无声丢弃。
+    // （渲染层的判据是 store 的 hasSendableContent —— 跨进程无法 import，只能镜像。）
+    if (!isTrustedSender(e) || (!payload?.text && !payload?.attachments?.length && !payload?.refs?.length)) return
     // session_id 缺省/null = 新建任务（后端惰性生成短 id 建会话）；否则定位到目标会话
     const sessionId = typeof payload.session_id === 'string' && payload.session_id ? payload.session_id : undefined
     // project_id：新建任务的归属工作空间（已有会话由后端按 session_id 解析归属）
@@ -276,7 +278,8 @@ function createWindow(): void {
         ...(projectId !== undefined ? { project_id: projectId } : {}),
         ...(payload.overrides ? { overrides: payload.overrides } : {}),
         ...(payload.model_id ? { model_id: payload.model_id } : {}),
-        ...(payload.attachments?.length ? { attachments: payload.attachments } : {})
+        ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
+        ...(payload.refs?.length ? { refs: payload.refs } : {})
       }
     }))
   })
@@ -331,6 +334,26 @@ function createWindow(): void {
     })
     if (r.canceled || !r.filePaths.length) return null
     return r.filePaths[0]
+  })
+
+  // ── 引用文件或文件夹（@-mention）──────────────────────────────────
+  // 与附件**完全独立**：不复制、不存储，只把工作空间内的路径清单交给模型。
+  // 一次拉全量（前端本地过滤），所以超时给得比普通命令宽：大仓库遍历是百毫秒级。
+  ipcMain.handle('agent:listRefs', async (e, payload?: { projectId?: string | null; sessionId?: string | null }) => {
+    if (!isTrustedSender(e)) return null
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    return request(
+      'refs_list',
+      'refs',
+      {
+        ...(projectId !== undefined ? { project_id: projectId } : {}),
+        ...(sessionId !== undefined ? { session_id: sessionId } : {})
+      },
+      20000
+    )
   })
 
   ipcMain.handle('agent:openInFinder', async (e, payload: { path?: string }) => {

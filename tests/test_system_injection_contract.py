@@ -256,15 +256,21 @@ class SystemInjectionContractTests(unittest.TestCase):
         # SessionManager / WorkspacePaths 是附件辅助函数的参数注解；
         # harvest_attachments 由 `_history_to_ui` 实际调用。
         # （2026-09-20 修复：附件功能上线，与 test_subagent_sidecar 再次同因）
+        # harvest_refs 同上 —— 引用（@-mention）功能回放用（2026-09-21）。
+        # is_tool_images_message 同因 —— 工具读图（view_image）的合成消息判据，
+        # `_history_to_ui` 用它跳过 agent_loop 追加的那条假 user 消息（2026-09-21）。
         import typing
-        from attachments import harvest_attachments
+        from attachments import harvest_attachments, is_tool_images_message
         from paths import WorkspacePaths
+        from refs import harvest_refs
         from session_manage import SessionManager
         ns: dict = {n: getattr(typing, n) for n in dir(typing) if not n.startswith("_")}
         ns.update({
             "SessionManager": SessionManager,
             "WorkspacePaths": WorkspacePaths,
             "harvest_attachments": harvest_attachments,
+            "harvest_refs": harvest_refs,
+            "is_tool_images_message": is_tool_images_message,
         })
         exec(compile(seg, "ws_bridge_hist", "exec"), ns)  # noqa: S102 - 测试内自用
         history_to_ui = ns["_history_to_ui"]

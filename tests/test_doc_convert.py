@@ -244,5 +244,150 @@ class AnchorTests(unittest.TestCase):
         self.assertEqual(D.asset_dir(Path("/x"), "att_abc").name, "att_abc.pages")
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Office 抽取（2026-09-21 从 attachments 上移，见 docs/frontend/15）
+# ══════════════════════════════════════════════════════════════════
+# 上移的理由是**两条通道共用同一段代码**：附件通道与工具读文档通道对同一个
+# xlsx 必须给出同样质量的结果。所以这组测试同时守两件事 —— 抽取内容本身，
+# 以及末尾那条"丢了什么"的诚实声明（它以前根本不存在）。
+
+class _OfficeFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # resolve()：macOS 的临时目录经 /var → /private/var 符号链接，不解析的话
+        # 与 `tool_cache_dir` 内部的 resolve() 结果对不上（路径断言会假失败）
+        self.root = Path(self._tmp.name).resolve()
+
+    def _xlsx(self, name="book.xlsx", rows=(("月份", "金额"), ("一月", 12))) -> Path:
+        import openpyxl
+        p = self.root / name
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "销量"
+        for row in rows:
+            ws.append(list(row))
+        wb.save(str(p))
+        return p
+
+    def _docx(self, name="doc.docx") -> Path:
+        import docx
+        p = self.root / name
+        d = docx.Document()
+        d.add_paragraph("第一段")
+        d.add_paragraph("第二段")
+        t = d.add_table(rows=1, cols=2)
+        t.rows[0].cells[0].text = "A"
+        t.rows[0].cells[1].text = "B"
+        d.save(str(p))
+        return p
+
+    def _pptx(self, name="deck.pptx") -> Path:
+        from pptx import Presentation
+        p = self.root / name
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.title.text = "标题一"
+        prs.save(str(p))
+        return p
+
+
+class ConvertOfficeTests(_OfficeFixture):
+    def test_xlsx_carries_sheet_row_count_and_loss_note(self):
+        out = D.convert_office(self._xlsx(), ".xlsx", limit=30000)
+        self.assertEqual(out["converter"], D.OFFICE_CONVERTER)
+        self.assertIn("--- 工作表: 销量（2 行）---", out["markdown"])
+        self.assertIn("月份\t金额", out["markdown"])
+        self.assertIn("仅提取文本与表格结构", out["markdown"])
+        self.assertFalse(out["text_truncated"])
+        self.assertEqual(out["images"], [])          # Office 永远没有页图
+        self.assertEqual(out["warnings"], [])
+
+    def test_docx_keeps_paragraphs_then_tables(self):
+        out = D.convert_office(self._docx(), ".docx", limit=30000)
+        body = out["markdown"]
+        self.assertIn("第一段", body)
+        self.assertIn("A | B", body)
+        self.assertLess(body.index("第一段"), body.index("A | B"))
+
+    def test_pptx_uses_slide_headers(self):
+        out = D.convert_office(self._pptx(), ".pptx", limit=30000)
+        self.assertIn("--- 第 1 页 ---", out["markdown"])
+        self.assertIn("标题一", out["markdown"])
+
+    def test_empty_workbook_returns_placeholder_without_loss_note(self):
+        """抽空 → 只留占位串（`text_is_empty_note` 的判据），**不加**损失声明 ——
+        声明是给"有内容但缺视觉"的正文用的，空文档要的是"什么都没读到"。"""
+        out = D.convert_office(self._xlsx(rows=()), ".xlsx", limit=30000)
+        self.assertTrue(D.text_is_empty_note(out["markdown"]))
+        self.assertNotIn("仅提取文本与表格结构", out["markdown"])
+        self.assertEqual(out["text_truncated"], False)
+
+    def test_truncation_is_declared(self):
+        out = D.convert_office(self._docx(), ".docx", limit=6)
+        self.assertTrue(out["text_truncated"])
+        self.assertEqual(out["warnings"], ["内容已截断"])
+        self.assertIn("已截断至 6 字符", out["markdown"])
+        # 损失声明必须**仍在**（截断说明追加在它之后，不能把它挤掉）
+        self.assertIn("仅提取文本与表格结构", out["markdown"])
+
+    def test_unsupported_extension_raises(self):
+        with self.assertRaises(ValueError):
+            D.convert_office(self.root / "a.pdf", ".pdf", limit=100)
+
+    def test_missing_library_raises_so_caller_can_degrade(self):
+        """库缺失必须抛（由调用方兜），不能静默返回空正文。"""
+        import sys
+        from unittest import mock
+        book = self._xlsx()          # 先在补丁之外造好文件
+        with mock.patch.dict(sys.modules, {"openpyxl": None}):
+            with self.assertRaises(RuntimeError):
+                D.convert_office(book, ".xlsx", limit=100)
+
+
+class HumanizeAnchorTests(unittest.TestCase):
+    def test_page_anchor_becomes_readable_note(self):
+        md = "--- 第 1 页 ---\ntext\n<!--img:p3-->"
+        self.assertEqual(D.humanize_anchors(md),
+                         "--- 第 1 页 ---\ntext\n[第 3 页为图像，随附]")
+
+    def test_unknown_anchor_kind_still_gets_a_label(self):
+        self.assertEqual(D.humanize_anchors("x<!--img:f2-->y"),
+                         "x[随附图片 f2]y")
+
+    def test_no_anchor_is_untouched(self):
+        self.assertEqual(D.humanize_anchors("plain text"), "plain text")
+
+
+class ToolCacheDirTests(_OfficeFixture):
+    def test_requires_a_workdir(self):
+        """workdir 为空 → None（`Path("")` 会被解析成进程 cwd，那是另一个事故）。"""
+        src = self._xlsx()
+        self.assertIsNone(D.tool_cache_dir("", src))
+        self.assertIsNone(D.tool_cache_dir(None, src))
+
+    def test_dir_lives_under_the_workspace_and_is_keyed(self):
+        src = self._xlsx()
+        path = D.tool_cache_dir(self.root, src)
+        self.assertIsNotNone(path)
+        self.assertTrue(str(path).startswith(
+            str(self.root / D.TOOL_CACHE_DIRNAME / D.TOOL_CACHE_SUBDIR)))
+        self.assertEqual(path, D.tool_cache_dir(self.root, src))    # 稳定
+        self.assertEqual(len(path.name), 16)                        # sha1 截断
+
+    def test_gitignore_written_once(self):
+        src = self._xlsx()
+        D.tool_cache_dir(self.root, src)
+        gi = self.root / D.TOOL_CACHE_DIRNAME / ".gitignore"
+        self.assertEqual(gi.read_text(encoding="utf-8").strip(), "*")
+
+    def test_absent_source_has_no_key(self):
+        """源文件 stat 不到 → 算不出 key → 返回 None（调用方据此走错误分支）。"""
+        ghost = self.root / "ghost.xlsx"
+        self.assertIsNone(D._cache_key(ghost, max_edge=1, max_pages=1,
+                                       max_images=1, min_text=1))
+        self.assertIsNone(D.tool_cache_dir(self.root, ghost))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react'
-import { isSendableAttachment, useAgentStore } from '@store/agentStore'
+import { hasSendableContent, isSendableAttachment, useAgentStore } from '@store/agentStore'
 import MessageList from './MessageList'
 import InputBox from './InputBox'
 import TaskBoard from './TaskBoard'
+import type { EditorSnapshot } from './editor/serializeDoc'
+
+/** 空草稿（模块级常量：身份稳定，避免每次渲染都造新对象） */
+const EMPTY_DRAFT: EditorSnapshot = { text: '', refs: [] }
 
 /** 中央聊天面板：空态品牌 / 消息流 + 输入区 */
 export default function ChatPanel(): JSX.Element {
@@ -11,16 +15,22 @@ export default function ChatPanel(): JSX.Element {
   const draftAttachments = useAgentStore((s) => s.draftAttachments)
   const stageAttachments = useAgentStore((s) => s.stageAttachments)
   const removeDraftAttachment = useAgentStore((s) => s.removeDraftAttachment)
-  const [draft, setDraft] = useState('')
+  // 正文 + 引用的快照。**编辑器内容不受这一份 state 控制** —— 它只用于发送判据
+  // 与"发完清空"，回灌进编辑器会冲掉光标 / 打断拼音输入（见 InputBox 的 props 注释）。
+  const [draft, setDraft] = useState<EditorSnapshot>(EMPTY_DRAFT)
+  // 自增即"清空输入框"信号（清空走编辑器命令，不做受控同步）
+  const [clearSignal, setClearSignal] = useState(0)
 
   const doSend = (): void => {
     // 用共享判据而不是 `status === 'ready'`：degraded（分析不完整但可用）也必须随
     // payload 发出，否则扫描件会被静默丢掉（见 isSendableAttachment 的说明）。
     const ready = draftAttachments.filter(isSendableAttachment)
-    // 正文与附件都为空的发送没有意义；**只有附件不打字也必须能发**
-    if (!draft.trim() && ready.length === 0) return
-    send(draft, ready)
-    setDraft('')
+    // 正文 / 就绪附件 / 引用 **三者任一非空**即可发送；全空才拦下。
+    // 判据只有一处（store 的 hasSendableContent），别在这里另写一份。
+    if (!hasSendableContent(draft.text, ready, draft.refs)) return
+    send(draft.text, ready, draft.refs)
+    setDraft(EMPTY_DRAFT)
+    setClearSignal((n) => n + 1)
   }
 
   // 全局兜底：任何落在 composer 之外的 dragover/drop 都必须 preventDefault。
@@ -55,6 +65,7 @@ export default function ChatPanel(): JSX.Element {
           value={draft}
           onChange={setDraft}
           onSend={doSend}
+          clearSignal={clearSignal}
           attachments={draftAttachments}
           onStagePaths={(paths) => void stageAttachments(paths)}
           onRemoveAttachment={removeDraftAttachment}

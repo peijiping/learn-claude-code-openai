@@ -6,6 +6,7 @@ import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
 import { attachmentUrl, useAgentStore, type Message, type SubAgentMsg, type ToolCallMsg } from '@store/agentStore'
 import MessageMenu from './MessageMenu'
 import AttachmentBar, { isDegraded } from './AttachmentBar'
+import RefBar from './RefBar'
 
 /** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
 function fmtTokens(n: number): string {
@@ -215,6 +216,9 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
               />
             )}
             {msg.content}
+            {/* 引用（@-mention）：与附件并列但**形状与语义都不同** —— 引用是
+                "指向工作空间里的某个路径"，零复制，故用独立组件与独立样式渲染 */}
+            <RefBar refs={msg.refs} onOpen={(p) => void window.agent.openInFinder(p)} />
             <div className="msg-meta">
               {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}
               <button

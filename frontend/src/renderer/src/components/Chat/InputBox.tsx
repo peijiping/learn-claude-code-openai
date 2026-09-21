@@ -1,16 +1,46 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { EditorContent, useEditor, type Editor } from '@tiptap/react'
+import Document from '@tiptap/extension-document'
+import Paragraph from '@tiptap/extension-paragraph'
+import Text from '@tiptap/extension-text'
+import HardBreak from '@tiptap/extension-hard-break'
+import History from '@tiptap/extension-history'
+import Placeholder from '@tiptap/extension-placeholder'
 import { Icon } from '@components/common/Icon'
 import { hasImageInput } from '@components/Settings/llmShared'
-import { attachmentUrl, isSendableAttachment, showToast, useAgentStore, resolveModelMeta, providerDot, projectDisplayName, type DraftAttachment } from '@store/agentStore'
+import {
+  attachmentUrl,
+  hasSendableContent,
+  showToast,
+  useAgentStore,
+  resolveModelMeta,
+  providerDot,
+  projectDisplayName,
+  type DraftAttachment
+} from '@store/agentStore'
+import { useWorkspaceRefs } from '@hooks/useWorkspaceRefs'
 import PlusMenu, { PLUS_MENU_LABELS, type PlusMenuKey } from './PlusMenu'
 import AttachmentBar, { type AttachmentView } from './AttachmentBar'
 import DropOverlay from './DropOverlay'
+import RefPicker from './RefPicker'
+import { createRefExtension, type RefPanelState } from './editor/refExtension'
+import { serializeEditor, type EditorSnapshot } from './editor/serializeDoc'
+import { filterRefs, type RefCandidate } from '@lib/refFilter'
+
+/** 默认工作空间 id：它的沙箱根是临时草稿目录（`~/.aigent/projects/default/scratch`），
+ *  里面没有用户的项目文件可引用 → `@` 入口在这里置灰。 */
+const DEFAULT_PROJECT = 'default'
 
 interface InputBoxProps {
-  value: string
-  onChange: (v: string) => void
+  /** 正文 + 引用的快照。**只用于发送判据，绝不回灌进编辑器** —— 把父 state
+   *  同步回编辑器（setContent）会冲掉光标、打断拼音输入、清空撤销栈。 */
+  value: EditorSnapshot
+  /** 编辑器内容变化时回传快照（父组件据此更新发送判据） */
+  onChange: (v: EditorSnapshot) => void
   onSend: () => void
+  /** 发送后自增 → 清空编辑器并聚焦（清空走命令，不走受控同步） */
+  clearSignal: number
   /** 附件草稿（三条入口都写入 store，这里只读展示） */
   attachments: DraftAttachment[]
   /** 把一批本地绝对路径登记为附件（原生对话框 / 拖拽 / 粘贴共用） */
@@ -56,11 +86,12 @@ const THINKING_LABELS: Record<string, string> = {
   very_high: '极高'
 }
 
-/** 中央核心输入区：textarea + 附件条 + 工具栏 + 上下文条 */
+/** 中央核心输入区：富文本编辑器（正文 + 引用胶囊）+ 附件条 + 工具栏 + 上下文条 */
 export default function InputBox({
   value,
   onChange,
   onSend,
+  clearSignal,
   attachments,
   onStagePaths,
   onRemoveAttachment,
@@ -83,9 +114,8 @@ export default function InputBox({
   const newSession = useAgentStore((s) => s.newSession)
   const openProject = useAgentStore((s) => s.openProject)
   const addProjectFromPicker = useAgentStore((s) => s.addProjectFromPicker)
-  const taRef = useRef<HTMLTextAreaElement>(null)
   const [modelOpen, setModelOpen] = useState(false)
-  // 加号「添加内容」菜单（2026-09-20）：本期只做外壳，各条目按 key 后续接线
+  // 加号「添加内容」菜单：条目按 key 分发，见 handlePlusPick
   const [plusOpen, setPlusOpen] = useState(false)
   // 工作空间下拉（chip 点开）：上部分 = 已打开过的空间，末尾固定项 = 选择文件夹
   const [wsOpen, setWsOpen] = useState(false)
@@ -132,34 +162,126 @@ export default function InputBox({
   const currentProjectId =
     activeSession === null ? (pendingProjectId ?? activeProject) : activeProject
   const currentProjectPath = projects.find((p) => p.id === currentProjectId)?.path ?? null
-
   const hasSession = activeSession !== null
 
-  // 会话建成即锁空间（2026-09-20）：工作空间选择只属于「新会话」。已有会话
-  // 一律不可改归属 —— 下拉隐藏，chip 退化为只读展示；后端同样拒绝改归属，
-  // 前端隐藏只是交互层的第一道门。
+  // 会话建成即锁空间（2026-09-20）：工作空间选择只属于「新会话」。已有会话一律
+  // 不可改归属 —— 下拉隐藏，chip 退化为只读展示；后端同样拒绝改归属。
   useEffect(() => {
     if (hasSession) setWsOpen(false)
   }, [hasSession])
-  const autoGrow = (el: HTMLTextAreaElement): void => {
-    el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+
+  // ── 引用候选（@-mention）────────────────────────────────────────
+  // 一次拉全量 + 前端本地过滤；沙箱根由 (空间, 会话) 共同决定，换空间自动重拉。
+  const refs = useWorkspaceRefs(currentProjectId ?? null, activeSession)
+
+  // 编辑器**只创建一次**，它捕获的回调全都会固化成首帧闭包 —— 因此凡是会随
+  // 渲染变化的值/函数，一律经 ref 读取，绝不直接闭包捕获。
+  const refsRef = useRef(refs)
+  refsRef.current = refs
+  const liveRef = useRef({
+    onChange,
+    onSend,
+    onStagePaths,
+    canSend: false,
+    isSending: false
+  })
+  liveRef.current.onChange = onChange
+  liveRef.current.onSend = onSend
+  liveRef.current.onStagePaths = onStagePaths
+  liveRef.current.isSending = isSending
+
+  const editorRef = useRef<Editor | null>(null)
+  const pickerRef = useRef<RefPanelState | null>(null)
+  const [picker, setPicker] = useState<RefPanelState | null>(null)
+  const selectedRef = useRef(0)
+  const [selected, setSelected] = useState(0)
+  // 当前空间是否不可引用（键盘处理在编辑器创建时就固化了闭包 → 必须走 ref）
+  const refDisabledRef = useRef(false)
+  const setSel = (i: number): void => {
+    selectedRef.current = i
+    setSelected(i)
   }
 
-  const onKeyDown = (e: React.KeyboardEvent): void => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault()
-      if (!isSending && canSend) onSend()
+  // 面板条目**每次渲染现算**，不存进 picker 状态：候选列表是异步到位的，
+  // 存一份快照会导致"列表到货了面板却不刷新"——用户只能再敲一个字才看见结果。
+  const pickerItems = picker ? filterRefs(refs.items, picker.query) : []
+  const pickerItemsRef = useRef<RefCandidate[]>([])
+  pickerItemsRef.current = pickerItems
+
+  /** 面板状态变化：非 null = 打开/更新，null = 关闭 */
+  const handlePickerChange = (next: RefPanelState | null): void => {
+    if (!next) {
+      pickerRef.current = null
+      setPicker(null)
+      return
     }
+    // 首次打开才开始拉取（之后复用缓存）
+    refsRef.current.ensure()
+    const prev = pickerRef.current
+    pickerRef.current = next
+    setPicker(next)
+    // 只有 query 变了才回到第一项：需求要的"默认选中第一项"针对的是一次新的检索，
+    // 而不是用户刚用方向键选好又被重置
+    if (!prev || prev.query !== next.query) setSel(0)
   }
 
-  // ── 附件：拖拽 + 粘贴（两个入口都收敛到 onStagePaths）────────────────
-  // 拖拽计数：dragenter/dragleave 会在进入子元素时成对冒泡，只用布尔量会让遮罩
-  // 疯狂闪断 —— 用深度计数，归零才收起。
-  const dragDepth = useRef(0)
-  const [dragging, setDragging] = useState(false)
+  /** 面板打开期间的按键（由 Suggestion 转交；返回 true = 已消费） */
+  const handlePickerKey = (event: KeyboardEvent): boolean => {
+    // 空间不可引用时面板只显示一行原因，键盘也**不能盲选** ——
+    // 否则会出现"面板说不可用、回车却插进来一个胶囊"的自相矛盾。
+    if (refDisabledRef.current) return false
+    const items = pickerItemsRef.current
+    if (!pickerRef.current) return false
+    if (event.key === 'ArrowDown') {
+      if (items.length === 0) return false
+      // clamp 不环绕：越界不动，符合列表直觉
+      setSel(Math.min(selectedRef.current + 1, items.length - 1))
+      event.preventDefault()
+      return true
+    }
+    if (event.key === 'ArrowUp') {
+      if (items.length === 0) return false
+      setSel(Math.max(selectedRef.current - 1, 0))
+      event.preventDefault()
+      return true
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      // 空结果时不消费：让 Enter 继续走"发送"（否则用户被困在面板里出不来）
+      if (items.length === 0) return false
+      const item = items[selectedRef.current]
+      if (!item) return false
+      event.preventDefault()
+      pickerRef.current.command(item)
+      return true
+    }
+    // 其余（含 Escape）交给 Suggestion 自己处理：Escape 会关面板并**保留已输入的
+    // `@query` 文本**，符合"Esc 只是取消这次选择"的预期
+    return false
+  }
 
-  /** 文件列表 → 本地路径列表（三条入口共用的收敛函数）。
+  /** 编辑器级按键。
+   *
+   *  ⚠️ 顺序事实：`editorProps.handleKeyDown` 比插件的 handleKeyDown **先**执行
+   *  （prosemirror-view 的 someProp 先查直接 props、再查插件）。所以面板开着且
+   *  有条目时，这里必须 `return false` 把 Enter 让给 Suggestion 去"选中"——否则
+   *  会出现"面板开着却把消息发出去了"。 */
+  const handleEditorKeyDown = (event: KeyboardEvent): boolean => {
+    // 输入法组合期间一律不拦（拼音候选框里的 Enter 不是"发送"）。
+    // 与改造前的 textarea 守卫同源，另加 view.composing 这层保险见下。
+    if (event.isComposing || (event as KeyboardEvent & { keyCode?: number }).keyCode === 229) {
+      return false
+    }
+    if (event.key !== 'Enter' || event.shiftKey) return false
+    if (editorRef.current?.view.composing) return false
+    const panel = pickerRef.current
+    if (panel && pickerItemsRef.current.length > 0) return false // 交给 Suggestion 选中
+    if (panel) handlePickerChange(null) // 空结果：先关面板，再按"发送"处理
+    event.preventDefault()
+    if (!liveRef.current.isSending && liveRef.current.canSend) liveRef.current.onSend()
+    return true
+  }
+
+  /** 文件列表 → 本地路径列表（拖拽 / 粘贴共用的收敛函数）。
    *  能拿到路径的直接用；拿不到的（截图等剪贴板图片没有磁盘路径）把**字节**交给
    *  主进程落成临时文件，再按路径走同一条后端流程。 */
   const pathsFromFiles = async (files: File[]): Promise<string[]> => {
@@ -182,6 +304,67 @@ export default function InputBox({
     return paths
   }
 
+  const editor = useEditor(
+    {
+      // 刻意不用 starter-kit：聊天输入框不需要标题/列表/加粗，装上只会把 schema
+      // 与样式面撑大。这里只要「一个段落 + 文本 + 软换行 + 撤销栈 + 占位符 + 引用」。
+      extensions: [
+        Document,
+        Paragraph,
+        Text,
+        HardBreak,
+        History,
+        Placeholder.configure({ placeholder: '有什么我可以帮你的吗？' }),
+        createRefExtension({
+          candidates: () => refsRef.current.items,
+          onChange: handlePickerChange,
+          onKeyDown: handlePickerKey
+        })
+      ],
+      editorProps: {
+        attributes: { class: 'composer-input composer-editor' },
+        handleKeyDown: (_view, event) => handleEditorKeyDown(event),
+        // 粘贴：**只在确实带了文件时才拦截**，否则会把纯文本粘贴吃掉
+        handlePaste: (_view, event) => {
+          const files = Array.from(event.clipboardData?.files ?? [])
+          if (files.length === 0) return false
+          event.preventDefault()
+          void (async () => {
+            const paths = await pathsFromFiles(files)
+            if (paths.length) liveRef.current.onStagePaths(paths)
+            else showToast('未能读取剪贴板内容', 'error', 3000)
+          })()
+          return true
+        },
+        // 拖放：只**阻止 ProseMirror 把文件名当文字插进来**，登记仍由 .composer 的
+        // onDrop 统一负责（事件继续冒泡）—— 两处都登记会把同一批文件提交两次
+        handleDrop: (_view, event) => {
+          const files = (event as DragEvent).dataTransfer?.files
+          if (!files || files.length === 0) return false
+          event.preventDefault()
+          return true
+        }
+      },
+      onUpdate: ({ editor: ed }) => liveRef.current.onChange(serializeEditor(ed))
+    },
+    []
+  )
+  editorRef.current = editor
+
+  // 发送完成 → 清空正文与胶囊并聚焦。**不用 setContent 做同步**（见 props 注释）
+  useEffect(() => {
+    if (clearSignal <= 0) return
+    const ed = editorRef.current
+    if (!ed) return
+    ed.commands.clearContent(true)
+    ed.commands.focus()
+  }, [clearSignal])
+
+  // 拖拽计数：dragenter/dragleave 会在进入子元素时成对冒泡，只用布尔量会让遮罩
+  // 疯狂闪断 —— 用深度计数，归零才收起。
+  const dragDepth = useRef(0)
+  const [dragging, setDragging] = useState(false)
+
   const onDrop = async (e: React.DragEvent): Promise<void> => {
     e.preventDefault()
     e.stopPropagation()
@@ -194,38 +377,40 @@ export default function InputBox({
     else showToast('未能读取拖入的内容', 'error', 3000)
   }
 
-  const onPaste = async (e: React.ClipboardEvent): Promise<void> => {
-    const files = Array.from(e.clipboardData?.files ?? [])
-    // 只在确实粘贴了文件/图片时才拦截默认行为，否则会把纯文本粘贴吃掉
-    if (files.length === 0) return
-    e.preventDefault()
-    const paths = await pathsFromFiles(files)
-    if (paths.length) onStagePaths(paths)
-    else showToast('未能读取剪贴板内容', 'error', 3000)
-  }
-
   // ── 附件能力预检（前后端双重守卫里的第一道）────────────────────────
   // 图片走 vision，需要模型声明 image 输入能力；文本/文档类不受限（走文本内联）。
   // 后端在 chat 分支还会再判一次（前端隐藏/禁用只是交互层，后端才是最终守卫）。
   const hasImageDraft = attachments.some((a) => a.kind === 'image')
   const imageUnsupported = hasImageDraft && !hasImageInput(active?.capabilities)
-  // 按钮可用性与 ChatPanel 构造 payload 共用同一判据（`isSendableAttachment`）：
-  // degraded 也算"可发送"—— 解析不完整不等于不能用。两处各写一遍正是附件被
-  // 静默丢掉的原因，别再拆开。
-  const readyCount = attachments.filter(isSendableAttachment).length
+  // 发送可用：正文 / 就绪附件 / 引用**任一非空**即可（判据只有一处：
+  // store 里的 `hasSendableContent`，InputBox 的按钮与 ChatPanel 构造 payload 共用）；
+  // 且不能有"正在读取"的附件（避免半成品发出去）
   const stagingCount = attachments.filter((a) => a.status === 'staging').length
-  // 发送可用：有正文，或至少有一个就绪附件；且没有"正在读取"的附件（避免半成品发出去）
-  const canSend = (value.trim().length > 0 || readyCount > 0) && stagingCount === 0 && !imageUnsupported
+  const canSend =
+    hasSendableContent(value.text, attachments, value.refs) &&
+    stagingCount === 0 &&
+    !imageUnsupported
+  liveRef.current.canSend = canSend
+
+  // 引用在当前空间不可用（默认草稿空间，或后端已明确 disabled）
+  const refPathDisabled = currentProjectId === DEFAULT_PROJECT || refs.disabled
+  refDisabledRef.current = refPathDisabled
 
   // 加号「添加内容」菜单条目点击：先收起菜单，再分发。
-  // 逐项接线的唯一落点 —— 按 key 分支即可（见 docs/frontend/02 §3.3）：
-  //   attachFile → 已接线（原生文件对话框，2026-09-20）
-  //   其余四项仍为占位 toast（各自是独立特性，见 docs/frontend/04 后续增量）
+  // 逐项接线的唯一落点 —— 按 key 分支即可（见 docs/frontend/02 §3.3）。
   const handlePlusPick = async (key: PlusMenuKey): Promise<void> => {
     setPlusOpen(false)
     if (key === 'attachFile') {
       const paths = await window.agent.pickFiles().catch(() => [] as string[])
       if (paths.length) onStagePaths(paths)
+      return
+    }
+    if (key === 'refPath') {
+      // 「引用文件或文件夹」**只做一件事**：往输入框插一个 `@`，之后与手工输入的
+      // `@` 完全同一条路径（候选面板 / 过滤 / 胶囊都是同一套）。
+      // ⚠️ 绝不能改成 pickFiles：那会走附件的复制链路，把"引用"变成"上传"。
+      if (refPathDisabled) return
+      editorRef.current?.chain().focus().insertContent('@').run()
       return
     }
     showToast(`「${PLUS_MENU_LABELS[key]}」功能待开发`, 'info', 2000)
@@ -235,7 +420,7 @@ export default function InputBox({
   const stats = currentContextStats
   const usedPct = stats ? stats.used_percent : 0
   const indicatorColor = usedPct >= 90 ? '#e5484d' : usedPct >= 70 ? '#f5a623' : '#2ea043'
-  // 本会话 token 消耗累计（usage_stats 事件 / 切会话 usage_totals 恢复）：tooltip 后三行数据源
+  // 本会话 token 消耗累计（usage_stats 事件 / 切会话 usage_totals 恢复）
   const sesUsage = activeSession !== null ? sessionUsageBySession[activeSession] ?? null : null
   const sesHasData = !!sesUsage && sesUsage.total_tokens > 0
   const ctxMultiple =
@@ -273,19 +458,21 @@ export default function InputBox({
         onOpen={(v) => v.sourcePath && onOpenAttachment(v.sourcePath)}
       />
 
-      <textarea
-        ref={taRef}
-        className="composer-input"
-        placeholder="有什么我可以帮你的吗？"
-        value={value}
-        rows={1}
-        onChange={(e) => {
-          onChange(e.target.value)
-          autoGrow(e.target)
-        }}
-        onKeyDown={onKeyDown}
-        onPaste={(e) => void onPaste(e)}
+      {/* 引用候选面板：在输入框**上方**向上弹出（定位由 CSS 承担） */}
+      <RefPicker
+        state={picker}
+        items={pickerItems}
+        selected={selected}
+        loading={refs.loading}
+        error={refs.error}
+        disabled={refPathDisabled}
+        reason={refs.reason}
+        truncated={refs.truncated}
+        onHover={setSel}
+        onPick={(item: RefCandidate) => pickerRef.current?.command(item)}
       />
+
+      <EditorContent editor={editor} />
 
       {/* 附件相关的内联提示（比 toast 更贴近操作点） */}
       {imageUnsupported && (
@@ -308,7 +495,18 @@ export default function InputBox({
             >
               <Icon name="plus" size={16} />
             </button>
-            {plusOpen && <PlusMenu onPick={handlePlusPick} onClose={() => setPlusOpen(false)} />}
+            {plusOpen && (
+              <PlusMenu
+                onPick={handlePlusPick}
+                onClose={() => setPlusOpen(false)}
+                disabledKeys={refPathDisabled ? ['refPath'] : []}
+                disabledReason={
+                  currentProjectId === DEFAULT_PROJECT
+                    ? '默认工作空间是临时草稿目录，没有可引用的文件；请先切换到自定义工作空间'
+                    : refs.reason
+                }
+              />
+            )}
           </span>
           <button className="tool-btn access">
             完全访问 <Icon name="chevronDown" size={12} />
@@ -390,34 +588,31 @@ export default function InputBox({
               <>
                 <div className="model-menu-mask" onClick={() => { setModelOpen(false); setHoveredPanel(null) }} />
                 <div className="model-menu">
-                  {enabled.map((m) => {
-                    const meta = resolveModelMeta(llmConfig, m)
-                    return (
-                      // 用 div 而非 button：面板内的思考强度 chip / 开关也是 button，
-                      // button 嵌套 button 非法会被浏览器修复，导致面板不弹出。
-                      <div
-                        key={m.id}
-                        role="menuitem"
-                        className={`model-menu-item ${m.id === active?.id ? 'active' : ''}`}
-                        onMouseEnter={(e) => {
-                          clearHide()
-                          const r = e.currentTarget.getBoundingClientRect()
-                          setHoveredPanel({ id: m.id, ...resolvePanelPos(r) })
-                        }}
-                        onMouseLeave={() => scheduleHide(m.id)}
-                        onClick={() => {
-                          clearHide()
-                          setModelOpen(false)
-                          setHoveredPanel(null)
-                          if (m.id !== active?.id) setSessionModel(m.id)
-                        }}
-                      >
-                        <span className={`model-dot ${providerDot(m.provider)}`} />
-                        <span className="model-menu-name">{m.display_name || m.id}</span>
-                        {m.id === active?.id && <Icon name="check" size={13} />}
-                      </div>
-                    )
-                  })}
+                  {enabled.map((m) => (
+                    // 用 div 而非 button：面板内的思考强度 chip / 开关也是 button，
+                    // button 嵌套 button 非法会被浏览器修复，导致面板不弹出。
+                    <div
+                      key={m.id}
+                      role="menuitem"
+                      className={`model-menu-item ${m.id === active?.id ? 'active' : ''}`}
+                      onMouseEnter={(e) => {
+                        clearHide()
+                        const r = e.currentTarget.getBoundingClientRect()
+                        setHoveredPanel({ id: m.id, ...resolvePanelPos(r) })
+                      }}
+                      onMouseLeave={() => scheduleHide(m.id)}
+                      onClick={() => {
+                        clearHide()
+                        setModelOpen(false)
+                        setHoveredPanel(null)
+                        if (m.id !== active?.id) setSessionModel(m.id)
+                      }}
+                    >
+                      <span className={`model-dot ${providerDot(m.provider)}`} />
+                      <span className="model-menu-name">{m.display_name || m.id}</span>
+                      {m.id === active?.id && <Icon name="check" size={13} />}
+                    </div>
+                  ))}
                 </div>
                 {/* 使用 Portal 把悬浮配置面板渲染到 body 顶层，脱离 .model-menu 及其祖先的
                     overflow / transform / 裁剪限制，面板可完整显示、必要时浮出菜单甚至窗口边界外的可视区。

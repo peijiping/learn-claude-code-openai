@@ -261,10 +261,20 @@ class SessionRuntime:
         return self.agent
 
     def request_stop(self) -> None:
-        """请求停止本会话当前 turn（线程安全）；不影响其它会话。"""
+        """请求停止本会话当前 turn 与所有后台任务（线程安全）；不影响其它会话。
+
+        三件事一次做完（2026-09-21，修"停止按钮管不到后台子智能体"）：
+        1. stop_evt：start_turn 收尾据此回 stopped、bg watch 据此不再自动续轮；
+        2. agent.request_stop()：主智能体 agent_loop 在下一边界停下；
+        3. background_manager.request_stop_all()：协作式停止后台任务——
+           sub_agent 在迭代边界收束为 aborted；任务状态立即标 stopped，
+           has_running() 变 False → bg watch 退出 → 状态收敛为 done，
+           已被放弃的结果不会被复活注入。
+        """
         self.stop_evt.set()
         if self.agent is not None:
             self.agent.request_stop()
+            self.agent.background_manager.request_stop_all()
 
     def record_model_switch(self, model_id: str | None) -> None:
         """把一次用户侧模型切换记录到本会话运行中的 agent（turn 收尾净变化展示）。
@@ -306,6 +316,10 @@ class SessionRuntime:
             log.info("session_%s bg watch cancelled (new turn)", self.sid)
             self._bg_watch_task.cancel()
             self._bg_watch_task = None
+        # 清掉可能遗留的停止信号：background 态下用户点过停止后，bg watch
+        # 按 stop_evt 收尾但不会清它（清信号只在续轮路径发生）——不清的话
+        # 下一轮正常结束会被误判成 stopped。
+        self.stop_evt.clear()
         self._pending_overrides = (reasoning_effort, max_context)
         self.busy = True
         self._turn_started = time.monotonic()

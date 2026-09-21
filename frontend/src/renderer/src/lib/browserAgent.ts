@@ -150,7 +150,8 @@ class BrowserAgentBridge implements AgentApi {
     overrides?: { thinking_strength?: string; max_context?: string } | null,
     modelId?: string | null,
     projectId?: string | null,
-    attachments?: Parameters<AgentApi['send']>[5]
+    attachments?: Parameters<AgentApi['send']>[5],
+    refs?: Parameters<AgentApi['send']>[6]
   ): Promise<void> {
     this.sendRaw(JSON.stringify({
       kind: 'chat',
@@ -160,7 +161,8 @@ class BrowserAgentBridge implements AgentApi {
         ...(typeof projectId === 'string' && projectId ? { project_id: projectId } : {}),
         ...(overrides ? { overrides } : {}),
         ...(modelId ? { model_id: modelId } : {}),
-        ...(attachments?.length ? { attachments } : {})
+        ...(attachments?.length ? { attachments } : {}),
+        ...(refs?.length ? { refs } : {})
       }
     }))
     return Promise.resolve()
@@ -265,6 +267,25 @@ class BrowserAgentBridge implements AgentApi {
   }
   async listProjects(): Promise<unknown> {
     return this.request('projects_list', 'projects')
+  }
+
+  // ── 引用文件或文件夹（@-mention）────────────────────────────────
+  /** 浏览器预览里同样能跑通：桥本身就连着 ws_bridge，直接发 refs_list 即可
+   *  （后端同机读盘，与 Electron 路径语义一致；超时放宽到大仓库遍历的量级）。 */
+  async listRefs(payload?: { projectId?: string | null; sessionId?: string | null }): Promise<unknown> {
+    return this.request(
+      'refs_list',
+      'refs',
+      {
+        ...(typeof payload?.projectId === 'string' && payload.projectId
+          ? { project_id: payload.projectId }
+          : {}),
+        ...(typeof payload?.sessionId === 'string' && payload.sessionId
+          ? { session_id: payload.sessionId }
+          : {})
+      },
+      20000
+    )
   }
   async addProject(path: string): Promise<unknown> {
     return this.request('project_add', 'projects', { path })

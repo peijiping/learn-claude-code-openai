@@ -28,6 +28,27 @@ attachments.py - 会话附件（图片 / 文件）：登记、解析、发送前
 绑定。详见文档「取舍」一节。
 
 ════════════════════════════════════════════════════════════════════════
+工具读图（`run_read` 读到图片/页图，2026-09-21）—— 同一套哲学、另一条通道
+════════════════════════════════════════════════════════════════════════
+
+模型看不见磁盘，它只看得见**请求体**。所以"给模型一个图片路径"本身毫无意义：
+必须有谁把像素读进请求体。本模块同时承担两条这样的通道：
+
+- **附件通道**（`attachment` 块）：用户在桌面端显式添加文件 → 复制副本 + 解析，
+  图片在**用户自己那条消息**里展开。
+- **工具通道**（`tool_image` 块）：模型调 `run_read(path)` 主动索取 →
+  **零复制**（直接读工作空间里的原文件）→ 图片在一条**合成 user 消息**里展开。
+
+工具通道必须用合成消息而不是塞进 tool 消息，原因是协议限制：Chat Completions 的
+`tool` 消息 `content` 只接受 text part，图片塞不进去（只有 Anthropic Messages /
+OpenAI Responses 支持工具结果带图）。所以 tool 消息只承载一句**元数据说明**
+（"已读取 x.png，image/png，128KB"），图片块紧随其后作为独立消息发出。
+
+注意说明**不是对图片内容的转述** —— 让另一个模型转述再回填是有损的二手信息，
+正确做法是让主模型直接看到像素。这条边界值得反复强调：**工具的返回值形状，
+就是模型能看到的东西。**
+
+════════════════════════════════════════════════════════════════════════
 目录布局（`WorkspacePaths.attachments_dir`）
 ════════════════════════════════════════════════════════════════════════
 
@@ -44,6 +65,7 @@ attachments.py - 会话附件（图片 / 文件）：登记、解析、发送前
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
@@ -62,7 +84,17 @@ from paths import (
 )
 # doc_convert 是叶子模块（只依赖标准库 + logger），模块级导入安全；pymupdf 本身
 # 仍然是函数内懒加载。锚点语法与资产目录名让转换层做**唯一定义**，避免两处各写一份。
-from doc_convert import ASSETS_DIR_SUFFIX, IMAGE_ANCHOR_RE
+# 同理，「未提取到文本」占位串与 Office 抽取也在转换层唯一定义（2026-09-21 上移，
+# 见 docs/frontend/15）—— 附件通道与工具读文档通道必须用同一套措辞与同一套判据。
+import doc_convert
+from doc_convert import (
+    ASSETS_DIR_SUFFIX,
+    EMPTY_NOTE_PREFIX,
+    IMAGE_ANCHOR_RE,
+    OFFICE_EXTS,
+    empty_note,
+    text_is_empty_note,
+)
 
 log = get_logger("attachments")
 
@@ -74,6 +106,22 @@ KIND_TEXT = "text"           # 纯文本 / 代码：直接按文本读，不额�
 # jsonl content 里的块类型。**刻意用中性词**（不是 "image_url"）：存储形态与
 # 厂商线格式解耦，`_model_messages` 负责展开。
 ATTACHMENT_BLOCK_TYPE = "attachment"
+
+# 工具读来的图片（`run_read` 读到图片 / 读到 PDF 的页图，2026-09-21）。与附件块同一
+# 套哲学：中性词、**只有路径与 mime、不含字节**，只在发送边界展开成 image_url。
+#
+# 它和附件块长得像但**不是一回事**：附件块在 user 消息里（用户显式给出），
+# 工具图片块在一条**合成 user 消息**里（紧随该批 tool 消息之后）—— 因为
+# Chat Completions 的 `tool` 消息只接受 text part，图片塞不进工具结果本身。
+#
+# 形状：`{"type","text","images":[{path,name,mime,page?}],"source"?}`。`images` 是
+# **列表**（一次读 PDF 可以带回 N 张页图）；旧数据的单数 `image` 字段仍被读取
+# （见 `tool_image_items` 的归一化），但**只有历史回放会遇到**。
+TOOL_IMAGE_BLOCK_TYPE = "tool_image"
+
+# 合成消息的 marker 字段：标记"这条 user 消息承载的是工具读取的图片"。
+# 它**不在 MODEL_MSG_FIELDS 白名单**里 → 落 jsonl、但不漏进 API 请求体。
+TOOL_IMAGES_MARKER = "_tool_images"
 
 # 解析产物后缀（与工程内其它"派生文件"命名习惯一致，带 att_id 前缀便于定位）
 TEXT_SUFFIX = ".txt"
@@ -160,7 +208,7 @@ def max_bytes(kind: str) -> int:
 
 
 def text_max_chars() -> int:
-    """单个文档抽取文本的字符上限（默认 30000，与 run_read_pdf 同口径）。"""
+    """单个文档抽取文本的字符上限（默认 30000，与 run_read 的 PDF/Office 分支同口径）。"""
     return _int_env("ATTACHMENT_TEXT_MAX_CHARS", 30000, minimum=256)
 
 
@@ -179,6 +227,29 @@ def image_max_edge() -> int:
     except (TypeError, ValueError):
         return 1568
     return value if value >= 0 else 1568
+
+
+def image_decode_max_pixels() -> int:
+    """发送用缩略图允许**解码**的像素上限（默认 5 亿；0 = 不限制）。
+
+    为什么需要这条线（2026-09-21）：`Image.open()` 会命中 Pillow 自己的解压炸弹
+    阈值（默认 89MP 报警、≥179MP 直接抛 `DecompressionBombError`）。那个阈值是
+    防**不可信输入**的 DOS 防线，而这里读的是用户自己工作空间里的图 —— 高分屏
+    截图、PDF 分块渲染出 22500×15016（3.4 亿像素）是常态，却被判成炸弹。
+    所以防线换成**自己的、能说清话的**一条：超线时明确告诉模型"没发出去、
+    因为多大、怎么办"，而不是让 provider 回一句难懂的 400 把整轮打死。
+
+    5 亿像素 ≈ 解码峰值 1.5GB（RGB）；实测 3.4 亿像素的 PNG 解码+缩放
+    约 1 秒 / 1.35GB。要突破这个量级（或反过来收紧到更小）改这里。
+    """
+    raw = os.environ.get("ATTACHMENT_IMAGE_DECODE_MAX_PIXELS")
+    if raw is None or str(raw).strip() == "":
+        return 500_000_000
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 500_000_000
+    return value if value >= 0 else 500_000_000
 
 
 def inline_max_bytes() -> int:
@@ -309,17 +380,22 @@ def extract_text(path: Path, ext: str) -> tuple[str, bool, int | None]:
 
     任何解析库缺失/文件损坏都会抛异常，由调用方（stage / expand）兜住 ——
     本函数自身不做静默降级，因为"抽不到内容"必须让用户看见。
+
+    **Office 三种格式委托 `doc_convert.convert_office`**（2026-09-21 上移）：
+    附件通道与工具读文档通道共用同一段抽取代码，否则同一个 xlsx「上传」与
+    「@ 引用」会给出不同质量的结果。`.pdf` 的纯文本版本**留在这里** —— 它是
+    转换层抛异常时的兜底实现（`_extract_pdf`），不是主路径。
     """
     limit = text_max_chars()
     if ext == ".pdf":
         return _extract_pdf(path, limit)
-    if ext == ".docx":
-        return _clip(_extract_docx(path), limit)
-    if ext == ".xlsx":
-        return _clip(_extract_xlsx(path), limit)
-    if ext == ".pptx":
-        return _clip(_extract_pptx(path), limit)
+    if ext in OFFICE_EXTS:
+        out = doc_convert.convert_office(path, ext, limit=limit)
+        return (str(out.get("markdown") or ""),
+                bool(out.get("text_truncated")),
+                out.get("pages"))
     return _clip(read_text_file(path, limit * 4 + 1024), limit)
+
 
 
 def _clip(text: str, limit: int) -> tuple[str, bool, int | None]:
@@ -330,44 +406,47 @@ def _clip(text: str, limit: int) -> tuple[str, bool, int | None]:
 
 
 # ── 「未提取到文本」占位 ────────────────────────────────────────────
-# 抽空时正文只可能是这样一句占位（各格式措辞不同，前缀统一）。它同时是**哨兵**：
-#   ① 给模型 —— 明确知道"这里本该有内容但没读到"，不会基于残缺上下文硬答；
-#   ② 给 stage/UI —— 据此记 warning、显示"已降级"，而不是把空内容当"解析成功"。
-# 在此之前只有 PDF 有占位，docx/xlsx/pptx 抽空会返回空串，前端照样显示
-# "已提取 0 字"，用户与模型都不知道内容丢了。
-EMPTY_NOTE_PREFIX = "（未提取到文本"
-
-
-def _empty_note(ext: str) -> str:
-    if ext == ".pdf":
-        return "（未提取到文本，可能是扫描件或纯图片 PDF）"
-    if ext == ".docx":
-        return "（未提取到文本：文档可能只含图片、图表或文本框）"
-    if ext == ".xlsx":
-        return "（未提取到文本：工作簿可能只含图片或图表）"
-    if ext == ".pptx":
-        return "（未提取到文本：幻灯片可能只含图片）"
-    return "（未提取到文本）"
-
-
-def text_is_empty_note(text: str) -> bool:
-    """正文是否只是「未提取到文本」占位（stage / UI 据此判定"已降级"）。"""
-    return str(text or "").lstrip().startswith(EMPTY_NOTE_PREFIX)
+# 定义已上移到转换层（2026-09-21，见 docs/frontend/15）：`empty_note` /
+# `text_is_empty_note` / `EMPTY_NOTE_PREFIX` 由本模块顶部导入后**原样再导出**，
+# 既有调用方与测试不受影响。
+#
+# 为什么必须唯一定义：附件通道与工具读文档通道共用同一套"抽不到"判据。措辞或
+# 前缀一旦分叉，"已降级"的判定就会在两条通道上给出不同答案 —— 而它同时是给
+# 模型看的（"这里本该有内容但没读到"）和给 stage/UI 看的（记 warning）。
 
 
 def _convert_document(src: Path, ext: str, dest: Path, att_id: str) -> dict:
     """文档 → 统一中间表示（Markdown + 页图资产）。
 
-    **优先走 `doc_convert` 的统一转换层**（PDF 页图 + 文本层双路），不可用或失败时
-    回落今天的纯文本抽取 —— 降级链保证"最差情况等于现状"，不引入回归。
+    **全部走 `doc_convert` 的统一转换层**：PDF 是「文本层 + 页图」双路，
+    docx / xlsx / pptx 是 `convert_office` 的文本抽取（2026-09-21 上移，见
+    docs/frontend/15）。PDF 保留"转换层抛异常 → 回落纯文本抽取"的降级链
+    （最差情况等于现状）；Office 没有这条链，因为回落目标是同一段代码。
 
     返回 `{"body","text_truncated","pages","warnings","images","tables","converter"}`。
     `images` 是**页图资产个数**（int）；资产明细靠目录约定 `<att_id>.pages/pN.jpg`
     恢复，不进 meta —— 省 jsonl 体积，也不怕 meta 丢失。
     """
     limit = text_max_chars()
+    if ext in OFFICE_EXTS:
+        # Office 走统一转换层的文本抽取，**不再"回落"** —— 回落目标是同一段代码
+        # （同一批懒加载库），重试一次只是把同一个异常抛两遍。抽取失败（库缺失 /
+        # 文件损坏）照旧上抛，由 `_stage_one` 记成附件读取失败，与改造前一致。
+        out = doc_convert.convert_office(src, ext, limit=limit)
+        markdown = str(out.get("markdown") or "")
+        warnings = list(out.get("warnings") or [])
+        if text_is_empty_note(markdown):
+            warnings.append("未提取到文本")
+        return {
+            "body": markdown,
+            "text_truncated": bool(out.get("text_truncated")),
+            "pages": out.get("pages"),
+            "warnings": warnings,
+            "images": 0,
+            "tables": int(out.get("tables") or 0),
+            "converter": str(out.get("converter") or doc_convert.OFFICE_CONVERTER),
+        }
     try:
-        import doc_convert
         if ext == ".pdf":
             out = doc_convert.convert_pdf(
                 src, dest, att_id,
@@ -462,76 +541,10 @@ def _extract_pdf(path: Path, limit: int) -> tuple[str, bool, int | None]:
         body = "\n\n".join(parts)
         truncated = read_pages < total or len(body) > limit
         if not body.strip():
-            # 与 tools.run_read_pdf 同一口径的提示，避免用户以为"文件坏了"
-            body = _empty_note(".pdf")
+            body = empty_note(".pdf")
         return body[:limit], truncated, total
     finally:
         doc.close()
-
-
-def _extract_docx(path: Path) -> str:
-    try:
-        import docx
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("未安装 python-docx，无法解析 .docx") from exc
-    document = docx.Document(str(path))
-    parts = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    body = "\n".join(parts)
-    # 抽空必须留痕：否则一行表格都没有的 docx 会静默变成空正文
-    return body if body.strip() else _empty_note(".docx")
-
-
-def _extract_xlsx(path: Path) -> str:
-    try:
-        import openpyxl
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("未安装 openpyxl，无法解析 .xlsx") from exc
-    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-    try:
-        parts: list[str] = []
-        data_rows = 0
-        for sheet in wb.worksheets:
-            rows: list[str] = []
-            for row in sheet.iter_rows(values_only=True):
-                cells = ["" if v is None else str(v) for v in row]
-                if any(c.strip() for c in cells):
-                    rows.append("\t".join(cells))
-            # 工作表标题**不算内容** —— 否则一个只有空表的工作簿也会抽出
-            # "--- 工作表: Sheet1 ---"，看起来"解析成功"实则什么都没读到
-            parts.append(f"--- 工作表: {sheet.title} ---")
-            parts.extend(rows)
-            data_rows += len(rows)
-        body = "\n".join(parts)
-        return body if data_rows else _empty_note(".xlsx")
-    finally:
-        wb.close()
-
-
-def _extract_pptx(path: Path) -> str:
-    try:
-        from pptx import Presentation
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("未安装 python-pptx，无法解析 .pptx") from exc
-    prs = Presentation(str(path))
-    parts: list[str] = []
-    text_shapes = 0
-    for idx, slide in enumerate(prs.slides, start=1):
-        bodies: list[str] = []
-        for shape in slide.shapes:
-            frame = getattr(shape, "text_frame", None)
-            if frame is not None and (frame.text or "").strip():
-                bodies.append(frame.text.strip())
-        # 同 xlsx：「--- 第 N 页 ---」标题不算内容，否则纯图片幻灯片会被当成有正文
-        parts.append(f"--- 第 {idx} 页 ---")
-        parts.extend(bodies)
-        text_shapes += len(bodies)
-    body = "\n".join(parts)
-    return body if text_shapes else _empty_note(".pptx")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -542,33 +555,36 @@ def prepare_image(src: Path, dst: Path) -> bool:
     """生成"发送用"缩略图。返回是否真的生成了。
 
     规则：长边 > image_max_edge，或原图 > 1.5MB 时才缩放（其余情况发原图，
-    避免为了省几十 KB 反而引入一次 JPEG 有损重编码）。Pillow 缺失或失败一律
-    返回 False → 发送原图（功能不降级，只是多花点 token）。
+    避免为了省几十 KB 反而引入一次 JPEG 有损重编码）。缩放能力由
+    `_resize_jpeg_bytes` 统一提供 —— 含 Pillow 解压炸弹阈值的处理：旧实现里
+    那张 3.4 亿像素的 PNG 在这里就抛 `DecompressionBombError` → 缩略图没生成
+    → 原图被当成"发送用图"递了出去（2026-09-21 provider 400 的另一半原因）。
+
+    失败仍返回 False → 发送原图（附件路径的既有约定）。与工具图路径"缩放失败
+    绝不回落原图"**有意不同**：附件在登记时已按类型与体积校验过，且没有向模型
+    解释原因的通路；能落到这里的只剩"超过本机解码上限"的极端图。
     """
     if dst.exists():
         return True
     edge = image_max_edge()
     if edge <= 0:
         return False
-    try:
-        from PIL import Image
-    except ImportError:
-        log.info("未安装 Pillow，图片不做缩放（将发送原图）")
+    data, code, detail = _resize_jpeg_bytes(src, edge,
+                                            need_above_bytes=_RESIZE_ABOVE_BYTES)
+    if data is None:
+        if code == _RESIZE_NO_NEED:
+            return False
+        if code == _RESIZE_NO_PILLOW:
+            log.info("未安装 Pillow，图片不做缩放（将发送原图）")
+        else:
+            log.warning("图片预处理失败（将发送原图）: %s: %s", code, detail)
         return False
     try:
-        with Image.open(src) as im:
-            im.load()
-            width, height = im.size
-            if max(width, height) <= edge and src.stat().st_size <= 1_500_000:
-                return False
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            im.thumbnail((edge, edge), Image.LANCZOS)
-            im.save(dst, "JPEG", quality=82, optimize=True)
-        return True
-    except Exception as exc:  # noqa: BLE001 - 预处理失败不能拦住附件可用
-        log.warning("图片预处理失败（将发送原图）: %s: %s", type(exc).__name__, exc)
+        dst.write_bytes(data)
+    except OSError as exc:
+        log.warning("缩略图落盘失败（将发送原图）: %s: %s", dst, exc)
         return False
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -962,6 +978,18 @@ def text_view(content) -> str:
             label = "图片" if att.get("kind") == KIND_IMAGE else "附件"
             name = str(att.get("name") or "")
             parts.append(f"[{label}: {name}]" if name else f"[{label}]")
+        elif block.get("type") == TOOL_IMAGE_BLOCK_TYPE:
+            # 工具读图（run_read 读到图片/页图，2026-09-21）：块里只有路径与 mime，
+            # 文本视图给一个标签即可，**绝不把路径拼进来**（路径不是内容）。
+            # 一个块可能装多张图（一次读 PDF 的页图）→ 首张名字 + 总数，不摊开。
+            names = [str(item.get("name") or "") for item in tool_image_items(block)]
+            names = [n for n in names if n]
+            if not names:
+                parts.append("[图片]")
+            elif len(names) == 1:
+                parts.append(f"[图片: {names[0]}]")
+            else:
+                parts.append(f"[图片: {names[0]} 等 {len(names)} 张]")
         elif isinstance(block.get("text"), str):
             parts.append(block["text"])
     return " ".join(part for part in parts if part)
@@ -1061,6 +1089,296 @@ def history_has_attachments(messages) -> bool:
     return False
 
 
+# ── 工具读图（run_read 读到图片/页图，2026-09-21）──────────────────────
+# 与附件**刻意不同的两点**，写在这里免得后来者以为可以照抄：
+#
+# 1. **生命周期没有 stage 阶段**。附件在登记时就把缩放副本落盘（那时有天然的
+#    dst 目录）；工具图片来自工作空间里的任意文件，而发送边界**不允许写盘**
+#    （热路径 + 往用户工作空间塞派生文件是不该有的副作用）。所以缩放改在
+#    **编码时于内存里做**（`_data_url_resized`），不产生任何新文件。
+# 2. **图片不走 tool 消息**。Chat Completions 的 `tool` 消息只接受 text part，
+#    图片塞不进去 → 工具返回值只带一句元数据说明，图片块由 agent_loop 聚合进
+#    一条**合成 user 消息**（`build_tool_images_message`）。
+
+
+def tool_images_max_per_turn() -> int:
+    """一轮内随附给模型的工具图片数上限（默认 8）。
+
+    上限存在的理由：图片一旦进了历史，**此后每次请求都要重新上传一遍 base64**
+    （附件同理）。不设限时模型连读二十张图，请求体与每轮上传都会线性膨胀。
+    超出的图**不静默丢弃**，换成一句说清原因的文本（模型才知道自己没看全）。
+    """
+    return _int_env("VIEW_IMAGE_MAX_PER_TURN", 8, minimum=1)
+
+
+def _image_item(path, *, name: str = "", mime: str = "", page=None) -> dict:
+    """一张图片的**条目**（路径 + 元数据，不含字节）。"""
+    raw = str(path or "")
+    p = Path(raw) if raw else Path()
+    item = {
+        "path": str(p) if raw else "",
+        "name": name or (p.name if raw else ""),
+        "mime": mime or (mime_of(p) if raw else ""),
+    }
+    if page is not None:
+        try:
+            item["page"] = int(page)
+        except (TypeError, ValueError):
+            pass
+    return item
+
+
+def tool_image_items(value) -> list[dict]:
+    """工具返回值 → 图片条目列表。**唯一的归一化入口**。
+
+    同时认两种形状：新形状 `images: [...]`（一次读 PDF 带回多张页图，2026-09-21）
+    与旧形状 `image: {...}`（历史 jsonl 里的单图记录）。归一化**只在这一处做**，
+    消费侧一律走它 —— 否则每加一个消费点就要各自兼容一次存量数据。
+    空路径的条目在这里丢掉（畸形数据不该变成"一张没有路径的图"）。
+    """
+    if not isinstance(value, dict) or value.get("type") != TOOL_IMAGE_BLOCK_TYPE:
+        return []
+    raw = value.get("images")
+    if not isinstance(raw, list):
+        single = value.get("image")
+        raw = [single] if isinstance(single, dict) else []
+    items: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "")
+        if not path:
+            continue
+        item = {
+            "path": path,
+            "name": str(entry.get("name") or ""),
+            "mime": str(entry.get("mime") or ""),
+        }
+        if entry.get("page") is not None:
+            item["page"] = entry["page"]
+        items.append(item)
+    return items
+
+
+def build_tool_image_result(path, *, name: str = "", mime: str = "", page=None) -> dict:
+    """**单图**工具返回值（`run_read` 读到一张图片）。中性条目 + 一句元数据说明，**不含字节**。
+
+    返回值里带 `text` 是协议要求：tool 消息必须回答那条 `tool_call_id`，而它
+    只能放文本。所以职责被拆成两半 —— "说明"走 tool 消息，"图片"走进随其后的
+    合成 user 消息。说明只是**元数据**（格式、体积），**不是对图片内容的转述**：
+    转述是有损的二手信息，而模型要看的是像素本身。
+
+    多图（PDF 的文本层 + 页图）用 `build_tool_images_result`。
+    """
+    item = _image_item(path, name=name, mime=mime, page=page)
+    try:
+        size_text = (human_size(Path(item["path"]).stat().st_size)
+                     if item["path"] else "体积未知")
+    except OSError:
+        size_text = "体积未知"
+    label = item["name"] or item["path"]
+    return {
+        "type": TOOL_IMAGE_BLOCK_TYPE,
+        "text": f"已读取图片 {label}（{item['mime'] or '未知格式'}，{size_text}），内容随附。",
+        "images": [item],
+    }
+
+
+def build_tool_images_result(images, *, text: str = "", source: str = "") -> dict:
+    """**多图**工具返回值（`run_read` 读 PDF：文本层 + N 张页图）。
+
+    `images` 每项是 dict（`path` + 可选 `name` / `mime` / `page`）。`text` 是 tool
+    消息的正文（PDF 的文本层与说明），`source` 是这一组图片的来源标签（如
+    `spec.pdf`），**只用于合成消息的头部说明、不进账本块**。
+    """
+    items: list[dict] = []
+    for entry in images or []:
+        if isinstance(entry, dict):
+            item = _image_item(entry.get("path"),
+                               name=str(entry.get("name") or ""),
+                               mime=str(entry.get("mime") or ""),
+                               page=entry.get("page"))
+        else:
+            item = _image_item(entry)
+        if item["path"]:
+            items.append(item)
+    out: dict = {"type": TOOL_IMAGE_BLOCK_TYPE, "text": str(text or ""),
+                 "images": items}
+    if str(source or "").strip():
+        out["source"] = str(source).strip()
+    return out
+
+
+def is_tool_image_result(value) -> bool:
+    """是不是工具读图的返回值（引擎据此决定"不要 str() 掉它"）。
+
+    判据是**形状**（type + 至少一个图片字段在），不是"里面有有效路径"：空路径的
+    畸形块也该被识别成图片结果、由聚合层丢掉，而不是 `str()` 成一段 JSON 塞进
+    tool 消息。
+    """
+    return (isinstance(value, dict) and value.get("type") == TOOL_IMAGE_BLOCK_TYPE
+            and (isinstance(value.get("images"), list)
+                 or isinstance(value.get("image"), dict)))
+
+
+def tool_image_text(value) -> str:
+    """工具返回值里的说明文本（用作 tool 消息的 content）。"""
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return "已读取图片，内容随附。"
+
+
+def tool_image_block(value) -> dict | None:
+    """工具返回值 → 中性账本块（剥掉外层说明，只留路径与元数据）。
+
+    一个工具结果 = **一块**（块内可以是多张图）：这样"一次 PDF 读取"在历史里仍是
+    一条记录，回放时不会拆成 N 条互不相干的图片条目。
+    """
+    if not is_tool_image_result(value):
+        return None
+    items = tool_image_items(value)
+    if not items:
+        return None
+    return {"type": TOOL_IMAGE_BLOCK_TYPE, "images": items}
+
+
+def _group_label(value, items: list[dict]) -> str:
+    """一组图片的标签（用于合成消息头部与"被丢掉"的提示）。"""
+    source = str(value.get("source") or "").strip() if isinstance(value, dict) else ""
+    if source:
+        pages = [str(i.get("page")) for i in items if i.get("page") is not None]
+        if pages and len(pages) == len(items):
+            return f"{source} 第 {'、'.join(pages)} 页"
+        return f"{source}（{len(items)} 张）"
+    if len(items) == 1:
+        return str(items[0].get("name") or items[0].get("path") or "")
+    names = [str(i.get("name") or i.get("path") or "") for i in items[:3]]
+    return "、".join(n for n in names if n)
+
+
+def build_tool_images_message(values, *, limit: int | None = None) -> dict | None:
+    """一批工具返回值 → **一条**合成 user 消息（说明文本 + M 个图片块）。
+
+    必须**批量聚合成一条**：图片块不能插在两条 tool 消息之间 —— 那会打断
+    assistant 的 `tool_calls` ↔ tool 消息链（协议风险）。调用方（agent_loop）
+    在该批 tool 消息**全部落盘之后**才追加这一条。
+
+    **预算按"组"计，不按"张"计**（2026-09-21）：上限 `VIEW_IMAGE_MAX_PER_TURN`
+    数的是**图片承载的工具结果**个数。一次 PDF 读取是一个组，要么整组随附、要么
+    整组丢掉 —— **绝不把一次文档读取按页数拦腰截断**（那样模型会以为它看到了全部
+    页，比什么都不给更危险）。单组内部张数由工具自己按 `ATTACHMENT_DOC_MAX_IMAGES`
+    限制，并在工具正文里点名未渲染的页。
+
+    没有任何图片（全是畸形数据）时返回 None，调用方不追加空消息。
+    """
+    cap = tool_images_max_per_turn() if limit is None else limit
+    blocks: list = []
+    labels: list[str] = []
+    dropped: list[str] = []
+    for value in values or []:
+        block = tool_image_block(value)
+        if block is None:
+            continue
+        label = _group_label(value, block["images"])
+        if len(blocks) >= cap:
+            dropped.append(label)
+            continue
+        blocks.append(block)
+        labels.append(label)
+    if not blocks and not dropped:
+        return None
+    total = sum(len(b["images"]) for b in blocks)
+    if total == 1:
+        head = f"[以下是 run_read 读取的图片，内容随附：{labels[0]}]"
+    else:
+        head = (f"[以下是 run_read 读取的图片，共 {total} 张，内容随附："
+                f"{'、'.join(labels)}]")
+    lines = [head]
+    if dropped:
+        lines.append(
+            f"（另有 {len(dropped)} 个文件未随附：单轮图片上限 {cap} 个，"
+            f"可下一轮继续读取：{'、'.join(dropped[:5])}）"
+        )
+    return {
+        "role": "user",
+        "content": [{"type": "text", "text": "\n".join(lines)}, *blocks],
+        TOOL_IMAGES_MARKER: True,
+    }
+
+
+def is_tool_images_message(message) -> bool:
+    """这条消息是不是"承载工具图片的合成消息"（回放侧据此跳过）。"""
+    return bool(isinstance(message, dict) and message.get(TOOL_IMAGES_MARKER))
+
+
+# ── 图片识别（魔数优先）─────────────────────────────────────────────
+# 只认这几类：`IMAGE_EXTS` 里的每一种都在此有对应签名。SVG 不在此列（它是文本，
+# 走 TEXT_EXTS），所以"看起来像图片但其实该当文本读"的文件不会被误判。
+_IMAGE_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
+
+def sniff_image_mime(path) -> str:
+    """按**文件头**判图片类型；不是可识别的图片返回 ""。
+
+    为什么不信扩展名：模型/用户手里的文件常挂着不匹配的后缀（截图存成 .txt、
+    改名过的下载文件、被当图片引用的日志）。把二进制当图片发出去会污染上下文，
+    甚至让 provider 直接报错；反过来把真图当文本读则是必然的解码失败。
+    16 字节读一次就够（WebP 走 RIFF 容器：头部 `RIFF` + 偏移 8 起 `WEBP`）。
+    """
+    try:
+        with Path(path).open("rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return ""
+    for signature, mime in _IMAGE_SIGNATURES:
+        if head.startswith(signature):
+            return mime
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def is_image_path(path) -> bool:
+    """扩展名判定（**不读盘**，零 IO）——给 `run_read` 这种每轮都跑的热路径用。
+
+    严格性与 `sniff_image_mime` 有意区分：这里只看后缀，因为它的用途是
+    "在必然失败之前指路"，漏判的后果只是一次解码报错（`run_read` 的
+    `UnicodeDecodeError` 分支会再兜一次），而误判的代价是白读一次盘。
+    """
+    return Path(str(path)).suffix.lower() in IMAGE_EXTS
+
+
+def history_has_images(messages) -> bool:
+    """这批消息里是否含**任何**待展开的图片（附件图片 ∪ 工具图片）。
+
+    发送边界用它做结构化短路：无图片的会话不去读模型能力。原来只判附件块
+    （`history_has_attachments`），工具图片进来后必须一起判 —— 否则走
+    读图的会话会拿到"未知模型 = 按支持图片处理"的默认值，
+    不支持图片的模型收到图片后会由 provider 报错。
+    """
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == ATTACHMENT_BLOCK_TYPE and isinstance(block.get("attachment"), dict):
+                return True
+            if btype == TOOL_IMAGE_BLOCK_TYPE:
+                return True
+    return False
+
+
 def expand_content_for_model(message, session_dir: Path | None, *,
                              supports_image: bool | None = None):
     """把一条待发送消息里的附件块展开为 provider 线格式。
@@ -1092,6 +1410,18 @@ def expand_content_for_model(message, session_dir: Path | None, *,
             # extend 而非 append：文档可能展开成「文本 + 图片 + 文本…」多块
             expanded.extend(_expand_one(block["attachment"], session_dir,
                                         supports_image=supports_image))
+            changed = True
+        elif isinstance(block, dict) and block.get("type") == TOOL_IMAGE_BLOCK_TYPE:
+            # 工具读图（2026-09-21）：块里只有路径与 mime，展开成 `image_url` 或
+            # 说清原因的占位文本。**一个块可能装多张图**（一次读 PDF 带回的页图），
+            # 所以这里是 extend 一层循环，不是取单张。
+            items = tool_image_items(block)
+            if not items:
+                expanded.append(block)  # 畸形块原样透传，绝不抛
+                continue
+            for image in items:
+                expanded.extend(_expand_tool_image(image,
+                                                   supports_image=supports_image))
             changed = True
         else:
             expanded.append(block)
@@ -1234,6 +1564,200 @@ def _expand_image(att: dict, files: dict, name: str,
     return _text_block(f"[图片缺失: {name}]（原文件已被移动或删除）")
 
 
+def _expand_tool_image(image: dict, *, supports_image: bool | None) -> list[dict]:
+    """工具图片块 → `image_url` 块（或说清原因的占位文本）。
+
+    与 `_expand_image`（附件）的差别只有一条：**没有 files 映射、不落盘缩放**。
+    缩放改在编码时内存里做（`_data_url_tool_image`），因为发送边界不许往
+    用户工作空间写派生文件。
+
+    所有失败路径都降级成"说清原因"的文本，**绝不抛异常** —— 本函数位于
+    `_model_messages` 的列表推导里，异常穿透会让本轮请求体缺消息、整轮被打死。
+    """
+    name = str(image.get("name") or "")
+    if supports_image is False:
+        # 能力不符 → 占位。**必须在读盘/编码之前判**：既省一次 base64，
+        # 也保证"模型看不到的图"会明确说出来而不是静默消失。
+        return [_text_block(
+            f"[图片: {name}]（未发送：当前模型不支持图片输入，"
+            f"请切换到带「图片」能力的模型）")]
+    raw = str(image.get("path") or "")
+    if not raw:
+        return [_text_block(f"[图片缺失: {name}]（记录里没有路径）")]
+    path = Path(raw)
+    try:
+        exists = path.is_file()
+    except OSError:
+        exists = False
+    if not exists:
+        return [_text_block(f"[图片缺失: {name or raw}]（文件已被移动或删除）")]
+    mime = _image_mime(path, image)
+    url, why = _data_url_tool_image(path, mime)
+    if url:
+        return [_image_block(url)]
+    try:
+        size_text = human_size(path.stat().st_size)
+    except OSError:
+        size_text = "体积未知"
+    # 说清"为什么没发出去"+"下一步怎么办"：`why` 来自编码层（尺寸超解码上限 /
+    # 缩放失败 / 超过内联上限），替换掉旧版一律写"超过内联上限"的错话。
+    return [_text_block(
+        f"[图片: {name or path.name}]（未能发送：{why or '未知原因'}，文件 {size_text}。"
+        f"可先用 bash 缩放后再读，如 sips -Z 1568 \"{path}\" --out 小图.jpg）")]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  "发送用"缩放核心（附件落盘版 与 工具图内存版 共用）
+# ══════════════════════════════════════════════════════════════════
+#
+# **2026-09-21 事故与修复**（`view_image` 后 provider 回
+# "You have uploaded an unsupported image"，整轮对话被打死）：
+# 用户 @ 引用了一张 22500×15016（3.4 亿像素、4.6MB）的 PNG。`Image.open()`
+# 命中 Pillow 的解压炸弹阈值（≥179MP 抛 `DecompressionBombError`）→ 旧代码把
+# "缩放搞砸了"和"尺寸本来就小、不需要缩"混为同一个 `None` → **回落发原图** →
+# provider 收到一张 3.4 亿像素的 PNG，回一句与真实原因无关的 400。
+# 修复两点，缺一不可：
+#   1. 阈值**抬升**（那是我方防线，不是 provider 能力），改由
+#      `image_decode_max_pixels()` 接手，先读头部尺寸、再决定是否解码；
+#   2. **缩放失败绝不回落原图** —— 只有"尺寸本来就 ≤ edge"才走原图
+#      （状态码 `NO_NEED` 与 `FAILED` 必须分开，这正是事故的形状）。
+#
+# 超过这个体积才值得付一次重编码（与 `prepare_image` 的 1.5MB 同口径）：
+# 为省几十 KB 而引入一次 JPEG 有损编码不划算。
+_RESIZE_ABOVE_BYTES = 1_500_000
+
+_RESIZE_OK = "ok"
+_RESIZE_NO_NEED = "no_need"        # 长边/体积本来就在范围内 → 调用方发原图
+_RESIZE_NO_PILLOW = "no_pillow"    # 未安装 Pillow → 无法判断，调用方按原行为处理
+_RESIZE_TOO_BIG = "too_big"        # 声明尺寸超本机解码上限（**未解码**）
+_RESIZE_FAILED = "failed"          # 解码/编码异常
+
+# 只为"临时抬升 Pillow 阈值"这一瞬间串行化 `Image.open()`：检查发生在 open
+# 那一刻，`load()` 不再查。这样既不把 1GB 级解码压在锁里，也避免并发线程
+# 读到阈值的中间态（各自 save/restore 会互相把对方按回默认值）。
+_RESIZE_OPEN_LOCK = threading.Lock()
+
+
+def _resize_jpeg_bytes(path: Path, edge: int, *,
+                       need_above_bytes: int = 0) -> tuple[bytes | None, str, str]:
+    """把图缩到长边 `edge` 并编成 JPEG 字节。**任何异常都不外抛**。
+
+    返回 `(JPEG 字节 | None, 状态码, 说明)`；说明是 `宽×高`（状态码
+    `FAILED` 时是异常摘要）。字节为 None 时看状态码决定调用方怎么办 ——
+    除 `NO_NEED` / `NO_PILLOW` 外一律**不要**回落原图。
+
+    `need_above_bytes`：体积超过它才值得缩（`prepare_image` 传 1.5MB 复刻
+    "尺寸够小但体积大 → 也缩"的老规则；工具图路径调用前已判过体积，传 0）。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, _RESIZE_NO_PILLOW, ""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, _RESIZE_FAILED, "文件不可读"
+    try:
+        with _RESIZE_OPEN_LOCK:
+            previous = Image.MAX_IMAGE_PIXELS
+            Image.MAX_IMAGE_PIXELS = None
+            try:
+                im = Image.open(path)
+                width, height = im.size  # 头部解析，**尚未解码像素**
+            finally:
+                Image.MAX_IMAGE_PIXELS = previous
+    except Exception as exc:  # noqa: BLE001 - 打不开的文件降级为说明
+        log.warning("图片打开失败 %s: %s: %s", path.name, type(exc).__name__, exc)
+        return None, _RESIZE_FAILED, f"无法打开（{type(exc).__name__}）"
+
+    dims = f"{width}×{height}"
+    cap = image_decode_max_pixels()
+    try:
+        if max(width, height) <= edge and stat.st_size <= need_above_bytes:
+            return None, _RESIZE_NO_NEED, dims
+        if cap and width * height > cap:
+            # 判在 `load()` 之前：不解码就不会有 1GB 级内存尖峰
+            return None, _RESIZE_TOO_BIG, dims
+        im.load()
+        if im.mode not in ("RGB", "L"):
+            converted = im.convert("RGB")
+            im.close()
+            im = converted
+        im.thumbnail((edge, edge), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=82, optimize=True)
+        return buf.getvalue(), _RESIZE_OK, dims
+    except Exception as exc:  # noqa: BLE001 - 缩放失败回落由调用方决定
+        log.warning("图片缩放失败 %s（%s）: %s: %s",
+                    path.name, dims, type(exc).__name__, exc, exc_info=True)
+        return None, _RESIZE_FAILED, dims
+    finally:
+        try:
+            im.close()
+        except Exception:  # noqa: BLE001 - 关闭失败无需惊动调用方
+            pass
+
+
+def _data_url_tool_image(path: Path, mime: str) -> tuple[str | None, str]:
+    """工具图片 →（`data:` URL, **失败说明**）。说明为空串表示成功。
+
+    与附件版 `_data_url` 的差别：**大图先在内存里缩到 `image_max_edge` 再编码**，
+    不落盘（发送边界不许往用户工作空间写派生文件）。缩放的成败与上限统一由
+    `_resize_jpeg_bytes` 负责（含 Pillow 解压炸弹阈值的处理）。
+
+    先试缩放、后判上限：一张 20MB 的截图缩完只有几百 KB，必须在缩放**之后**
+    用编码结果去比上限，否则会误判为"太大发不出去"。
+
+    **失败时返回的说明必须原样进上下文**：模型看不到图时得知道自己没看全、
+    以及下一步怎么办（先 bash 缩放再读），而不是把 3.4 亿像素的原图硬发出去
+    换一个与真实原因无关的 provider 400。
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, "文件不可读"
+    edge = image_max_edge()
+    # 缓存同时存成功与失败：失败往往是**解码级**成本（1GB/1 秒），
+    # 每轮 LLM 往返重算一遍不可接受。键含 edge 与解码上限（两者都是可调配置，
+    # 配置一变结论就可能不同），并用 "tool_image" 标签与 `_data_url` 区分。
+    key = ("tool_image", str(path), int(stat.st_mtime_ns), int(stat.st_size),
+           mime, int(edge), int(image_decode_max_pixels()))
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    if edge > 0 and stat.st_size > _RESIZE_ABOVE_BYTES:
+        data, code, detail = _resize_jpeg_bytes(path, edge)
+        if data is not None:
+            result = ("data:image/jpeg;base64,"
+                      + base64.b64encode(data).decode("ascii"), "")
+            _cache_put(key, result)
+            return result
+        if code == _RESIZE_TOO_BIG:
+            result = (None, f"图像尺寸 {detail} 超出本机解码上限"
+                            f"（{image_decode_max_pixels():,} 像素）")
+            _cache_put(key, result)
+            return result
+        if code == _RESIZE_FAILED:
+            result = (None, f"缩放失败（{detail}）")
+            _cache_put(key, result)
+            return result
+        # NO_NEED：尺寸本来就在范围内，原图可直接发。
+        # NO_PILLOW：本机没装 Pillow（项目的声明依赖，正常不会发生），无从判断
+        # 尺寸 → 保持"发原图"的旧行为，下一条内联上限仍会兜住体积。
+    if stat.st_size > inline_max_bytes():
+        log.warning("工具图片超过内联上限（%s > %s），本次不发送：%s",
+                    human_size(stat.st_size), human_size(inline_max_bytes()), path.name)
+        return None, f"超过内联上限 {human_size(inline_max_bytes())}"
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        log.warning("读取工具图片失败 %s: %s", path, exc)
+        return None, "读取失败"
+    url = f"data:{mime or DEFAULT_MIME};base64," + base64.b64encode(raw).decode("ascii")
+    _cache_put(key, (url, ""))
+    return url, ""
+
+
 def _expand_document(att: dict, files: dict, session_dir: Path | None,
                      name: str, supports_image: bool | None) -> list[dict]:
     """文档/文本附件 → 头部说明 +（按锚点交错的正文与图片）。
@@ -1249,11 +1773,11 @@ def _expand_document(att: dict, files: dict, session_dir: Path | None,
     if (att.get("text_truncated") or total_truncated) and original is not None:
         # 2026-09-20：旧文案是「完整文件：{path}，可用工具继续读取」——**假承诺**。
         # 附件目录恒在 `~/.aigent/projects/<id>/.attachments/` 下（工作空间之外），
-        # `safe_path()` 的 `is_relative_to(base)` 一律拒绝，`run_read`/`run_read_pdf`
+        # `safe_path()` 的 `is_relative_to(base)` 一律拒绝，`run_read`
         # 必然失败（模型随后就会说"读不到/找不到"）。只有 `bash` 不经过沙箱校验。
         # 所以这里如实说明"在哪、为什么读不了、怎么才能读"。
         tail = (f"\n…（以上为节选，完整原件位于 {original}。"
-                f"该路径在本会话工作空间之外，run_read / run_read_pdf 会被沙箱拒绝；"
+                f"该路径在本会话工作空间之外，run_read 会被沙箱拒绝；"
                 f"需要完整内容时，可先用 bash 把它复制到工作空间内再读）")
 
     blocks = _document_blocks(body, assets, supports_image)

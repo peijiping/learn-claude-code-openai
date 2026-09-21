@@ -165,6 +165,14 @@ class ContextCompact:
         ② token 估算会按字符数暴涨 → 上下文圆圈提前触顶 → 反复触发压缩。
         无附件块的消息（str / 普通 dict / 未知 type）走原分支，行为与改造前
         逐字相同（见 tests/test_context_compact_attachment_str.py）。
+
+        **引用（@-mention，2026-09-21）**：`{"type":"ref"}` 路径引用块同理，
+        只降级成 `[引用: 名字]`。它虽然没有字节，但一旦走未知分支，路径清单与
+        JSON 键名会被拼进摘要与 token 估算 —— 同样的污染，只是量级更小。
+
+        **工具读图（run_read 读到图片/页图，2026-09-21）**：`{"type":"tool_image"}` 块同理，
+        降级成 `[图片: 名字]`。它带的是**绝对路径**，掉进未知分支等于把用户主
+        目录结构写进每一版 L4 摘要。
         """
         if isinstance(content, str):
             return content
@@ -177,6 +185,16 @@ class ContextCompact:
                     btype = block.get("type")
                     if btype == "attachment":
                         parts.append(self._attachment_label(block))
+                    elif btype == "ref":
+                        # 引用（@-mention，2026-09-21）。字面量与 attachments 分支
+                        # 同款（权威定义在 refs.REF_BLOCK_TYPE），同步口径见
+                        # tests/test_context_compact_attachment_str.py。
+                        parts.append(self._ref_label(block))
+                    elif btype == "tool_image":
+                        # 工具读图（run_read 读到图片/页图，2026-09-21）。**同样不能走
+                        # str(block)** —— 块里带绝对路径与 JSON 键名，拼进 L4 摘要
+                        # 与 token 估算纯属污染。与附件图片同款：只留一个标签。
+                        parts.append(self._tool_image_label(block))
                     elif btype in ("image_url", "image", "input_image"):
                         # 已是线格式（历史数据 / 手工构造）：同样不能外泄
                         parts.append("[图片]")
@@ -196,6 +214,47 @@ class ContextCompact:
         label = "图片" if kind == "image" else "附件"
         name = str(att.get("name") or "").strip()
         return f"[{label}: {name}]" if name else f"[{label}]"
+
+    @staticmethod
+    def _ref_label(block: dict) -> str:
+        """引用块 → `[引用: 名字]`（供摘要与 token 估算）。
+
+        与 `_attachment_label` 同因：**绝不能走 `str(block)`** —— 那会把路径清单
+        连同 JSON 键名（path / name / is_dir）原样拼进 L4 摘要与 token 估算，
+        摘要预算被无意义地吃掉，上下文圆圈也会提前触顶。
+        """
+        ref = block.get("ref")
+        ref = ref if isinstance(ref, dict) else {}
+        name = str(ref.get("name") or "").strip()
+        if not name:
+            path = str(ref.get("path") or "").strip()
+            name = path.rsplit("/", 1)[-1] if path else ""
+        return f"[引用: {name}]" if name else "[引用]"
+
+    @staticmethod
+    def _tool_image_label(block: dict) -> str:
+        """工具图片块 → `[图片: 名字]`（供摘要与 token 估算）。
+
+        **名字取自 `name`，绝不回落到 path**：path 是绝对路径，放进摘要等于把
+        用户主目录结构写进每一版压缩摘要里，而它对"这轮发生了什么"没有价值。
+
+        一个块可能装多张图（一次读 PDF 的页图）→ 只报首张名字 + 总数，不把
+        整份页图清单摊进摘要。同时认旧形状的单数 `image` 字段（存量 jsonl）。
+        """
+        raw = block.get("images")
+        if isinstance(raw, list):
+            entries = raw
+        else:
+            single = block.get("image")
+            entries = [single] if isinstance(single, dict) else []
+        names = [str(e.get("name") or "").strip() for e in entries
+                 if isinstance(e, dict)]
+        names = [n for n in names if n]
+        if not names:
+            return "[图片]"
+        if len(names) == 1:
+            return f"[图片: {names[0]}]"
+        return f"[图片: {names[0]} 等 {len(names)} 张]"
 
     def message_to_text(self, msg) -> str:
         """从 LangChain 消息 / dict / 其他对象里取出文本 content（统一为 str）。"""
@@ -336,6 +395,13 @@ class ContextCompact:
 
         块类型用字面量与 `content_to_str` 保持一致（两处都不 import
         `attachments`，避免压缩器反向依赖附件模块）。
+
+        **工具图片块（`tool_image`）刻意不算在内**（2026-09-21）—— 别"顺手补上"：
+        它与附件的可恢复性**相反**。附件副本在工作空间之外，模型自己拿不到，裁掉
+        就永久失去；工具图片是工作空间里的普通文件，模型随时可以 `run_read` 再读
+        一次（与引用块同理：裁剪器的 keep 集只放"丢了就找不回来"的东西）。
+        而且 L1 触发在几十条消息的深度上 —— 那时留下来的裸图，连它当时要回答的
+        问题都已经被占位抹掉了，留着也解读不了。
         """
         if isinstance(msg, dict):
             content = msg.get("content")

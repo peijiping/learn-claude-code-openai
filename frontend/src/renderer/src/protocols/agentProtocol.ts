@@ -184,6 +184,8 @@ export type UiEvent =
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
   | { kind: 'attachments_staged'; payload: AttachmentsStagedPayload }
+  /** 引用候选列表（应答 `refs_list`）。**点对点信封，不进 isKnownAgentEvent 白名单** */
+  | { kind: 'refs'; payload: RefsPayload }
   | { kind: 'llm_config'; payload: LlmConfigResult }
   | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
   /** 任务面板快照（整份替换，不做增量）。
@@ -211,7 +213,8 @@ export interface AttachmentStats {
   images: number
   /** 识别到的表格数。`find_tables` 对无框线表格命中 0，是**下界** */
   tables: number
-  /** 走的哪条转换路径：`pymupdf` / `fallback_text` / `text_layer` / `''` */
+  /** 走的哪条转换路径：`pymupdf`（PDF 文本层+页图）/ `office_text`（docx/xlsx/pptx 文本抽取，
+   *  2026-09-21 起走统一转换层）/ `fallback_text`（转换层不可用时的兜底）/ `text_layer` / `''` */
   converter: string
   /** 「诚实失败」通道：**非空即表示该附件已降级**（UI 标琥珀 + tooltip 显示原因）。
    *  例：「第 1 页无文本层，已按图像发送」「未提取到文本」「内容已截断」 */
@@ -261,6 +264,51 @@ export interface AttachmentsStagedPayload {
   project_id: string
 }
 
+/** `refs` 信封载荷：工作空间内的**扁平**候选列表（无层级）。
+ *
+ *  `type` 是**列表语义**（`dir` / `file`）；消息里的引用记录用的是 `is_dir`
+ *  （见 `RefInput` / `MessageRef`）。两者形状不同是刻意的：前者描述"枚举到的条目"，
+ *  后者描述"引用了一条路径"。
+ *
+ *  `path` 是绝对路径，`name` 是带后缀的名字；前端用 `path` 去掉 `name` 还原所在
+ *  目录，故后端**不重复发 dir 字段**。 */
+export interface RefListItem {
+  path: string
+  name: string
+  type: 'dir' | 'file'
+}
+
+export interface RefsPayload {
+  project_id: string
+  /** 本次枚举的沙箱根（会话 work_root 快照；与 run_read 同根） */
+  workdir: string
+  items: RefListItem[]
+  /** 命中条目上限 → 列表被截断（前端在底部提示） */
+  truncated: boolean
+  /** 已扫描到的条目数（含被忽略清单过滤掉的） */
+  total_seen: number
+  /** 因权限 / 并发删除而跳过的目录数 */
+  skipped: number
+  /** true = 当前空间不可引用（default 草稿空间 / 目录不可用）→ items 恒为空，
+   *  `reason` 给出给用户看的原因。**这是常规状态，不是错误**。 */
+  disabled: boolean
+  reason?: string
+}
+
+/** chat 携带的引用线索。后端**以磁盘为准**重新取 name / is_dir，这里的字段只是线索。 */
+export interface RefInput {
+  path: string
+  name?: string
+  is_dir?: boolean
+}
+
+/** 消息上的引用（回放与乐观渲染共用同一形状） */
+export interface MessageRef {
+  path: string
+  name: string
+  is_dir: boolean
+}
+
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
 export interface HistoryToolCall {
   name: string
@@ -304,6 +352,9 @@ export interface HistoryMessage {
   /** user 消息携带的附件（后端 `_history_to_ui` 从 content 的引用块 harvest 而来；
    *  无附件的老消息不带这个字段） */
   attachments?: AttachmentRef[]
+  /** user 消息引用的工作空间路径（后端 `_history_to_ui` harvest；**无引用时连字段
+   *  都不带** —— 与改造前的回放形状逐字节一致） */
+  refs?: MessageRef[]
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -530,6 +581,8 @@ export type ControlKind =
   | 'status_query'
   /** 附件登记（「添加文件或图片」）：前端把本地绝对路径交给后端复制+解析 */
   | 'attachment_stage'
+  /** 引用候选列表（「引用文件或文件夹」）：输入 @ 时拉一次完整扁平列表 */
+  | 'refs_list'
   | 'llm_config_get'
   | 'llm_config_save'
   | 'llm_models_fetch'
@@ -559,6 +612,11 @@ export interface ChatPayload {
    *  **只传 id 与少量线索，不传文件内容**：后端按 att_id 从草稿区把文件归位到
    *  会话目录，并在发送边界展开成模型线格式。 */
   attachments?: ChatAttachmentInput[]
+  /** 本轮的引用（工作空间内的文件/目录路径）。
+   *  **零复制、零存储**：后端只做越界校验与规范化，然后挂一个中性引用块，
+   *  把「路径清单 + 内容不在上下文中、需要时用 run_read」注入模型上下文。
+   *  与 attachments 是**并列且独立**的两条通道。 */
+  refs?: RefInput[]
 }
 
 /** chat 携带的附件线索（真实元数据以磁盘上的 meta.json 为准，前端字段只是线索） */

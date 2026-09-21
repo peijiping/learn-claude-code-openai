@@ -10,11 +10,20 @@ export interface ChatAttachmentInput {
   project_id?: string
 }
 
+/** chat 携带的引用线索（结构与 renderer 侧 RefInput 一致）。**只有路径，不含内容**。 */
+export interface RefInput {
+  path: string
+  name?: string
+  is_dir?: boolean
+}
+
 export interface AgentApi {
   /** 发起一次对话。
    *  attachments=本轮附件（`attachment_stage` 登记得到的 att_id 列表）；
-   *  **只有附件没有正文时 text 传空串**（后端据此只插附件块，不插空文本块）。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null) => Promise<void>
+   *  **只有附件没有正文时 text 传空串**（后端据此只插附件块，不插空文本块）。
+   *  refs=本轮引用的工作空间路径（**零复制**，只传路径）；**只有引用没正文也是
+   *  合法发送**。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
@@ -46,6 +55,10 @@ export interface AgentApi {
   stageAttachments: (payload: { paths: string[]; projectId?: string | null }) => Promise<unknown>
   /** 在系统文件管理器中定位目录（工作空间右键菜单） */
   openInFinder: (path: string) => Promise<{ ok: boolean; error?: string }>
+  /** ── 引用文件或文件夹（@-mention）─────────────────────────────────
+   *  与附件 **完全独立**：不复制、不存储，只给模型一份路径清单。
+   *  拉取当前工作空间的可引用条目（扁平、一次全量）；超时返回 null。 */
+  listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }) => Promise<unknown>
   /** 工作空间列表（主要数据源是 `projects` 广播信封，这里是主动拉取的兜底） */
   listProjects: () => Promise<unknown>
   /** 把选定目录登记为工作空间（已登记则复用；后端同时置为活动空间） */

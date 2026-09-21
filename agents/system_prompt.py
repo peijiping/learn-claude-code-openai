@@ -133,7 +133,8 @@ class SystemPromptBuilder:
 - **禁止**对二进制文件（PDF、图片、压缩包）用 strings / cat / hexdump
 - **禁止**一次读超过 500 行，用 limit 或 | head 控制
 - **禁止**单次工具输出超过 5000 字符进上下文，用 | head -100 / | tail 控制
-- 读 PDF **必须**用 run_read_pdf 工具
+- 读 PDF / 图片 / Office 文档 **必须**用 run_read 工具（它按类型自动分派：
+  PDF 同时给每页文本与含图表的整页图，图片直接给像素，docx/xlsx/pptx 给文本）
 """
 
     def _get_skills(self) -> str:
@@ -197,7 +198,7 @@ class SystemPromptBuilder:
 ## sub_agent（子智能体）
 **强制使用**（主对话不得直接执行）：读 ≥3 文件 / 读 PDF / 工具调用 ≥5 步 / 探索代码库。
 - 默认不含 task 工具（只由主智能体维护）
-- 只读场景设 `allowed_tools=["bash","run_read","run_read_pdf"]`（**名字必须与 API 下发的完全一致**，写错会拿不到该工具）
+- 只读场景设 `allowed_tools=["bash","run_read"]`（**名字必须与 API 下发的完全一致**，写错会拿不到该工具。run_read 已含 PDF / 图片 / Office 的读取，不需要别的读工具名）
 - 无依赖想省时间 → `parallel=true` 并发；有依赖 → `parallel=false` 串行
 - 想拿 ID 后回头查 → `run_in_background=true`（立即返回 bg_id；不参与并行/串行桶，永远独立后台化）
 

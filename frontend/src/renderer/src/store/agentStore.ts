@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryMessage, ModelSwitch, ProjectMeta, ProjectsPayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryMessage, MessageRef, ModelSwitch, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -219,6 +219,9 @@ export interface Message {
   /** user 消息携带的附件（实时由草稿项转成，回放由后端 harvest 而来）。
    *  图片经 `attachmentUrl()` 转成自定义协议 URL 显示缩略图。 */
   attachments?: AttachmentRef[]
+  /** user 消息引用的工作空间路径（实时由 `serializeDoc` 收集，回放由后端 harvest）。
+   *  **只有引用没有正文也是合法发送**。与 attachments 是并列且独立的通道。 */
+  refs?: MessageRef[]
 }
 
 /** 输入区的附件草稿项。
@@ -271,6 +274,25 @@ export interface DraftAttachment {
  */
 export function isSendableAttachment(a: DraftAttachment): boolean {
   return a.status === 'ready' || a.status === 'degraded'
+}
+
+/** 本轮有没有**可发送的内容** —— 正文 / 就绪附件 / 引用 三者任一非空。
+ *
+ *  **这个判据必须只有一处**（与 `isSendableAttachment` 同理，见其上方注释）：
+ *  InputBox 的发送按钮、InputBox 的 Enter 守卫、ChatPanel 构造 payload、
+ *  store.send 的内部守卫，四处都调它；主进程 `agent:send` 的守卫因为跨进程
+ *  无法 import，只能镜像同一条件（多一个 `refs`）—— 那里漏判就等于把消息
+ *  静默丢掉，是本项目已经踩过一次的坑。 */
+export function hasSendableContent(
+  text: string,
+  attachments: DraftAttachment[],
+  refs?: RefInput[] | null
+): boolean {
+  return (
+    (text ?? '').trim().length > 0 ||
+    attachments.some(isSendableAttachment) ||
+    (refs?.length ?? 0) > 0
+  )
 }
 
 let draftSeq = 0
@@ -334,8 +356,9 @@ interface AgentState {
   setPython: (p: PythonState) => void
   /** 发送一轮消息。`attachments` = 本轮随消息发出的**已就绪**草稿附件
    *  （调用方从 draftAttachments 里筛 status==='ready'）；缺省 = 无附件，
-   *  存量调用不受影响。正文与附件不能同时为空（调用方先判）。 */
-  send: (text: string, attachments?: DraftAttachment[]) => void
+   *  存量调用不受影响。`refs` = 本轮引用的工作空间路径（零复制，只传路径）。
+   *  正文 / 附件 / 引用**三者不能同时为空**（调用方先用 `hasSendableContent` 判）。 */
+  send: (text: string, attachments?: DraftAttachment[], refs?: RefInput[]) => void
   /** 把本地绝对路径登记为草稿附件（原生对话框 / 拖拽 / 粘贴三条入口的唯一汇合点）。
    *  结果经 `attachments_staged` 信封回填（本函数只放占位项，不等回包）。 */
   stageAttachments: (paths: string[], projectId?: string | null) => Promise<void>
@@ -574,7 +597,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       // 回放：空闲期/本轮切换提示，落到「切换发生时」的 assistant 消息上
       switch: m.model_info?.switch ?? undefined,
       // 回放：user 消息携带的附件（后端从 content 引用块 harvest；无附件不带该字段）
-      ...(m.attachments && m.attachments.length ? { attachments: m.attachments } : {})
+      ...(m.attachments && m.attachments.length ? { attachments: m.attachments } : {}),
+      // 回放：user 消息引用的工作空间路径（同上，无引用时后端连字段都不发）
+      ...(m.refs && m.refs.length ? { refs: m.refs } : {})
     }
   })
 }
@@ -949,24 +974,35 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }),
   setPython: (p) => set({ python: p }),
 
-  send: (text, attachments) => {
+  send: (text, attachments, refInputs) => {
     const t = text.trim()
     const atts = attachments ?? []
-    // 「仅附件无正文」是合法发送：正文与附件**同时**为空才拦下。
+    const refs = refInputs ?? []
+    // 「仅附件无正文」「仅引用无正文」都是合法发送：三者同时为空才拦下。
     // （历史 bug：后端 main/index.ts 曾用 !payload.text 直接丢弃这类消息。）
-    if ((!t && atts.length === 0) || get().isSending) return
+    if (!hasSendableContent(t, atts, refs) || get().isSending) return
     const sid = get().activeSession
     const modelId = get().sessionModelId
     // 新建任务的归属工作空间（点「+」/ chip 选定；未指定 = 后端当前活动空间）
     const projectId = sid === null ? (get().pendingProjectId ?? get().activeProject) : null
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
-    // 乐观渲染：把本轮附件直接挂到 user 消息上（缩略图立即出现）。
+    // 乐观渲染：把本轮附件与引用直接挂到 user 消息上（缩略图 / 引用胶囊立即出现）。
     // 缩略图按 (空间, att_id) 寻址 → 草稿区→会话目录的迁移不会让它失效；
-    // 后端回放时的 AttachmentRef 形状一致，切走再切回不跳变。
-    const refs = atts.map(draftToRef)
+    // 后端回放时的形状一致，切走再切回不跳变。
+    const attRefs = atts.map(draftToRef)
+    // 引用没有 id 概念，按 path 去重（与后端 normalize_refs 同一口径）
+    const msgRefs: MessageRef[] = []
+    const seenRefs = new Set<string>()
+    for (const r of refs) {
+      const path = String(r?.path ?? '')
+      if (!path || seenRefs.has(path)) continue
+      seenRefs.add(path)
+      msgRefs.push({ path, name: String(r?.name ?? ''), is_dir: !!r?.is_dir })
+    }
     const userMsg: Message = {
       id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso(),
-      ...(refs.length ? { attachments: refs } : {})
+      ...(attRefs.length ? { attachments: attRefs } : {}),
+      ...(msgRefs.length ? { refs: msgRefs } : {})
     }
     const assMsg: Message = {
       id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso()
@@ -985,9 +1021,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     })
     // 发送实际交给后端：fresh 时后端生成短 id 并回发 session 信封，前端据此迁移草稿；
     // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）；
-    // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位
+    // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位；
+    // refs 只带路径，后端做越界校验后挂中性引用块（**不复制、不读内容**）。
     window.agent
-      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput))
+      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs)
       .catch(() => set({ isSending: false }))
   },
 
@@ -1056,7 +1093,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       })
       return
     }
-    // 真实停止：通知后端只停当前显示会话这一轮（其它后台会话不受影响）
+    // 真实停止：通知后端只停当前显示会话这一轮与它的后台任务（其它会话不受影响）。
+    // background 态（turn 已结束、后台子智能体还在跑）也在停止范围内。
     window.agent.stop(sid)
     set((s) => {
       const buf = (s.messagesBySession[sid] ?? []).map(clearStreaming)
@@ -1065,6 +1103,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         messagesBySession: { ...s.messagesBySession, [sid]: buf },
         messages: s.activeSession === sid ? buf : s.messages,
         runningSessions: s.runningSessions.filter((n) => n !== sid),
+        bgSessions: s.bgSessions.filter((n) => n !== sid),
         isSending: false
       }
     })
@@ -1163,8 +1202,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             pendingFresh: null,
             messagesBySession,
             messages: messagesBySession[sid] ?? [],
-            isSending: s.runningSessions.includes(sid),
-            // 活动空间对齐到新会话的归属（点空间 B 的「+」新建时，活动空间可能还停在 A）
+      isSending: s.runningSessions.includes(sid) || s.bgSessions.includes(sid),
+      // 活动空间对齐到新会话的归属（点空间 B 的「+」新建时，活动空间可能还停在 A）
             ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {})
           }
         })
@@ -1191,9 +1230,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           void get().setSessionUnread(p.session_id, unread)
         }
         set((s) => {
-          // running：turn 执行中（脉冲点 + 停止按钮）；background：turn 已结束
-          // 但后台任务仍在执行（脉冲点，无停止按钮）；done/stopped：全部复位。
-          // 未读/已读状态由元数据（sessions[].unread）持久化驱动，不做前端内存态。
+          // running：turn 执行中；background：turn 已结束但后台任务仍在执行。
+          // 两者都算"执行中"——侧栏脉冲点与发送按钮的停止态共用同一判据
+          // （2026-09-21 起 background 也显示停止按钮，点击会连后台任务一起停）；
+          // done/stopped：全部复位。未读/已读状态由元数据（sessions[].unread）
+          // 持久化驱动，不做前端内存态。
           const runningSessions =
             p.status === 'running'
               ? addUnique(s.runningSessions, p.session_id)
@@ -1208,7 +1249,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             ...s,
             runningSessions,
             bgSessions,
-            isSending: s.activeSession !== null && runningSessions.includes(s.activeSession)
+            isSending:
+              s.activeSession !== null &&
+              (runningSessions.includes(s.activeSession) ||
+                bgSessions.includes(s.activeSession))
           }
         })
         break
@@ -1514,7 +1558,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       activeSession: sid,
       pendingFresh: null,
       messages: s.messagesBySession[sid] ?? [],
-      isSending: s.runningSessions.includes(sid),
+      isSending: s.runningSessions.includes(sid) || s.bgSessions.includes(sid),
       ...(pid ? { activeProject: pid, pendingProjectId: pid } : {}),
       // 切会话清空附件草稿：草稿属于"正在编辑的这条消息"，不能跨会话漂移
       //（文本草稿沿用既有行为不清，差异见 docs/frontend/12 的取舍一节）

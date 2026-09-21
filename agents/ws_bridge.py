@@ -26,6 +26,7 @@ from attachments import (
     gc_drafts,
     gc_orphan_session_dirs,
     harvest_attachments,
+    is_tool_images_message,
     migrate_to_session,
     remove_session_attachments,
     stage as stage_attachments,
@@ -42,6 +43,15 @@ from paths import (
     WorkspacePaths,
     default_scratch_paths,
     workspace_paths,
+)
+# 引用（@-mention，2026-09-21）：与附件**完全独立**的一条通道 —— 不复制、不存储，
+# 只把工作空间内的路径清单发给模型。协议与设计见 docs/frontend/13。
+from refs import (
+    attach_ref_blocks,
+    harvest_refs,
+    list_workspace as list_ref_workspace,
+    normalize_refs,
+    ref_title_hint,
 )
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
@@ -507,6 +517,87 @@ def _sessions_of_project(project_id: str) -> list[str]:
             if rt.workspace is not None and rt.workspace.id == project_id]
 
 
+# ── 引用（@-mention，2026-09-21，桌面端「引用文件或文件夹」）────────────
+# 与附件是**两条独立的通道**（设计见 docs/frontend/13）：
+#   附件 = 复制副本到工作空间**之外** → 沙箱拒绝 → 只能预注入全文；
+#   引用 = 指向工作空间**之内**的真实路径 → 模型能 run_read → 只给路径与类型。
+# 桥层职责：① `refs_list` 命令（一次拉回完整扁平列表，按键在前端本地过滤）；
+#           ② `chat` 携带 refs 时规范化路径并挂中性引用块；
+#           ③ 回放时 harvest 出引用列表。
+#
+# ⚠️ 位置说明：以下辅助函数刻意放在 `_text_of` 定义**之前**。从该定义到
+# `handle` 入口之间的源码会被 tests/test_subagent_sidecar.py 与
+# test_system_injection_contract.py 切片 exec（裸 dict 命名空间，切片内的模块级
+# 引用要逐个预置）。放在切片外，零维护成本。
+# 注意：本节注释里**不能出现** `_text_of` 的完整定义字面量（`def` + 名字 + 括号），
+# 否则 `src.index(...)` 会先命中注释，切片从一个注释中间开始 → 语法错误。
+
+# default 空间下 @ 不可用的原因。**这是常规状态而不是错误**：default 的沙箱根是
+# 临时草稿目录（~/.aigent/projects/default/scratch），里面没有用户的项目文件可引用。
+# 前端据此在候选面板里显示一行原因，而不是弹 toast 打扰。
+DEFAULT_REF_DISABLED_REASON = (
+    "默认工作空间是临时草稿目录，没有可引用的项目文件；请先切换到自定义工作空间"
+)
+
+
+def _refs_disabled(project_id: str, reason: str) -> dict:
+    """`refs` 信封的「不可用」形态（与成功形态同一套字段，前端不必分支解析）。"""
+    return {
+        "project_id": project_id,
+        "workdir": "",
+        "items": [],
+        "truncated": False,
+        "total_seen": 0,
+        "skipped": 0,
+        "disabled": True,
+        "reason": reason,
+    }
+
+
+async def _refs_payload(project_id: str, session_id: str = "") -> dict:
+    """组装 `refs` 信封：定位沙箱根 → 扁平列目录（BFS + 忽略清单 + 上限）。
+
+    沙箱根必须与**工具看到的根**一致（有会话时按会话 `work_root` 快照，否则按空间
+    现值）—— 否则会出现"列表里选得到、模型却读不到"的脱节，而"可读"正是引用功能
+    成立的前提。
+    """
+    ws_paths = None
+    if session_id:
+        meta = None
+        try:
+            meta = await asyncio.to_thread(
+                _manager_for_session(session_id).load_meta, session_id)
+        except Exception as exc:  # noqa: BLE001 - 读不到 meta 就按空间现值兜底
+            log.warning("refs_list 读取会话元数据失败 session=%s: %s: %s",
+                        session_id, type(exc).__name__, exc)
+        try:
+            ws_paths = _workspace_for_session(project_id, meta)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("refs_list 解析会话沙箱根失败 session=%s: %s: %s",
+                        session_id, type(exc).__name__, exc)
+    else:
+        try:
+            ws_paths = _workspace_of(project_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("refs_list 解析工作空间失败 project=%s: %s: %s",
+                        project_id, type(exc).__name__, exc)
+
+    if ws_paths is None:
+        return _refs_disabled(project_id, "该工作空间的目录当前不可用（已被移动或删除）")
+    if ws_paths.id == DEFAULT_PROJECT_ID:
+        # 刻意在**遍历之前**返回：scratch 是草稿区，扫它既没意义也白费时间
+        return _refs_disabled(project_id, DEFAULT_REF_DISABLED_REASON)
+    if not _project_ready(project_id):
+        return _refs_disabled(project_id, "该工作空间的目录当前不可用（已被移动或删除）")
+
+    # 阻塞 IO 必须离开事件循环：带 node_modules 的工作空间遍历是百毫秒量级
+    listing = await asyncio.to_thread(list_ref_workspace, ws_paths.workdir)
+    out = dict(listing)
+    out["project_id"] = project_id
+    out["disabled"] = False
+    return out
+
+
 def _text_of(content) -> str:
     """历史消息 content 兼容转换：str 直接返回，list（多模态 blocks）拼接 text。"""
     if isinstance(content, str):
@@ -724,6 +815,13 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
     for m in messages:
         role = m.get("role")
         if role == "user":
+            # 工具读图（run_read 读到图片/页图，2026-09-21）：承载图片的那条是
+            # **合成**消息（由 agent_loop 追加、带 `_tool_images` marker），不是
+            # 用户说的话。不跳过的话，前端每次回放都会多出一个内容为
+            # "[以下是 run_read 读取的图片…]"的假用户气泡。图片本身已在工具条
+            # （run_read 调用）里可见，不必在这里重复表达。
+            if is_tool_images_message(m):
+                continue
             content = _text_of(m.get("content"))
             if content.startswith("<system-reminder>"):
                 continue
@@ -735,6 +833,12 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
             attachments = harvest_attachments(m.get("content"))
             if attachments:
                 ui_msg["attachments"] = attachments
+            # 引用（2026-09-21）：同上，从 content 里 harvest 出引用列表供气泡渲染。
+            # **只在确有引用时才加字段** —— 无引用的消息连字段都不多一个，
+            # 与改造前的回放形状逐字节一致。
+            refs = harvest_refs(m.get("content"))
+            if refs:
+                ui_msg["refs"] = refs
             # 消息记录时间（jsonl created_at，秒级 ISO 本地时间；老行缺省）
             if m.get("created_at"):
                 ui_msg["created_at"] = m["created_at"]
@@ -881,9 +985,11 @@ async def handle(ws):
                     )
                     # 默认标题：创建会话元数据时即用首条消息前 30 字，列表立刻可读；
                     # 首轮结束后再由 _finalize_title_after_turn 用 LLM 总结精炼（≤20 字）。
-                    # 纯附件消息（正文为空）用 `[附件] 文件名` 兜底，否则首轮无标题。
+                    # 纯附件消息（正文为空）用 `[附件] 文件名` 兜底、纯引用消息用
+                    # `[引用] 文件名` 兜底，否则首轮无标题。
                     default_title = _default_session_title(
-                        text or _attachment_title_hint(payload))
+                        text or _attachment_title_hint(payload)
+                        or ref_title_hint(payload.get("refs")))
                     if default_title:
                         await asyncio.to_thread(
                             sm.set_auto_title, new_sid, default_title, "trunc"
@@ -964,15 +1070,33 @@ async def handle(ws):
                 # 前端发送的是叠加态（standard/extended 二选一），这里已由前端换算成
                 # 具体窗口字符串；若前端仅传开关位则回落到 None（走全局）。跳过空串。
                 max_context = str(max_context_raw) if max_context_raw else None
-                # 消息 content：**无附件时是纯字符串**（与改造前逐字节一致），
-                # 有附件时才变成 [文本块 + 附件引用块...] 的多模态数组。引用块只
-                # 记元数据，真正的文件字节由发送边界（_model_messages）展开。
+                # 消息 content：**无附件无引用时是纯字符串**（与改造前逐字节一致），
+                # 否则才变成 [文本块 + 附件引用块 + 路径引用块...] 的多模态数组。
+                # 两种块都只记元数据，真正的文件内容由发送边界（_model_messages）展开。
                 user_query = build_user_content(text, attachment_records)
-                # 标题素材：正文优先；纯附件消息用 `[附件] 文件名` 兜底
-                title_src = text if text.strip() else _attachment_title_hint(payload)
+                # ── 引用挂载（2026-09-21）──────────────────────────────────
+                # 与附件是两条独立通道：这里只挂「路径 + 类型」的中性块，
+                # **不复制文件、不读内容**。规范化以磁盘为准（前端字段可伪造，
+                # 伪造不出磁盘），越界/非法条目就地丢弃但不阻断发送。
+                # 无 refs 时 attach_ref_blocks 原样返回同一个对象，上面那条
+                # "逐字节一致"的保证因此不受影响。
+                raw_refs = payload.get("refs") or []
+                ref_records: list[dict] = []
+                if raw_refs:
+                    ref_records = normalize_refs(ws_session.workdir, raw_refs)
+                    dropped = len(raw_refs) - len(ref_records)
+                    if dropped > 0:
+                        log.warning(
+                            "chat 引用被丢弃 %d 条（越界/非法/重复）session=%s",
+                            dropped, sid)
+                    user_query = attach_ref_blocks(user_query, ref_records)
+                # 标题素材：正文优先；纯附件用 `[附件] 文件名`、纯引用用 `[引用] 文件名`
+                title_src = (text if text.strip()
+                             else _attachment_title_hint(payload)
+                             or ref_title_hint(payload.get("refs")))
                 # 后台线程跑 turn；事件循环继续处理其它命令（切换 / 其它会话 / stop）
-                log.info("chat 派发: session_%s text=%r attachments=%d",
-                         sid, text[:80], len(attachment_records))
+                log.info("chat 派发: session_%s text=%r attachments=%d refs=%d",
+                         sid, text[:80], len(attachment_records), len(ref_records))
                 turn_task = asyncio.create_task(
                     rt.start_turn(user_query, reasoning_effort=reasoning_effort,
                                   max_context=max_context)
@@ -1018,6 +1142,26 @@ async def handle(ws):
                         "failed": result["failed"],
                         "project_id": want_pid,
                     }))
+
+            elif kind == "refs_list":
+                # 引用候选列表（2026-09-21）：前端输入 `@` 时**拉一次完整扁平列表**，
+                # 之后按键在本地过滤（零延迟，取舍见 docs/frontend/13）。
+                # 归属按 sid 优先（与其它按 sid 的操作同口径），否则用 payload 的
+                # project_id，再缺省用当前活动空间。
+                sid_req = str(payload.get("session_id") or "")
+                if sid_req:
+                    pid = _SID_PROJECT.get(sid_req) or _project_of_session(sid_req)
+                else:
+                    pid = str(payload.get("project_id") or "") or _active_project()
+                try:
+                    refs_payload = await _refs_payload(pid, sid_req)
+                except Exception as exc:  # noqa: BLE001 - 桥层兜底，绝不打死连接
+                    log.error("refs_list 失败: %s: %s", type(exc).__name__, exc,
+                              exc_info=True)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"读取工作空间文件失败：{exc}"}))
+                    continue
+                await safe_send(ws, _envelope("refs", refs_payload))
 
             elif kind == "stop":
                 # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响

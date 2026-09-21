@@ -20,7 +20,8 @@
       "@protocols/*": ["src/renderer/src/protocols/*"],
       "@components/*": ["src/renderer/src/components/*"],
       "@store/*": ["src/renderer/src/store/*"],
-      "@hooks/*": ["src/renderer/src/hooks/*"]
+      "@hooks/*": ["src/renderer/src/hooks/*"],
+      "@lib/*": ["src/renderer/src/lib/*"]
     }
   },
   "include": [

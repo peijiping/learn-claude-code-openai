@@ -23,9 +23,18 @@ doc_convert.py - 统一转换层（文档 → Markdown + 页面图片资产）
 模块边界
 ════════════════════════════════════════════════════════════════════════
 
-**叶子模块**：只依赖标准库 + 懒加载 `pymupdf`。**不 import `attachments` /
-引擎模块** —— 降级链由 `attachments._convert_document` 编排（本模块抛异常或
-不可用时，回落今天的纯文本抽取，最差情况等于现状）。
+**叶子模块**：只依赖标准库 + 懒加载 `pymupdf` / `python-docx` / `openpyxl` /
+`python-pptx`。**不 import `attachments` / 引擎模块** —— 降级链由调用方编排
+（`attachments._convert_document` 对 PDF 仍有兜底；Office 走本模块的
+`convert_office`，见 docs/frontend/15）。
+
+对外三件事：
+
+| 函数 | 用途 |
+| --- | --- |
+| `convert_pdf` | PDF → 文本层 + 页图资产（附件通道与工具通道共用） |
+| `convert_office` | docx / xlsx / pptx → 文本 + 表格结构（无视觉版式，末尾如实声明） |
+| `tool_cache_dir` | 工具读文档时页图的落盘目录（`<workdir>/.aigent/pages/<key>/`） |
 
 契约（`convert_pdf`）：
 
@@ -44,7 +53,11 @@ meta 丢了也能恢复。
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import shutil
+import time
 from pathlib import Path
 
 from logger import get_logger
@@ -65,6 +78,31 @@ PAGE_JPEG_QUALITY = 88
 
 # Markdown 里的图片锚点。`pN` = 页图，`fN` = 图内嵌要素（后续批次）。
 IMAGE_ANCHOR_RE = re.compile(r"<!--\s*img:([A-Za-z][0-9]{1,4})\s*-->")
+
+# ── Office 格式（2026-09-21 上移到本模块，见 docs/frontend/15）────────────
+# 这三种格式**没有视觉版式**：LibreOffice 渲染（~800MB）已被否决，所以只做
+# 「保序文本 + 表格结构」抽取，并在正文末尾**如实声明丢了什么**。声明写在
+# 转换层而不是注入侧：附件通道与工具通道共用它，两处口径必须一致。
+OFFICE_EXTS = (".docx", ".xlsx", ".pptx")
+
+# 抽取结果为空时的占位（同时是**哨兵**：stage/UI 据此判定"已降级"而不是
+# "解析成功但内容为空"）。前缀统一，各格式措辞不同。
+EMPTY_NOTE_PREFIX = "（未提取到文本"
+
+_OFFICE_LOSSY_NOTE = "（本格式仅提取文本与表格结构；图表、图片、版式未包含）"
+
+# ── 工具读文档的页图缓存（2026-09-21，见 docs/frontend/15）──────────────
+# 工具的页图必须**在工具调用期间**落盘：中性块只带路径，编码发生在发送边界，
+# 而发送边界不许写盘。落在**工作空间内**的 `.aigent/pages/<key>/`，目录名由
+# 「源文件绝对路径 + mtime_ns + size + 渲染参数」哈希得出 —— 源文件一变 key
+# 就变，旧目录成为无人引用的死文件，因此**不需要精确 GC**，只需按 TTL 惰性清剪。
+# `<workdir>/.aigent` 必须同时加进 `refs.DEFAULT_IGNORE_DIRS`，否则它会出现在
+# `@` 的候选列表里（缓存目录对用户毫无引用价值）。
+TOOL_CACHE_DIRNAME = ".aigent"
+TOOL_CACHE_SUBDIR = "pages"
+# 目录内自带的 .gitignore：即使用户的工作空间是 git 仓库，也不必改他们自己的
+# .gitignore 去忽略我们的缓存 —— 我们自己把这个目录从他们的版本控制里摘出去。
+_TOOL_CACHE_GITIGNORE = "*\n"
 
 
 def asset_dir(out_dir: Path, att_id: str) -> Path:
@@ -187,6 +225,8 @@ def convert_pdf(src: Path, out_dir: Path, att_id: str, *,
         # 无视觉模型兜底的主通道，不该被图像预算砍掉。
         render_budget = total if max_pages <= 0 else min(total, max_pages)
         image_budget = max_images if max_images > 0 else total
+        # 页图目录不可写时置位：后续页不再尝试渲染（见下面的 OSError 分支）
+        render_disabled = False
 
         any_text = False
         for i in range(total):
@@ -205,11 +245,23 @@ def convert_pdf(src: Path, out_dir: Path, att_id: str, *,
             if not _needs_page_image(text, has_picture, tables, min_text,
                                      _page_has_drawings(page)):
                 continue
+            if render_disabled:
+                continue
             if page_no > render_budget or len(images) >= image_budget:
                 skipped_pages.append(page_no)
                 continue
             if not dest_dir.is_dir():
-                dest_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    # 页图目录可能是不可写的：工具通道把它落在**工作空间内**
+                    # （用户可能挂在只读盘上 / 目录属主不对）。这种情况下
+                    # "给不出页图"是可接受的降级 —— 但**文本层必须照旧完整**，
+                    # 异常若穿出去会把文本一起丢掉（整轮对话被打死）。
+                    log.warning("页图目录不可写，转为纯文本模式: %s", exc)
+                    warnings.append("页图目录不可写，本次只提取文本层")
+                    render_disabled = True
+                    continue
             asset = _render_page(fitz, page, dest_dir, page_no, max_edge)
             if asset is None:
                 warnings.append(f"第 {page_no} 页图像渲染失败")
@@ -255,3 +307,284 @@ def convert_pdf(src: Path, out_dir: Path, att_id: str, *,
 def find_anchors(markdown: str) -> list[str]:
     """Markdown 里出现过的锚点 id，按出现顺序（展开侧切块用）。"""
     return IMAGE_ANCHOR_RE.findall(markdown or "")
+
+
+def humanize_anchors(markdown: str) -> str:
+    """把存储锚点译成模型可读的说明。
+
+    锚点（`<!--img:pN-->`）是**给展开侧切块用的存储标记**，不该出现在给模型看的
+    文本里。`pN` 的 N 就是页码（见 `_render_page`），所以能还原成人话。
+    """
+    def _sub(match: re.Match) -> str:
+        ident = match.group(1)
+        digits = ident[1:]
+        if ident.startswith("p") and digits.isdigit():
+            return f"[第 {int(digits)} 页为图像，随附]"
+        return f"[随附图片 {ident}]"
+
+    return IMAGE_ANCHOR_RE.sub(_sub, markdown or "")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  可调参数（读在调用点；见 AGENTS.md 的 config.json 约定）
+# ══════════════════════════════════════════════════════════════════
+
+_DEFAULT_TOOL_CACHE_TTL_SECONDS = 604800
+
+
+def tool_cache_ttl_seconds() -> int:
+    """页图缓存目录的存活秒数（默认 7 天）。超期目录在下一次渲染时被清剪。
+
+    写成函数而不是常量：`config.load()` 合并配置进 `os.environ` 的时机可能晚于
+    本模块被导入，常量会在配置生效前被固化。
+    """
+    raw = os.environ.get("TOOL_DOC_CACHE_TTL_SECONDS")
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_TOOL_CACHE_TTL_SECONDS
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return _DEFAULT_TOOL_CACHE_TTL_SECONDS
+    return value if value > 0 else _DEFAULT_TOOL_CACHE_TTL_SECONDS
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Office 文本抽取（docx / xlsx / pptx）
+# ══════════════════════════════════════════════════════════════════
+# 从 attachments.py 上移（2026-09-21，见 docs/frontend/15）：附件通道与工具读文档
+# 通道**共用同一段抽取代码**，否则同一个 xlsx「上传」与「@ 引用」会给出不同质量
+# 的结果。第三方库仍在**函数内**懒加载，本模块保持叶子性质（不 import attachments
+# 或引擎模块）。
+#
+# 能力边界（明确记录，不是缺陷）：这三种格式**没有视觉版式** —— 只抽「保序文本 +
+# 表格结构」，栏位、图文相对位置、图表一律拿不到。渲染它们需要 LibreOffice
+# （~800MB 外部二进制），已被否决。所以正文末尾**如实声明**丢了什么，而不是让
+# 模型以为已尽收眼底。
+
+def empty_note(ext: str) -> str:
+    """抽取结果为空时的占位串（各格式措辞不同，前缀统一）。
+
+    它同时是**哨兵**：给模型的是"这里本该有内容但没读到"，给 stage/UI 的是
+    「已降级」的判据（见 `text_is_empty_note`）。所以措辞不能随意改。
+    """
+    if ext == ".pdf":
+        return "（未提取到文本，可能是扫描件或纯图片 PDF）"
+    if ext == ".docx":
+        return "（未提取到文本：文档可能只含图片、图表或文本框）"
+    if ext == ".xlsx":
+        return "（未提取到文本：工作簿可能只含图片或图表）"
+    if ext == ".pptx":
+        return "（未提取到文本：幻灯片可能只含图片）"
+    return "（未提取到文本）"
+
+
+def text_is_empty_note(text) -> bool:
+    """正文是否只是「未提取到文本」占位（stage / UI 据此判定"已降级"）。"""
+    return str(text or "").lstrip().startswith(EMPTY_NOTE_PREFIX)
+
+
+def _extract_docx(path: Path) -> tuple[str, int]:
+    """docx → (正文, 内容块数)。段落在前，表格按行 `" | "` 连接追加在后。"""
+    try:
+        import docx
+    except ImportError as exc:  # pragma: no cover - 环境相关
+        raise RuntimeError("未安装 python-docx，无法解析 .docx") from exc
+    document = docx.Document(str(path))
+    parts = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+    blocks = len(parts)
+    for table in document.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+                blocks += 1
+    return "\n".join(parts), blocks
+
+
+def _extract_xlsx(path: Path) -> tuple[str, int]:
+    """xlsx → (正文, 数据行数)。空工作表只留标题行、不计内容。"""
+    try:
+        import openpyxl
+    except ImportError as exc:  # pragma: no cover - 环境相关
+        raise RuntimeError("未安装 openpyxl，无法解析 .xlsx") from exc
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    try:
+        parts: list[str] = []
+        data_rows = 0
+        for sheet in wb.worksheets:
+            rows: list[str] = []
+            for row in sheet.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v) for v in row]
+                if any(c.strip() for c in cells):
+                    rows.append("\t".join(cells))
+            # 行数写进标题：模型据此知道这张表是「50 行」还是「5000 行」，
+            # 也就知道下面的内容是不是被截断过。工作表标题**不算内容** —— 否则
+            # 一个只有空表的工作簿也会抽出标题行，看起来"解析成功"实则什么都没读到。
+            parts.append(f"--- 工作表: {sheet.title}（{len(rows)} 行）---")
+            parts.extend(rows)
+            data_rows += len(rows)
+        return "\n".join(parts), data_rows
+    finally:
+        wb.close()
+
+
+def _extract_pptx(path: Path) -> tuple[str, int]:
+    """pptx → (正文, 有文本的文本框数)。纯图片幻灯片只留页标题、不计内容。"""
+    try:
+        from pptx import Presentation
+    except ImportError as exc:  # pragma: no cover - 环境相关
+        raise RuntimeError("未安装 python-pptx，无法解析 .pptx") from exc
+    prs = Presentation(str(path))
+    parts: list[str] = []
+    text_shapes = 0
+    for idx, slide in enumerate(prs.slides, start=1):
+        bodies: list[str] = []
+        for shape in slide.shapes:
+            frame = getattr(shape, "text_frame", None)
+            if frame is not None and (frame.text or "").strip():
+                bodies.append(frame.text.strip())
+        # 同 xlsx：页标题不算内容
+        parts.append(f"--- 第 {idx} 页 ---")
+        parts.extend(bodies)
+        text_shapes += len(bodies)
+    return "\n".join(parts), text_shapes
+
+
+_OFFICE_EXTRACTORS = {
+    ".docx": _extract_docx,
+    ".xlsx": _extract_xlsx,
+    ".pptx": _extract_pptx,
+}
+
+OFFICE_CONVERTER = "office_text"
+
+
+def convert_office(src, ext: str, *, limit: int) -> dict:
+    """docx / xlsx / pptx → Markdown（文本 + 表格结构）**并自行截断**。
+
+    与 `convert_pdf` 的两处刻意差异：
+
+    - **本函数自己截断**（`limit`）。PDF 的截断留给调用方，是因为页图与正文要按
+      锚点交错、截断点必须由展开侧掌握；Office 正文是纯文本，截断与「已截断」的
+      诚实声明必须一起走，否则两条通道（附件 / 工具）会各自实现一遍、迟早不一致。
+    - 额外返回 `text_truncated`，调用方不必再比对长度。
+
+    契约不变：库缺失 / 文件损坏一律抛异常，由调用方兜（不做静默降级）。
+    """
+    extractor = _OFFICE_EXTRACTORS.get(str(ext or "").lower())
+    if extractor is None:
+        raise ValueError(f"convert_office 不支持的格式：{ext}")
+    body, units = extractor(Path(src))
+    base = {
+        "text_truncated": False,
+        "pages": None,
+        "images": [],
+        "tables": 0,
+        "converter": OFFICE_CONVERTER,
+        "warnings": [],
+    }
+    if not units:
+        # 抽空必须留痕：正文只有占位串，`text_is_empty_note` 是"已降级"的判据
+        return {**base, "markdown": empty_note(ext)}
+    truncated = len(body) > max(0, int(limit))
+    if truncated:
+        body = body[:limit]
+    body = f"{body}\n\n{_OFFICE_LOSSY_NOTE}"
+    if truncated:
+        body += f"\n（已截断至 {limit} 字符，完整内容请用 bash 或脚本读取原文件）"
+    warnings = ["内容已截断"] if truncated else []
+    return {**base, "markdown": body, "text_truncated": truncated, "warnings": warnings}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  工具读文档：页图缓存目录
+# ══════════════════════════════════════════════════════════════════
+# 为什么需要在工具调用期间落盘：中性图片块只带**路径**，真正的编码发生在发送
+# 边界，而发送边界不许写盘（doc 14）。所以渲染必须发生在工具里，且产物要活到
+# 那一跳请求为止 —— 落在 `<workdir>/.aigent/pages/<key>/`。
+#
+# 为什么不落 OS 临时目录：工具（`ToolRegistry`）只拿得到 `workdir` / `bash_cwd`，
+# 拿不到会话元数据目录；而落在工作空间里意味着模型与用户都能用普通文件工具看到
+# 它、清它。代价是与「引用通道零复制、不污染工作空间」出现一个明示例外 ——
+# 用「@ 忽略清单 + 目录内 .gitignore + TTL 清剪」把它收窄，并在文档里如实写明。
+
+def _cache_key(src, *, max_edge: int, max_pages: int, max_images: int,
+               min_text: int) -> str | None:
+    """缓存目录名 = 源文件身份 + 渲染参数的哈希。
+
+    含 `mtime_ns` 与 `size`：文件一改，key 就变 —— 旧目录再无人引用，因此
+    **不需要精确 GC**。渲染参数进 key 是因为它们决定页图集与渲染判据。
+    """
+    try:
+        st = Path(src).resolve().stat()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    raw = "|".join((
+        str(Path(src).resolve()), str(st.st_mtime_ns), str(st.st_size),
+        str(max_edge), str(max_pages), str(max_images), str(min_text),
+    ))
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _write_cache_gitignore(cache_root: Path) -> None:
+    """建缓存根目录并写一份 `.gitignore`（内容 `*`）。
+
+    不写 `.gitignore` 的话，用户的工作空间若是 git 仓库，一次读 PDF 就会在他们的
+    `git status` 里冒出一堆未跟踪文件；而去改他们自己的 `.gitignore` 更越界。
+    **目录创建也在这里做**（失败一律吞掉）：不可写是完全可接受的降级，
+    由 `convert_pdf` 转为纯文本模式并记 warning。
+    """
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        target = cache_root / ".gitignore"
+        if not target.exists():
+            target.write_text(_TOOL_CACHE_GITIGNORE, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 - 写不了就算了，不影响读文档
+        log.debug("准备页图缓存目录失败（转为纯文本模式）: %s", exc)
+
+
+def _prune_cache(pages_root: Path, keep: str) -> None:
+    """清掉超过 TTL 的同级缓存目录（顺手做，不清剪也不影响正确性）。"""
+    cutoff = time.time() - tool_cache_ttl_seconds()
+    try:
+        entries = list(os.scandir(pages_root))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name == keep:
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                continue
+            shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError as exc:  # noqa: BLE001 - 单个目录删不掉不该毁掉本次读取
+            log.debug("清剪缓存目录失败 %s: %s", entry.name, exc)
+
+
+def tool_cache_dir(workdir, src, *, max_edge: int = 1568, max_pages: int = 20,
+                   max_images: int = 20, min_text: int = 200) -> Path | None:
+    """工具读文档时页图的落盘目录；无法**定位**时返回 None。
+
+    **返回 None 只代表"连路径都算不出来"**（workdir 为空或不可解析）—— 那属于
+    调用方的参数问题。目录**不可写**不在这里返回 None：那种情况是完全可接受的
+    降级，由 `convert_pdf` 内部转为纯文本模式并记 warning。若这里因为不可写而返回
+    None，调用方连**文本层**都拿不到，那才是真正的损失（用户可能只是把项目挂在
+    只读盘上，读 PDF 的正文完全应当照常工作）。
+    """
+    if not str(workdir or "").strip():
+        return None
+    key = _cache_key(src, max_edge=max_edge, max_pages=max_pages,
+                     max_images=max_images, min_text=min_text)
+    if not key:
+        return None
+    try:
+        cache_root = Path(workdir).expanduser().resolve() / TOOL_CACHE_DIRNAME
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.warning("页图缓存路径不可解析: %s: %s", type(exc).__name__, exc)
+        return None
+    pages_root = cache_root / TOOL_CACHE_SUBDIR
+    _write_cache_gitignore(cache_root)   # 内部建目录，失败静默
+    _prune_cache(pages_root, key)
+    return pages_root / key

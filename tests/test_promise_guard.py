@@ -23,11 +23,13 @@
 
 改动 `_PROMISE_RE` / `_PAST_FOLLOW` / `PROMISE_GUARD_MAX*` 时请同步加/改这里的断言。
 """
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = ROOT / "agents"
@@ -216,6 +218,18 @@ class PromiseGuardLoopTests(unittest.TestCase):
     def _run(self, scripts):
         ctx = tempfile.TemporaryDirectory()
         self.addCleanup(ctx.cleanup)
+        # `_make_offline_agent` 内部的 SessionManager → ContextCompact → LLMClient()
+        # 要求密钥/地址**已配置**（只校验存在、不联网）。本机没有
+        # `~/.aigent/credentials.json` 时会在构造阶段抛 ValueError —— 表现为
+        # **单独跑本文件必红**、只在"别的用例先往 os.environ 塞过值"的全套运行里绿
+        # （2026-09-21 发现：执行顺序依赖）。补一对假值让本文件自足；
+        # 请求永远发不出去（streamed_create 已被脚本桩替换）。
+        env = mock.patch.dict(os.environ, {
+            "OPENAI_API_KEY": "test-key-not-used",
+            "OPENAI_BASE_URL": "http://127.0.0.1:9/v1",
+        })
+        env.start()
+        self.addCleanup(env.stop)
         agent = _make_offline_agent(Path(ctx.name))
         orig = agent_full_v2.streamed_create
         scripted = _ScriptedLLM(scripts)

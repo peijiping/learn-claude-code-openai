@@ -123,6 +123,30 @@ class SnipCompactTests(_Base):
         idx = [out.index(k) for k in keeps]
         self.assertEqual(idx, sorted(idx))
 
+    def test_tool_image_message_is_deliberately_not_protected(self):
+        """工具图片块（`tool_image`）**不进 keep 集** —— 与附件的可恢复性相反。
+
+        附件副本在工作空间之外（`~/.aigent/...`），模型自己拿不到，裁掉就永久
+        失去；工具图片是工作空间里的普通文件，模型随时能 `view_image` 再读一次
+        （与引用块同理）。keep 集只放"丢了就找不回来"的东西 —— 别"顺手"把它补上。
+        """
+        tool_img = {"role": "user", "content": [
+            {"type": "tool_image",
+             "image": {"path": "/w/shot.png", "name": "shot.png"}},
+        ]}
+        msgs = self._history([user("m0"), tool_img, user("m2"), user("m3")])
+        out = self.cc.snip_compact(msgs)
+        self.assertNotIn(tool_img, out)
+        # 同一条消息若同时带附件块，则**必须**保住（附件优先）
+        mixed = {"role": "user", "content": [
+            {"type": "tool_image", "image": {"path": "/w/shot.png", "name": "s.png"}},
+            {"type": "attachment", "attachment": {"id": "att_x", "kind": "image",
+                                                  "name": "a.png"}},
+        ]}
+        out2 = self.cc.snip_compact(
+            self._history([user("m0"), mixed, user("m2"), user("m3")]))
+        self.assertIn(mixed, out2)
+
     def test_placeholder_is_a_plain_dict_message(self):
         """占位必须是 dict —— 历史要落 jsonl 并能从磁盘读回。"""
         msgs = self._history([user(f"m{i}") for i in range(4)])
