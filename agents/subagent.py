@@ -10,32 +10,48 @@ import os
 import json
 import time
 import uuid
+import threading
 from datetime import datetime
 
 from paths import WORKDIR
 from hooks import HookSystem
 from llm_manage import LLMClient
+from llm_config import model_supports_image
 from logger import get_logger
 from streaming_client import CallbackSink, FilterSink, StreamEvent, streamed_create
+# 工具读图（2026-09-21）：`run_read` 读到图片 / PDF 页图时返回中性图片块，
+# 子智能体这条循环**没有**独立的发送边界（不像主智能体有 `_model_messages`），
+# 所以必须在这里就地展开成线格式（见下面 tool_image_values 那段）。
+from attachments import (
+    TOOL_IMAGES_MARKER,
+    build_tool_images_message,
+    expand_content_for_model,
+    is_tool_image_result,
+    tool_image_text,
+)
 
 # 统一日志（~/.aigent/logs/agent_日期.log）：排查"前端状态断了"时，
 # 对照后端工具执行打点与前端卡片更新时间即可定位断连窗口。
 log = get_logger("subagent")
 
-class SubAgent:
-    """
-    通用型子智能体。
 
-    每次 run() 调用都会在隔离的消息上下文里独立循环，只把最终摘要回传给
-    调用方。默认拥有全部工具权限，通过 system_prompt 引导行为，
-    也可通过 allowed_tools 在单次调用时收窄工具集。
-    """
+def build_default_system_prompt(workdir=None) -> str:
+    """子智能体默认系统提示（工作目录随所属工作空间变化）。
 
-    DEFAULT_SYSTEM_PROMPT = f"""你是一个通用型子智能体，工作目录是 {WORKDIR}。
+    曾是类级 f-string 常量 → 导入期就把 WORKDIR 烤死了，多工作空间下所有子智能体
+    都会自称"工作目录是 default 的沙盒"，与它真正操作的空间不符（子智能体的
+    文件工具用的是注入的 tool_registry.workdir）。改为按实例构造。
+    """
+    wd = workdir if workdir is not None else WORKDIR
+    return f"""你是一个通用型子智能体，工作目录是 {wd}。
         ## 核心规则
         1. **任务导向**：严格按照任务描述完成指定工作，不要发散
         2. **输出控制**：每次工具调用都要限制输出量。读取文件时使用 limit 参数，bash 命令用 | head 限制行数
-        3. **PDF 读取**：必须使用 read_pdf 工具读取 PDF，不要使用 strings/cat 等命令
+        3. **工具名必须与下发的一致**：可用的基础工具名是 bash / run_read /
+           run_write / run_edit / run_glob（**没有** read_file / read_pdf 这些
+           名字）。`run_read` 是**读文件的唯一入口**：文本、图片、PDF、Word/Excel/PPT
+           都由它按类型自动处理（PDF 会同时给出每页文本与含图表的整页图，
+           图片直接给像素）。名字写错会直接报 "Unknown tool"，白白消耗轮次。
         4. **摘要优先**：你的输出是给主智能体看的，只返回关键发现和结果，不要返回原始数据
         5. **安全操作**：执行写入或删除操作前，确认目标路径在工作目录内
         6. **看板边界**：不要创建或更新任务看板；不要调用 task_create、task_create_many 或 task_update；任务看板由主智能体统一维护
@@ -48,6 +64,22 @@ class SubAgent:
         - [关键发现或实现细节]
         ### 注意
         [需要注意的问题或后续工作]"""
+
+
+# 兼容：模块级常量保留（= default 沙箱根口径），实例请用 self.DEFAULT_SYSTEM_PROMPT
+DEFAULT_SYSTEM_PROMPT = build_default_system_prompt()
+
+
+class SubAgent:
+    """
+    通用型子智能体。
+
+    每次 run() 调用都会在隔离的消息上下文里独立循环，只把最终摘要回传给
+    调用方。默认拥有全部工具权限，通过 system_prompt 引导行为，
+    也可通过 allowed_tools 在单次调用时收窄工具集。
+    """
+
+    DEFAULT_SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
 
     MAX_ITERATIONS = 100
 
@@ -68,6 +100,12 @@ class SubAgent:
         self.hook_system = hook_system
         self.sub_llm_client = LLMClient().llm
         self.model = os.environ.get("OPENAI_MODEL_ID", "")
+        # 默认系统提示按本实例的工作根构造（= 注入的 ToolRegistry 的 workdir）。
+        # 仍作为**实例属性**暴露：既有 `self.DEFAULT_SYSTEM_PROMPT` 引用无需改动。
+        registry_workdir = getattr(tool_registry, "workdir", None) if tool_registry else None
+        self.DEFAULT_SYSTEM_PROMPT = build_default_system_prompt(
+            registry_workdir or getattr(hook_system, "workdir", None)
+        )
 
     def set_llm(self, llm_client, model: str) -> None:
         """配置热切换：就地重建子智能体的 LLM 绑定（无需重建实例）。"""
@@ -128,6 +166,7 @@ class SubAgent:
         allowed_tools: list[str] | None = None,
         workdir=None,
         tool_call_id: str = "",
+        stop_event: threading.Event | None = None,
     ) -> tuple[str, dict]:
         """
         执行一次子智能体任务。
@@ -152,6 +191,10 @@ class SubAgent:
             tool_call_id: 发起本次子任务的主智能体 tool_call id。会写进 transcript
                      并随 sub_agent_start 事件上行，供前端/回放把执行记录挂到
                      "发起 sub_agent 的那条 assistant 消息"下（唯一锚点规则）。
+            stop_event: 可选的协作式停止事件。用户在前端点"停止"时由
+                     BackgroundManager.request_stop_all() 置位；子智能体在每轮
+                     LLM 调用前与每次工具执行前检查，命中即收束为 aborted
+                     transcript（前端显示"已中断"徽标），不再发起新的调用。
 
         返回:
             (str, dict): (任务执行结果的摘要文本, 子智能体执行过程 transcript)。
@@ -206,6 +249,10 @@ class SubAgent:
         # transcript 名称取任务 prompt 前 80 字，便于回放时辨认
         name = (prompt[:80] + "…") if len(prompt) > 80 else (prompt or "子智能体")
 
+        # 本次子任务的 LLM token 消耗累计（多次迭代调用求和，回传主智能体记账）
+        sub_usage = {"prompt_tokens": 0, "completion_tokens": 0,
+                     "cached_tokens": 0, "total_tokens": 0}
+
         def _finish(summary: str, err: str = "") -> tuple[str, dict]:
             """收束为 (回传主智能体的摘要, transcript)：统一补齐状态/正文/耗时。"""
             return summary, self._build_transcript(
@@ -216,18 +263,44 @@ class SubAgent:
                 tool_call_id=tool_call_id,
                 started_at=_started_at,
                 duration_ms=int((time.monotonic() - _t0) * 1000),
+                usage=sub_usage,
+            )
+
+        def _stopped() -> bool:
+            """用户是否已请求停止（stop_event 由 request_stop_all 置位）。"""
+            return stop_event is not None and stop_event.is_set()
+
+        def _finish_aborted() -> tuple[str, dict]:
+            """用户主动停止：收束为 aborted transcript（前端显示「已中断」徽标）。
+
+            已完成的轮次事件保留在 transcript 里（可回放看到中断前的过程）；
+            正文记"已停止"，状态 aborted 与"执行失败（error）"区分开。
+            """
+            return "已停止", self._build_transcript(
+                subagent_id, name, collected,
+                text="已停止",
+                prompt=prompt,
+                tool_call_id=tool_call_id,
+                started_at=_started_at,
+                duration_ms=int((time.monotonic() - _t0) * 1000),
+                usage=sub_usage,
+                status="aborted",
             )
 
         sub_msg = None
         try:
             for iteration in range(self.MAX_ITERATIONS):
+                # 每轮 LLM 调用前检查停止信号（协作式：正在执行中的工具调用
+                # 无法从外部打断，但不再发起新一轮/新工具）
+                if _stopped():
+                    return _finish_aborted()
                 try:
                     # 统一流式入口：内部聚合出完整消息，sub_msg 接口兼容 OpenAI message。
                     # 注意：streamed_create 返回 (message, finish_reason, usage)，
                     # 第二个值必须叫 finish_reason —— 早期误写成 `_finish`，把上面
                     # 定义的 _finish() 闭包覆盖成了字符串，导致后续 `_finish(...)`
                     # 抛 "TypeError: 'str' object is not callable"（子智能体跑完即崩）。
-                    sub_msg, finish_reason, _usage = streamed_create(
+                    sub_msg, finish_reason, sub_llm_usage = streamed_create(
                         self.sub_llm_client,
                         sinks=sub_sinks,
                         model=self.model,
@@ -238,6 +311,9 @@ class SubAgent:
                         reasoning_effort="high", #思考强度，DeepSeek只有 high、max 两个选项
                         extra_body={"thinking":{"type":"enabled"}} #思考模式开关，值范围 disabled、enabled，默认 enabled
                     )
+                    # 子任务 token 消耗累计（含缓存命中），随 transcript 回传主智能体
+                    for k in sub_usage:
+                        sub_usage[k] += int(sub_llm_usage.get(k, 0) or 0)
                 except Exception as e:
                     error_msg = f"子智能体 API 调用失败 (第 {iteration + 1} 轮): {type(e).__name__}: {e}"
                     print(f"  [subagent] {error_msg}")
@@ -248,7 +324,14 @@ class SubAgent:
                     content = self._extract_content(sub_msg.model_dump())
                     return _finish(content or "(no summary)")
 
+                # 本轮工具读到的图片（run_read 读图片 / 读 PDF 页图）。必须在**所有**
+                # tool 消息之后聚合成一条合成 user 消息（插在两条 tool 消息之间会打断
+                # assistant.tool_calls ↔ tool 的链）。
+                tool_image_values: list = []
                 for tool_call in sub_msg.tool_calls:
+                    # 工具执行前再查一次停止信号：LLM 响应已到但用户恰好点了停止
+                    if _stopped():
+                        return _finish_aborted()
                     tool_id = tool_call.id
                     tool_name = tool_call.function.name
                     # OpenAI SDK 返回的 function.arguments 是 JSON 字符串,需解析为 dict 才能 ** 解包
@@ -285,10 +368,17 @@ class SubAgent:
                             self.hook_system.trigger("PostToolUse", tool_call, output)
                         else:
                             output = f"Unknown tool: {tool_name}"
+                        # run_read 读到图片时返回**中性图片块**而不是字符串：tool
+                        # 消息只能放文本（协议要求），所以拆成两半 —— 说明进 tool
+                        # 消息，图片本体随后由合成 user 消息带上。
+                        if is_tool_image_result(output):
+                            tool_image_values.append(output)
                         result = {
                             "role": "tool",
                             "tool_call_id": tool_id,
-                            "content": str(output),
+                            "content": (tool_image_text(output)
+                                        if is_tool_image_result(output)
+                                        else str(output)),
                         }
                     else:
                         result = {
@@ -297,6 +387,22 @@ class SubAgent:
                             "content": "Error: tool call missing name",
                         }
                     sub_messages.append(result)
+
+                # 图片在**所有 tool 消息落盘之后**再追加（顺序硬约束，与主智能体
+                # 的 agent_loop 同款）。这里必须**就地展开**成线格式：子智能体没有
+                # 主智能体那样的 `_model_messages` 发送边界，把中性块直接塞进请求体
+                # 会被 provider 拒绝。能力门控同样不能省（text-only 模型下
+                # `_expand_tool_image` 会降级为占位文本，而不是让 provider 报错）。
+                if tool_image_values:
+                    image_msg = build_tool_images_message(tool_image_values)
+                    if image_msg:
+                        expanded = expand_content_for_model(
+                            image_msg, None,
+                            supports_image=model_supports_image(
+                                getattr(self, "model", "") or ""))
+                        # marker 只用于主智能体回放辨认，这里没有投影层，必须自己摘掉
+                        expanded.pop(TOOL_IMAGES_MARKER, None)
+                        sub_messages.append(expanded)
 
                 # print(f"  [subagent] 第 {iteration + 1} 轮，执行了 {len(sub_msg.tool_calls)} 个工具调用")
 
@@ -327,7 +433,9 @@ class SubAgent:
     def _build_transcript(self, subagent_id: str, name: str, events: list,
                           error: str = "", text: str = "", prompt: str = "",
                           tool_call_id: str = "", started_at: str = "",
-                          duration_ms: int | None = None) -> dict:
+                          duration_ms: int | None = None,
+                          usage: dict | None = None,
+                          status: str | None = None) -> dict:
         """把旁路收集的子智能体事件聚合为可持久化的 transcript（旁路记录一条）。
 
         字段与 `subagent_store` 的记录结构、前端 SubAgentMsg 的可视字段一致。
@@ -383,7 +491,7 @@ class SubAgent:
             "subagent_id": subagent_id,
             "tool_call_id": tool_call_id,
             "name": name,
-            "status": "error" if error else "done",
+            "status": status or ("error" if error else "done"),
             "prompt": prompt,
             "thinking": thinking,
             "text": text,
@@ -391,4 +499,5 @@ class SubAgent:
             "error": error,
             "started_at": started_at,
             "duration_ms": duration_ms,
+            "usage": usage or {},
         }

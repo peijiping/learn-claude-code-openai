@@ -64,8 +64,8 @@ export default function SessionMenu({
           onClose()
         }}
       >
-        <Icon name="trash" size={14} />
-        <span>删除</span>
+        <Icon name="archive" size={14} />
+        <span>归档</span>
       </button>
     </div>
   )

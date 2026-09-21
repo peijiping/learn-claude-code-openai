@@ -2,8 +2,20 @@
 """
 todo_manager.py - 单会话待办事项管理
 
+⚠️ 本模块已于 2026-09-16 下线，**禁止新增引用**。
+
 会话级轻量级计划板：数据持久化为单个 JSON 文件。
 对标 s05 课程的 todo_write 工具：单列表、3 态、刷新式更新。
+
+下线原因（保留代码仅为审阅与回滚便利）：
+1. 与 task 看板（task_manager.py）功能高度重合，且本质是"无 owner、无依赖的退化 Task"；
+2. 其 update(items, fresh_start) 是**整表覆盖写**语义 —— 会冲掉并发修改且容易漏项，
+   与 Claude Code 团队当年删掉 TodoWrite 的动因一致；
+3. 配套的"连续 N 轮未更新就注入提醒"机制会把清单变成不可违背的剧本。
+
+替代：create_task / claim_task / complete_task（agents/task_manager.py）。
+调用方已在 tools.py / agent_full_v2.py / session_prompt.py 中注释或改写。
+paths.todo_file_for_session / TODO_DIR 仍保留（幂等，且被 tests/test_session_id_naming.py 引用）。
 """
 
 import json

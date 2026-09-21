@@ -12,11 +12,16 @@ export type StreamEventType =
   | 'turn_end'
   | 'sub_agent_start'
   | 'sub_agent_end'
+  /** token 消耗统计（turn 收尾 / 迟到子智能体补发）：usage 为 {turn?, session} 两级汇总 */
+  | 'usage_stats'
   /** 子智能体内部工具「开始真正执行」：流聚合完成（tool_call）≠ 执行开始，
    *  执行阶段（往往最耗时）据此把卡片里对应工具行拨回"执行中"，
    *  修复后台子智能体执行期间卡片零更新的断连观感（2026-09-12）。 */
   | 'tool_exec_start'
   | 'tool_exec_end'
+  /** 空闲期模型切换：下拉框模型改变时即时上行，携带切换快照 switch
+   *  （挂到「切换时最后一条 assistant 消息」上，先于用户下一条指令展示） */
+  | 'model_switch'
 
 export interface ContextStats {
   /** 当前会话已用 token（启发式估算） */
@@ -29,10 +34,58 @@ export interface ContextStats {
   max_label: string
 }
 
+/** token 消耗统计（后端 usage 节点统一结构，四字段；占比由前端计算） */
+export interface UsageStats {
+  prompt_tokens: number
+  completion_tokens: number
+  /** 缓存命中 token（OpenAI prompt_tokens_details.cached_tokens / DeepSeek prompt_cache_hit_tokens 归一） */
+  cached_tokens: number
+  total_tokens: number
+  /** 累计轮数（仅会话级 usage_totals 携带） */
+  turns?: number
+}
+
+/** 轮级模型切换（净变化 = 轮始→轮末）：本轮执行中发生过模型切换时，
+ *  随 model_info.switch / usage_stats.model.switch 下发；净切回原模型不携带。 */
+export interface ModelSwitch {
+  from_id: string
+  from_name: string
+  to_id: string
+  to_name: string
+  /** 末次切换时间戳（秒） */
+  ts?: number
+}
+
+/** 轮级模型快照：本轮实际使用的模型与参数（jsonl 轮末 assistant 行 model_info
+ *  节点 / usage_stats 事件 model 字段）。窗口即本轮统计所用口径；老轮次缺省不显示。 */
+export interface TurnModelInfo {
+  /** llmconfig.json 模型条目 id（如 "m_xxx"；未绑定模型时为空串） */
+  model_id: string
+  /** 展示名（模型 display_name；未绑定时为 env 模型名） */
+  model_name: string
+  /** 本轮生效的上下文窗口（token 数；未知为 0） */
+  max_context: number
+  /** 窗口缩写标签（如 "128K" / "1M"） */
+  max_context_label: string
+  /** 思考强度档位（low/high/very_high；空 = 未启用/未知） */
+  reasoning_effort: string
+  /** 本轮净模型切换（仅本轮执行中切换过模型时存在；缺省 = 无切换） */
+  switch?: ModelSwitch
+}
+
+/** usage_stats 事件载荷：turn（本轮，主 + 子智能体）+ session（会话累计）两级汇总
+ *  + model（本轮模型快照）。turn 缺省 = 后台子智能体迟到完成的 session 级补发
+ *  （只刷新圆圈 tooltip，不动消息 footer）。 */
+export interface UsageStatsEventUsage {
+  turn?: UsageStats
+  session: UsageStats
+  model?: TurnModelInfo
+}
+
 export interface AgentEvent {
   type: StreamEventType
-  /** 事件所属会话号；多会话并发时据此路由到对应消息缓冲 */
-  session_num?: number
+  /** 事件所属会话 id（短随机串 / 存量编号字符串）；多会话并发时据此路由到对应消息缓冲 */
+  session_id?: string
   text?: string
   /** 工具调用 id。子智能体生命周期事件（sub_agent_start / sub_agent_end）里
    *  表示**发起该子任务的主智能体 tool_call_id** —— 前端据此执行"唯一锚点
@@ -41,9 +94,69 @@ export interface AgentEvent {
   tool_name?: string
   args?: string
   finish_reason?: string
-  usage?: Record<string, number>
+  /** usage_stats 事件：{turn?, session} 两级汇总（见 UsageStatsEventUsage）；
+   *  其余事件（turn_end 遗留）为扁平 usage dict（前端不再消费） */
+  usage?: UsageStatsEventUsage | Record<string, number>
   /** 子智能体来源标识：非空表示该事件由某次子智能体任务发出（前端折叠到子智能体块下） */
   subagent_id?: string
+  /** model_switch 事件：空闲期模型切换快照（from/to 展示名），挂到切换时最后一条 assistant 消息 */
+  switch?: ModelSwitch
+}
+
+/** 任务项展示状态。pending / in_progress / completed 是**落盘**状态；
+ *  blocked 是**派生**状态 —— 由 blockedBy 实时算出，不写进任务文件
+ *  （避免"依赖状态"与"任务状态"双写不一致）。 */
+export type TaskItemStatus = 'pending' | 'in_progress' | 'completed' | 'blocked'
+
+/** 任务面板里的一行 */
+export interface TaskItem {
+  id: string
+  subject: string
+  /** 落盘状态 */
+  status: 'pending' | 'in_progress' | 'completed'
+  /** 展示用状态（含派生的 blocked） */
+  derived_status: TaskItemStatus
+  /** 认领者；主智能体为 "agent"，队友为队友名，null 表示未认领 */
+  owner: string | null
+  /** 父任务 id（拆子树用，最多 3 层） */
+  parentId: string | null
+  depth: number
+  orderIndex: number
+  blockedBy: string[]
+  /** 完成摘要（complete_task 的 result） */
+  result: string
+  started_at: number | null
+  updated_at: number
+  /** 子项进度（由子项派生，父任务自身 status 不受影响） */
+  child_total: number
+  child_completed: number
+}
+
+/** 任务面板快照：后端每次任务状态变化都推**整份**快照（幂等替换，不做增量）。
+ *
+ *  - `status`: running = 组内还有未完成任务（面板常驻、不可关闭）；
+ *              done    = 本组已全部完成（面板自动收起 + 出现「关闭」）
+ *  - `revision`: 组内单调递增，用于丢弃多线程（后台子智能体）乱序到达的旧快照
+ *  - `counts.blocked`: 派生口径，与 tasks[].derived_status 一致
+ */
+export interface TaskBoardSnapshot {
+  group_id: string
+  revision: number
+  status: 'running' | 'done'
+  /** 派生字段（后端算，不落盘）：组内**是否真有一条 in_progress**。
+   *  与 `status` 是两件事 —— `status` 只回答"活干完没有"，回答不了"现在有人跑吗"：
+   *  一条没人认领的 pending/blocked 残留会让 status 长期停在 running。
+   *  面板徽标必须以本字段为准，否则会出现"会话已完成但显示执行中"（2026-09-18 修）。
+   *  可选：缺字段（旧版后端）时面板回退用 counts.in_progress 近似。 */
+  has_in_progress?: boolean
+  counts: {
+    total: number
+    completed: number
+    in_progress: number
+    pending: number
+    blocked: number
+  }
+  tasks: TaskItem[]
 }
 
 /** 会话执行状态（后端 → 前端）：驱动侧边栏运行指示 / 完成绿点 / 停止按钮。
@@ -60,14 +173,141 @@ export type UiEvent =
   | { kind: 'tasks'; payload: { text: string } }
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
+  /** 工作空间列表（连接建立时重放 + 增删改后广播）。前端侧边栏空间树与
+   *  输入框 chip 下拉都由它驱动；`active` 是后端持久化的"当前活动空间"。 */
+  | { kind: 'projects'; payload: ProjectsPayload }
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
-  | { kind: 'session'; payload: { num: number; message_count: number } }
-  | { kind: 'session_status'; payload: { num: number; status: SessionRunStatus } }
-  | { kind: 'session_history'; payload: { num: number; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
-  | { kind: 'session_model'; payload: { num: number; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
-  | { kind: 'session_delete_result'; payload: { deleted: number[]; failed: number[] } }
+  | { kind: 'session'; payload: { session_id: string; message_count: number; /** 新会话所属工作空间 id（前端据此对齐活动空间） */ project_id?: string } }
+  | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
+  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } }
+  | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
+  | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
+  /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
+  | { kind: 'attachments_staged'; payload: AttachmentsStagedPayload }
+  /** 引用候选列表（应答 `refs_list`）。**点对点信封，不进 isKnownAgentEvent 白名单** */
+  | { kind: 'refs'; payload: RefsPayload }
   | { kind: 'llm_config'; payload: LlmConfigResult }
-  | { kind: 'context_stats'; payload: { num: number } & ContextStats }
+  | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
+  /** 任务面板快照（整份替换，不做增量）。
+   *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
+   *  会话切换/回放时后端只发未完成组，故已结束的组切回来不会显示。 */
+  | { kind: 'task_board'; payload: { session_id: string; board: TaskBoardSnapshot | null } }
+
+/** 附件种类（与后端 attachments.KIND_* 对齐） */
+export type AttachmentKind = 'image' | 'document' | 'text'
+
+/** 附件解析统计（2026-09-20）。
+ *
+ *  草稿、实时消息、回放消息**三条路径共用同一形状** —— UI 由它算出
+ *  「2.1MB · 12 页 · 5 图 · 3 表」以及"已降级"状态，避免三处各写一套文案。
+ *
+ *  字段名保持后端的 snake_case（与 `created_at` / `model_info` 等既有约定一致）。
+ *  旧 jsonl 行 / 老后端没有这些键时，前端一律取默认值（0 / '' / []）。 */
+export interface AttachmentStats {
+  /** 已抽取的文本字符数（文档类才有） */
+  text_chars: number
+  text_truncated: boolean
+  /** PDF 总页数（其它类型为 null） */
+  pages: number | null
+  /** 随附的图片数量（PDF 页图等） */
+  images: number
+  /** 识别到的表格数。`find_tables` 对无框线表格命中 0，是**下界** */
+  tables: number
+  /** 走的哪条转换路径：`pymupdf`（PDF 文本层+页图）/ `office_text`（docx/xlsx/pptx 文本抽取，
+   *  2026-09-21 起走统一转换层）/ `fallback_text`（转换层不可用时的兜底）/ `text_layer` / `''` */
+  converter: string
+  /** 「诚实失败」通道：**非空即表示该附件已降级**（UI 标琥珀 + tooltip 显示原因）。
+   *  例：「第 1 页无文本层，已按图像发送」「未提取到文本」「内容已截断」 */
+  warnings: string[]
+}
+
+/** 已发送附件（回放 / 实时消息上都用这个形状渲染）。
+ *  字段名保持后端的 snake_case（与 created_at / model_info 等既有约定一致），
+ *  避免每个渲染点都做一次 camel 转换。 */
+export interface AttachmentRef extends AttachmentStats {
+  id: string
+  kind: AttachmentKind | ''
+  name: string
+  mime: string
+  ext: string
+  size: number
+  /** 用户的**原始**文件路径（「在 Finder 中显示」用它） */
+  source_path: string
+  /** 会话内副本的绝对路径（图片缩略图 / 打开文件用它） */
+  stored_path: string
+  /** 后端归位时发现文件已不在（手工删过）→ UI 显示「文件已缺失」占位 */
+  missing?: boolean
+}
+
+/** 后端登记完成（`attachments_staged`）的一条附件 */
+export interface StagedAttachment extends AttachmentStats {
+  att_id: string
+  kind: AttachmentKind | ''
+  name: string
+  mime: string
+  ext: string
+  size: number
+  source_path: string
+  project_id: string
+}
+
+export interface StagedFailure {
+  path: string
+  reason: string
+}
+
+/** `attachments_staged` 信封载荷：items=成功项，failed=逐条失败原因。
+ *  单条失败不影响整批（用户选了 5 个文件不能因为 1 个不支持就全失败）。 */
+export interface AttachmentsStagedPayload {
+  items: StagedAttachment[]
+  failed: StagedFailure[]
+  project_id: string
+}
+
+/** `refs` 信封载荷：工作空间内的**扁平**候选列表（无层级）。
+ *
+ *  `type` 是**列表语义**（`dir` / `file`）；消息里的引用记录用的是 `is_dir`
+ *  （见 `RefInput` / `MessageRef`）。两者形状不同是刻意的：前者描述"枚举到的条目"，
+ *  后者描述"引用了一条路径"。
+ *
+ *  `path` 是绝对路径，`name` 是带后缀的名字；前端用 `path` 去掉 `name` 还原所在
+ *  目录，故后端**不重复发 dir 字段**。 */
+export interface RefListItem {
+  path: string
+  name: string
+  type: 'dir' | 'file'
+}
+
+export interface RefsPayload {
+  project_id: string
+  /** 本次枚举的沙箱根（会话 work_root 快照；与 run_read 同根） */
+  workdir: string
+  items: RefListItem[]
+  /** 命中条目上限 → 列表被截断（前端在底部提示） */
+  truncated: boolean
+  /** 已扫描到的条目数（含被忽略清单过滤掉的） */
+  total_seen: number
+  /** 因权限 / 并发删除而跳过的目录数 */
+  skipped: number
+  /** true = 当前空间不可引用（default 草稿空间 / 目录不可用）→ items 恒为空，
+   *  `reason` 给出给用户看的原因。**这是常规状态，不是错误**。 */
+  disabled: boolean
+  reason?: string
+}
+
+/** chat 携带的引用线索。后端**以磁盘为准**重新取 name / is_dir，这里的字段只是线索。 */
+export interface RefInput {
+  path: string
+  name?: string
+  is_dir?: boolean
+}
+
+/** 消息上的引用（回放与乐观渲染共用同一形状） */
+export interface MessageRef {
+  path: string
+  name: string
+  is_dir: boolean
+}
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
 export interface HistoryToolCall {
@@ -95,10 +335,26 @@ export interface HistorySubAgent {
 export interface HistoryMessage {
   role: 'user' | 'assistant'
   content: string
+  /** 消息记录时间（jsonl created_at，秒级 ISO 本地时间如 2026-09-18T10:30:00；
+   *  老会话行缺省 → 右下角不显示时间） */
+  created_at?: string
   thinking?: string
   toolCalls?: HistoryToolCall[]
   /** 本 assistant 消息下调用过的子智能体执行块（后端由 role=subagent 行挂载，回放展示用） */
   subagents?: HistorySubAgent[]
+  /** 本轮 token 消耗（轮末 assistant 行携带；老会话/无消耗轮缺省） */
+  usage?: UsageStats
+  /** 本轮模型快照（轮末 assistant 行 model_info 节点；老轮次缺省不显示） */
+  model_info?: TurnModelInfo
+  /** turn 收尾时的会话级累计快照（轮末 assistant 行 usage_session 节点；
+   *  回放恢复 footer 第二段「本会话累计」，与实时 usage_stats.session 同构） */
+  usage_session?: UsageStats
+  /** user 消息携带的附件（后端 `_history_to_ui` 从 content 的引用块 harvest 而来；
+   *  无附件的老消息不带这个字段） */
+  attachments?: AttachmentRef[]
+  /** user 消息引用的工作空间路径（后端 `_history_to_ui` harvest；**无引用时连字段
+   *  都不带** —— 与改造前的回放形状逐字节一致） */
+  refs?: MessageRef[]
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -236,10 +492,11 @@ export interface LlmModelsResult {
   error?: string
 }
 
-/** 会话元数据（来自后端 index.jsonl + 会话文件统计） */
+/** 会话元数据（来自后端会话元数据 + 会话文件统计） */
 export interface SessionMeta {
-  num: number
-  /** 会话标题；null = 未生成（UI 回退显示 session_N） */
+  /** 会话 id：短随机串（新会话）/ 存量编号字符串（旧会话）；全链路唯一标识 */
+  id: string
+  /** 会话标题；null = 未生成（UI 回退显示 session_<id>） */
   title: string | null
   /** 标题来源：none 未生成 / auto LLM 生成 / trunc 截断兜底 / user 手动重命名 */
   title_source?: 'auto' | 'user' | 'trunc' | 'none'
@@ -247,10 +504,44 @@ export interface SessionMeta {
   created_at?: string
   updated_at?: string
   trashed_at?: string | null
-  message_count: number
   file?: string
   /** 会话绑定的模型 id（记录进会话元数据）；null = 未绑定（用全局） */
   model_id?: string | null
+  /** 所属工作空间 id（多工作空间：前端据此把会话挂到对应空间节点下）。
+   *  存量会话缺字段时后端按目录归属兜底，故这里可能缺省（视为 default）。 */
+  project?: string
+  /** 会话累计 token 消耗（后端 add_usage_totals 写入元数据；无消耗会话缺省） */
+  usage_totals?: UsageStats | null
+  /** 未读标记：会话完整结束且用户尚未进入查看时为 true（后端元数据持久化，跨重启/多窗口同步） */
+  unread?: boolean
+}
+
+/**
+ * 工作空间元数据（`projects` 信封里的元素）。
+ *
+ * 一个工作空间 = 一个真实目录 + 一份元数据目录（`~/.aigent/projects/<id>/`）。
+ * 它的会话历史 / 任务 / 记忆 / 沙箱根都按 id 隔离（见 docs/frontend/11）。
+ */
+export interface ProjectMeta {
+  /** 工作空间 id：默认空间恒为 "default"，其余为 "ws" + 10 位 base62 短码 */
+  id: string
+  /** 展示名（新增时默认取文件夹名；同名目录后端自动加 " (2)" 后缀） */
+  name: string
+  /** 真实目录绝对路径；默认空间为 null（它没有真实目录） */
+  path: string | null
+  /** 是否为默认工作空间（固定第一位，不可重命名/删除） */
+  system: boolean
+  /** 真实目录当前是否可达（被删/移动硬盘未挂载 → false，UI 置灰并禁止新建/发送） */
+  exists: boolean
+  created_at?: string | null
+  last_opened_at?: string | null
+}
+
+/** `projects` 信封载荷：全部工作空间 + 当前活动空间 */
+export interface ProjectsPayload {
+  projects: ProjectMeta[]
+  /** 当前活动工作空间 id（后端持久化；chip 显示与新建任务归属的默认值） */
+  active: string
 }
 
 /** 会话元数据里记录的模型参数（UI 级：后端不参与窗口换算，仅保存已选档位） */
@@ -268,6 +559,7 @@ export interface SessionModelOverridesMap {
 export type ControlKind =
   | 'chat'
   | 'session_switch'
+  | 'session_set_unread'
   | 'session_clear'
   | 'session_model'
   | 'sessions_list'
@@ -276,10 +568,21 @@ export type ControlKind =
   | 'session_restore'
   | 'session_delete'
   | 'trash_list'
+  /** 工作空间（多项目）：列表 / 新增（登记目录）/ 切换活动 / 重命名 / 删除 */
+  | 'projects_list'
+  | 'project_add'
+  | 'project_open'
+  | 'project_rename'
+  | 'project_remove'
   | 'goal_status'
   | 'tasks'
   | 'skills'
   | 'stop'
+  | 'status_query'
+  /** 附件登记（「添加文件或图片」）：前端把本地绝对路径交给后端复制+解析 */
+  | 'attachment_stage'
+  /** 引用候选列表（「引用文件或文件夹」）：输入 @ 时拉一次完整扁平列表 */
+  | 'refs_list'
   | 'llm_config_get'
   | 'llm_config_save'
   | 'llm_models_fetch'
@@ -289,11 +592,15 @@ export interface WsOutbound {
   payload?: Record<string, unknown>
 }
 
-/** 前端 → 后端 chat 命令载荷：num 指明目标会话（新建任务无激活会话时省略，由后端领号） */
+/** 前端 → 后端 chat 命令载荷：session_id 指明目标会话（新建任务无激活会话时省略，由后端生成短 id） */
 export interface ChatPayload {
+  /** 正文。**带附件时可以为空串**（纯附件消息）—— 后端据此判定是否插入文本块。 */
   text: string
-  num?: number
+  session_id?: string
   fresh?: boolean
+  /** 新建任务的归属工作空间 id（点哪个空间的「+」就进哪个空间）。
+   *  缺省 = 后端当前活动空间。已有会话无需携带（后端按 session_id 解析归属）。 */
+  project_id?: string
   /** 当前会话请求级覆盖（来自模型下拉悬浮配置面板） */
   overrides?: {
     thinking_strength?: string
@@ -301,6 +608,27 @@ export interface ChatPayload {
   }
   /** 当前会话绑定/选择的模型 id（新建任务随首条消息持久化） */
   model_id?: string | null
+  /** 本轮的附件（`attachment_stage` 登记后拿到的 att_id 列表）。
+   *  **只传 id 与少量线索，不传文件内容**：后端按 att_id 从草稿区把文件归位到
+   *  会话目录，并在发送边界展开成模型线格式。 */
+  attachments?: ChatAttachmentInput[]
+  /** 本轮的引用（工作空间内的文件/目录路径）。
+   *  **零复制、零存储**：后端只做越界校验与规范化，然后挂一个中性引用块，
+   *  把「路径清单 + 内容不在上下文中、需要时用 run_read」注入模型上下文。
+   *  与 attachments 是**并列且独立**的两条通道。 */
+  refs?: RefInput[]
+}
+
+/** chat 携带的附件线索（真实元数据以磁盘上的 meta.json 为准，前端字段只是线索） */
+export interface ChatAttachmentInput {
+  att_id: string
+  kind: AttachmentKind | ''
+  name: string
+  mime?: string
+  ext: string
+  size?: number
+  /** 登记时所属工作空间（跨空间场景下后端据此找回草稿） */
+  project_id?: string
 }
 
 export function parseWsLine(raw: string): UiEvent {
@@ -322,7 +650,9 @@ export function isKnownAgentEvent(ev: AgentEvent): boolean {
     'turn_end',
     'sub_agent_start',
     'sub_agent_end',
+    'usage_stats',
     'tool_exec_start',
-    'tool_exec_end'
+    'tool_exec_end',
+    'model_switch'
   ].includes(ev.type)
 }

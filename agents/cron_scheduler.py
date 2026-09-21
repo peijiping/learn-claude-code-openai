@@ -324,7 +324,7 @@ class CronScheduler:
             agent = Agent(session_prefix="cron_", silent=True)
             agent.init_session(resume=False)
             # print(f"  \033[35m[cron execute] {job.id} → session "
-            #       f"cron_{agent.session_num}\033[0m")
+            #       f"cron_{agent.session_id}\033[0m")
             result = agent.run_turn(f"[Scheduled] {job.prompt}")
         except Exception as e:
             log.error("[cron execute error] %s: %s", job.id, e)

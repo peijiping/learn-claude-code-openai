@@ -77,10 +77,17 @@ class BackgroundManager:
         tool_args: dict,
         tool_call_id: str,
         executor: Callable[[], str],
+        stop_event: threading.Event | None = None,
     ) -> str:
-        """Run executor in a daemon thread. Returns background task ID."""
+        """Run executor in a daemon thread. Returns background task ID.
+
+        stop_event：可选的外部协作式停止事件（由调用方创建并传给 executor，
+        使子智能体等长任务能在迭代边界感知"用户点了停止"）。不传则内部
+        自建一个（仅用于 request_stop_all 兜底置位，executor 不读它）。
+        """
         self.bg_counter += 1
         bg_id = f"bg_{self.bg_counter:04d}"
+        ev = stop_event if stop_event is not None else threading.Event()
         # 显示文本：bash 取 command；sub_agent 取 prompt 前 80 字；其他用工具名
         cmd = (
             tool_args.get("command")
@@ -97,8 +104,18 @@ class BackgroundManager:
             except Exception as e:
                 result = f"Error: {type(e).__name__}: {e}"
             with self.background_lock:
-                self.background_tasks[bg_id]["status"] = "completed"
-                self.background_results[bg_id] = result
+                t = self.background_tasks[bg_id]
+                # 只有仍在 running 才晋升 completed：用户已点停止（status 被标
+                # 成 stopped）时不得"复活"——否则 stop 后 has_completed_pending()
+                # 又变 True，守望会把一个已被用户放弃的结果再续轮注入。
+                resurrected = t["status"] != "running"
+                if not resurrected:
+                    t["status"] = "completed"
+                    self.background_results[bg_id] = result
+            if resurrected:
+                log.info("[background] %s 已被用户停止，迟到结果（%.1fs）丢弃",
+                         bg_id, time.monotonic() - started)
+                return
             # 完成即打点（含耗时）：区分"任务真完成"与"结果尚未注入主循环"
             elapsed = time.monotonic() - started
             print(f"  \033[33m[background] completed {bg_id} ({elapsed:.1f}s): "
@@ -110,6 +127,7 @@ class BackgroundManager:
                 "tool_call_id": tool_call_id,
                 "command": cmd,
                 "status": "running",
+                "stop_event": ev,
             }
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -164,6 +182,25 @@ class BackgroundManager:
                 for t in self.background_tasks.values()
             )
 
+    # 用户主动停止（2026-09-21 新增）：把所有运行中的后台任务标记为 stopped
+    # 并置各自的 stop_event。协作式停止——sub_agent 等支持事件的 executor 在
+    # 迭代边界感知并收束为 aborted；不支持事件的 executor（如 bash 的
+    # subprocess.run）线程会跑完当前调用，但状态已是 stopped：
+    # - has_running() 立即变 False → bg watch 退出 → 会话状态收敛为 done；
+    # - worker 收尾时不会把 stopped 复活成 completed → 结果不会被注入。
+    def request_stop_all(self) -> list[str]:
+        """请求停止所有运行中的后台任务，返回被停止的任务 id 列表。"""
+        with self.background_lock:
+            stopped = []
+            for bid, t in self.background_tasks.items():
+                if t["status"] == "running":
+                    t["status"] = "stopped"
+                    t["stop_event"].set()
+                    stopped.append(bid)
+        for bid in stopped:
+            log.info("[background] %s stopped by user", bid)
+        return stopped
+
     # 是否有"已完成但尚未注入通知"的后台结果（auto-followup 用途）：
     # 完成后台任务的 watch 结束、但结果还没被主智能体消费过（collect
     # 才会把 completed → notified）时返回 True，供会话运行时决定是否
@@ -175,6 +212,33 @@ class BackgroundManager:
                 t["status"] == "completed"
                 for t in self.background_tasks.values()
             )
+
+    # ── 续轮失败的"精确回滚"（2026-09-18 事故新增）────────────────────
+    # 场景：后台续轮（run_background_followup）在 agent_loop 起点就把本批结果
+    # 消费成 notified，随后执行期抛异常。若无人回滚，回循环顶时
+    # has_completed_pending() 恒为 False → 守望直接收尾回 done，会话被静默
+    # 判定结束：用户看不到最终总结、任务面板永久停摆。这两个方法让
+    # SessionRuntime 能按"本轮要消费的那一批 id"精确退回，而非全量重放。
+    def snapshot_completed_ids(self) -> list[str]:
+        """快照当前尚未被消费（status=completed）的后台任务 id。"""
+        with self.background_lock:
+            return [bid for bid, t in self.background_tasks.items()
+                    if t["status"] == "completed"]
+
+    def restore_completed(self, ids: list[str]) -> int:
+        """把这批 id 中已被消费（notified）的退回 completed，返回恢复条数。
+
+        只动传进来的 id：已在上几轮成功注入过的历史结果不受影响，
+        不会导致旧通知重复进入新上下文。
+        """
+        restored = 0
+        with self.background_lock:
+            for bid in ids:
+                t = self.background_tasks.get(bid)
+                if t is not None and t["status"] == "notified":
+                    t["status"] = "completed"
+                    restored += 1
+        return restored
 
     # 收集所有已完成的后台任务，生成 task_notification 通知列表。
     # 设计要点（与教程版不同）：

@@ -32,10 +32,15 @@ export default function MessageList(): JSX.Element {
   }, [messages, activeSession])
 
   return (
-    <div className="msglist" ref={containerRef} onScroll={handleScroll}>
-      {messages.map((m) => (
-        <MessageItem key={m.id} msg={m} />
-      ))}
+    // 两层结构：外层 .msgscroll 是**占满对话区全宽**的滚动视口（滚轮落在内容列两侧的
+    // 空白处同样能滚动），内层 .msglist 只负责 940px 上限 + 居中 + 内边距。
+    // 滚动位置 / 贴底判定一律以 .msgscroll 为准（containerRef 挂在外层）。
+    <div className="msgscroll" ref={containerRef} onScroll={handleScroll}>
+      <div className="msglist">
+        {messages.map((m) => (
+          <MessageItem key={m.id} msg={m} />
+        ))}
+      </div>
     </div>
   )
 }

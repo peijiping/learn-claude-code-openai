@@ -28,24 +28,40 @@
   color: var(--color-text-primary);
 }
 
-/* 消息流：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
-.msglist {
+/* 消息滚动视口：占满对话区**全部宽度**（不只是 940px 内容列）。
+ * 2026-09-20 由「.msglist 单层既滚动又限宽」改为「视口 / 内容列」两层：
+ * 单层时滚轮只落在 940px 内容列内才生效 —— 鼠标移到两侧空白（窗口宽于 940px 时的
+ * 留白）就滚不动对话记录，与主流智能体客户端的观感不符。视口层刻意**不设 max-width**。
+ * 滚动实现与贴底判定都挂在本层（MessageList 的 containerRef）。 */
+.msgscroll {
   flex: 1;
-  overflow-y: auto;
-  padding: var(--sp-5) var(--sp-5) var(--sp-2);
   min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  /* 横向溢出（超宽表格 / 不换行长串）不在此层滚动：代码块、表格各自有横向滚动框，
+   * 正文长串由 .markdown-body 的 overflow-wrap 换行兜底 —— 避免整块对话区横向漂移。 */
+  overflow-x: hidden;
+  /* 显式声明链式滚动：内层滚动框（深度思考框）滚到边界后，继续滚轮可带动本视口 */
+  overscroll-behavior-y: auto;
+}
+
+/* 消息内容列：宽度上限 940px（与输入区一致），窗口更宽时居中固定，窗口更窄时随容器收缩。
+ * 本层**不滚动**（滚动交给外层 .msgscroll），只负责限宽 / 居中 / 内边距。
+ * 底部留 28px 滚动空间：消息右下角悬浮的「时间+复制」元信息（-26px）滚动到底时仍可见。 */
+.msglist {
   width: 100%;
   max-width: 940px;
   margin: 0 auto;
+  padding: var(--sp-5) var(--sp-5) calc(var(--sp-5) + var(--sp-1));
 }
-/* 对话区域隐藏滚动条但保留滚动：消息列表 / 深度思考框 / 输入框 */
-.msglist,
+/* 对话区域隐藏滚动条但保留滚动：消息视口 / 深度思考框 / 输入框 */
+.msgscroll,
 .thinking-content,
 .composer-input {
   scrollbar-width: none;
   -ms-overflow-style: none;
 }
-.msglist::-webkit-scrollbar,
+.msgscroll::-webkit-scrollbar,
 .thinking-content::-webkit-scrollbar,
 .composer-input::-webkit-scrollbar {
   display: none;
@@ -68,6 +84,52 @@
   font-size: var(--fs-md);
   line-height: 1.6;
   user-select: text;
+  position: relative;
+}
+
+/* 消息底部元信息（时间 + 复制按钮）：悬停消息行时淡入，定位在消息体右下角。
+ * User 气泡 / Assistant 正文统一浮在消息体右下外侧（bottom: -26px）。
+ * 点击复制该条消息原始正文（复制时停止事件冒泡）。 */
+.msg-meta {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.msg-time {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  user-select: none;
+}
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.msg-copy-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.msg-bubble.user .msg-meta {
+  bottom: -26px;
+  right: 0;
+}
+.assistant-body .msg-meta {
+  bottom: -26px;
+  right: 0;
+}
+.msg-row:hover .msg-meta {
+  opacity: 1;
 }
 
 /* assistant 消息 */
@@ -90,6 +152,7 @@
 .assistant-body {
   flex: 1;
   min-width: 0;
+  position: relative;
 }
 
 /* 思考过程 */
@@ -295,6 +358,39 @@
   font-size: var(--fs-xs);
 }
 
+/* token footer 两段式（本轮 / 本会话累计）之间的分隔 */
+.msg-usage-sep {
+  display: inline-block;
+  width: 1px;
+  height: 10px;
+  margin: 0 var(--sp-2);
+  background: var(--color-border);
+  vertical-align: middle;
+}
+
+/* 模型切换提示：本轮执行中切换过模型时，在答复末尾展示一条居中浅灰提示，
+   文字两侧各一条浅灰横线（无顶部线、无背景填充） */
+.model-switch-notice {
+  margin-top: var(--sp-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.model-switch-notice::before,
+.model-switch-notice::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+.model-switch-info {
+  font-size: 12px;
+  line-height: 1;
+}
+
 /* 输入区：宽度上限 940px（与消息列表一致），窗口更宽时居中固定，窗口更窄时随容器收缩 */
 .composer-wrap {
   padding: var(--sp-3) var(--sp-5) var(--sp-4);
@@ -316,10 +412,15 @@
   border: none;
   outline: none;
   resize: none;
+  /* textarea 的 UA 默认底色是白色（background-color: field）：它是 .composer 的第一个子元素，
+     会盖住父级 border-radius 的左上/右上圆角与顶边（子元素绘制在父级边框之上），
+     表现为"上方两角是方角、顶边线断掉"。置为透明，白底与圆角统一由 .composer 画。 */
+  background: transparent;
   padding: var(--sp-3) var(--sp-4);
   font-family: inherit;
   font-size: var(--fs-md);
   line-height: 1.6;
+  min-height: calc(1.6em * 2 + var(--sp-3) * 2); /* 默认两行高度（行高×2 + 上下内边距） */
   max-height: 160px;
 }
 .composer-input::placeholder {
@@ -330,7 +431,6 @@
   align-items: center;
   justify-content: space-between;
   padding: var(--sp-1) var(--sp-3) var(--sp-2);
-  border-top: 1px solid var(--color-border);
   gap: var(--sp-3);
 }
 .toolbar-left,
@@ -554,6 +654,11 @@
   color: var(--color-text-primary);
   z-index: 950;
   pointer-events: none;
+  text-align: left;
+}
+/* 多行统计（上下文 / 累计输入 / 缓存命中 / 输出）逐行展示 */
+.context-tooltip div {
+  line-height: 1.7;
 }
 .send-btn:disabled {
   opacity: 0.5;
@@ -563,16 +668,10 @@
   background: var(--color-text-secondary);
 }
 
-/* 上下文条 */
-.composer-context {
-  display: flex;
-  gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-3);
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-sidebar);
-  /* 补偿 .composer 去掉 overflow:hidden 后的圆角裁剪：仅底部圆角需要自己裁 */
-  border-radius: 0 0 var(--radii-btn) var(--radii-btn);
-}
+/* 工作空间选择器（输入框工具栏 chip 的下拉，2026-09-18）
+   - .ws-select：定位容器（chip + 下拉的相对锚点）
+   - .ws-picker：向上弹出（与 .model-menu 同款：mask 遮罩 + 面板）
+   - 上段 = 已打开的工作空间，底部固定项 = 选择文件夹… */
 .ctx-chip {
   display: inline-flex;
   align-items: center;
@@ -585,3 +684,770 @@
   background: var(--color-bg-main);
 }
 
+/* ══════════════════════════════════════════════════════════════
+   任务面板（TaskBoard）：固定在输入框上方
+   - 展开态固定高度 168px，超出滚动；折叠态只留 40px 表头
+   - 执行中不提供任何关闭入口（由组件决定不渲染），完成后才出现「关闭」
+   - 不提供「继续执行」按钮（2026-09-16 移除）：续跑靠用户在输入框手打消息
+   ══════════════════════════════════════════════════════════════ */
+.task-card {
+  flex: none;
+  width: 100%;
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 0 var(--sp-5);
+}
+.task-card__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 40px;
+  padding: 0 var(--sp-3);
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+}
+.task-card:not(.task-card--collapsed) .task-card__head {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.task-card__title {
+  font-weight: 500;
+}
+.task-card__count {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.task-card__meta {
+  color: var(--color-text-secondary);
+}
+.task-card__spacer {
+  flex: 1;
+}
+.task-card__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 1px var(--sp-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-xs);
+}
+.task-card__badge--running {
+  color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.task-card__badge--done {
+  color: var(--color-ok);
+  background: rgba(52, 168, 83, 0.1);
+}
+/* 停滞（有未完成项但没有任何 in_progress）：刻意用中性灰 —— 既不是"在跑"，
+   也不是"完成"，避免用户误读成"还有东西在执行"（2026-09-18 事故后新增） */
+.task-card__badge--stalled {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-hover);
+}
+/* 停滞时进度条也不再高亮（没有东西在推进） */
+.task-card--stalled .task-card__bar-fill {
+  background: var(--color-border);
+}
+/* 执行中的脉冲点：与侧边栏 .tree-dot.running 同语义（"还有活没干完"） */
+.task-card__pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  animation: task-pulse 1.4s ease-in-out infinite;
+}
+@keyframes task-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+/* 注意：`.mini-btn`（sidebar.css）是**固定 24×24 的纯图标**按钮，
+   带文字时会被挤成竖排并溢出——本区块内只用它渲染图标（如「关闭」×）。
+   原先的「继续执行」按钮误用了它，2026-09-16 已删除。 */
+
+.task-card__bar {
+  height: 2px;
+  background: var(--color-border);
+}
+.task-card__bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  transition: width 0.25s ease;
+}
+.task-card--done .task-card__bar-fill {
+  background: var(--color-ok);
+}
+
+/* 固定高度 + 滚动条：20 条任务也不会撑破布局 */
+.task-card__body {
+  height: 168px;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-top: none;
+  border-radius: 0 0 var(--radii-btn) var(--radii-btn);
+  background: var(--color-bg-main);
+}
+.task-card--collapsed .task-card__body,
+.task-card--collapsed .task-card__bar {
+  display: none;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 26px;
+  padding-right: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.task-row__subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-row__meta,
+.task-row__result {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.task-row__result {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-row__owner {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.task-row--completed .task-row__subject {
+  color: var(--color-text-secondary);
+  text-decoration: line-through;
+}
+.task-row--blocked .task-row__subject {
+  color: var(--color-text-secondary);
+}
+
+.task-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-text-secondary);
+  background: transparent;
+}
+.task-dot--running {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  animation: task-pulse 1.4s ease-in-out infinite;
+}
+.task-dot--done {
+  border-color: var(--color-ok);
+  background: var(--color-ok);
+}
+.task-dot--blocked {
+  border-color: var(--color-danger);
+  border-style: dashed;
+}
+
+
+
+/* ═══════════════════════════════════════════════════════════════
+   工作空间选择器（输入框底部 chip 的下拉，2026-09-18）
+   - .ws-select：定位容器（chip + 下拉的相对锚点）
+   - .ws-picker：向上弹出（与 .model-menu 同款：mask 遮罩 + 面板）
+   - 上段 = 已打开的工作空间，底部固定项 = 选择文件夹…
+   ═══════════════════════════════════════════════════════════════ */
+.ws-select {
+  position: relative;
+  display: inline-flex;
+}
+.ctx-chip.clickable {
+  cursor: pointer;
+}
+.ctx-chip.clickable:hover,
+.ctx-chip.clickable.open {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.ctx-chip-label {
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ws-picker-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+}
+.ws-picker {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 220px;
+  max-width: 360px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.2));
+  z-index: 901;
+}
+.ws-picker-group {
+  padding: var(--sp-1) var(--sp-3);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+.ws-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+.ws-picker-item:hover {
+  background: var(--color-bg-hover);
+}
+.ws-picker-item.active {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+/* 路径失效的空间：可见但不可选（点了会切到一个不存在的目录） */
+.ws-picker-item.missing {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ws-picker-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ws-picker-sep {
+  height: 1px;
+  margin: var(--sp-1) 0;
+  background: var(--color-border);
+}
+.ws-picker-empty {
+  padding: var(--sp-3);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   加号「添加内容」菜单（输入框底部左侧「+」，2026-09-20）
+   - .plus-select：定位容器（+ 按钮 + 弹出菜单的相对锚点）
+   - .plus-menu：向上弹出（与 .model-menu / .ws-picker 同款分层：mask 900 / 面板 901）
+   - 两段式分组：添加内容 / 执行方式，组间仅留白、不加分隔线（对齐设计稿）
+   ═══════════════════════════════════════════════════════════════ */
+.plus-select {
+  position: relative;
+  display: inline-flex;
+}
+/* + 按钮在菜单展开期间保持高亮（toggle 语义） */
+.tool-btn.open {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.plus-menu-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+}
+.plus-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 208px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.2));
+  z-index: 901;
+}
+/* 组间用留白分隔（无分割线，对齐设计稿） */
+.plus-menu-section + .plus-menu-section {
+  margin-top: var(--sp-2);
+}
+.plus-menu-group {
+  padding: var(--sp-1) var(--sp-2);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  user-select: none;
+}
+.plus-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: 7px var(--sp-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+.plus-menu-item:hover {
+  background: var(--color-bg-hover);
+}
+.plus-menu-item.active {
+  color: var(--color-accent);
+}
+.plus-menu-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   会话附件（「添加文件或图片」，2026-09-20）
+   见 docs/frontend/12-附件与文件输入.md。
+   输入区的附件条（可删）与消息气泡内的附件条共用 .att-* 类，只有尺寸差异。
+   ══════════════════════════════════════════════════════════════════ */
+
+/* 拖拽遮罩的定位上下文（各下拉菜单仍锚在各自的 .xxx-select 上，不受影响） */
+.composer {
+  position: relative;
+}
+
+/* 拖拽进入态：整块输入区高亮，明确"松手即添加到这里" */
+.composer.dragover {
+  border-color: var(--color-accent);
+  background: var(--color-bg-hover);
+}
+
+/* 拖拽遮罩：**必须 pointer-events:none** —— 否则 drop 会落在遮罩上而不是
+   composer，投放直接失效（拖拽交互最经典的坑）。 */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radii-btn);
+  background: color-mix(in srgb, var(--color-bg-main) 82%, transparent);
+  border: 1px dashed var(--color-accent);
+}
+
+.drop-overlay-inner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--color-accent);
+  font-size: var(--fs-sm);
+}
+
+/* ── 附件条 ────────────────────────────────────────────────────── */
+.att-bar {
+  display: flex;
+  flex-wrap: wrap;
+  /* 同行 chip 顶部对齐 + 各自有 min-height：文案行数变化不会让整行高度抖动 */
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+/* 消息气泡内：紧凑、右对齐（user 气泡本身靠右） */
+.att-bar.compact {
+  padding: 0 0 var(--sp-2);
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.att-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 260px;
+  min-height: 34px;
+  padding: 4px 6px 4px 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  font-size: var(--fs-xs);
+}
+
+/* chip 在输入区可由父级宽度约束，长文件名必须能省略号截断而不是撑破输入框 */
+.att-chip .att-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.att-name {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-primary);
+}
+
+.att-meta {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* 失败原因往往很长：chip 里单行省略（否则会把同行 chip 撑得高低不齐）。
+   完整原因在 tooltip 与原生 toast 里给全，信息不丢。 */
+.att-meta.err {
+  color: var(--color-danger);
+}
+
+/* 降级文案（琥珀）：完整原因在 tooltip 里，这里只显示一句短提示 */
+.att-meta.warn {
+  color: var(--color-warn);
+}
+
+/* 图片缩略图：固定方形 + object-fit，避免长图撑破输入区 */
+.att-thumb {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+  background: var(--color-bg-hover);
+}
+
+.att-icon {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+
+.att-chip.staging {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.att-chip.failed {
+  border-color: var(--color-danger);
+}
+
+/* 已降级（2026-09-20）：解析不完整，但**可以发送** —— 用琥珀而不是红色，
+   因为"降级"不是"失败"（扫描件已按图像发送、内容被截断都算降级）。 */
+.att-chip.degraded {
+  border-color: var(--color-warn);
+}
+
+.att-chip.degraded .att-name {
+  color: var(--color-warn);
+}
+
+.att-chip.failed .att-name,
+.att-chip.missing .att-name {
+  color: var(--color-danger);
+}
+
+.att-chip.clickable {
+  cursor: pointer;
+}
+
+.att-chip.clickable:hover {
+  background: var(--color-bg-hover);
+}
+
+/* 固定 20×20 只放 Icon（与 .mini-btn 同一约定） */
+.att-remove {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.att-remove:hover {
+  background: var(--color-bg-active);
+  color: var(--color-danger);
+}
+
+/* ── 输入区内的附件提示（比 toast 更贴近操作点）────────────────── */
+.composer-hint {
+  padding: 0 var(--sp-4) var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+.composer-hint.error {
+  color: var(--color-danger);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   引用文件/文件夹（@-mention，2026-09-21）
+   见 docs/frontend/13-引用文件与文件夹（@-mention）.md。
+   与附件（.att-*）**刻意分成两套类名**：引用是"指向工作空间里的某个路径"，
+   零复制、零存储，不能让人误以为"已上传/已复制"。
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── 富文本输入区（替代原 textarea）────────────────────────────── */
+.composer-input.composer-editor {
+  /* 与 textarea 时代同款：默认两行高、最多 160px 后内部滚动。
+     "自动长高"刻意交给 CSS：JS 的 autoGrow 在 ProseMirror 频繁重渲染下容易和
+     内容更新抢时序，表现为光标跳动；CSS 方案更稳，也不会被重渲染打断。 */
+  min-height: calc(1.6em * 2 + var(--sp-3) * 2);
+  max-height: 160px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: text;
+}
+
+.composer-input.composer-editor p {
+  margin: 0;
+}
+
+/* 占位符（Placeholder 扩展会在空编辑器上打 .is-editor-empty） */
+.composer-input.composer-editor p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  color: var(--color-text-secondary);
+  pointer-events: none;
+}
+
+/* Suggestion 给正在检索的 `@query` 打的装饰：只做轻微着色，不做花哨效果 */
+.composer-input.composer-editor .suggestion {
+  color: var(--color-accent);
+}
+
+/* ── 输入区里的引用胶囊（ProseMirror NodeView）────────────────────
+   底色与消息气泡里的 `.ref-chip` **共用同一组变量**（--color-ref-*）：
+   同一个引用在输入区与气泡里必须长得一模一样。 */
+.ref-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 0 8px 0 2px;
+  margin: 0 1px;
+  border-radius: var(--radius-pill);
+  background: var(--color-ref-bg);
+  color: var(--color-ref-fg);
+  font-size: var(--fs-sm);
+  line-height: 20px;
+  vertical-align: baseline;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ref-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 悬浮换图标：默认图标 ⇄ 删除图标。
+   注意 `Icon` 组件自带内联 `display:block`，所以切换必须作用在**外层 span**
+   （.ref-icon-*）上，直接写 svg 的 class 会被内联样式压掉、切换不生效。
+   两个状态共用同一个 18×18 的槽位，胶囊宽度不会因悬浮而跳动。 */
+.ref-capsule-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.ref-capsule .ref-icon-remove {
+  display: none;
+}
+
+.ref-capsule:hover .ref-icon-default {
+  display: none;
+}
+
+.ref-capsule:hover .ref-icon-remove {
+  display: inline-flex;
+}
+
+.ref-capsule-icon:hover {
+  background: rgba(var(--color-ref-rgb), 0.18);
+}
+
+.ref-capsule-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── 候选面板（在输入框上方向上弹出）────────────────────────── */
+.ref-picker {
+  position: absolute;
+  /* 相对输入框向上弹出：需求是"在对话框上方"，不锚光标，故不用 floating-ui */
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin-bottom: var(--sp-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+}
+
+/* 列表区高度**封顶 280px**，超出内部滚动。
+   用 max-height 而非固定 height：条目少时面板随之变矮，不会出现一大片空白。 */
+.ref-picker-list {
+  max-height: 280px;
+  overflow-y: auto;
+  /* 滚到边界时不带动外层（消息流）一起滚 —— 滚动穿透是嵌套滚动最经典的坑 */
+  overscroll-behavior: contain;
+  padding: var(--sp-1) 0;
+}
+
+.ref-picker-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--color-text-primary);
+  font-size: var(--fs-md);
+  cursor: pointer;
+}
+
+.ref-picker-item.active {
+  background: var(--color-bg-active);
+}
+
+.ref-picker-name {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 所在目录的绝对路径：平铺列表里靠它消歧，故右对齐、弱化 */
+.ref-picker-dir {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+}
+
+.ref-picker-empty {
+  padding: var(--sp-3) var(--sp-4);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+}
+
+.ref-picker-foot {
+  padding: var(--sp-1) var(--sp-3) var(--sp-2);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* ── 消息气泡里的只读引用胶囊 ──────────────────────────────────
+   两个用法共用一套配色（浅蓝底 + 深蓝字，与输入区 `.ref-capsule` 同一组变量）：
+   - `.ref-chip.inline`：**内联在正文里**（`@路径` token 就地替换，只显示文件名）；
+   - `.ref-chip`：正文里没能内联渲染时的**兜底行**（`.ref-bar` 内）。
+   两种情况都无边框 —— 有边框会让它看起来像"按钮"，而它只是一个引用标记。 */
+.ref-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-1) 0 0;
+}
+
+.ref-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: var(--color-ref-bg);
+  color: var(--color-ref-fg);
+  font-size: var(--fs-sm);
+  line-height: 18px;
+  cursor: pointer;
+}
+
+/* 正文内联：与输入区胶囊同高（20px 行高、左右各 8px 内边距），
+   且以 baseline 对齐 —— 行内元素必须跟着文字基线走，否则一行里胶囊会上下跳。 */
+.ref-chip.inline {
+  padding: 0 8px;
+  margin: 0 1px;
+  line-height: 20px;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+.ref-chip:hover {
+  background: var(--color-ref-bg-hover);
+  color: var(--color-ref-fg);
+}
+
+.ref-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 加号菜单里的置灰条目（先于操作的反馈）──────────────────── */
+.plus-menu-item.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.plus-menu-item.disabled:hover {
+  background: transparent;
+}

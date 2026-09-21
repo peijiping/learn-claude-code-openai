@@ -9,13 +9,14 @@ tools.py - 工具注册中心（ToolRegistry）
 - 工具定义（base_tools / tools / main_agent_tools）→ 懒加载属性
 - 工具处理器（handlers）→ 懒加载属性，方法名到调用方的统一映射
 - 统一执行入口 execute(name, **args)
-- 依赖注入（skills / memory / task_manager / bus）+ holder 模式（background / todo）
+- 依赖注入（skills / memory / task_manager / bus）+ holder 模式（background）
 
 路径常量统一从 paths.py 导入，不再在此模块内声明（见 AGENTS.md 路径规则）。
 
 ⚠️ 不再提供全局单例 TOOL_REGISTRY。
 由调用方（Agent 等）显式实例化 ToolRegistry()，保证多实例隔离。
-每个 Agent 实例拥有独立的 ToolRegistry / todo holder / background holder。
+每个 Agent 实例拥有独立的 ToolRegistry / background holder / task_manager。
+（todo holder 已于 2026-09-16 随 todo 工具下线停用，定义保留但不再被引用。）
 """
 
 import os
@@ -36,6 +37,27 @@ from todo_manager import TodoManager
 from task_manager import TaskManager
 from message_bus import MessageBus, VALID_MSG_TYPES
 from memories import MemoryStore
+from logger import get_logger
+# 工具读图与读文档（2026-09-21）：中性图片块的构造在 attachments 里定义（展开侧
+# 也在那），本模块只负责"读盘 + 判类型 + 造块"。**不引入循环依赖**：attachments
+# 只依赖标准库 + paths/config/doc_convert + logger，不 import tools。
+# 文档转换走 doc_convert（叶子模块）：PDF 的「文本层 + 页图」与 Office 的文本抽取
+# 都由它提供，附件通道与工具通道共用同一段代码。
+import doc_convert
+from attachments import (
+    IMAGE_EXTS,
+    build_tool_image_result,
+    build_tool_images_result,
+    doc_max_images,
+    doc_max_pages,
+    doc_page_image_min_text,
+    image_max_edge,
+    sniff_image_mime,
+    text_max_chars,
+)
+
+# 统一日志：run_bash 等工具层的异常兜底打点（见 run_bash 的 except 分支）
+log = get_logger("tools")
 
 
 # ── 团队工具名集合（s17 自主智能体）────────────────────────────────
@@ -69,7 +91,22 @@ class ToolRegistry:
         bus: MessageBus | None = None,
         cron_scheduler=None,
         teammate_manager=None,
+        workdir: Path | None = None,
+        bash_cwd: Path | None = None,
     ):
+        # 工作根（图省事也叫"沙箱根"）：文件工具（run_read/run_write/run_edit/
+        # run_glob）相对路径的基准，也是 `safe_path` 的越界判定基准。
+        # 多工作空间下每个 Agent 传自己空间的 `workdir`（= 用户选定的真实目录）；
+        # 不传时沿用遗留 WORKDIR（default 空间），行为一字不变。
+        self.workdir = Path(workdir) if workdir is not None else WORKDIR
+        # run_bash 的**缺省**工作目录。None = 进程 cwd（历史行为）。
+        # 为什么和 workdir 分开（2026-09-18）：default 空间历史上 bash 就跑在
+        # 进程 cwd（Electron 拉起后端时 = 应用/仓库目录），文件工具跑在 WORKDIR，
+        # 两者本就不同；把 default 的 bash 一并挪到 WORKDIR 会改变既有会话里
+        # 相对路径命令的落点（风险远大于收益）。**自定义工作空间**则两者都落在
+        # 选定目录（Agent 构造时显式传 `bash_cwd=ws.workdir`），语义自洽。
+        self.bash_cwd = Path(bash_cwd) if bash_cwd is not None else None
+
         # ── 依赖注入：默认惰性构造，允许外部传入自定义实例 ──
         self.skills = skills if skills is not None else SkillLoader(SKILLS_DIR)
         self.memory = memory if memory is not None else MemoryStore(MEMORY_DIR)
@@ -93,7 +130,9 @@ class ToolRegistry:
         self._default_agent_tools_cache = None
 
     # ═══════════════════════════════════════════════════════════
-    #  holder 模式：background / todo（运行期注入）
+    #  holder 模式：background（运行期注入）
+    #  todo holder（_todo_manager / set_todo_manager / get_todo_manager）已于
+    #  2026-09-16 随 todo 工具下线停用 —— 定义保留以便回滚，但**不应新增引用**。
     # ═══════════════════════════════════════════════════════════
 
     def set_background_manager(self, bm) -> None:
@@ -161,19 +200,19 @@ class ToolRegistry:
             )
         return mgr
 
-    def set_todo_manager(self, session_num: int) -> "TodoManager":
+    def set_todo_manager(self, session_id: str) -> "TodoManager":
         """
-        切换 TodoManager 到指定 session 编号对应的 todo 文件。
+        切换 TodoManager 到指定会话 id 对应的 todo 文件。
 
         调用时机：
         - 启动时 init_session 后
-        - /newsession、/switchsession N、/clearsession 后
+        - /newsession、/switchsession <id>、/clearsession 后
 
         每次调用都会重新构造 TodoManager（构造时即从磁盘 load），
         这样上一个会话的内存状态与新会话完全隔离。
         """
         TODO_DIR.mkdir(parents=True, exist_ok=True)
-        todo_file = todo_file_for_session(session_num)
+        todo_file = todo_file_for_session(session_id)
         self._todo_manager = TodoManager(todo_file)
         return self._todo_manager
 
@@ -186,7 +225,7 @@ class ToolRegistry:
         mgr = self._todo_manager
         if mgr is None:
             raise RuntimeError(
-                "TodoManager 未初始化。请先调用 set_todo_manager(session_num) "
+                "TodoManager 未初始化。请先调用 set_todo_manager(session_id) "
                 "或在启动后使用 init_session。"
             )
         return mgr
@@ -225,26 +264,30 @@ class ToolRegistry:
         tail = text[-tail_size:]
         return f"{head}\n\n... [输出已截断，共 {len(text)} 字符，保留首 {head_size} + 尾 {tail_size} 字符] ...\n\n{tail}"
 
-    @staticmethod
-    def safe_path(p: str, base: Path | None = None) -> Path:
+    def safe_path(self, p: str, base: Path | None = None) -> Path:
         """
         验证路径是否在指定工作根内，防止路径遍历攻击
         安全机制：
-        - 将相对路径与工作根（base，默认 WORKDIR）拼接后转换为绝对路径
+        - 将相对路径与工作根（base，默认本实例的 workdir）拼接后转换为绝对路径
         - 检查最终路径是否仍然在 base 内
         - 如果路径逃逸到 base 之外，抛出 ValueError
         参数：
             p: 相对路径字符串
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；
+                  None 时用 **本实例的 `self.workdir`**
         返回：
             验证通过后的绝对路径(Path对象)
         异常：
             ValueError: 当路径试图逃逸到工作根之外时抛出
                          例如：p = "../../etc/passwd" 会被拒绝
+        说明（2026-09-18）：
+            原为 `@staticmethod` + 模块级 `WORKDIR`。多工作空间下每个 Agent 的沙箱根
+            不同（= 该空间选定的真实目录），故改为实例方法读 `self.workdir`。
+            `base` 覆盖语义不变（worktree / 子智能体 scoped workdir 仍走它）。
         """
         # 拼接工作根和输入路径，并解析为绝对路径
         # .resolve() 会解析符号链接并返回绝对路径
-        base = base or WORKDIR
+        base = base or self.workdir
         path = (base / p).resolve()
 
         # is_relative_to() 检查 path 是否在 base 的子目录中
@@ -263,7 +306,8 @@ class ToolRegistry:
         - 输出截断：结果最多返回50000字符，防止内存溢出
         参数：
             command: 要执行的shell命令字符串
-            base: 可选，命令的工作目录（worktree 场景传入 worktree 路径）；None 时用进程当前目录
+            base: 可选，命令的工作目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `bash_cwd`，再退到进程 cwd
         返回：
             命令成功：返回标准输出+标准错误的合并内容（最多50000字符）
             命令失败：返回格式 "Error: command failed with return code X\\n错误信息"
@@ -277,9 +321,16 @@ class ToolRegistry:
             r = subprocess.run(
                 command,
                 shell=True,
-                cwd=base or os.getcwd(),
+                cwd=base or self.bash_cwd or os.getcwd(),
                 capture_output=True,
                 text=True,
+                # 显式 utf-8 + errors="replace"：**绝不能**用默认的严格解码。
+                # 2026-09-18 事故根因：模型执行 `sed -n '1,40p' x.md | head -c 4200`，
+                # head -c 按**字节**切割，把中文字符切成半个，尾部落下不完整 UTF-8
+                # 序列 → text=True（strict）在解码 stdout 时抛 UnicodeDecodeError。
+                # 这类命令是合法用法，不能让它炸掉整轮对话，故用 U+FFFD 替换非法字节。
+                encoding="utf-8",
+                errors="replace",
                 timeout=120
             )
             out = (r.stdout + r.stderr).strip()
@@ -291,76 +342,212 @@ class ToolRegistry:
         except subprocess.TimeoutExpired:
             # 命令执行超时（超过120秒）
             return "Error: Timeout (120s)"
-
-    def run_read(self, path: str, limit: int | None = None, base: Path | None = None) -> str:
-        """
-        读取文件内容
-        功能特性：
-        - 使用 safe_path 进行安全路径验证
-        - 支持行数限制：只读取前limit行，避免大文件撑爆内存
-        - 当文件被截断时，显示剩余行数提示
-        - 自动截断超长内容至50000字符
-        参数：
-            path: 要读取的文件路径（相对路径）
-            limit: 可选，限制读取的行数。默认None表示读取全部
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
-        返回：
-            成功：文件内容字符串（可能被截断）
-            失败：格式 "Error: {异常信息}"
-        """
-        try:
-            lines = self.safe_path(path, base).read_text().splitlines()
-            if limit and limit < len(lines):
-                lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-            return "\n".join(lines)
         except Exception as e:
-            return f"Error: {e}"
+            # 兜底：任何意外异常都降级成一条工具结果返回给模型，绝不向上抛。
+            # 工具层的契约是"返回字符串"，一旦让异常穿透 agent_loop，本轮的
+            # tool_result 就缺一条（历史留下孤儿 tool_call），整轮对话被当场打死。
+            log.error(
+                "run_bash 异常: %s: %s | command=%r", type(e).__name__, e, command[:200],
+                exc_info=True,
+            )
+            return f"Error: {type(e).__name__}: {e}"
 
-    def run_read_pdf(self, path: str, max_pages: int = 5, chars_per_page: int = 3000, base: Path | None = None) -> str:
-        """
-        使用 pymupdf 安全读取 PDF 文件，分页提取文本
-        功能特性：
-        - 使用 safe_path 进行安全路径验证
-        - 分页提取，每页限制字符数
-        - 限制最大读取页数
-        - 总输出截断至 30000 字符
+    def run_read(self, path: str, limit: int | None = None,
+                 max_pages: int | None = None, base: Path | None = None):
+        """读取文件内容 —— **读取文件的唯一入口**，按类型自动分派。
+
+        | 输入 | 行为 |
+        | --- | --- |
+        | 文本 / 代码 | 返回文本（`limit` 限行数） |
+        | 图片 | 返回**中性图片块**（下一跳才编码成像素） |
+        | PDF | 返回**文本层 + 页图**（含图表/扫描页才渲染，见 `doc_convert`） |
+        | docx / xlsx / pptx | 返回文本 + 表格结构（无视觉版式，末尾如实声明） |
+        | 目录 | 报错并指路（`run_glob` / `ls`） |
+
+        **为什么要合并成一个名字（2026-09-21）**：此前是 `run_read` /
+        `run_read_pdf` / `view_image` 三个工具，"选错工具"是模型最常见的一类失败 ——
+        读 PDF 用了 `run_read` 拿到一句解码错误、读图片用了 `run_read` 拿到二进制
+        乱码，每次都要多花一轮。真实 Claude Code 同样是一个 Read 工具按类型分派，
+        模型没有选错的机会。合并后**提示词里不再需要任何格式→工具的映射表**。
+
+        判类型**魔数优先**（`sniff_image_mime`）、扩展名兜底：被改名成 `.txt` 的
+        图片也能正确走进图片分支（改造前它会报"二进制无法解码"）。
+
         参数：
-            path: PDF 文件路径（相对路径）
-            max_pages: 最大读取页数，默认5
-            chars_per_page: 每页最大字符数，默认3000
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            path: 文件路径（相对路径按 base / workdir 解析）
+            limit: 文本分支最多读多少行；Office 分支当作字符上限
+            max_pages: PDF 最多渲染多少张**页图**（默认 `doc_max_pages()`）
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）
         返回：
-            成功：PDF 文本内容
-            失败：格式 "Error: {异常信息}"
+            文本分支 → str；图片 / PDF 分支 → 中性图片块 dict —— 引擎按**形状**
+            识别（`is_tool_image_result`），**不会**把它 str() 掉。任何失败都收束为
+            `"Error: ..."` 字符串，**绝不抛异常**（异常穿透会打死整轮 agent_loop）。
         """
         try:
             fp = self.safe_path(path, base)
-            if not fp.exists():
-                return f"Error: File not found: {path}"
-            if not str(fp).lower().endswith('.pdf'):
-                return f"Error: Not a PDF file: {path}"
-            try:
-                import fitz
-            except ImportError:
-                return "Error: pymupdf 未安装。请运行: python3 -m pip install pymupdf"
-            doc = fitz.open(str(fp))
-            total_pages = len(doc)
-            results = [f"PDF: {path}, 总页数: {total_pages}"]
-            read_pages = min(max_pages, total_pages)
-            for i in range(read_pages):
-                text = doc[i].get_text().strip()
-                if text:
-                    results.append(f"--- 第 {i+1} 页 ---")
-                    results.append(text[:chars_per_page])
-                else:
-                    results.append(f"--- 第 {i+1} 页 --- (无可提取文本，可能为扫描件)")
-            if total_pages > read_pages:
-                results.append(f"... (还有 {total_pages - read_pages} 页未读取，可增大 max_pages 参数)")
-            doc.close()
-            return "\n".join(results)[:30000]
-
         except Exception as e:
             return f"Error: {e}"
+        try:
+            if fp.is_dir():
+                return (f"Error: {path} 是目录，run_read 只读文件。"
+                        f"查看目录内容请用 run_glob，或用 bash 的 ls。")
+            if not fp.exists():
+                return f"Error: File not found: {path}"
+            mime = sniff_image_mime(fp)
+            if mime:
+                return self._read_image(path, mime=mime, base=base)
+            ext = fp.suffix.lower()
+            if ext == ".pdf":
+                return self._read_pdf(fp, path, max_pages=max_pages, base=base)
+            if ext in doc_convert.OFFICE_EXTS:
+                return self._read_office(fp, path, limit)
+            return self._read_text(fp, path, limit)
+        except Exception as e:  # noqa: BLE001 - 工具层契约：绝不向上抛
+            log.error("run_read 异常: %s: %s | path=%r", type(e).__name__, e,
+                      str(path)[:200], exc_info=True)
+            return f"Error: {type(e).__name__}: {e}"
+
+    def _read_text(self, fp: Path, display: str, limit: int | None) -> str:
+        """文本分支：读全文 + 按行截断。
+
+        图片在这里**已经不可能出现**（`run_read` 用魔数先判走了），所以解码失败
+        就真的是"未知二进制"，提示面对准它，不再指向某个工具名。
+        """
+        try:
+            lines = fp.read_text().splitlines()
+        except UnicodeDecodeError:
+            return (f"Error: {display} 不是文本文件（二进制内容无法解码）。"
+                    f"可用 bash：`file \"{display}\"` 确认它的真实格式。")
+        if isinstance(limit, int) and limit > 0 and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)
+
+    def _read_office(self, fp: Path, display: str, limit: int | None) -> str:
+        """Office 分支：走统一转换层抽「文本 + 表格结构」。
+
+        图表、图片、版式**拿不到**（需要 LibreOffice，已被否决），转换层会在正文
+        末尾如实声明。库缺失 / 文件损坏由 `convert_office` 抛异常，交给 `run_read`
+        的外层兜底 —— 与本模块"不做静默降级"的既有约定一致。
+        """
+        cap = limit if isinstance(limit, int) and limit > 0 else text_max_chars()
+        out = doc_convert.convert_office(fp, fp.suffix.lower(), limit=cap)
+        body = str(out.get("markdown") or "")
+        return body if body.strip() else doc_convert.empty_note(fp.suffix.lower())
+
+    def _read_image(self, path: str, mime: str = "",
+                    base: Path | None = None):
+        """图片分支：把磁盘上的图片**读进上下文**，让模型用自己的视觉能力查看。
+
+        ⚠️ 本方法**不调用任何模型**，也不生成任何文字描述。它只做三件事：
+        `safe_path` 校验 → 魔数确认真是图片 → 返回一个**中性图片块**（只有
+        路径与 mime，**没有字节**）。真正的"看图"发生在下一跳请求里 ——
+        agent_loop 把该块聚合成一条合成 user 消息，`_model_messages` 在发送
+        边界把它编码成 `image_url`，同一个模型那时才看到像素。
+
+        为什么不做"转述"：让另一个模型描述图片再回填，等于让主模型拿着有损的
+        二手信息作答（子模型不知道用户到底想问什么，图表数值/UI 对齐/报错行号
+        必然丢），而且同一张图付两次钱。
+
+        参数：
+            path: 图片文件路径（`run_read` 已用魔数判过类型，这里再兜一次）
+            mime: 可选，调用方已探好的 mime（省一次读盘）
+        返回：
+            成功：`{"type":"tool_image","text":...,"images":[{...}]}` 中性块
+            失败：`"Error: ..."` 字符串（工具层契约：绝不向上抛）
+        """
+        try:
+            fp = self.safe_path(path, base)
+        except Exception as e:
+            return f"Error: {e}"
+        try:
+            if not fp.is_file():
+                return f"Error: File not found: {path}"
+        except OSError as e:
+            return f"Error: {type(e).__name__}: {e}"
+        resolved_mime = mime or sniff_image_mime(fp)
+        if not resolved_mime:
+            exts = "/".join(ext.lstrip(".") for ext in IMAGE_EXTS)
+            return (f"Error: 不是可识别的图片文件：{path}。可识别的图片格式为"
+                    f"（{exts}）。纯文本或代码直接传路径即可，PDF 与 Office"
+                    f"文档也走同一个 run_read。")
+        try:
+            return build_tool_image_result(fp, mime=resolved_mime)
+        except Exception as e:  # noqa: BLE001 - 工具层契约：绝不向上抛
+            log.error("构造图片块失败: %s: %s", type(e).__name__, e,
+                      exc_info=True)
+            return f"Error: {type(e).__name__}: {e}"
+
+    def _read_pdf(self, fp: Path, display: str, *, max_pages: int | None = None,
+                  base: Path | None = None):
+        """PDF 分支：**文本层 + 页图**一起交给模型（2026-09-21 重做）。
+
+        与附件通道**同源**（都走 `doc_convert.convert_pdf`：按「文本层是否足以
+        代表这一页」决定渲不渲页图），差别只有落盘位置 —— 附件落在
+        `.attachments/<sid>/`，这里落在**工作空间内**的
+        `<workdir>/.aigent/pages/<key>/`（理由见 `doc_convert.tool_cache_dir`）。
+
+        改造前这个分支只抽文本层（`fitz.get_text`），含图表的页与扫描件等于
+        什么都没给 —— 用户"@ 了一个带图表的 PDF，模型却答不出图表内容"就是
+        这么来的。现在图表的视觉真相随页图一起进上下文。
+
+        参数：
+            max_pages: 最多渲染多少张页图（默认 `doc_max_pages()`）。注意它约束的
+                       是**页图**，文本层永远全量 —— 文本是无视觉模型兜底的主通道。
+        返回：
+            有页图 → 中性图片块 dict；无页图 → 纯文本 str；失败 → `"Error: ..."`。
+        """
+        try:
+            import fitz  # noqa: F401 - 只为早失败；真正的转换在 doc_convert 里
+        except ImportError:
+            return "Error: pymupdf 未安装。请运行: python3 -m pip install pymupdf"
+
+        page_budget = (max_pages if isinstance(max_pages, int) and max_pages > 0
+                       else doc_max_pages())
+        max_edge = image_max_edge()
+        image_budget = doc_max_images()
+        min_text = doc_page_image_min_text()
+        workdir = base or self.workdir
+        cache_dir = doc_convert.tool_cache_dir(
+            workdir, fp, max_edge=max_edge, max_pages=page_budget,
+            max_images=image_budget, min_text=min_text)
+        if cache_dir is None:
+            # 只在"连路径都算不出来"时发生（workdir 为空 / 不可解析）。
+            # **目录不可写不算**：那种情况由 convert_pdf 内部转为纯文本模式，
+            # 正文照常拿到，只是没有页图。
+            return (f"Error: 无法解析页图缓存目录（workdir 为空或不可解析）。"
+                    f"可用 bash 直接读该 PDF。")
+
+        out = doc_convert.convert_pdf(
+            fp, cache_dir, "doc", max_edge=max_edge, max_pages=page_budget,
+            max_images=image_budget, min_text=min_text)
+        pages = int(out.get("pages") or 0)
+        assets = [a for a in (out.get("images") or []) if isinstance(a, dict)]
+        body = doc_convert.humanize_anchors(str(out.get("markdown") or "")).strip()
+        if not body and not assets:
+            return (f"[PDF: {display}] 共 {pages} 页，未提取到任何文本或可渲染内容"
+                    f"（可能为空白 / 加密 / 损坏）。")
+
+        head = f"PDF: {display}，共 {pages} 页。"
+        if assets:
+            page_list = "、".join(str(a.get("page")) for a in assets)
+            head += (f"随附页图 {len(assets)} 张（第 {page_list} 页），"
+                     f"正文中 `[第 N 页为图像，随附]` 处就是它。")
+        else:
+            head += ("本次未随附页图：该 PDF 的文本层足以代表各页内容，"
+                     "或页图渲染被跳过（见下方说明）。")
+        # warnings 是"诚实失败"通道（无文本层已按图发送 / 页图目录不可写 /
+        # 只渲染了前 N 页…）—— 必须让模型看到，否则它会以为已尽收眼底。
+        tail = [f"（{w}）" for w in (out.get("warnings") or []) if str(w).strip()]
+        text = "\n".join([head, body, *tail]).strip()[:text_max_chars()]
+        if not assets:
+            return text
+        images = [{
+            "path": str(a.get("path") or ""),
+            "name": f"{fp.name} 第 {a.get('page')} 页",
+            "mime": "image/jpeg",
+            "page": a.get("page"),
+        } for a in assets]
+        return build_tool_images_result(images, text=text, source=fp.name)
 
     def run_write(self, path: str, content: str, base: Path | None = None) -> str:
         """
@@ -373,7 +560,8 @@ class ToolRegistry:
         参数：
             path: 要写入的文件路径（相对路径）
             content: 要写入的内容字符串
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：格式 "Wrote {字节数} bytes to {路径}"
             失败：格式 "Error: {异常信息}"
@@ -402,7 +590,8 @@ class ToolRegistry:
             path: 要编辑的文件路径（相对路径）
             old_text: 要被替换的原文本（必须是完整的连续字符串）
             new_text: 替换后的新文本
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：格式 "Edited {路径}"
             失败（文本未找到）：格式 "Error: Text not found in {路径}"
@@ -430,12 +619,13 @@ class ToolRegistry:
         - 仅返回相对于工作目录的路径
         参数：
             pattern: 要匹配的文件路径模式（支持 glob 模式）
-            base: 可选，工作根目录（worktree 场景传入 worktree 路径）；None 时用 WORKDIR
+            base: 可选，工作根目录（worktree / 子智能体 scoped 场景传入）；
+                  None 时用本实例的 `self.workdir`
         返回：
             成功：匹配的文件路径列表（每个路径占一行）
             失败：格式 "Error: {异常信息}"
         """
-        base = base or WORKDIR
+        base = base or self.workdir
         try:
             results = []
             for match in g.glob(pattern, root_dir=base):
@@ -453,18 +643,28 @@ class ToolRegistry:
         """建立工具名称到调用入口的映射（懒构建、可缓存）。
 
         当大模型返回工具调用请求时，agent 循环 / SubAgent 按工具名
-        从这里取出处理器执行。holder 型依赖（todo / background）在
+        从这里取出处理器执行。holder 型依赖（background）在
         调用时才 get，保证运行期注入后依然拿到同一实例。
         """
         return {
             "bash":        lambda **kw: self.run_bash(kw["command"]),
-            "run_read":    lambda **kw: self.run_read(kw["path"], kw.get("limit")),
-            "run_read_pdf": lambda **kw: self.run_read_pdf(
-                kw["path"], kw.get("max_pages", 5), kw.get("chars_per_page", 3000)),
+            # 读文件只有一个入口（2026-09-21）：文本 / 图片 / PDF / Office 由
+            # `run_read` 内部按类型分派（魔数优先）。返回值可能是 str，也可能是
+            # **中性图片块 dict**（读图片、读带页图的 PDF）—— 引擎侧按形状识别
+            # （`is_tool_image_result`）并装配成合成 user 消息，**不会**把它
+            # str()/json.dumps() 掉。全仓仅此一个工具会返回非 str。
+            "run_read":    lambda **kw: self.run_read(
+                kw["path"], kw.get("limit"), kw.get("max_pages")),
             "run_write":   lambda **kw: self.run_write(kw["path"], kw["content"]),
             "run_edit":    lambda **kw: self.run_edit(kw["path"], kw["old_text"], kw["new_text"]),
             "run_glob":    lambda **kw: self.run_glob(kw["pattern"]),
-            "todo":        lambda **kw: self.get_todo_manager().update(kw["items"], kw.get("fresh_start", False)),
+            # ── todo 已下线（2026-09-16）────────────────────────────────
+            # 原 TodoWrite：单列表、整表替换语义 update(items, fresh_start)。
+            # 下线原因：与 task 看板功能高度重合；且「每轮整表覆盖写」会冲掉
+            # 并发修改、容易漏项（Claude Code 已走过同一条路并删掉该工具）。
+            # 能力由 create_task / claim_task / complete_task 承接。
+            # 回滚方式：取消下一行注释，并恢复 _tools_cache 里的 "todo" 定义。
+            # "todo":      lambda **kw: self.get_todo_manager().update(kw["items"], kw.get("fresh_start", False)),
             "load_skill":  lambda **kw: self.skills.load_skill(kw["name"]),
             "list_skills": lambda **kw: self.skills.list_skills(),
             "write_memory":   lambda **kw: self.memory.write(kw["name"], kw["type"], kw["description"], kw["body"]),
@@ -473,11 +673,25 @@ class ToolRegistry:
                 subject=kw["subject"],
                 description=kw.get("description", ""),
                 blockedBy=kw.get("blockedBy"),
+                parent_id=kw.get("parent_id"),
             ),
             "list_tasks": lambda **kw: self.task_manager.run_list_tasks(),
             "get_task": lambda **kw: self.task_manager.run_get_task(kw["task_id"]),
             "claim_task": lambda **kw: self.task_manager.run_claim_task(kw["task_id"]),
-            "complete_task": lambda **kw: self.task_manager.run_complete_task(kw["task_id"]),
+            "complete_task": lambda **kw: self.task_manager.run_complete_task(
+                kw["task_id"], kw.get("result", "")
+            ),
+            # 2026-09-18 新增：残留/写错的任务要能**就地**修或删。
+            # 缺这两个出口时，模型只能另建"修正依赖版"新任务，
+            # 旧任务永久留在板上 → 面板永远停在「执行中」（事故见 task_manager 模块头）
+            "update_task": lambda **kw: self.task_manager.run_update_task(
+                kw["task_id"],
+                subject=kw.get("subject"),
+                description=kw.get("description"),
+                blockedBy=kw.get("blockedBy"),
+                result=kw.get("result"),
+            ),
+            "delete_task": lambda **kw: self.task_manager.run_delete_task(kw["task_id"]),
             # check_background：仅查询语义，不消费结果；可重复调用。
             # agent_full_v2.py 在每个 turn 开头以及 turn 内每轮 tool 执行后，
             # 会自动把已完成任务以 <task_notification> 注入上下文（消费语义），
@@ -562,16 +776,13 @@ class ToolRegistry:
         """返回 handler 的浅拷贝，仅文件类工具改用 `base=cwd` 调用。
 
         供子智能体 / 队友注入工作目录（worktree）使用，让文件操作落在
-        指定 cwd（如 WORKTREE_DIR/<name>）内。其余工具（todo/技能/记忆/
-        任务/团队等）复用共享 handlers，不改动 lead 的 handlers 本体。
+        指定 cwd（如 WORKTREE_DIR/<name>）内。其余工具（任务/技能/记忆/
+        团队等）复用共享 handlers，不改动 lead 的 handlers 本体。
         """
         scoped = self.handlers.copy()
         scoped["bash"] = lambda **kw: self.run_bash(kw["command"], base=cwd)
         scoped["run_read"] = lambda **kw: self.run_read(
-            kw["path"], kw.get("limit"), base=cwd)
-        scoped["run_read_pdf"] = lambda **kw: self.run_read_pdf(
-            kw["path"], kw.get("max_pages", 5), kw.get("chars_per_page", 3000),
-            base=cwd)
+            kw["path"], kw.get("limit"), kw.get("max_pages"), base=cwd)
         scoped["run_write"] = lambda **kw: self.run_write(
             kw["path"], kw["content"], base=cwd)
         scoped["run_edit"] = lambda **kw: self.run_edit(
@@ -609,27 +820,27 @@ class ToolRegistry:
                     }
                 },
                 {
+                    # 读文件**唯一入口**（2026-09-21）。描述措辞直接决定模型会不会用
+                    # 它、会不会绕路先试 strings/cat/hexdump，所以三件事必须说清：
+                    #   ① 文本 / 图片 / PDF / Office **都走它**（模型不必按格式换工具）
+                    #   ② 图片与 PDF 页图给的是**像素本身**，不是文字描述
+                    #   ③ PDF 同时给出文本层与页图（图表、扫描件的视觉真相在那）
                     "type": "function",
                     "function": {
-                        "name": "run_read", "description": "读取文件内容。",
+                        "name": "run_read",
+                        "description": "读取文件内容。**文本、图片、PDF、Word/Excel/PPT 都用这一个工具**，"
+                                       "它会按文件类型自动处理：文本/代码返回原文；"
+                                       "图片返回**图片本身**（你直接看到像素，而不是一段文字描述）；"
+                                       "PDF 返回**每页文本 + 含图表或扫描页的整页图**；"
+                                       "docx/xlsx/pptx 返回文本与表格内容（图表与版式不在其中，会明确说明）。"
+                                       "读 PDF、图片、Office 文档时**不要**改用 bash 的 cat/strings/hexdump —— "
+                                       "那些命令拿不到正确内容，只会白花一轮。",
                         "parameters": {"type": "object", "properties": {
-                            "path": {"type": "string"},
-                            "limit": {"type": "integer"},
+                            "path": {"type": "string", "description": "文件路径"},
+                            "limit": {"type": "integer", "description": "可选：文本文件最多读多少行；Office 文档当作字符上限"},
+                            "max_pages": {"type": "integer", "description": "可选：PDF 最多附带多少张整页图（默认 20）。页图是看清图表与扫描件的唯一途径"},
                             "parallel": {"type": "boolean", "default": False,
                                 "description": "True 时与同次响应中其他独立文件读取并行执行。多个互不依赖的 read 一起发可提速。"}
-                        }, "required": ["path"]}
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "run_read_pdf", "description": "使用 pymupdf 安全读取 PDF 文件，分页提取文本。读取 PDF 时必须使用此工具，不要使用 bash 的 strings/cat 等命令。",
-                        "parameters": {"type": "object", "properties": {
-                            "path": {"type": "string", "description": "PDF 文件路径"},
-                            "max_pages": {"type": "integer", "description": "最大读取页数，默认5"},
-                            "chars_per_page": {"type": "integer", "description": "每页最大字符数，默认3000"},
-                            "parallel": {"type": "boolean", "default": False,
-                                "description": "True 时与同次响应中其他独立 PDF 读取并行执行。批量读 PDF 时一起发可大幅提速。"}
                         }, "required": ["path"]}
                     }
                 },
@@ -662,6 +873,9 @@ class ToolRegistry:
                         }, "required": ["pattern"]}
                     }
                 },
+                # 原「view_image」工具定义已下线（2026-09-21）：读图片并入 run_read
+                # —— 模型不会再"该用 A 却用了 B"。图片依旧是**像素本身**进上下文
+                # （通道没变，见 docs/frontend/14 与 15），只是入口不再单独暴露。
             ]
         return self._base_tools_cache
 
@@ -671,18 +885,20 @@ class ToolRegistry:
         if self._tools_cache is None:
             self._tools_cache = [
                 *self.base_tools,
-                {"type": "function", "function": {
-                    "name": "todo",
-                    "description": "更新当前会话的待办列表。整体替换语义：传入完整的 items 数组即可。对复杂任务建议在动手前先调用一次（把计划铺开），执行中逐步把对应项标记为 in_progress / completed。fresh_start=True 表示开始新计划——会先丢弃当前列表里所有已完成的任务，适合在同一会话内切换到下一个独立任务时使用。",
-                    "parameters": {"type": "object", "properties": {
-                        "items": {"type": "array", "description": "完整的待办事项列表。", "items": {"type": "object", "properties": {
-                            "id": {"type": "string", "description": "任务标识，可省略，省略时按数组下标生成。"},
-                            "text": {"type": "string", "description": "任务内容（必填）。"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "任务状态；同一时刻只能有 1 个 in_progress。"},
-                        }, "required": ["text", "status"]}},
-                        "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
-                    }, "required": ["items"]}
-                }},
+                # ── "todo" 工具定义已下线（2026-09-16）────────────────────
+                # 下线理由见 _build_handlers 内同处注释。保留原文便于审阅/回滚：
+                # {"type": "function", "function": {
+                #     "name": "todo",
+                #     "description": "更新当前会话的待办列表。整体替换语义：传入完整的 items 数组即可。对复杂任务建议在动手前先调用一次（把计划铺开），执行中逐步把对应项标记为 in_progress / completed。fresh_start=True 表示开始新计划——会先丢弃当前列表里所有已完成的任务，适合在同一会话内切换到下一个独立任务时使用。",
+                #     "parameters": {"type": "object", "properties": {
+                #         "items": {"type": "array", "description": "完整的待办事项列表。", "items": {"type": "object", "properties": {
+                #             "id": {"type": "string", "description": "任务标识，可省略，省略时按数组下标生成。"},
+                #             "text": {"type": "string", "description": "任务内容（必填）。"},
+                #             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "任务状态；同一时刻只能有 1 个 in_progress。"},
+                #         }, "required": ["text", "status"]}},
+                #         "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
+                #     }, "required": ["items"]}
+                # }},
                 {"type": "function", "function": {
                     "name": "load_skill", "description": "加载指定名称的专业技能（skill）知识。",
                     "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "要加载的专业技能（skill）名称"}}, "required": ["name"]}
@@ -721,13 +937,22 @@ class ToolRegistry:
                 # ── [改动 3] 新增：任务管理工具 ──────────────────────────────
                 {"type": "function", "function": {
                     "name": "create_task",
-                    "description": "Create a new task with optional blockedBy dependencies.",
+                    "description": "创建一个任务。可选 blockedBy 声明依赖（依赖未完成时无法认领），"
+                                   "可选 parent_id 拆成子树（最多 3 层）。同一批计划的任务会自动归为一组。",
                     "parameters": {"type": "object",
                                    "properties": {
-                                       "subject": {"type": "string"},
-                                       "description": {"type": "string"},
+                                       "subject": {"type": "string",
+                                                   "description": "简短标题，用于任务面板列表展示"},
+                                       "description": {"type": "string",
+                                                       "description": "详细说明，建议包含验收标准"},
                                        "blockedBy": {"type": "array",
-                                                     "items": {"type": "string"}}},
+                                                     "items": {"type": "string"},
+                                                     "description": "依赖的任务 ID：须等这些任务全部 completed 后才能认领本任务。"
+                                                                    "**必须是从 create_task / list_tasks 返回里复制的真实 id**"
+                                                                    "（形如 t_<时间戳>_<随机数>）；写序号或不存在的 id 会被直接拒绝创建。"
+                                                                    "若要依赖同批新建的前序任务：先建它、拿到 id 后再建本任务"},
+                                       "parent_id": {"type": "string",
+                                                     "description": "父任务 ID（可选）。用于把大任务拆成子项，最多 3 层"}},
                                    "required": ["subject"]}
                 }},
                 {"type": "function", "function": {
@@ -759,7 +984,43 @@ class ToolRegistry:
                 }},
                 {"type": "function", "function": {
                     "name": "complete_task",
-                    "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+                    "description": "完成一个 in_progress 任务，并返回因此解锁的下游任务。",
+                    "parameters": {"type": "object",
+                                   "properties": {
+                                       "task_id": {"type": "string"},
+                                       "result": {"type": "string",
+                                                  "description": "可选完成摘要（一句话说明这条做了什么），会显示在任务面板上"}},
+                                   "required": ["task_id"]}
+                }},
+                # ── 2026-09-18 新增：残留任务的**就地**修正 / 删除出口 ──────────
+                {"type": "function", "function": {
+                    "name": "update_task",
+                    "description": "就地修正一条任务（改 blockedBy / subject / description / result）。"
+                                   "任务写错了、依赖填错了、或已不再照原计划做时用本工具，"
+                                   "**不要另建一条\"修正版\"新任务** —— 旧任务会永久留在面板上，"
+                                   "让整组永远回不到「全部完成」。"
+                                   "status 与 parent_id 不可改：状态只走 claim_task / complete_task，"
+                                   "层级本期不支持移动。",
+                    "parameters": {"type": "object",
+                                   "properties": {
+                                       "task_id": {"type": "string"},
+                                       "subject": {"type": "string",
+                                                   "description": "新的简短标题（不传则不改）"},
+                                       "description": {"type": "string",
+                                                       "description": "新的详细说明（不传则不改）"},
+                                       "blockedBy": {"type": "array",
+                                                     "items": {"type": "string"},
+                                                     "description": "新的依赖列表，整体替换；传 [] 清空依赖。"
+                                                                    "必须是真实存在的 task id（不存在的会被拒绝），且不能成环"},
+                                       "result": {"type": "string",
+                                                  "description": "完成摘要（不传则不改）"}},
+                                   "required": ["task_id"]}
+                }},
+                {"type": "function", "function": {
+                    "name": "delete_task",
+                    "description": "删除一条任务（用于清掉不再需要的残留项）。删除后其它任务对它的依赖引用会被自动移除，"
+                                   "避免留下悬空依赖。有子任务时会被拒绝 —— 先删子任务。"
+                                   "已做完的活不要删：用 complete_task 留痕。",
                     "parameters": {"type": "object",
                                    "properties": {"task_id": {"type": "string"}},
                                    "required": ["task_id"]}
@@ -1075,26 +1336,44 @@ class ToolRegistry:
 
     # ── sub_agent 工具定义（默认与团队模式共用）────────────────────
     def _sub_agent_tool_def(self) -> dict:
-        """sub_agent 工具定义（分发子任务给通用型子智能体）。"""
+        """sub_agent 工具定义（分发子任务给通用型子智能体）。
+
+        ⚠️ 本定义的措辞直接决定模型能否稳定产出工具调用，改动前注意两条硬约束
+        （2026-09-14 事故复盘）：
+        1. **schema 不得自相矛盾**：`required` 里列出的字段，description 里不能
+           又禁止模型填。历史写法 `required=["prompt","parallel"]` + "已传
+           run_in_background=true 时不要再传 parallel" 让模型在「批量任务必须
+           后台」这个唯一高频场景下**每一次都必须违规**（实测模型确实只传
+           prompt/description/allowed_tools/run_in_background，缺 parallel）。
+           这种"必填但被禁止"的构造下模型偶尔会放弃工具调用、只回一句
+           "我派一个子智能体去读"，本轮随即结束 —— 用户看到的就是"直接中断"。
+        2. **示例里的工具名必须与 `base_tools` 完全一致**（bash / run_read /
+           run_write / run_edit / run_glob）。写成 read_file / read_pdf 这类不
+           存在的名字会污染 allowed_tools，子智能体直接拿不到那件工具。
+           注意 `run_read` 是**读文件的唯一入口**（2026-09-21 起图片、PDF、
+           Office 都由它分派），所以示例里**不该再出现 run_read_pdf / view_image**。
+        """
         return {"type": "function", "function": {
             "name": "sub_agent",
-            "description": "分发子任务给通用型子智能体。子智能体拥有独立上下文（不污染主对话），共享文件系统，只返回最终摘要。子智能体默认拥有执行工具权限，但不包含 task 系列工具；任务看板只由主智能体维护。当任务需要多步骤操作、读取多个文件、收集信息或可能产生大量工具调用时使用。\n\n⚠️ 强制规则（必须遵守，违例会阻塞主循环浪费时间）：\n凡是「批量 / 全量 / 跨多个文件 / 跨整个目录 / 预计耗时 > 30 秒」的任务，**必须传 run_in_background=true** 丢到后台线程异步执行，立即返回任务 ID，结果通过后续轮次的 <task_notification> 收回。绝对不要同步等待这类任务完成。\n判断标准（命中任意一条就必须后台）：\n  - 涉及 ≥ 2 个文件 / 整个目录 / 全部 N 个 X\n  - prompt 含「全部 / 全量 / 批量 / 跑一遍 / 扫描 / 审计 / 构建 / 测试套件」等关键词\n  - 需要多步骤工具调用且总耗时可能 > 30 秒\n允许同步（run_in_background 默认 false）的场景：\n  - 单个文件的快速查询、单步工具调用\n  - 必须等前序结果才能继续的下一步操作\n\n如果多个子任务之间没有依赖关系，设置 parallel=true 让它们并行执行以提升效率；串行时设为 false。注意：run_in_background 与 parallel 互斥——已传 run_in_background=true 时不要再传 parallel。\n\n可通过 allowed_tools 限制子智能体的工具范围，例如只允许只读操作。\n\n示例：\n- sub_agent(prompt=\"读取 DRG_Docs 目录下全部 19 个 PDF 的标题和摘要\", run_in_background=true)  ← 批量全目录，必须后台\n- sub_agent(prompt=\"实现用户注册功能\", parallel=\"false\")\n- sub_agent(prompt=\"分析当前代码架构并设计重构方案\", parallel=\"false\")\n- sub_agent(prompt=\"只读方式搜索代码中的安全问题\", allowed_tools=[\"bash\",\"read_file\",\"read_pdf\"], parallel=\"true\")\n- sub_agent(prompt=\"跑全量测试并报告失败用例\", parallel=\"false\", run_in_background=true)",
+            "description": "分发子任务给通用型子智能体。子智能体拥有独立上下文（不污染主对话），共享文件系统，只返回最终摘要。子智能体默认拥有执行工具权限，但不包含 task 系列工具；任务看板只由主智能体维护。当任务需要多步骤操作、读取多个文件、收集信息或可能产生大量工具调用时使用。\n\n⚠️ 决定派发就必须在**本轮同一条回复里立即发起本次工具调用**。只输出「我派一个子智能体去读」这类正文而不调用本工具，本轮会直接结束、子任务永远不会执行（实测事故：模型承诺派发但零工具调用 → turn 结束 → 用户侧表现为「直接中断、不往下执行」）。\n\n⚠️ 强制规则（必须遵守，违例会阻塞主循环浪费时间）：\n凡是「批量 / 全量 / 跨多个文件 / 跨整个目录 / 预计耗时 > 30 秒」的任务，**必须传 run_in_background=true** 丢到后台线程异步执行，立即返回任务 ID，结果通过后续轮次的 <task_notification> 收回。绝对不要同步等待这类任务完成。\n判断标准（命中任意一条就必须后台）：\n  - 涉及 ≥ 2 个文件 / 整个目录 / 全部 N 个 X\n  - prompt 含「全部 / 全量 / 批量 / 跑一遍 / 扫描 / 审计 / 构建 / 测试套件」等关键词\n  - 需要多步骤工具调用且总耗时可能 > 30 秒\n允许同步（不传 run_in_background）的场景：\n  - 单个文件的快速查询、单步工具调用\n  - 必须等前序结果才能继续的下一步操作\n\nparallel 只对**同步**子任务有意义：多个互不依赖的同步子任务设 parallel=true 可并发执行；不传按串行处理。run_in_background=true 时本字段无意义，可以完全不传（后台任务各自独立，不参与并行/串行分桶）。\n\n可通过 allowed_tools 限制子智能体的工具范围，例如只允许只读操作。**工具名必须与 API 下发的完全一致**（现有只读工具为 bash / run_read / run_write；名字写错会拿不到该工具）。\n\n示例：\n- sub_agent(prompt=\"读取 DRG_Docs 目录下全部 6 个 PDF 的标题和摘要\", run_in_background=true)  ← 批量全目录，必须后台\n- sub_agent(prompt=\"实现用户注册功能\", parallel=false)\n- sub_agent(prompt=\"分析当前代码架构并设计重构方案\", parallel=false)\n- sub_agent(prompt=\"只读方式搜索代码中的安全问题\", allowed_tools=[\"bash\",\"run_read\"], parallel=true)\n- sub_agent(prompt=\"跑全量测试并报告失败用例\", run_in_background=true)",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "给子智能体的任务描述，应具体说明要做什么"},
                     "description": {"type": "string", "description": "任务的简短描述，用于日志记录"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "限制子智能体可用的工具名称列表。不设置则默认使用全部工具。例如 [\"bash\",\"read_file\",\"read_pdf\"] 限制为只读工具集"},
-                    "parallel": {"type": "boolean", "description": "是否与其他 sub_agent 并行执行。"},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "限制子智能体可用的工具名称列表。不设置则默认使用全部工具。例如 [\"bash\",\"run_read\"] 限制为只读工具集"},
+                    "parallel": {"type": "boolean", "default": False,
+                        "description": "仅对同步子任务有意义：True 表示与其他同步 sub_agent 并行执行，"
+                                       "不传按串行处理。run_in_background=true 时无意义，不必传。"},
                     "run_in_background": {"type": "boolean", "default": False,
                         "description": "True 时把子任务丢到后台线程异步执行，立即返回后台任务 ID；"
                                        "结果通过 <task_notification> 在后续轮次通知。"
-                                       "与 parallel 互斥：传 True 时不再走并行/串行等待桶。"},
+                                       "批量/全量/多文件任务必须传 True。"},
                     "workdir": {"type": "string",
                         "description": "可选，已创建 worktree 的名称。给定时子智能体的工作目录（所有文件操作根）为 WORKTREE_DIR/<workdir>，"
                                        "用于在隔离 worktree 内改代码并运行测试。需先 create_worktree 创建。"}
                 },
-                "required": ["prompt", "parallel"]
+                "required": ["prompt"]
             }
         }}
 
@@ -1115,8 +1394,15 @@ class ToolRegistry:
             return self._mcp_manager.assemble_handlers().get(tool_name)
         return None
 
-    def execute(self, tool_name: str, **tool_args) -> str:
-        """按工具名执行一次工具调用；未知工具返回错误字符串。"""
+    def execute(self, tool_name: str, **tool_args):
+        """按工具名执行一次工具调用；未知工具返回错误字符串。
+
+        返回类型是 `str`，**唯一例外是 `run_read`** —— 读图片或读带页图的 PDF 时
+        它返回一个中性图片块（`{"type":"tool_image",...}`，见 `_read_image` /
+        `_read_pdf`）。工具层"永远返回东西、绝不抛异常"的契约不变：所有失败路径
+        仍然返回 `"Error: ..."` 字符串，调用方按形状分流即可
+        （`agent_full_v2._execute_tool_call`）。
+        """
         handler = self.resolve_handler(tool_name)
         if handler is None:
             return f"Error: Unknown tool {tool_name}"

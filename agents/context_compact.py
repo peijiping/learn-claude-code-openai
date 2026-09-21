@@ -43,8 +43,11 @@ log = get_logger("compact")
 # 新增/修改时同步更新 .env 与 .env.example，详见 AGENTS.md。
 
 
-# 上下文窗口默认 token 上限；构造 ContextCompact 时若 .env 未配 MAX_CONTEXT_TOKENS 则回落到此值。
-DEFAULT_MAX_CONTEXT_TOKENS = int(os.environ.get("DEFAULT_MAX_CONTEXT_TOKENS") or 1000000)
+# 上下文窗口默认 token 上限（最后兜底）：模型元数据缺失且无显式覆盖时使用。
+# LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+# （llm_config.resolve_model_window / SessionRuntime 每轮传入），不再读全局 env
+# （历史 bug：全局 MAX_CONTEXT_TOKENS 与所选模型真实窗口不符导致统计误用 1M）。
+DEFAULT_MAX_CONTEXT_TOKENS = 1_000_000
 
 # L1 snip —— 消息条数裁剪
 # 消息总条数超过该值时触发 snip_compact，把中间替换为单条占位 HumanMessage。
@@ -101,7 +104,7 @@ _SUMMARY_PROMPT = """\
 class ContextStats:
     """上下文用量统计：用于 UI 展示与压缩决策。"""
     used_tokens: int          # 当前消息历史估算占用的 token 数（启发式估算，非精确值）
-    max_tokens: int           # 上下文窗口的 token 上限（来自 .env MAX_CONTEXT_TOKENS 或默认值）
+    max_tokens: int           # 上下文窗口的 token 上限（会话覆盖值或默认兜底值）
     used_percent: float       # 已用比例 0-100，用于触发压缩管线的阈值判断
     remaining_percent: float  # 剩余比例 0-100，主要给 UI 展示"还剩多少可用"
     max_label: str            # 上限的可读化文本（"200K" / "1M"），给 UI 标签用
@@ -143,7 +146,7 @@ class ContextCompact:
     ):
         self.max_context_tokens = (
             max_context_tokens
-            or self.parse_max_context_tokens(os.environ.get("MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT_TOKENS)
+            or DEFAULT_MAX_CONTEXT_TOKENS
         )
         self.summarizer = summarizer
         self.transcript_dir = Path(transcript_dir) if transcript_dir else Path.cwd() / TRANSCRIPT_DIRNAME
@@ -153,7 +156,24 @@ class ContextCompact:
     # ── 3a. 消息工具：content 归一化、类型判断、序列化 ──────────────
 
     def content_to_str(self, content) -> str:
-        """把 LangChain 消息的 content 归一化为 str。"""
+        """把 LangChain 消息的 content 归一化为 str。
+
+        **附件（2026-09-20）**：多模态 content 里可能带附件块。这里只做
+        "降级成可读文本"，**绝不把块本身序列化进结果** —— 图片 block 里
+        可能内联着 base64（几十万字符），一旦被 `str(block)` 拼进来：
+        ① L4 摘要会把它整段塞进摘要 prompt（摘要预算 4000 token，直接报废）；
+        ② token 估算会按字符数暴涨 → 上下文圆圈提前触顶 → 反复触发压缩。
+        无附件块的消息（str / 普通 dict / 未知 type）走原分支，行为与改造前
+        逐字相同（见 tests/test_context_compact_attachment_str.py）。
+
+        **引用（@-mention，2026-09-21）**：`{"type":"ref"}` 路径引用块同理，
+        只降级成 `[引用: 名字]`。它虽然没有字节，但一旦走未知分支，路径清单与
+        JSON 键名会被拼进摘要与 token 估算 —— 同样的污染，只是量级更小。
+
+        **工具读图（run_read 读到图片/页图，2026-09-21）**：`{"type":"tool_image"}` 块同理，
+        降级成 `[图片: 名字]`。它带的是**绝对路径**，掉进未知分支等于把用户主
+        目录结构写进每一版 L4 摘要。
+        """
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -162,11 +182,79 @@ class ContextCompact:
                 if isinstance(block, str):
                     parts.append(block)
                 elif isinstance(block, dict):
-                    parts.append(str(block.get("text", block)))
+                    btype = block.get("type")
+                    if btype == "attachment":
+                        parts.append(self._attachment_label(block))
+                    elif btype == "ref":
+                        # 引用（@-mention，2026-09-21）。字面量与 attachments 分支
+                        # 同款（权威定义在 refs.REF_BLOCK_TYPE），同步口径见
+                        # tests/test_context_compact_attachment_str.py。
+                        parts.append(self._ref_label(block))
+                    elif btype == "tool_image":
+                        # 工具读图（run_read 读到图片/页图，2026-09-21）。**同样不能走
+                        # str(block)** —— 块里带绝对路径与 JSON 键名，拼进 L4 摘要
+                        # 与 token 估算纯属污染。与附件图片同款：只留一个标签。
+                        parts.append(self._tool_image_label(block))
+                    elif btype in ("image_url", "image", "input_image"):
+                        # 已是线格式（历史数据 / 手工构造）：同样不能外泄
+                        parts.append("[图片]")
+                    else:
+                        parts.append(str(block.get("text", block)))
                 else:
                     parts.append(getattr(block, "text", str(block)))
             return "\n".join(parts)
         return str(content)
+
+    @staticmethod
+    def _attachment_label(block: dict) -> str:
+        """附件块 → `[图片: 名字]` / `[附件: 名字]`（供摘要与 token 估算）。"""
+        att = block.get("attachment")
+        att = att if isinstance(att, dict) else {}
+        kind = att.get("kind")
+        label = "图片" if kind == "image" else "附件"
+        name = str(att.get("name") or "").strip()
+        return f"[{label}: {name}]" if name else f"[{label}]"
+
+    @staticmethod
+    def _ref_label(block: dict) -> str:
+        """引用块 → `[引用: 名字]`（供摘要与 token 估算）。
+
+        与 `_attachment_label` 同因：**绝不能走 `str(block)`** —— 那会把路径清单
+        连同 JSON 键名（path / name / is_dir）原样拼进 L4 摘要与 token 估算，
+        摘要预算被无意义地吃掉，上下文圆圈也会提前触顶。
+        """
+        ref = block.get("ref")
+        ref = ref if isinstance(ref, dict) else {}
+        name = str(ref.get("name") or "").strip()
+        if not name:
+            path = str(ref.get("path") or "").strip()
+            name = path.rsplit("/", 1)[-1] if path else ""
+        return f"[引用: {name}]" if name else "[引用]"
+
+    @staticmethod
+    def _tool_image_label(block: dict) -> str:
+        """工具图片块 → `[图片: 名字]`（供摘要与 token 估算）。
+
+        **名字取自 `name`，绝不回落到 path**：path 是绝对路径，放进摘要等于把
+        用户主目录结构写进每一版压缩摘要里，而它对"这轮发生了什么"没有价值。
+
+        一个块可能装多张图（一次读 PDF 的页图）→ 只报首张名字 + 总数，不把
+        整份页图清单摊进摘要。同时认旧形状的单数 `image` 字段（存量 jsonl）。
+        """
+        raw = block.get("images")
+        if isinstance(raw, list):
+            entries = raw
+        else:
+            single = block.get("image")
+            entries = [single] if isinstance(single, dict) else []
+        names = [str(e.get("name") or "").strip() for e in entries
+                 if isinstance(e, dict)]
+        names = [n for n in names if n]
+        if not names:
+            return "[图片]"
+        if len(names) == 1:
+            return f"[图片: {names[0]}]"
+        return f"[图片: {names[0]} 等 {len(names)} 张]"
 
     def message_to_text(self, msg) -> str:
         """从 LangChain 消息 / dict / 其他对象里取出文本 content（统一为 str）。"""
@@ -268,9 +356,14 @@ class ContextCompact:
     # ── 3d. 边界调整：避开拆开 tool_use / tool_result ──────────────
 
     def _find_last_ai_index(self, messages: list) -> int:
-        """返回最后一条 AIMessage 的索引；找不到返回 -1。"""
+        """返回最后一条 assistant 消息的索引；找不到返回 -1。
+
+        历史消息是**纯 dict**（`json.JSONDecoder().raw_decode` 的产物），不是
+        LangChain 对象 —— 全模块统一按 dict 访问，见 `is_ai_with_tool_use`。
+        """
         for i in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[i], AIMessage):
+            msg = messages[i]
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
                 return i
         return -1
 
@@ -292,8 +385,53 @@ class ContextCompact:
 
     # ── 3e. L1: snip_compact —— 裁掉中间消息 ───────────────────────
 
+    @staticmethod
+    def _has_attachment_block(msg) -> bool:
+        """消息里是否带附件引用块（`{"type":"attachment", ...}`）。
+
+        L1 裁剪必须认得它：图片在 `content_to_str` 里只被折算成 `[图片: name]`
+        约 5 个字符，**看起来是最廉价的裁剪对象，实际是最贵的东西** —— 裁掉它，
+        模型就再也看不到那份附件了（图片尤其无法靠"用工具再读一次"补回来）。
+
+        块类型用字面量与 `content_to_str` 保持一致（两处都不 import
+        `attachments`，避免压缩器反向依赖附件模块）。
+
+        **工具图片块（`tool_image`）刻意不算在内**（2026-09-21）—— 别"顺手补上"：
+        它与附件的可恢复性**相反**。附件副本在工作空间之外，模型自己拿不到，裁掉
+        就永久失去；工具图片是工作空间里的普通文件，模型随时可以 `run_read` 再读
+        一次（与引用块同理：裁剪器的 keep 集只放"丢了就找不回来"的东西）。
+        而且 L1 触发在几十条消息的深度上 —— 那时留下来的裸图，连它当时要回答的
+        问题都已经被占位抹掉了，留着也解读不了。
+        """
+        if isinstance(msg, dict):
+            content = msg.get("content")
+        else:
+            content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(block, dict) and block.get("type") == "attachment"
+            and isinstance(block.get("attachment"), dict)
+            for block in content
+        )
+
+    @staticmethod
+    def _placeholder_message(text: str) -> dict:
+        """构造占位消息。
+
+        历史消息**一律是 dict**（`{"role": ..., "content": ...}`）：它来自 jsonl、
+        也要被写回 jsonl，LangChain 消息对象在这里活不过一轮。此前 L1/L4 用的是
+        `HumanMessage(...)`，而该名字在本模块从未导入 —— 压缩一触发就 NameError。
+        """
+        return {"role": "user", "content": text}
+
     def snip_compact(self, messages: list, max_messages: int = SNIP_MAX_MESSAGES) -> list:
-        """消息条数 > max_messages 时，保留头 SNIP_KEEP_HEAD + 尾 SNIP_KEEP_TAIL 条，中间用占位 HumanMessage 替代。"""
+        """消息条数 > max_messages 时，保留头 SNIP_KEEP_HEAD + 尾 SNIP_KEEP_TAIL 条，中间用占位 HumanMessage 替代。
+
+        **带附件的消息不从中间裁掉**：它们被摘出来排在占位之后、尾部之前，
+        占位里的条数只统计真正被裁掉的，保持诚实。排序上的代价可以接受
+        （中段的原始顺序本来就已经被占位抹平），换来的是模型不会失去附件内容。
+        """
         if len(messages) <= max_messages:
             return messages
 
@@ -302,8 +440,12 @@ class ContextCompact:
         if head_end >= tail_start:
             return messages
 
-        placeholder = HumanMessage(content=f"[snipped {tail_start - head_end} messages from conversation middle]")
-        return [*messages[:head_end], placeholder, *messages[tail_start:]]
+        middle = messages[head_end:tail_start]
+        kept = [m for m in middle if self._has_attachment_block(m)]
+        snipped = len(middle) - len(kept)
+        placeholder = self._placeholder_message(
+            f"[snipped {snipped} messages from conversation middle]")
+        return [*messages[:head_end], placeholder, *kept, *messages[tail_start:]]
 
     # ── 3f. L2: micro_compact —— 旧 tool_result 用占位文本替换 ─────
 
@@ -318,8 +460,9 @@ class ContextCompact:
             return 0
         replaced = 0
         for _, msg in tool_results[:-keep_recent]:
-            if len(self.content_to_str(msg.content)) > 320 and msg.content != self._MICRO_PLACEHOLDER:
-                msg.content = self._MICRO_PLACEHOLDER
+            content = self.content_to_str(msg.get("content", ""))
+            if len(content) > 320 and msg.get("content") != self._MICRO_PLACEHOLDER:
+                msg["content"] = self._MICRO_PLACEHOLDER
                 replaced += 1
         return replaced
 
@@ -366,22 +509,25 @@ class ContextCompact:
         if not tool_msgs:
             return 0
 
-        total = sum(len(self.content_to_str(m.content)) for m in tool_msgs)
+        total = sum(len(self.content_to_str(m.get("content", ""))) for m in tool_msgs)
         if total <= max_bytes:
             return 0
 
         # 按体积从大到小排序，优先落盘最大的
-        ranked = sorted(tool_msgs, key=lambda m: len(self.content_to_str(m.content)), reverse=True)
+        ranked = sorted(tool_msgs,
+                        key=lambda m: len(self.content_to_str(m.get("content", ""))),
+                        reverse=True)
         persisted = 0
         for msg in ranked:
             if total <= max_bytes:
                 break
-            content_str = self.content_to_str(msg.content)
+            content_str = self.content_to_str(msg.get("content", ""))
             if len(content_str) <= persist_threshold:
                 continue
-            new_content = self.persist_large_output(msg.tool_call_id, content_str, tool_results_dir)
+            new_content = self.persist_large_output(
+                msg.get("tool_call_id", ""), content_str, tool_results_dir)
             total = total - len(content_str) + len(new_content)
-            msg.content = new_content
+            msg["content"] = new_content
             persisted += 1
         return persisted
 
@@ -438,15 +584,17 @@ class ContextCompact:
 
     def _protected_prefix_end(self, messages: list) -> int:
         """返回受保护前缀的结束位置：仅 SystemMessage（不能进摘要）。"""
-        return 1 if messages and messages[0].role == "system" else 0
+        return 1 if messages and messages[0].get("role") == "system" else 0
 
     def _find_ai_with_tool_call(self, messages: list, before_index: int, tool_call_id: str) -> Optional[int]:
         """从 before_index 往前找含指定 tool_call_id 的 AIMessage；遇到 HumanMessage 停止（跨轮无意义）。"""
         for i in range(before_index - 1, -1, -1):
             msg = messages[i]
-            if msg.role == "user":
+            if msg.get("role") == "user":
                 return None
-            if self.is_ai_with_tool_use(msg) and any(tc.get("id") == tool_call_id for tc in msg.tool_calls):
+            if (self.is_ai_with_tool_use(msg)
+                    and any(tc.get("id") == tool_call_id
+                            for tc in (msg.get("tool_calls") or []))):
                 return i
         return None
 
@@ -454,7 +602,8 @@ class ContextCompact:
         """把保留后缀的起点向前扩展，让每个 ToolMessage 都能找到对应 tool_call（避免孤立 tool_result）。"""
         start = recent_start
         while start > 0 and self.is_tool_result(messages[start]):
-            prev_ai = self._find_ai_with_tool_call(messages, start, messages[start].tool_call_id)
+            prev_ai = self._find_ai_with_tool_call(
+                messages, start, messages[start].get("tool_call_id", ""))
             if prev_ai is None or prev_ai >= start:
                 break
             start = prev_ai
@@ -492,7 +641,7 @@ class ContextCompact:
         log.info("[transcript saved: %s]", transcript_path)
         return [
             *messages[:prefix_end],
-            HumanMessage(content=f"<context_summary>\n{summary}\n</context_summary>"),
+            self._placeholder_message(f"<context_summary>\n{summary}\n</context_summary>"),
             *messages[recent_start:],
         ]
 

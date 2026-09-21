@@ -1,41 +1,122 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+
+/** chat 携带的附件线索（与 renderer 侧 ChatAttachmentInput 同构） */
+interface ChatAttachmentInput {
+  att_id: string
+  kind: '' | 'image' | 'document' | 'text'
+  name: string
+  mime?: string
+  ext: string
+  size?: number
+  project_id?: string
+}
+
+/** chat 携带的引用线索（与 renderer 侧 RefInput 同构）。**只有路径**，不含内容。 */
+interface RefInput {
+  path: string
+  name?: string
+  is_dir?: boolean
+}
 
 /**
  * preload - 渲染进程与主进程之间唯一的"合规通道"。
  * 只暴露白名单 API（不透出原始 ipcRenderer），contextIsolation 开启下安全。
  */
 const agent = {
-  /** 发起一次对话；num=目标会话号（新建任务时传 null/缺省，后端惰性领号建会话）。
+  /** 发起一次对话；sessionId=目标会话 id（新建任务时传 null/缺省，后端惰性生成短 id 建会话）。
    * overrides=当前会话请求级覆盖（思考强度/更大上下文），随本轮请求带上。
-   * modelId=当前会话绑定模型，新建任务随首条消息持久化。 */
-  send: (text: string, num?: number | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, num, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}) }),
+   * modelId=当前会话绑定模型，新建任务随首条消息持久化。
+   * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。
+   * attachments=本轮附件（附件登记得到的 att_id 列表）；**只有附件无正文时 text 传空串**。
+   * refs=本轮引用的工作空间路径（**零复制**：只传路径，后端校验越界后挂中性引用块）；
+   * **只有引用无正文同样是合法发送**。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}), ...(refs?.length ? { refs } : {}) }),
 
   /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
    * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
-  setSessionModel: (payload: { num?: number | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }): Promise<void> =>
+  setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }): Promise<void> =>
     ipcRenderer.invoke('agent:setSessionModel', payload),
 
   /** 停止指定会话正在执行的那一轮（其它后台会话不受影响） */
-  stop: (num: number): Promise<void> => ipcRenderer.invoke('agent:stop', { num }),
+  stop: (sessionId: string): Promise<void> => ipcRenderer.invoke('agent:stop', { session_id: sessionId }),
 
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
-  switchSession: (num: number): Promise<{ num: number; message_count: number }> =>
-    ipcRenderer.invoke('agent:switchSession', { num }),
+  switchSession: (sessionId: string): Promise<{ session_id: string; message_count: number }> =>
+    ipcRenderer.invoke('agent:switchSession', { session_id: sessionId }),
   clearSession: (): Promise<{ deleted: number }> =>
     ipcRenderer.invoke('agent:clearSession'),
   listSessions: (): Promise<unknown[]> => ipcRenderer.invoke('agent:listSessions'),
+  /** 标记会话未读/已读（进入会话=已读，后端写入元数据持久化） */
+  setSessionUnread: (payload: { session_id?: string; unread?: boolean }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:setSessionUnread', payload),
 
   /** 会话管理：重命名 / 软删除（回收站）/ 还原 / 批量永久删除 / 回收站列表 */
-  renameSession: (num: number, title: string): Promise<unknown> =>
-    ipcRenderer.invoke('agent:renameSession', { num, title }),
-  trashSession: (num: number): Promise<unknown> =>
-    ipcRenderer.invoke('agent:trashSession', { num }),
-  restoreSession: (num: number): Promise<unknown> =>
-    ipcRenderer.invoke('agent:restoreSession', { num }),
-  deleteSessions: (nums: number[]): Promise<unknown> =>
-    ipcRenderer.invoke('agent:deleteSessions', { nums }),
+  renameSession: (sessionId: string, title: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:renameSession', { session_id: sessionId, title }),
+  trashSession: (sessionId: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:trashSession', { session_id: sessionId }),
+  restoreSession: (sessionId: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:restoreSession', { session_id: sessionId }),
+  deleteSessions: (ids: string[]): Promise<unknown> =>
+    ipcRenderer.invoke('agent:deleteSessions', { ids }),
   listTrash: (): Promise<unknown[]> => ipcRenderer.invoke('agent:listTrash'),
+
+  /** ── 工作空间（多项目）─────────────────────────────────────────────
+   * 目录选择与"在 Finder 中打开"是宿主能力，必须走主进程原生对话框/文件管理器。 */
+  /** 弹原生目录选择框；用户取消返回 null */
+  pickFolder: (): Promise<string | null> => ipcRenderer.invoke('agent:pickFolder'),
+
+  /** ── 会话附件（「添加文件或图片」，2026-09-20）─────────────────────
+   * 三类入口（原生对话框 / 拖拽 / 粘贴）最终都收敛成"本地绝对路径列表"，交给
+   * 后端（同机进程）自己读盘：**不经 IPC/WS 传文件字节**。
+   * 设计见 docs/frontend/12-附件与文件输入.md。 */
+  /** 弹原生文件选择框（多选 + 类型白名单）；取消返回空数组 */
+  pickFiles: (): Promise<string[]> => ipcRenderer.invoke('agent:pickFiles'),
+  /** 拖拽取路径。Electron 32+ 移除了 `File.path`，`webUtils.getPathForFile` 是唯一
+   * 途径，且**必须在渲染层调用**（DOM `File` 不能通过 IPC 序列化给主进程）。
+   * 截图/剪贴板图片没有磁盘路径 → 返回空串，调用方改走 readClipboardImage。 */
+  getPathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file) || ''
+    } catch {
+      return ''
+    }
+  },
+  /** 把剪贴板图片的字节落成临时文件，返回该文件路径；失败返回 null。
+   *  截图没有磁盘路径，且 Electron 44 的主进程 Clipboard 已改为 W3C 风格异步 API
+   *  （不再提供 readImage）→ 由渲染层从粘贴事件取到 File 后把**字节**交过来。
+   *  ArrayBuffer/Uint8Array 都是 IPC 可结构化克隆的类型，不受"File 不能过 IPC"限制。 */
+  saveClipboardImage: (payload: { bytes: ArrayBuffer | Uint8Array; mime?: string }): Promise<string | null> =>
+    ipcRenderer.invoke('agent:saveClipboardImage', payload),
+  /** 把一批本地路径登记为草稿附件（后端复制 + 解析）；结果经 `attachments_staged`
+   *  信封异步回来，渲染层按 source_path 与本地占位项配对 */
+  stageAttachments: (payload: { paths: string[]; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:stageAttachments', payload),
+  /** 在系统文件管理器中定位该目录 */
+  openInFinder: (path: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('agent:openInFinder', { path }),
+
+  /** ── 引用文件或文件夹（@-mention，2026-09-21）─────────────────────
+   * 与附件**完全独立**的一条通道：**不复制、不存储**，只把工作空间内的路径清单
+   * 交给模型，内容由模型自己用 run_read 按需读取。
+   * 设计见 docs/frontend/13-引用文件与文件夹（@-mention）.md。 */
+  /** 拉取当前工作空间的可引用条目（**扁平、一次全量**；打开 `@` 时拉一次，
+   *  之后按键在前端本地过滤）。返回 `RefsPayload`；主进程等待超时返回 null。 */
+  listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:listRefs', payload ?? {}),
+  /** 工作空间列表（`projects` 信封为主要数据源，这里是主动拉取的兜底） */
+  listProjects: (): Promise<unknown> => ipcRenderer.invoke('agent:listProjects'),
+  /** 把选定目录登记为工作空间（已登记过则复用；后端同时把它设为活动空间） */
+  addProject: (path: string): Promise<unknown> => ipcRenderer.invoke('agent:addProject', { path }),
+  /** 切换活动工作空间（后端持久化，广播 projects） */
+  openProject: (projectId: string): Promise<void> => ipcRenderer.invoke('agent:openProject', { project_id: projectId }),
+  /** 重命名（默认空间后端会拒绝并回 error 信封） */
+  renameProject: (projectId: string, name: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:renameProject', { project_id: projectId, name }),
+  /** 删除工作空间（只删元数据目录，真实目录保留；不可恢复，调用方必须先确认） */
+  removeProject: (projectId: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:removeProject', { project_id: projectId }),
 
   /** 状态类查询 */
   goalStatus: (): Promise<string> => ipcRenderer.invoke('agent:goalStatus'),

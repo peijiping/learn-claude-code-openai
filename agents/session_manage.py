@@ -11,22 +11,76 @@ session_manage.py - 会话管理模块
     from session_manage import SessionManager
 
     manager = SessionManager(chat_history_dir, system_prompt)
-    session_num, session_file, messages = manager.init_session()
+    session_id, session_file, messages = manager.init_session()
 """
 
 import json
 import os
+import secrets
+import string
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
-from paths import DEFAULT_PROJECT_SLUG, todo_file_for_session
+import paths  # 运行期读 paths.TASKS_DIR（测试/CLI 会临时改写模块级值，不能静态捕获）
+from paths import DEFAULT_PROJECT_SLUG, task_files_for_session
 from logger import get_logger
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("session")
+
+# ── 会话短 id（2026-09-14：文件命名从 session_<N> 自增编号迁移到随机短 id）──
+# 新会话文件名：session_<id>.jsonl（id = 10 字符 base62 随机串，如 Kx7mQ2vT8p）。
+# 存量会话不迁移（新旧共存）：其 id 即原编号的字符串形式（"session_6" → "6"），
+# 全链路统一用 str 类型的 session_id 寻址，存量文件天然兼容。
+# 防歧义约定：**全数字 stem = 存量编号，混合字符 = 新 id** —— 生成时全数字重掷。
+BASE62_CHARS = string.ascii_letters + string.digits
+SESSION_ID_LEN = 10
+
+# token 消耗统计的四字段（与 LLM usage 投影结构一致，会话级累计/轮级明细共用）
+USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "cached_tokens", "total_tokens")
+
+
+def new_session_id() -> str:
+    """生成 10 字符 base62 随机短 id；恰好全为数字则重掷。
+
+    随机熵 59.5 bit（1 万会话碰撞率 ≈ 0.00002%）；调用方创建文件时再查重、
+    撞了重新生成 → 工程上不可能重复。不用 uuid：36 字符文件名太长。
+    """
+    while True:
+        sid = "".join(secrets.choice(BASE62_CHARS) for _ in range(SESSION_ID_LEN))
+        if not sid.isdigit():
+            return sid
+
+
+# 会话 id 的**跨工作空间**唯一性守卫（多工作空间改造，2026-09-18）。
+# 由桥层注入"该 id 是否已被任意工作空间占用"的查询（见 set_session_id_guard）。
+_SESSION_ID_TAKEN: Optional[Callable[[str], bool]] = None
+
+
+def set_session_id_guard(fn: Optional[Callable[[str], bool]]) -> None:
+    """注入会话 id 的全局占用查询（None = 关闭）。
+
+    为什么必须有：id 若只在**单个空间**的目录里查重，两个工作空间就可能各自
+    生成同一个 `session_x`。而 session_id 是全链路路由键（前端按它分发事件与
+    消息缓冲、桥层按它解析所属空间），一旦重号就是"事件进了别的会话 / 切会话
+    切到别的空间"，且没有任何自愈路径。概率极低，但代价是数据错位级别的，
+    所以宁可每次新建多 N 次 stat。
+    """
+    global _SESSION_ID_TAKEN
+    _SESSION_ID_TAKEN = fn
+
+
+def _id_taken_globally(sid: str) -> bool:
+    fn = _SESSION_ID_TAKEN
+    if fn is None:
+        return False
+    try:
+        return bool(fn(sid))
+    except Exception:  # noqa: BLE001 - 守卫本身不能阻断建会话
+        return False
 
 
 def _now_iso() -> str:
@@ -38,7 +92,8 @@ class SessionManager:
     """会话管理器，负责对话历史的持久化和管理"""
 
     def __init__(self, chat_history_dir: Path, system_prompt: str,
-                 session_prefix: str = "session_", subagent_store=None):
+                 session_prefix: str = "session_", subagent_store=None,
+                 project_id: str = DEFAULT_PROJECT_SLUG, tasks_dir: Path | None = None):
         """
         初始化会话管理器
 
@@ -52,11 +107,18 @@ class SessionManager:
                             `session_N.subagents.jsonl`，主会话文件只保留标准
                             消息（并在加载时把历史遗留的 in-file 行一次性迁出）。
                             为 None 时（CLI 旧路径）：保持原行为。
+            project_id: 本管理器服务的**工作空间 id**（多工作空间，2026-09-18）。
+                        写进会话元数据的 `project` 字段，前端据此把会话挂到对应
+                        空间节点下；缺省 "default"（CLI / 单空间行为不变）。
+            tasks_dir: 该工作空间的任务目录（删会话/清空会话时级联清理用）。
+                       缺省回落模块级 `paths.TASKS_DIR`（= default 空间）。
         """
         self.chat_history_dir = chat_history_dir
         self.system_prompt = system_prompt
         self.session_prefix = session_prefix
         self.subagent_store = subagent_store
+        self.project_id = project_id
+        self._tasks_dir = tasks_dir
         self.compact_manager = ContextCompact(
             transcript_dir=chat_history_dir.parent / ".transcripts",
             tool_results_dir=chat_history_dir.parent / ".task_outputs" / "tool-results",
@@ -77,11 +139,29 @@ class SessionManager:
         """格式化当前上下文窗口显示信息。"""
         return self.compact_manager.format_context_label(messages)
 
+    @property
+    def tasks_dir(self) -> Path:
+        """本会话所属工作空间的任务目录（元数据目录下的 `.tasks`）。
+
+        多工作空间（2026-09-18）：由调用方（`Agent` / `SessionRuntime`）按
+        `workspace.tasks_dir` 显式注入，**不从 `chat_history_dir.parent` 反推** ——
+        反推要求"chat_history_dir 一定叫 .chathistory 且直接挂在元数据目录下"，
+        这个约定在 CLI / 测试夹具（直接给一个裸目录当 chat_history_dir）下不成立，
+        会算到隔壁目录去。未注入时回落模块级 `paths.TASKS_DIR`（= default 空间），
+        与改造前完全一致。
+        """
+        if self._tasks_dir is not None:
+            return self._tasks_dir
+        return paths.TASKS_DIR
+
     def set_max_context(self, max_context: str | None) -> None:
         """设置会话级上下文窗口覆盖（如 "1M" / "128k"）。
 
-        空串/None 时恢复为环境变量/默认值。同步影响 ContextCompact 的
-        压缩阈值与前端展示的上下文上限。
+        空串/None 时恢复默认窗口（DEFAULT_MAX_CONTEXT_TOKENS 兜底）。
+        LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+        （SessionRuntime 每轮把解析结果传入），不再读全局 env
+        MAX_CONTEXT_TOKENS（历史 bug：该值与所选模型真实窗口不符导致统计误用 1M）。
+        同步影响 ContextCompact 的压缩阈值与前端展示的上下文上限。
         """
         if max_context and str(max_context).strip():
             parsed = self.compact_manager.parse_max_context_tokens(
@@ -89,55 +169,109 @@ class SessionManager:
             )
             self.compact_manager.max_context_tokens = parsed
         else:
-            self.compact_manager.max_context_tokens = self.compact_manager.parse_max_context_tokens(
-                os.environ.get("MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT_TOKENS
-            )
+            self.compact_manager.max_context_tokens = DEFAULT_MAX_CONTEXT_TOKENS
 
-    def context_stats_dict(self, messages: list) -> dict:
-        """计算当前消息的上下文统计 dict（供前端 context_stats 事件）。"""
-        s = self.compact_manager.context_stats(messages)
-        return {
-            "used_tokens": s.used_tokens,
-            "max_tokens": s.max_tokens,
-            "used_percent": round(s.used_percent, 1),
-            "max_label": s.max_label,
-        }
-    def get_latest_session(self) -> tuple[int, Optional[Path]]:
+    def context_stats_dict(self, messages: list, max_context: str | None = None) -> dict:
+        """计算当前消息的上下文统计 dict（供前端 context_stats 事件）。
+
+        max_context 传入时按该窗口计算（如切会话时按会话元数据解析出的
+        所选模型窗口），**不改共享压缩器状态**——并发会话/多次切换互不污染；
+        缺省沿用 compact_manager 当前窗口。
         """
-        获取最新的会话编号和文件路径
+        cm = self.compact_manager
+        if max_context and str(max_context).strip():
+            window = cm.parse_max_context_tokens(
+                str(max_context).strip(), cm.max_context_tokens)
+        else:
+            window = cm.max_context_tokens
+        used = cm.estimate_tokens(messages)
+        used_percent = min(100.0, (used / window) * 100) if window else 0.0
+        return {
+            "used_tokens": used,
+            "max_tokens": window,
+            "used_percent": round(used_percent, 1),
+            "max_label": cm.format_token_count(window),
+        }
+    def get_latest_session(self) -> tuple[Optional[str], Optional[Path]]:
+        """
+        获取「最近使用」的会话 id 和文件路径。
+
+        排序键与 list_sessions 一致：元数据 updated_at（无则文件 mtime 兜底）
+        取最新 —— 编号退役后不再有"最大编号"概念，最近使用即最新会话。
 
         Returns:
-            (会话编号, 会话文件路径) 如果没有会话文件则返回 (0, None)
+            (会话 id, 会话文件路径) 如果没有会话文件则返回 (None, None)
         """
-        session_files = list(self.chat_history_dir.glob(f"{self.session_prefix}*.jsonl"))
-        if not session_files:
-            return 0, None
-
-        max_num = 0
-        for f in session_files:
-            try:
-                num = int(f.stem.replace(self.session_prefix, ""))
-                if num > max_num:
-                    max_num = num
-            except ValueError:
+        best_sid, best_file, best_key = None, None, 0.0
+        for f in self._iter_session_files():
+            sid = self._sid_from_stem(f.stem)
+            if sid is None:
                 continue
+            key = self._session_sort_key(f)
+            if key > best_key:
+                best_sid, best_file, best_key = sid, f, key
+        if best_sid is None or best_file is None:
+            return None, None
+        return best_sid, best_file
 
-        if max_num == 0:
-            return 0, None
-
-        return max_num, self.chat_history_dir / f"{self.session_prefix}{max_num}.jsonl"
-
-    def get_session_file(self, session_num: int) -> Path:
+    def get_session_file(self, session_id: str) -> Path:
         """
-        根据会话编号获取会话文件路径
+        根据会话 id 获取会话文件路径（存量会话 id 为原编号字符串，如 "6"）
 
         Args:
-            session_num: 会话编号
+            session_id: 会话 id（str）
 
         Returns:
             会话文件路径
         """
-        return self.chat_history_dir / f"{self.session_prefix}{session_num}.jsonl"
+        return self.chat_history_dir / f"{self.session_prefix}{session_id}.jsonl"
+
+    # ── 文件枚举与解析（session_N 自增编号 → 短 id 共存兼容） ────────
+
+    def _iter_session_files(self) -> list[Path]:
+        """枚举本前缀的会话主文件，排除旁路/备份/临时文件，按文件名稳定排序。"""
+        files = []
+        for f in self.chat_history_dir.glob(f"{self.session_prefix}*.jsonl"):
+            # 排除旁路文件（session_N.subagents.jsonl 的 stem 含 "."）与
+            # .jsonl.tmp 之外的派生文件；sidecar/备份的 stem 均带后缀段
+            if "." in f.stem[len(self.session_prefix):]:
+                continue
+            files.append(f)
+        return sorted(files, key=lambda p: p.name)
+
+    def _sid_from_stem(self, stem: str) -> Optional[str]:
+        """从文件 stem 解析会话 id："session_3"/"session_Kx7mQ2vT8p" → "3"/"Kx7mQ2vT8p"。
+
+        空串视为非法（返回 None）；不做 int 转换 —— 存量编号以字符串形式即 id。
+        """
+        sid = stem[len(self.session_prefix):] if stem.startswith(self.session_prefix) else ""
+        return sid or None
+
+    def _session_sort_key(self, session_file: Path) -> float:
+        """会话排序键：「最后修改时间」的 epoch 秒（float，保留亚秒精度）。
+
+        取元数据 updated_at 与文件 mtime 的较大者：
+        - meta 轨会话：append/重写路径会同步刷 updated_at（秒级 iso）；
+        - index 轨存量会话不单独刷新 → mtime（亚秒精度）兜底；
+        - 两者取 max 保证任何轨道下都语义正确，且同秒内的多次修改
+          仍能被 mtime 的亚秒精度区分。
+        """
+        ts = 0.0
+        sid = self._sid_from_stem(session_file.stem) or ""
+        meta = self.load_meta(sid) if sid else None
+        if meta is None:
+            meta = self.load_index().get(session_file.name) or {}
+        raw = str(meta.get("updated_at") or "")
+        if raw:
+            try:
+                ts = datetime.fromisoformat(raw).timestamp()
+            except ValueError:
+                ts = 0.0
+        try:
+            mtime = session_file.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return max(ts, mtime)
 
     def load_session_history(self, session_file: Path) -> list:
         """
@@ -211,14 +345,34 @@ class SessionManager:
             if msg_role == "system":
                 normalized.append({"role": "system", "content": content})
             elif msg_role == "user":
-                normalized.append({"role": "user", "content": content})
+                norm = {"role": "user", "content": content}
+                # 消息记录时间（UI 展示元数据，不进模型上下文），老行缺省
+                if msg_data.get("created_at"):
+                    norm["created_at"] = msg_data["created_at"]
+                normalized.append(norm)
             elif msg_role == "assistant":
-                normalized.append({
+                norm = {
                     "role": "assistant",
                     "content": content,
                     "reasoning_content": msg_data.get("reasoning_content", ""),
                     "tool_calls": msg_data.get("tool_calls", []),
-                })
+                }
+                if msg_data.get("created_at"):
+                    norm["created_at"] = msg_data["created_at"]
+                # usage 为 UI 展示元数据（轮级 token 消耗），不进模型上下文
+                #（Agent 侧发送 LLM 前会做白名单投影剔除）
+                if msg_data.get("usage"):
+                    norm["usage"] = msg_data["usage"]
+                # model_info 同为 UI 展示元数据（本轮模型快照 + 净切换 switch），
+                # 与 usage 平级保留——否则切会话回放/compact 重写后 footer 模型
+                # 与「模型已切换」提示会永久丢失（balance 数据丢失 bug）
+                if msg_data.get("model_info"):
+                    norm["model_info"] = msg_data["model_info"]
+                # usage_session 为 turn 收尾时的会话级累计快照（回放恢复「本会话
+                # 累计」footer 第二段）；与 usage/model_info 同为展示元数据，保留
+                if msg_data.get("usage_session"):
+                    norm["usage_session"] = msg_data["usage_session"]
+                normalized.append(norm)
             elif msg_role == "tool":
                 normalized.append({
                     "role": "tool",
@@ -456,14 +610,29 @@ class SessionManager:
         if role == "system":
             return {"role": "system", "content": message.get("content", "")}
         elif role == "user":
-            return {"role": "user", "content": message.get("content", "")}
+            row = {"role": "user", "content": message.get("content", "")}
+            # 消息记录时间（前端右下角展示）：新消息落盘时打点，
+            # 重写（compact/自愈）时保留行内已有值，避免老行被误改时间
+            row["created_at"] = message.get("created_at") or _now_iso()
+            return row
         elif role == "assistant":
-            return {
+            row = {
                 "role": "assistant",
                 "content": message.get("content", ""),
                 "reasoning_content": message.get("reasoning_content", ""),
                 "tool_calls": message.get("tool_calls", []),
             }
+            row["created_at"] = message.get("created_at") or _now_iso()
+            # 轮级 token 消耗（UI 展示元数据），存在才写入
+            if message.get("usage"):
+                row["usage"] = message["usage"]
+            # 本轮模型快照 + 净切换（model_info），与 usage 平级保留
+            if message.get("model_info"):
+                row["model_info"] = message["model_info"]
+            # 会话级累计快照（回放恢复 footer 第二段），存在才写入
+            if message.get("usage_session"):
+                row["usage_session"] = message["usage_session"]
+            return row
         elif role == "tool":
             return {
                 "role": "tool",
@@ -505,8 +674,121 @@ class SessionManager:
             with self._append_lock:
                 with open(session_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(self._message_to_json_row(message), ensure_ascii=False) + "\n")
+            # 会话内容变化 → 刷新元数据 updated_at（「按最后修改时间排序」的数据源）
+            self._touch_updated_at(session_file)
         except Exception as e:
             log.error("写入会话历史失败: %s", e)
+
+    def append_usage_to_last_assistant(self, session_file: Path, usage: dict,
+                                       model_info: dict | None = None,
+                                       usage_session: dict | None = None) -> bool:
+        """把轮级 token 消耗 + 模型快照写进会话文件**最后一条 assistant 行**（就地重写最后一行）。
+
+        turn 收尾时调用：末条 assistant 消息行落盘在前（append_message_to_session），
+        而整轮 usage 汇总（主循环全部调用 + 同步子智能体）要等 turn 结束才能确定，
+        故用「读尾块定位最后一行 → truncate 行首 → 重写该行」补写 usage 字段；
+        model_info（本轮使用的模型与参数快照）与之同一次重写补进 model_info 节点，
+        与 usage 平级——两者概念独立（配置 vs 消耗），且都被 _model_messages
+        白名单投影挡在 LLM 上下文之外。usage_session（turn 收尾时的会话级累计快照）
+        同样补进该行——旧回放只见「本轮」段，切会话后「本会话累计」段缺失；持久化后
+        回放 footer 第二段也能恢复（与实时 usage_stats 事件同构）。
+        末行不是 assistant（停止/异常收尾在 tool/user 行截断）时跳过返回 False。
+
+        持 _append_lock 与 append 互斥；调用方需同步内存态（history_messages[-1]）。
+        """
+        if not usage or not session_file.exists():
+            return False
+        try:
+            with self._append_lock:
+                # 从文件尾部反向找最后一个完整行（块读避免整文件加载）
+                with open(session_file, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    remaining, block = size, 4096
+                    tail = b""
+                    while remaining > 0:
+                        read_len = min(block, remaining)
+                        remaining -= read_len
+                        f.seek(remaining)
+                        chunk = f.read(read_len)
+                        tail = chunk + tail
+                        if b"\n" in chunk:
+                            break
+                lines = tail.rstrip(b"\n").split(b"\n") if tail.strip() else []
+                if not lines:
+                    return False
+                last = lines[-1]
+                try:
+                    obj = json.loads(last)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return False
+                if not isinstance(obj, dict) or obj.get("role") != "assistant":
+                    return False
+                obj["usage"] = usage
+                if model_info:
+                    obj["model_info"] = model_info
+                if usage_session:
+                    obj["usage_session"] = usage_session
+                new_line = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+                # 行首偏移 = 文件大小 - 末行字节长度 - 1（行尾换行符）
+                line_start = size - len(last) - 1
+                with open(session_file, "r+b") as f:
+                    f.truncate(line_start)
+                    f.seek(line_start)
+                    f.write(new_line)
+            return True
+        except OSError as e:
+            log.error("写入轮级 usage 失败: %s", e)
+            return False
+
+    def append_switch_to_last_assistant(self, session_file: Path, switch: dict) -> bool:
+        """把一次空闲期模型切换写进文件**最后一条 assistant 行**的 `model_info.switch`。
+
+        与 append_usage_to_last_assistant 体例一致：读尾块定位最后一行 → truncate 行首
+        → 重写该行。切换发生在空闲期，末条 assistant 必为上一轮已完成答复；把 switch
+        挂到它（而非下一轮答复）是「切换时最后一条 assistant 消息展示」的正确口径。
+        末行不是 assistant（切换发生在尚无任何答复的空会话）时跳过返回 False。
+        """
+        if not switch or not session_file.exists():
+            return False
+        try:
+            with self._append_lock:
+                with open(session_file, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    remaining, block = size, 4096
+                    tail = b""
+                    while remaining > 0:
+                        read_len = min(block, remaining)
+                        remaining -= read_len
+                        f.seek(remaining)
+                        chunk = f.read(read_len)
+                        tail = chunk + tail
+                        if b"\n" in chunk:
+                            break
+                lines = tail.rstrip(b"\n").split(b"\n") if tail.strip() else []
+                if not lines:
+                    return False
+                last = lines[-1]
+                try:
+                    obj = json.loads(last)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return False
+                if not isinstance(obj, dict) or obj.get("role") != "assistant":
+                    return False
+                model_info = dict(obj.get("model_info") or {})
+                model_info["switch"] = switch
+                obj["model_info"] = model_info
+                new_line = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+                line_start = size - len(last) - 1
+                with open(session_file, "r+b") as f:
+                    f.truncate(line_start)
+                    f.seek(line_start)
+                    f.write(new_line)
+            return True
+        except OSError as e:
+            log.error("写入空闲期模型切换失败: %s", e)
+            return False
 
     def append_subagent_to_session(self, session_file: Path, transcript: dict) -> None:
         """
@@ -526,6 +808,8 @@ class SessionManager:
         if self.subagent_store is not None:
             try:
                 self.subagent_store.append(session_file, transcript)
+                # 旁路记录也是会话活动 → 刷新 updated_at
+                self._touch_updated_at(session_file)
             except Exception as e:
                 log.error("写入子智能体执行记录失败: %s", e)
             return
@@ -655,6 +939,8 @@ class SessionManager:
                     pass
             log.error("重写会话历史失败: %s", e)
             raise
+        # 重写也是会话内容变化 → 刷新元数据 updated_at（放 try/except 外，失败不影响主流程）
+        self._touch_updated_at(session_file)
 
     def maybe_compact_context(
         self,
@@ -744,78 +1030,83 @@ class SessionManager:
         """
         return [{"role": "system", "content": self.system_prompt}]
 
-    def create_initialized_session(self) -> tuple[int, Path, list]:
+    def create_initialized_session(self) -> tuple[str, Path, list]:
         """
         创建新会话并写入完整初始消息。
 
         Returns:
-            (新会话编号, 新会话文件路径, 初始消息列表)
+            (新会话 id, 新会话文件路径, 初始消息列表)
         """
-        new_num, new_file = self.create_new_session()
+        new_sid, new_file = self.create_new_session()
         messages = self._build_initial_messages()
         for message in messages:
             self.append_message_to_session(new_file, message)
-        return new_num, new_file, messages
+        return new_sid, new_file, messages
 
-    def create_new_session(self) -> tuple[int, Path]:
+    def create_new_session(self) -> tuple[str, Path]:
         """
-        创建新会话
+        创建新会话：随机短 id 命名（撞名重掷，工程上不可能重复）
+
+        查重范围 = 本空间目录 **+ 全部工作空间**（`set_session_id_guard` 注入的
+        全局守卫）：session_id 是全链路路由键，跨空间重号会导致事件/归属错位。
 
         Returns:
-            (新会话编号, 新会话文件路径)
+            (新会话 id, 新会话文件路径)
         """
-        max_num, _ = self.get_latest_session()
-        new_num = max_num + 1
-        new_file = self.get_session_file(new_num)
+        sid = new_session_id()
+        new_file = self.get_session_file(sid)
+        while new_file.exists() or _id_taken_globally(sid):  # 碰撞重试：防御性兜底
+            sid = new_session_id()
+            new_file = self.get_session_file(sid)
         new_file.touch()
-        # 同步写入元数据索引条目（标题/创建时间/状态/项目归属）
-        self.ensure_index_entry(new_num)
-        return new_num, new_file
+        # 同步写入元数据条目（标题/创建时间/状态/项目归属）
+        self.ensure_index_entry(sid)
+        return sid, new_file
 
-    def init_session(self) -> tuple[int, Path, list]:
+    def init_session(self) -> tuple[str, Path, list]:
         """
         初始化会话：加载最后一次对话或创建新对话
 
         Returns:
-            (会话编号, 会话文件路径, 消息列表)
+            (会话 id, 会话文件路径, 消息列表)
         """
-        max_num, session_file = self.get_latest_session()
+        sid, session_file = self.get_latest_session()
 
         if session_file and session_file.exists():
             messages = self.load_session_history(session_file)
             if messages:
-                log.info("已加载会话: session_%d.jsonl (%d 条消息)",
-                         max_num, len(messages))
-                return max_num, session_file, messages
+                log.info("已加载会话: session_%s.jsonl (%d 条消息)",
+                         sid, len(messages))
+                return sid, session_file, messages
 
-        new_num, new_file, messages = self.create_initialized_session()
-        log.info("已创建新会话: session_%d.jsonl", new_num)
-        return new_num, new_file, messages
+        new_sid, new_file, messages = self.create_initialized_session()
+        log.info("已创建新会话: session_%s.jsonl", new_sid)
+        return new_sid, new_file, messages
 
-    def switch_session(self, target_num: int) -> tuple[int, Path, list]:
+    def switch_session(self, target_id: str) -> tuple[str, Path, list]:
         """
         切换到指定会话
 
         Args:
-            target_num: 目标会话编号
+            target_id: 目标会话 id（存量会话为原编号字符串）
 
         Returns:
-            (会话编号, 会话文件路径, 消息列表)
+            (会话 id, 会话文件路径, 消息列表)
 
         Raises:
             FileNotFoundError: 会话文件不存在
         """
-        target_file = self.get_session_file(target_num)
+        target_file = self.get_session_file(target_id)
         if not target_file.exists():
-            raise FileNotFoundError(f"会话 session_{target_num}.jsonl 不存在")
+            raise FileNotFoundError(f"会话 session_{target_id}.jsonl 不存在")
 
         messages = self.load_session_history(target_file)
-        return target_num, target_file, messages
+        return target_id, target_file, messages
 
     # ═══════════════════════════════════════════════════════════
-    #  会话元数据（index.jsonl，每行一条会话元数据）
-    #  与 session_<N>.jsonl 通过文件名关联；以文件名（含前缀）为键，
-    #  避免 session_ / cron_ 前缀共用目录时编号冲突。
+    #  会话元数据（独立 meta 文件 + index.jsonl 兜底轨道）
+    #  与 session_<id>.jsonl 通过文件名关联；以文件名（含前缀）为键。
+    #  新会话 id 为随机短 id；存量会话 id 为原编号字符串，两条轨道均兼容。
     # ═══════════════════════════════════════════════════════════
 
     @property
@@ -823,13 +1114,13 @@ class SessionManager:
         """会话元数据索引文件（与 chat history 同目录）。"""
         return self.chat_history_dir / "index.jsonl"
 
-    def meta_file(self, num: int) -> Path:
-        """新会话独立元数据路径：{chat_history_dir}/session_{num}.meta.json。"""
-        return self.chat_history_dir / f"{self.session_prefix}{num}.meta.json"
+    def meta_file(self, session_id: str) -> Path:
+        """会话独立元数据路径：{chat_history_dir}/session_<id>.meta.json。"""
+        return self.chat_history_dir / f"{self.session_prefix}{session_id}.meta.json"
 
-    def load_meta(self, num: int) -> Optional[dict]:
+    def load_meta(self, session_id: str) -> Optional[dict]:
         """读取单个会话的独立元数据；文件不存在返回 None。O(1)。"""
-        p = self.meta_file(num)
+        p = self.meta_file(session_id)
         if not p.exists():
             return None
         try:
@@ -840,7 +1131,8 @@ class SessionManager:
 
     def save_meta(self, meta: dict) -> None:
         """原子写单个 meta 文件（tmp + replace，复用 save_index 的写入模式）。O(1)。"""
-        meta_path = self.meta_file(int(meta.get("num", 0)))
+        sid = str(meta.get("id") or meta.get("num") or "")
+        meta_path = self.meta_file(sid)
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = meta_path.with_suffix(meta_path.suffix + ".tmp")
         try:
@@ -856,11 +1148,11 @@ class SessionManager:
             log.error("写入会话元数据失败: %s", e)
             raise
 
-    def _new_entry(self, num: int, file_name: str) -> dict:
-        """构造新会话的默认元数据条目（与旧 ensure_index_entry 字段一致）。"""
+    def _new_entry(self, session_id: str, file_name: str) -> dict:
+        """构造新会话的默认元数据条目。id 为字符串；存量条目的 num 字段读取时兼容。"""
         now = _now_iso()
         return {
-            "num": num,
+            "id": session_id,
             "file": file_name,
             "title": None,
             "title_source": "none",
@@ -868,17 +1160,23 @@ class SessionManager:
             "updated_at": now,
             "status": "active",
             "trashed_at": None,
-            "project": DEFAULT_PROJECT_SLUG,
+            "project": self.project_id,
+            # 会话级沙箱根快照（2026-09-20）：新建时解析一次写死，之后不可变。
+            # None = 存量会话/CLI 创建（读侧回退遗留 WORKDIR，零迁移）。
+            "work_root": None,
             "model_id": None,
             "overrides": None,
+            "unread": False,
         }
 
-    def _num_from_stem(self, stem: str) -> Optional[int]:
-        """从文件 stem 解析会话编号（"session_3"/"cron_12" → 3/12）。"""
-        try:
-            return int(stem.rsplit("_", 1)[1])
-        except (IndexError, ValueError):
-            return None
+    def _meta_entry_for(self, session_file: Path) -> dict:
+        """取某会话的元数据条目：优先独立 meta 文件，回退 index.jsonl（存量会话）。"""
+        sid = self._sid_from_stem(session_file.stem)
+        if sid:
+            meta = self.load_meta(sid)
+            if meta is not None:
+                return meta
+        return self.load_index().get(session_file.name) or {}
 
     def load_index(self) -> dict[str, dict]:
         """读取元数据索引：{jsonl 文件名: 元数据 dict}；坏行跳过。"""
@@ -926,6 +1224,7 @@ class SessionManager:
         - glob 全部 *.jsonl（含其他前缀，如 cron_），避免误删别家前缀的条目
         - 已有独立 meta 文件的会话（新方案）跳过，不写入 index.jsonl
         - 老会话补录：title=null、created_at 取文件 mtime、status=active
+        - stem 解析走 _sid_from_stem（存量编号与短 id 共存兼容）
         """
         entries = self.load_index()
         changed = False
@@ -934,11 +1233,17 @@ class SessionManager:
         for f in self.chat_history_dir.glob("*.jsonl"):
             if f.name == self.index_file.name:
                 continue
-            num = self._num_from_stem(f.stem)
-            if num is None:
+            if "." in f.stem[len(self.session_prefix):] and f.stem.startswith(self.session_prefix):
+                continue  # 旁路/派生文件（stem 含后缀段）不入索引
+            sid = self._sid_from_stem(f.stem) if f.stem.startswith(self.session_prefix) else None
+            if sid is None and not f.stem.startswith(self.session_prefix):
+                # 其他前缀（如 cron_）仅作对账占位，不解析 id
+                existing.add(f.name)
+                continue
+            if sid is None:
                 continue
             existing.add(f.name)
-            if self.meta_file(num).exists():
+            if self.meta_file(sid).exists():
                 # 新方案会话：元数据独立维护，index.jsonl 不再承载；跳过并在清理时保留
                 metas.add(f.name)
                 continue
@@ -950,7 +1255,7 @@ class SessionManager:
                 mtime = datetime.now()
             ts = mtime.isoformat(timespec="seconds")
             entries[f.name] = {
-                "num": num,
+                "id": sid,
                 "file": f.name,
                 "title": None,
                 "title_source": "none",
@@ -958,7 +1263,8 @@ class SessionManager:
                 "updated_at": ts,
                 "status": "active",
                 "trashed_at": None,
-                "project": DEFAULT_PROJECT_SLUG,
+                "project": self.project_id,
+                "unread": False,
             }
             changed = True
         for key in [k for k in entries if k not in existing and k not in metas]:
@@ -967,31 +1273,57 @@ class SessionManager:
         if changed:
             self.save_index(entries)
 
-    def ensure_index_entry(self, num: int) -> None:
+    def ensure_index_entry(self, session_id: str) -> None:
         """新建会话时写入独立元数据文件（已存在则跳过）。O(1)。"""
-        if self.load_meta(num):
+        if self.load_meta(session_id):
             return
-        key = self.get_session_file(num).name
-        self.save_meta(self._new_entry(num, key))
+        key = self.get_session_file(session_id).name
+        self.save_meta(self._new_entry(session_id, key))
 
-    def _update_entry(self, num: int, mutate) -> dict:
+    def _touch_updated_at(self, session_file: Path) -> None:
+        """会话内容变化（追加/重写/清空）后刷新元数据的 updated_at。
+
+        「按最后修改时间排序」的数据来源：
+        - meta 轨会话：这里同步刷新 updated_at（每条消息一次 <1KB 小文件写，
+          本地 SSD 无感）；
+        - index 轨存量会话：不单独刷新（避免全量重写 index），排序时由
+          _session_sort_key 用文件 mtime 兜底，语义等价。
+        """
+        sid = self._sid_from_stem(session_file.stem)
+        if not sid:
+            return
+        meta = self.load_meta(sid)
+        if meta is None:
+            return
+        meta["updated_at"] = _now_iso()
+        try:
+            self.save_meta(meta)
+        except Exception:
+            pass  # 刷新失败只影响排序精度，不阻断消息写入主流程
+
+    def _update_entry(self, session_id: str, mutate, touch: bool = True) -> dict:
         """定位条目 → mutate(entry) → 刷新 updated_at → 原子写回。
 
         新方案会话（存在独立 meta 文件）直接读写单文件 O(1)；
         存量会话回退 index.jsonl 全量路径，作为兜底。
 
+        touch: 是否同步刷新 updated_at（「最后修改时间排序」的数据源）。默认 True；
+        纯元数据操作（标记已读、切换模型、重命名等）传 False，避免点击/选择会话
+        就把会话顶到列表最前——排序时间只应随会话内容变化（对话/重写/清空）推进。
+
         Raises:
             FileNotFoundError: 会话 jsonl 不存在
         """
-        session_file = self.get_session_file(num)
+        session_file = self.get_session_file(session_id)
         if not session_file.exists():
             raise FileNotFoundError(f"会话 {session_file.name} 不存在")
         key = session_file.name
         with self._index_lock:
-            if self.meta_file(num).exists():
-                entry = self.load_meta(num) or self._new_entry(num, key)
+            if self.meta_file(session_id).exists():
+                entry = self.load_meta(session_id) or self._new_entry(session_id, key)
                 mutate(entry)
-                entry["updated_at"] = _now_iso()
+                if touch:
+                    entry["updated_at"] = _now_iso()
                 self.save_meta(entry)
             else:
                 # 存量会话：走 index.jsonl 全量路径
@@ -1003,35 +1335,65 @@ class SessionManager:
                     except OSError:
                         mtime = datetime.now()
                     ts = mtime.isoformat(timespec="seconds")
-                    entry = self._new_entry(num, key)
+                    entry = self._new_entry(session_id, key)
                     entry["created_at"] = entry["updated_at"] = ts
                     entries[key] = entry
                 mutate(entry)
-                entry["updated_at"] = _now_iso()
+                if touch:
+                    entry["updated_at"] = _now_iso()
                 self.save_index(entries)
         return entry
 
-    def rename_session(self, num: int, title: str) -> dict:
+    def rename_session(self, session_id: str, title: str) -> dict:
         """重命名会话（title_source=user，自动生成不再覆盖）。"""
         title = title.strip()
         if not title:
             raise ValueError("标题不能为空")
         return self._update_entry(
-            num, lambda e: e.update({"title": title[:60], "title_source": "user"})
+            session_id,
+            lambda e: e.update({"title": title[:60], "title_source": "user"}),
+            touch=False,
         )
 
-    def set_auto_title(self, num: int, title: str, source: str = "auto") -> None:
+    def set_auto_title(self, session_id: str, title: str, source: str = "auto") -> None:
         """写入自动生成的标题；用户手动改名（title_source=user）不覆盖。"""
         def mutate(e):
             if e.get("title_source") == "user":
                 return
             e.update({"title": title[:60], "title_source": source})
         try:
-            self._update_entry(num, mutate)
+            self._update_entry(session_id, mutate)
         except FileNotFoundError:
             pass
 
-    def set_session_model(self, num: int, model_id: str | None = None,
+    def set_unread(self, session_id: str, unread: bool = False) -> dict:
+        """记录会话的未读/已读状态（写入元数据，兼容新 meta 文件/存量 index）。
+
+        语义由前端驱动：会话完整结束且用户当前不在查看它 → unread=True；
+        用户进入（切换/点击查看）该会话 → unread=False。跨窗口/重启持久化。
+
+        只标记状态，不改会话内容 → 不刷新 updated_at（touch=False）：
+        否则"一点击会话就顶到列表最前"，排序时间只随对话内容推进。
+        """
+        return self._update_entry(
+            session_id, lambda e: e.update({"unread": bool(unread)}), touch=False,
+        )
+
+    def set_session_work_root(self, session_id: str, work_root: str | Path) -> dict:
+        """固化会话的沙箱根（work_root 会话级快照，2026-09-20）。
+
+        「会话建成即锁空间」的姊妹规则：沙箱根在**新建时**解析一次并写进元
+        数据，之后**不可变** —— 空间目录后续变化、default 沙箱策略调整都不
+        影响已有会话的相对路径落点。仅在会话创建路径调用一次；
+        存量 meta 无该字段（None）→ 读侧回退遗留 WORKDIR。
+        """
+        return self._update_entry(
+            session_id,
+            lambda e: e.update({"work_root": str(work_root)}),
+            touch=False,
+        )
+
+    def set_session_model(self, session_id: str, model_id: str | None = None,
                           overrides: dict | None = None) -> dict:
         """记录会话最后选择的模型与其参数（写入元数据，兼容新 meta 文件/存量 index）。
 
@@ -1044,27 +1406,51 @@ class SessionManager:
                 e["model_id"] = model_id
             if overrides is not None:
                 e["overrides"] = overrides
-        return self._update_entry(num, mutate)
+        # 选模型/调参数是 UI 操作，不是对话内容变化 → 不刷新 updated_at。
+        return self._update_entry(session_id, mutate, touch=False)
 
-    def trash_session(self, num: int) -> dict:
+    def add_usage_totals(self, session_id: str, delta: dict,
+                         count_turn: bool = True) -> None:
+        """把一轮 token 消耗增量累进会话元数据 usage_totals（O(1) 原子写）。
+
+        delta 为轮级 usage dict（USAGE_FIELDS 四字段）；count_turn=False 用于
+        后台子智能体迟到完成的补记（只加量不计数，turns 已在该轮收尾时 +1）。
+        """
+        if not delta:
+            return
+
+        def mutate(e):
+            totals = e.get("usage_totals") or {}
+            for k in USAGE_FIELDS:
+                totals[k] = int(totals.get(k) or 0) + int(delta.get(k) or 0)
+            if count_turn:
+                totals["turns"] = int(totals.get("turns") or 0) + 1
+            e["usage_totals"] = totals
+
+        try:
+            self._update_entry(session_id, mutate)
+        except FileNotFoundError:
+            pass  # 会话文件已不存在（如被并发删除），统计丢失可接受
+
+    def trash_session(self, session_id: str) -> dict:
         """软删除：标记 status=trashed，jsonl/todo 原样保留。"""
         return self._update_entry(
-            num, lambda e: e.update({"status": "trashed", "trashed_at": _now_iso()})
+            session_id, lambda e: e.update({"status": "trashed", "trashed_at": _now_iso()})
         )
 
-    def restore_session(self, num: int) -> dict:
+    def restore_session(self, session_id: str) -> dict:
         """从回收站还原：status=active，清空 trashed_at。"""
         return self._update_entry(
-            num, lambda e: e.update({"status": "active", "trashed_at": None})
+            session_id, lambda e: e.update({"status": "active", "trashed_at": None})
         )
 
-    def delete_session_permanent(self, num: int) -> bool:
-        """永久删除会话：jsonl + 绑定的 todo 文件 + 元数据。
+    def delete_session_permanent(self, session_id: str) -> bool:
+        """永久删除会话：jsonl + 任务板文件 + 子智能体旁路 + 元数据。
 
         新方案会话（存在独立 meta 文件）删除单文件 O(1)；
         存量会话回退移除 index.jsonl 中对应条目。
         """
-        session_file = self.get_session_file(num)
+        session_file = self.get_session_file(session_id)
         if not session_file.exists():
             return False
         try:
@@ -1075,17 +1461,20 @@ class SessionManager:
         # 子智能体旁路记录与主文件同生共死（不残留、不串台）
         if self.subagent_store is not None:
             self.subagent_store.delete(session_file)
-        # todo 与 chat history 同生共死（tools.set_todo_manager 创建的路径）
-        try:
-            todo_file = todo_file_for_session(num)
-            if todo_file.exists():
-                todo_file.unlink()
-        except OSError:
-            pass
+        # 任务板与 chat history 同生共死：删除本会话作用域下的全部 task 文件。
+        # （原此处删除 todo 文件；todo 已于 2026-09-16 下线，改由 task 承接）
+        # 单个删除失败不阻断会话删除 —— 与子智能体旁路文件的处理策略一致。
+        for task_file in task_files_for_session(
+            session_id, self.session_prefix, self.tasks_dir
+        ):
+            try:
+                task_file.unlink()
+            except OSError as e:
+                log.error("删除任务文件失败 %s: %s", task_file.name, e)
         with self._index_lock:
-            if self.meta_file(num).exists():
+            if self.meta_file(session_id).exists():
                 try:
-                    self.meta_file(num).unlink()
+                    self.meta_file(session_id).unlink()
                 except OSError as e:
                     log.error("删除会话元数据失败: %s", e)
             else:
@@ -1103,37 +1492,43 @@ class SessionManager:
             status: "active"（默认，任务树）或 "trashed"（回收站）
 
         Returns:
-            [{num, title, title_source, status, created_at, updated_at,
-              trashed_at, message_count, file}, ...] 按 num 降序（新会话在前）
+            [{id, title, title_source, status, created_at, updated_at,
+              trashed_at, file, model_id, project, usage_totals, unread}, ...]
+            按「最后修改时间」（元数据 updated_at，mtime 兜底）降序 —— 最近使用的在前
         """
         self.backfill_index()
-        entries = self.load_index()
         sessions = []
-        for f in self.chat_history_dir.glob(f"{self.session_prefix}*.jsonl"):
-            num = self._num_from_stem(f.stem)
-            if num is None:
-                continue
-            try:
-                with open(f, "r", encoding="utf-8") as file:
-                    msg_count = sum(1 for line in file if line.strip())
-            except (ValueError, IOError):
+        for f in self._iter_session_files():
+            sid = self._sid_from_stem(f.stem)
+            if sid is None:
                 continue
             # 优先独立 meta 文件（新方案会话），否则回退 index.jsonl（存量会话）
-            meta = self.load_meta(num) or entries.get(f.name) or {}
+            meta = self._meta_entry_for(f)
             sessions.append({
-                "num": num,
+                "id": sid,
                 "title": meta.get("title"),
                 "title_source": meta.get("title_source", "none"),
                 "status": meta.get("status", "active"),
                 "created_at": meta.get("created_at"),
                 "updated_at": meta.get("updated_at"),
                 "trashed_at": meta.get("trashed_at"),
-                "message_count": msg_count,
                 "file": f.name,
                 "model_id": meta.get("model_id"),
+                # 悬停卡片展示用：所属项目（工作空间）与会话级 token 累计。
+                # 存量 meta 缺 project 字段时兜底为**本管理器的空间 id**：
+                # 老会话按目录归属，永远不会被错认成 default 空间的会话。
+                "project": meta.get("project", self.project_id),
+                "usage_totals": meta.get("usage_totals"),
+                "unread": bool(meta.get("unread", False)),
             })
         sessions = [s for s in sessions if s.get("status") == status]
-        return sorted(sessions, key=lambda x: x["num"], reverse=True)
+        # 排序键与会话列表展示解耦：list_sessions 内单独算 key（含 mtime 兜底），
+        # 保证 index 轨存量会话的"追加消息"也能正确参与最近使用排序。
+        sessions.sort(
+            key=lambda s: self._session_sort_key(self.chat_history_dir / s["file"]),
+            reverse=True,
+        )
+        return sessions
 
     def clear_session(self, session_file: Path) -> int:
         """
@@ -1166,6 +1561,26 @@ class SessionManager:
             self.subagent_rows.pop(session_file, None)
             if self.subagent_store is not None:
                 self.subagent_store.clear(session_file)
+
+            # 任务板随会话内容同生共死：删除本会话作用域下的全部 task 文件。
+            # 注意必须放在这一层（而不是 Agent.clear_session）：ws_bridge 的
+            # session_clear 分支是**直接调 sm.clear_session** 的，不经过 Agent。
+            sid = self._sid_from_stem(session_file.stem)
+            if sid:
+                for task_file in task_files_for_session(
+                    sid, self.session_prefix, self.tasks_dir
+                ):
+                    try:
+                        task_file.unlink()
+                    except OSError as e:
+                        log.error("删除任务文件失败 %s: %s", task_file.name, e)
+
+            # token 累计统计随会话内容同生共死：元数据 usage_totals 一并清零
+            if sid:
+                try:
+                    self._update_entry(sid, lambda e: e.pop("usage_totals", None))
+                except FileNotFoundError:
+                    pass
 
             return max(0, deleted_count - 1)  # 减去保留的系统提示词
         except Exception as e:

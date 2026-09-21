@@ -5,8 +5,9 @@ agent_full_v2.py - 主智能体引擎（Agent 类）
 从函数式 REPL 重构为类形式：所有依赖与会话状态收敛为实例属性，
 不再使用模块级可变单例（tools.py 的全局 TOOL_REGISTRY 已移除）。
 
-- 每个 Agent 实例拥有独立的 ToolRegistry / todo holder / background holder /
+- 每个 Agent 实例拥有独立的 ToolRegistry / background holder / task_manager /
   hook_system / subagent_runner / session 状态，支持多实例隔离。
+  （todo holder 已于 2026-09-16 随 todo 下线停用，定义保留不引用。）
 - 交互入口：`python agents/agent_cli.py`（实例化 Agent 驱动 REPL）。
 
 为 s14 定时任务（每任务独立会话）与未来 TUI 多会话预留的接缝：
@@ -19,6 +20,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import threading
 import time
 
@@ -29,9 +31,23 @@ from session_manage import SessionManager
 from subagent import SubAgent
 from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
-from paths import (WORKDIR, CHAT_HISTORY_DIR, SKILLS_DIR, TEAM_DIR,
-                   WORKTREE_DIR, MCP_CONFIG, WORKFLOW_DIR)
+from paths import (SKILLS_DIR, WORKTREE_DIR, MCP_CONFIG, DEFAULT_PROJECT_ID,
+                   WorkspacePaths, workspace_paths)
+from attachments import (
+    build_tool_images_message,
+    expand_content_for_model,
+    history_has_images,
+    is_tool_image_result,
+    text_view,
+    tool_image_text,
+)
+# 引用（@-mention，2026-09-21）：与附件同构的"账本块 + 发送边界展开"，但**零复制**，
+# 只在请求体里给出一条路径清单。叶子模块，无循环依赖。
+from refs import expand_ref_blocks_for_model
 from tools import ToolRegistry
+from task_manager import TaskManager, current_board
+from memories import MemoryStore
+from message_bus import MessageBus
 from worktree import WorktreeManager
 from mcp_manager import MCPManager
 from workflow import WorkflowManager, register_default_workflows
@@ -42,6 +58,7 @@ from goal import (
 )
 from skills import SkillLoader
 from llm_manage import LLMClient
+from llm_config import get_model_by_id, model_supports_image
 from logger import get_logger
 from system_prompt import SystemPromptBuilder
 from error_recovery import ErrorRecovery, RecoveryAction
@@ -59,7 +76,7 @@ log = get_logger("agent")
 # 「尾部按需注入」的块标记名。注入消息形如：
 #   <system-reminder><memory_index revision="ab12cd34ef56">…索引…</memory_index></system-reminder>
 # 必须用 <system-reminder> 包裹 —— ws_bridge._history_to_ui 会跳过以此开头的 user 消息，
-# 所以这类注入不会出现在前端回放 / 聊天界面里（与 _inject_todo_reminder 的约定一致）。
+# 所以这类注入不会出现在前端回放 / 聊天界面里（与 _sync_task_board / _sync_memory_index 的约定一致）。
 # 每个 tag 各自独立判指纹，互不影响。
 MEMORY_INDEX_TAG = "memory_index"   # 记忆索引（L2 热段，变化最频繁）
 ENV_TAG = "env"                     # 环境与上下文：日期 / 星期 / 平台（L2 热段）
@@ -69,6 +86,98 @@ PROJECT_RULES_TAG = "project_rules"  # 工作区指令文件（AGENTS.md）会�
 _WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
+# ── 「承诺未兑现」守卫（2026-09-14 事故后新增）──────────────────────
+# 事故：模型回复「我派一个子智能体后台去读」，正文写得像去干活，但**一个
+# tool_call 都没发**，finish_reason=stop。停止边界只认"没有工具调用 = 模型想停"，
+# 于是这一轮直接结束 —— 任务从未执行，用户看到的是「直接中断、不往下执行、
+# 看不到最终结果」（实测 session_4，token 对账确认只有 2 次 LLM 调用）。
+# 这里在停止边界之前加一道**窄口径**拦截：只有"短正文 + 明确的行动承诺 +
+# 零工具调用 + 非过去语态"几条同时成立才回注一条提醒，让模型在本轮把话说圆
+# （要么立刻发起工具调用，要么给出最终答复）。
+# 宁可不拦，也绝不打断正常收尾：口径窄是刻意设计，触发条件任一条不满足就放行。
+# 关闭方式：PROMISE_GUARD_MAX=0（默认 1，即每轮最多拦一次）。
+PROMISE_GUARD_MAX = int(os.environ.get("PROMISE_GUARD_MAX") or 1)
+# 正文长度上限：真正的最终答复通常远超此值，而"我这就去…"这类占位承诺天然很短
+PROMISE_GUARD_MAX_CONTENT_CHARS = int(
+    os.environ.get("PROMISE_GUARD_MAX_CONTENT_CHARS") or 240
+)
+
+# 承诺句式：第一人称 + 「派发/调用/执行/读取」这类必须落成工具调用的动作动词。
+# 过去时（"我读了 / 我派了 / 我已经…"）不是承诺，由 _PAST_FOLLOW 否决。
+_PROMISE_RE = re.compile(
+    r"我(?:先|这就|立刻|立即|马上|直接|现在|接下来|准备|打算|会|要|将|来|去)*"
+    r"(?:去|来)?"
+    r"(?:派发|派|调度|分发|调用|执行|发起|跑一遍|跑一下|扫描|检索|读取|读一下|"
+    r"查询|查一下|查看|看一下|检查|启动|运行)"
+    r"|\bI(?:'ll| will| am going to|'m going to| shall)\s+"
+    r"(?:dispatch|call|invoke|run|read|spawn|launch|scan|start)\b"
+    r"|\bLet me\s+(?:dispatch|call|invoke|run|read|spawn|launch|scan|start)\b",
+    re.IGNORECASE,
+)
+# 完成/过去/名词化语态：命中后紧跟这些字 → 是在**汇报已做的事**，不是在承诺。
+# 例："我派了…" / "我读过…" / "我派的那个子智能体已完成" / "我派出的…"
+_PAST_FOLLOW = ("了", "过", "完", "的", "出")
+
+# ── token 消耗统计（usage 节点四字段，主循环与子智能体统一口径）────────
+_ZERO_USAGE = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "cached_tokens": 0,
+    "total_tokens": 0,
+}
+
+# 模型上下文消息白名单：jsonl 行可以携带 usage 等展示元数据（以及未来的
+# 任意扩展字段），但发给 LLM 的 messages 只投影固定字段——发送边界统一
+# 过滤，jsonl 新增任何字段都不会漏进 API（用户契约：读取不设限，发送白名单）。
+MODEL_MSG_FIELDS = ("role", "content", "reasoning_content", "tool_calls", "tool_call_id")
+
+
+def _text_of_message(message) -> str:
+    """取消息正文的纯文本（content 可能是 str，也可能是多模态 list）。
+
+    与 run_turn / ws_bridge._text_of 的取值口径保持一致，供守卫判断模型正文。
+    """
+    content = message.get("content", "") if isinstance(message, dict) else message
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def _looks_like_unfulfilled_promise(content: str) -> str:
+    """判断"短正文里承诺了动作、但没有发起任何工具调用"的收尾，返回命中片段。
+
+    三条全中才判定（口径刻意收窄，避免误拦正常收尾）：
+    1. 正文非空且 ≤ PROMISE_GUARD_MAX_CONTENT_CHARS；
+    2. 命中承诺句式（第一人称 + 需落地的动作动词）；
+    3. 命中处不是过去/完成语态。
+    """
+    text = (content or "").strip()
+    if not text or len(text) > PROMISE_GUARD_MAX_CONTENT_CHARS:
+        return ""
+    for m in _PROMISE_RE.finditer(text):
+        if text[m.end():m.end() + 1] in _PAST_FOLLOW:
+            continue          # "我派了…" / "我读过…" → 汇报，放行
+        return m.group(0)
+    return ""
+
+
+# 回注提醒：必须是 <system-reminder> 包裹（ws_bridge._history_to_ui 按此前缀
+# 过滤，否则会以"用户气泡"的形式漏到聊天界面，见 docs/frontend/03 §2.1）。
+PROMISE_GUARD_REMINDER = (
+    "<system-reminder>\n"
+    "<promise_guard>\n"
+    "你上一条回复承诺了要执行的动作（派发子智能体 / 调用工具），但并没有真的发起\n"
+    "工具调用，本轮因此直接结束了 —— 那个任务实际上还没有开始执行。\n"
+    "现在必须二选一，并且在本条回复里立刻做到：\n"
+    "1) 动作确实还没做完 → 立即发起对应的工具调用（例如 sub_agent），"
+    "不要再只写一句「我这就去…」；\n"
+    "2) 任务其实已经完成、或本来就不需要工具 → 直接给出最终答复正文，"
+    "不要再描述「接下来要做什么」。\n"
+    "</promise_guard>\n"
+    "</system-reminder>"
+)
+
+
 class Agent:
     """
     主智能体引擎：持有全部依赖与会话状态，支持多实例隔离。
@@ -76,7 +185,7 @@ class Agent:
     每个实例拥有独立的：
     - tools（ToolRegistry：基础工具方法 / definitions / handlers / execute）
     - skills / memory / hook_system / background_manager / subagent_runner / recovery
-    - session 状态（session_num / session_file / history_messages / todo holder）
+    - session 状态（session_id / session_file / history_messages / task_manager 作用域）
 
     交互入口 agent_cli.py 实例化本类并驱动 REPL；
     未来 cron（每任务独立会话）与 TUI（每会话一实例）直接复用。
@@ -93,7 +202,18 @@ class Agent:
         session_prefix: str = "session_",
         cron_scheduler=None,
         silent: bool = False,
+        workspace: WorkspacePaths | None = None,
     ):
+        # ── 工作空间（多工作空间改造，2026-09-18）──────────────────────
+        # 一个 Agent 实例**只服务一个工作空间**：会话历史 / 任务 / 记忆 / 收件箱 /
+        # 团队 / 工作流 / 沙箱根全部由这份路径束决定（见 docs/frontend/11）。
+        # 不传 = default 空间（沙箱根取遗留 WORKDIR、元数据取 ~/.aigent/projects/default），
+        # 与改造前**逐字一致** —— CLI 与既有调用方零改动。
+        self.workspace: WorkspacePaths = (
+            workspace if workspace is not None
+            else workspace_paths(DEFAULT_PROJECT_ID)
+        )
+
         # ── 模型参数（从 .env 读取） ──
         self.model = os.environ.get("OPENAI_MODEL_ID", "")
         self.fallback_model = os.environ.get("FALLBACK_MODEL_ID", "")
@@ -114,14 +234,24 @@ class Agent:
         }
 
         # ── 依赖（默认惰性构造；允许外部注入，多实例可共享/自定义） ──
+        # 技能**保持全局**（SKILLS_DIR，不随工作空间变）：技能是应用级能力，
+        # 换空间后"技能全没了"是割裂体验；沙箱根与运行时数据才按空间隔离。
         self.skills = skills if skills is not None else SkillLoader(SKILLS_DIR)
         self.tools = tools if tools is not None else ToolRegistry(
             skills=self.skills, cron_scheduler=cron_scheduler,
+            workdir=self.workspace.workdir,
+            # bash 缺省 cwd 也由路径束携带（2026-09-20 规则收口，Agent 不再自行
+            # 推导）：default(CLI/存量回退) = None → 进程 cwd（历史行为）；
+            # 自定义空间 = 选定目录；桌面端新建 default 会话 = scratch 草稿目录。
+            bash_cwd=self.workspace.bash_cwd,
+            memory=MemoryStore(self.workspace.memory_dir),
+            task_manager=TaskManager(self.workspace.tasks_dir),
+            bus=MessageBus(self.workspace.inbox_dir),
         )
         self.memory = memory if memory is not None else self.tools.memory
 
-        # 钩子实例：每实例独立，主循环与子智能体共用
-        self.hook_system = HookSystem(silent=self.silent)
+        # 钩子实例：每实例独立，主循环与子智能体共用（工作根 = 本空间沙箱根）
+        self.hook_system = HookSystem(silent=self.silent, workdir=self.workspace.workdir)
         self.hook_system.register_default_hooks()
 
         # 后台任务管理器：挂到本实例 tools 的 holder 上（实例级，非全局）
@@ -129,7 +259,8 @@ class Agent:
         self.tools.set_background_manager(self.background_manager)
 
         # 团队成员管理器（s17）：挂到本实例 tools 的 holder 上（注入本实例 tools，实例级）
-        self.teammate_manager = TeammateManager(TEAM_DIR, tools=self.tools)
+        # 队伍收件箱按工作空间隔离（换空间 = 换队伍，符合"不同项目分开"的直觉）
+        self.teammate_manager = TeammateManager(self.workspace.team_dir, tools=self.tools)
         self.tools.set_teammate_manager(self.teammate_manager)
 
         # worktree 管理器（s18）：挂到本实例 tools 的 holder 上（实例级）
@@ -164,7 +295,7 @@ class Agent:
         # 也**禁止**从 chat_history_dir.parent 反推：运行时数据迁到 ~/.aigent/projects/<slug>/
         # 之后那个 parent 已不是工作空间，曾因此让指令文件恒加载不到。
         self.system_prompt = SystemPromptBuilder(
-            workdir=WORKDIR,
+            workdir=self.workspace.workdir,
             skills=self.skills,
             tools=self.tools,
         )
@@ -186,7 +317,8 @@ class Agent:
 
         # 工作流运行时（s16）：复用本实例的 LLM 客户端与模型跑工作流子智能体，
         # 挂到本实例 tools 的 holder 上（实例级），并注册内置示例工作流
-        self.workflow_manager = WorkflowManager(WORKFLOW_DIR, self.llm_client, self.model)
+        self.workflow_manager = WorkflowManager(
+            self.workspace.workflow_dir, self.llm_client, self.model)
         register_default_workflows(self.workflow_manager)
         self.tools.set_workflow_manager(self.workflow_manager)
 
@@ -208,9 +340,29 @@ class Agent:
         # 累计 token 消耗：agent_loop 每次响应后累加（goal 状态展示"目标期间花费"用）
         self.total_tokens = 0
 
+        # ── token 消耗统计（主循环 + 子智能体全计入）──────────────────
+        # _turn_usage：轮级累计（run_turn / run_background_followup 开头重置），
+        #   收尾时写进会话 jsonl 末条 assistant 行的 usage 字段（UI 展示元数据）；
+        # usage_totals：会话级累计（跨重启持久化在 session_<id>.meta.json），
+        #   init_session / switch_session 从 meta 恢复，turn 收尾增量落盘。
+        self._turn_usage: dict = dict(_ZERO_USAGE)
+        self.usage_totals: dict = {**_ZERO_USAGE, "turns": 0}
+        # turn 执行中标志：后台子智能体迟到完成时据此区分"计入本轮"还是"只补会话级"
+        #（跨线程读：bg worker 线程读、主线程写，bool 赋值原子，无需加锁）
+        self._in_turn = False
+        # 本轮会话绑定的模型 id（llmconfig.json 条目 id，如 "m_xxx"）：
+        # 由 SessionRuntime 在 run_turn 前设置，_finalize_turn_usage 据此生成
+        # 轮级 model_info 快照（jsonl model_info 节点 + usage_stats 事件 model 字段）
+        self._turn_model_id: str | None = None
+        # 本轮（turn 执行期）模型切换事件序列，每项
+        #   {from_id, from_name, to_id, to_name, ts}；收尾时取净变化（轮始→轮末）
+        # 注入 model_info.switch（持久化 + usage_stats.model.switch 上行）；
+        # 净切回原模型（from_id==to_id）则不入 → 前端不显示、jsonl 不记录。
+        self._turn_switches: list[dict] = []
+
         # ── 会话状态（由 init_session / new_session / switch_session 填充） ──
         self.session_manager: SessionManager | None = None
-        self.session_num: int | None = None
+        self.session_id: str | None = None
         self.session_file: Path | None = None
         self.history_messages: list = []
 
@@ -302,6 +454,73 @@ class Agent:
         self._request_overrides["reasoning_effort"] = reasoning_effort
         self._request_overrides["max_context"] = max_context
 
+    def set_turn_model_snapshot(self, model_id: str | None) -> None:
+        """记录本轮会话绑定的模型 id（轮级 model_info 快照与统计用）。
+
+        由 SessionRuntime 在 run_turn 前按会话元数据传入；CLI 等无绑定
+        场景保持 None，快照回落 self.model（env 绑定的模型名）。
+        """
+        self._turn_model_id = model_id
+
+    def record_model_switch(self, to_id: str | None) -> dict | None:
+        """记录一次模型切换。
+
+        turn 执行期：计入本轮 `_turn_switches`，本轮收尾经 `_net_turn_switch`
+        取净变化后展示（返回 None，由收尾统一处理）；
+        空闲期（turn 未执行）：立即上行 `model_switch` 事件 + 持久化到「切换时
+        最后一条 assistant 消息」的 `model_info.switch`（返回该切换快照）。
+
+        空闲期 from 取当前会话基准模型 `_turn_model_id`，切换后同步更新它为 to
+        （供后续连续切换链取 from）；turn 执行期 from 取首条切换前的轮始模型，
+        否则取上一条 to。display_name 经 get_model_by_id 解析（空 id 回落全局
+        active 模型）。首条 from 与末条 to 相同（切回原模型）时在 _net_turn_switch
+        处整体丢弃。
+        """
+        if to_id is None:
+            return None
+        if self._in_turn:
+            chain = self._turn_switches
+            from_id = chain[-1].get("to_id") if chain else (self._turn_model_id or None)
+        else:
+            from_id = self._turn_model_id
+        if not from_id:
+            # 无前序模型（如全新会话首次绑定模型）：不是「切换」，不记录
+            return None
+        if from_id == to_id:
+            return None  # 切到与当前相同：视为未切换，忽略
+        from_m = get_model_by_id(from_id)
+        to_m = get_model_by_id(to_id)
+        sw = {
+            "from_id": from_id or "",
+            "from_name": str(from_m.get("display_name") or from_m.get("model")
+                             or from_id or "未知"),
+            "to_id": to_id or "",
+            "to_name": str(to_m.get("display_name") or to_m.get("model")
+                           or to_id or "未知"),
+            "ts": time.time(),
+        }
+        if self._in_turn:
+            self._turn_switches.append(sw)
+            return None
+        # 空闲期：立即展示 + 持久化，并推进当前模型基准供连续切换链取 from
+        self._turn_model_id = to_id
+        self._emit_idle_model_switch(sw)
+        return sw
+
+    def _emit_idle_model_switch(self, sw: dict) -> None:
+        """空闲期切换：立即上行 model_switch 事件，并把 switch 写入切换时最后一条
+        assistant 消息（model_info.switch），使实时与回放都在「切换前的那条答复」上
+        展示（而非下一轮答复末尾）。"""
+        self.stream_sink.emit(StreamEvent(type="model_switch", switch=sw))
+        if self.session_manager is not None and self.session_file is not None:
+            self.session_manager.append_switch_to_last_assistant(self.session_file, sw)
+            for m in reversed(self.history_messages):
+                if m.get("role") == "assistant":
+                    mi = dict(m.get("model_info") or {})
+                    mi["switch"] = sw
+                    m["model_info"] = mi
+                    break
+
     def _advanced_llm_kwargs(self) -> dict:
         """高级设置 → LLM 调用参数（chat.completions.create 的 kwargs）。
 
@@ -372,40 +591,283 @@ class Agent:
 
     def init_session(self, resume: bool = True) -> int:
         """
-        创建/恢复会话：构建 SessionManager → 初始化 → 绑定 todo → 注入 reminder。
+        创建/恢复会话：构建 SessionManager → 初始化 → 绑定任务板作用域 → 注入 reminder。
 
         resume=True：加载最近一次会话；resume=False：新建独立会话（cron 用）。
         """
         if self.session_manager is None:
             self.session_manager = SessionManager(
-                CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
-                session_prefix=self.session_prefix,
+                self.workspace.chat_history_dir, self.system_prompt.build_system_prompt(),
+                session_prefix=self.session_prefix, project_id=self.workspace.id,
+                tasks_dir=self.workspace.tasks_dir,
             )
         if resume:
-            self.session_num, self.session_file, self.history_messages = \
+            self.session_id, self.session_file, self.history_messages = \
                 self.session_manager.init_session()
         else:
-            self.session_num, self.session_file, self.history_messages = \
+            self.session_id, self.session_file, self.history_messages = \
                 self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 方案 B：加载回来的 messages[0] 是文件里那份（会话创建时构建），
         # 用最新构建的替换 —— 否则改了 AGENTS.md / 装了新技能，本会话看不到。
         self._refresh_system_prompt()
-        # todo 与 session 绑定：每次切会话都要重新指向对应的 todo 文件
-        self.tools.set_todo_manager(self.session_num)
+        # todo 已下线（2026-09-16）：不再绑定 TodoManager，todo reminder 一并移除。
+        # self.tools.set_todo_manager(self.session_id)
         # task 与 session 绑定：任务板限定在本会话作用域（"session_N"/"cron_N"）
-        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
-        self._inject_todo_reminder()
+        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
+        # 中断/恢复提示改由 _sync_task_board() 承接（见 Step 3），原 _inject_todo_reminder 已移除
         # L2 尾部注入：首次注入落在用户提问之前（指纹已在历史里则是 no-op）
         self._sync_memory_index()
         self._sync_environment()
-        log.info("会话初始化: %s%d (resume=%s, messages=%d)",
-                 self.session_prefix, self.session_num, resume, len(self.history_messages))
-        return self.session_num
+        # 任务板注入：恢复会话时提示"还有活没干完"（判据=存在未完成组，非"是否中断"）
+        self._sync_task_board()
+        self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
+        log.info("会话初始化: %s%s (resume=%s, messages=%d)",
+                 self.session_prefix, self.session_id, resume, len(self.history_messages))
+        return self.session_id
 
-    def run_turn(self, user_query: str) -> str:
+    # ── token 消耗统计（usage 节点四字段，主循环与子智能体统一口径）──────
+
+    def _restore_usage_totals(self) -> None:
+        """从会话元数据恢复会话级累计（跨重启/跨进程持久化在 meta.json）。
+
+        init_session / switch_session 时调用；meta 无 usage_totals（新会话或
+        存量会话）时归零。cron 等无元数据轨道的会话天然归零，行为不变。
+        """
+        totals = {**_ZERO_USAGE, "turns": 0}
+        try:
+            if self.session_manager is not None and self.session_id is not None:
+                meta = self.session_manager.load_meta(self.session_id) or {}
+                saved = meta.get("usage_totals") or {}
+                for k in _ZERO_USAGE:
+                    totals[k] = int(saved.get(k) or 0)
+                totals["turns"] = int(saved.get("turns") or 0)
+        except Exception:
+            pass  # 统计恢复失败不影响会话加载，从零重新累计（略偏保守）
+        self.usage_totals = totals
+
+    def _accumulate_usage(self, usage: dict) -> None:
+        """把一次 LLM 调用（或一个子智能体任务）的 usage 累进轮级与会话级计数器。"""
+        if not usage:
+            return
+        for k in _ZERO_USAGE:
+            v = int(usage.get(k, 0) or 0)
+            self._turn_usage[k] += v
+            self.usage_totals[k] += v
+
+    def _record_subagent_usage(self, usage: dict) -> None:
+        """子智能体 token 消耗记账（transcript.usage 回传）。
+
+        turn 在跑：并入轮级计数器（该轮 footer 汇总含子智能体）；
+        迟到完成（turn 已收尾，典型为后台子智能体）：轮级已定稿不再回改，
+        只补会话级累计 + meta 增量（count_turn=False），并补发仅含 session
+        的 usage_stats 事件刷新前端圆圈 tooltip。若迟到发生在下一轮 turn
+        执行期间，会被并入下一轮 footer（轮级归属略有偏移，会话级始终准确）。
+        """
+        if not usage or not any(int(v or 0) for v in usage.values()):
+            return
+        if self._in_turn:
+            self._accumulate_usage(usage)
+            return
+        for k in _ZERO_USAGE:
+            self.usage_totals[k] += int(usage.get(k, 0) or 0)
+        try:
+            if self.session_manager is not None and self.session_id is not None:
+                self.session_manager.add_usage_totals(
+                    self.session_id, usage, count_turn=False)
+        except Exception as e:
+            log.warning("迟到子智能体 usage 落盘失败（不影响对话）: %s", e)
+        # 仅 session 级的补发事件：前端只刷新圆圈 tooltip，不动消息 footer
+        self.stream_sink.emit(StreamEvent(
+            type="usage_stats", usage={"session": dict(self.usage_totals)}))
+
+    def _build_turn_model_info(self) -> dict:
+        """轮级模型快照：本轮实际使用的模型与参数。
+
+        窗口取压缩器当前生效值（set_max_context 已按本轮覆盖/模型窗口设置，
+        即「本轮统计用当时选择的模型和上下文参数」的口径）；思考档位取会话
+        覆盖，缺省回落模型元数据 default_thinking；模型 id 为空（会话绑定
+        的是全局 active 模型）时回落全局 active 模型条目，否则拿不到
+        default_thinking / display_name，footer 的思考档位会空缺。仅作 UI
+        展示元数据，不进 LLM 上下文（_model_messages 白名单投影）。
+        """
+        model_id = self._turn_model_id or ""
+        name = ""
+        default_strength = None
+        m = get_model_by_id(model_id)  # 空 model_id → 回落全局 active 模型
+        if m:
+            name = str(m.get("display_name") or m.get("model") or "")
+            default_strength = m.get("default_thinking")
+            model_id = m.get("id") or model_id
+        if not name:
+            name = self.model or ""
+        max_tokens = 0
+        label = ""
+        if self.session_manager is not None:
+            cm = self.session_manager.compact_manager
+            max_tokens = int(cm.max_context_tokens)
+            label = cm.format_token_count(max_tokens)
+        strength = self._request_overrides.get("reasoning_effort") or default_strength
+        info = {
+            "model_id": model_id,
+            "model_name": name,
+            "max_context": max_tokens,
+            "max_context_label": label,
+            "reasoning_effort": str(strength) if strength else "",
+        }
+        switch = self._net_turn_switch()
+        if switch:
+            info["switch"] = switch
+        return info
+
+    def _net_turn_switch(self) -> dict | None:
+        """本轮净模型切换（轮始→轮末）。
+
+        _turn_switches 为空 → 无切换，返回 None；多次切换 A→B→C 时取
+        首条 from 与末条 to（净变化）；净切回原模型（首条 from==末条 to，
+        如 A→B→A）→ 返回 None，不显示不记录。
+        """
+        if not self._turn_switches:
+            return None
+        first, last = self._turn_switches[0], self._turn_switches[-1]
+        if first.get("from_id") == last.get("to_id"):
+            return None
+        return {
+            "from_id": first.get("from_id", ""),
+            "from_name": first.get("from_name", ""),
+            "to_id": last.get("to_id", ""),
+            "to_name": last.get("to_name", ""),
+            "ts": last.get("ts"),
+        }
+
+    def _finalize_turn_usage(self) -> None:
+        """turn 收尾：轮级 usage + model_info 落盘（jsonl 末条 assistant 行
+        + meta 增量）并向前端发 usage_stats 事件（turn + session 两级汇总
+        + 本轮模型快照）。
+
+        run_turn / run_background_followup 的 agent_loop 返回后调用；停止/
+        异常路径同样到达（agent_loop 内部已消化停止与重试，返回即收尾）。
+        """
+        turn_usage = dict(self._turn_usage)
+        model_info = self._build_turn_model_info()
+        self._in_turn = False
+        if not any(turn_usage.values()):
+            return  # 本轮零消耗（如续轮前置检查直接返回），不发事件不落盘
+        try:
+            if self.session_manager is not None and self.session_id is not None:
+                self.session_manager.add_usage_totals(self.session_id, turn_usage)
+                self.usage_totals["turns"] = int(self.usage_totals.get("turns") or 0) + 1
+        except Exception as e:
+            log.warning("usage_totals 落盘失败（不影响对话）: %s", e)
+        try:
+            if self.session_manager is not None and self.session_file is not None:
+                # jsonl 末条 assistant 行补写 usage + model_info + usage_session
+                #（会话级累计快照，回放恢复 footer 第二段），并同步内存态
+                # （compact 重写保留）
+                if self.session_manager.append_usage_to_last_assistant(
+                        self.session_file, turn_usage, model_info,
+                        usage_session=dict(self.usage_totals)):
+                    for m in reversed(self.history_messages):
+                        if m.get("role") == "assistant":
+                            m["usage"] = turn_usage
+                            m["model_info"] = dict(model_info)
+                            m["usage_session"] = dict(self.usage_totals)
+                            break
+        except Exception as e:
+            log.warning("轮级 usage 落盘失败（不影响对话）: %s", e)
+        # 事件：前端 footer（msg.usage = turn + session 快照 + 本轮模型）与
+        # 圆圈 tooltip 共用
+        self.stream_sink.emit(StreamEvent(
+            type="usage_stats",
+            usage={"turn": turn_usage, "session": dict(self.usage_totals),
+                   "model": model_info},
+        ))
+
+    def _attachment_session_dir(self) -> Path | None:
+        """本会话的附件目录（`.attachments/<session_id>/`）；不可用时 None。
+
+        只服务于发送边界的附件展开。会话尚未建立（CLI 首轮前 / cron）或
+        workspace 缺失时返回 None —— 展开函数对这种情况原样透传，
+        因而**任何无附件场景的行为与改造前完全一致**。
+        """
+        sid = str(getattr(self, "session_id", "") or "")
+        workspace = getattr(self, "workspace", None)
+        if not sid or workspace is None:
+            return None
+        return workspace.attachments_dir / sid
+
+    def _model_messages(self) -> list:
+        """发给 LLM 的消息投影：白名单字段（见 MODEL_MSG_FIELDS）。
+
+        history_messages 里的 usage 等展示元数据在这一边界统一剔除，
+        jsonl 后续新增任何字段都不会漏进 API 请求。
+
+        **附件（2026-09-20）**：jsonl 里存的是中性的引用块
+        （`{"type":"attachment", ...}`，只有元数据、不含文件字节），在这里
+        展开为 provider 线格式（图片 → `image_url` + data URL；文档 → 提取文本）。
+        展开只作用于本次请求，**不回写 history_messages** —— 内存与 jsonl 恒为
+        账本形态，base64 只在这一刻存在。无附件消息由 expand 原样返回，
+        因此无附件会话的请求体与改造前逐字节一致（见
+        tests/test_agent_model_messages.py 的回归断言）。
+
+        **图片能力门控（2026-09-20）**：按本轮生效模型的能力决定图片是否真的发出。
+        在此之前只有 ws_bridge 的 chat 预检（且只扫当轮新附件），会话中途换模型、
+        历史回放、以及任何把图带进新轮的路径都不校验 —— 图片会被原样发给不支持
+        图片的模型。门控放在这里覆盖全部路径；`ws_bridge` 的预检保留，职责是
+        "迁移之前就报错"，避免草稿白搬到会话目录。
+
+        **引用（@-mention，2026-09-21）**：jsonl 里存的是中性的路径引用块
+        （`{"type":"ref","ref":{path,name,is_dir,project_id}}`，**零复制、无字节**），
+        在这一边界合并成一段说明文本（路径清单 + "内容不在上下文中，需 run_read"）。
+        与附件同一条策略：只作用于本次请求、不回写历史。无引用块时原样返回同一对象。
+
+        **工具读图（run_read 读到图片/页图，2026-09-21）**：`{"type":"tool_image"}` 块由
+        `run_read` 产出（一次读 PDF 可以带多张页图）、被 agent_loop 聚合成一条**
+        合成 user 消息**（marker
+        `_tool_images`）落盘。这里把它展开成 `image_url` + data URL（大图在内存里
+        先缩放，不落盘）。marker 字段不在 `MODEL_MSG_FIELDS` 白名单里，因此
+        只留在 jsonl 供回放辨认，**不会漏进请求体**。
+        """
+        session_dir = self._attachment_session_dir()
+        # 无附件无工具图片 → 短路：不读模型能力、不做任何额外工作，请求体与改造前等价。
+        # 有任一 → 查本轮生效模型的能力，text-only 模型下图片降级为占位。
+        # 判据是 `history_has_images`（附件图片 ∪ 工具图片）而不是只判附件：
+        # 读图的会话可能没有附件块，只判附件会拿到默认值 True，
+        # 于是图片被原样发给不支持图片的模型 —— 由 provider 报错。
+        # 查询必须包 try/except：本方法位于 retry lambda 内，异常会穿透到
+        # agent_loop 打死整轮（与 _expand_one 的"绝不抛异常"同一契约）。
+        # 空 _turn_model_id → 回落全局 active 模型，与 _turn_model_snapshot 同口径。
+        supports_image = True
+        if history_has_images(self.history_messages):
+            try:
+                supports_image = model_supports_image(
+                    getattr(self, "_turn_model_id", None) or "")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("查询模型图片能力失败（按支持图片处理）: %s: %s",
+                            type(exc).__name__, exc)
+                supports_image = True
+        projected = [
+            expand_content_for_model(
+                {k: m[k] for k in MODEL_MSG_FIELDS if k in m}, session_dir,
+                supports_image=supports_image,
+            )
+            for m in self.history_messages
+        ]
+        # 引用（@-mention，2026-09-21）：把中性的 `{"type":"ref"}` 块合并成一段
+        # 「路径清单 + 内容不在上下文中、需要时用 run_read」的说明文本块。与附件同一
+        # 策略 —— **只在发送边界现算，不回写 history_messages**。无引用块时该函数
+        # 返回**传入的同一个对象**，所以"无附件无引用时请求体逐字节等价"这条保证
+        # 由结构成立（tests/test_agent_model_messages.py 有身份断言钉住这一点）。
+        return [expand_ref_blocks_for_model(m) for m in projected]
+
+    def run_turn(self, user_query: str | list) -> str:
         """
         跑一轮非交互对话（CLI / cron / TUI 共用）。返回最终回复文本。
+
+        `user_query` 为**用户消息的 content**：纯文本消息是 `str`（CLI / cron /
+        存量路径全是这一种，行为逐字节不变）；桌面端带附件时是
+        `[文本块 + 附件引用块...]` 的多模态数组（由 ws_bridge 组装，引用块里
+        只有元数据，文件字节由 `_model_messages` 在发送边界展开）。
 
         agent_loop 内部仍会打印 thinking / 本轮回复（保持现状 UX）；
         本方法额外返回历史最后一条消息的文本，供调用方打印。
@@ -414,9 +876,23 @@ class Agent:
         # 重置连续 block 计数，避免上一轮的 block 累计误判触发 limit
         self._stop_evt.clear()  # 新一轮开始，清掉可能遗留的停止信号
         self.goal_controller.begin_query()
-        self.hook_system.trigger("UserPromptSubmit", user_query)
-        log.info("turn 开始: %s%d user_query=%r",
-                 self.session_prefix, self.session_num, user_query[:100])
+        self._turn_usage = dict(_ZERO_USAGE)  # 轮级统计重新累计
+        self._turn_switches = []  # 本轮切换序列归零（空闲期切换已在发生时即时上行）
+        # 中断恢复：把上一轮遗留（无人持有）的 in_progress 归一为 pending。
+        # 放在本轮任何工具调用之前 —— 此处看到的 in_progress 必然属于上一轮
+        #（本轮还没机会 claim 任何任务），因此无需再比较时间戳。
+        # 守卫：后台子智能体可能正合法持有某个 in_progress，此时不能动。
+        # 归一后这些任务才能被重新 claim —— 否则中断一次任务板就永久卡死。
+        if not self.background_manager.has_running():
+            _tm = getattr(self.tools, "task_manager", None)
+            if _tm is not None:
+                _tm.release_stale_in_progress()
+        # 钩子契约是「用户原始输入字符串」；日志同样按文本记。带附件时 content
+        # 已是多模态数组，故统一取文本视图（`[图片: x.png]` + 正文，不含字节）。
+        prompt_text = text_view(user_query)
+        self.hook_system.trigger("UserPromptSubmit", prompt_text)
+        log.info("turn 开始: %s%s user_query=%r",
+                 self.session_prefix, self.session_id, prompt_text[:100])
         self.history_messages.append({"role": "user", "content": user_query})
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
@@ -424,12 +900,14 @@ class Agent:
         self.session_manager.maybe_compact_context(
             self.history_messages, self.session_file
         )
+        self._in_turn = True
         self.agent_loop()
+        self._finalize_turn_usage()
         last = self.history_messages[-1].get("content", "")
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
-        log.info("turn 结束: %s%d (tokens累计=%d)",
-                 self.session_prefix, self.session_num, self.total_tokens)
+        log.info("turn 结束: %s%s (tokens累计=%d)",
+                 self.session_prefix, self.session_id, self.total_tokens)
         return str(last)
 
     def run_background_followup(self) -> str:
@@ -445,77 +923,90 @@ class Agent:
         """
         self._stop_evt.clear()
         self.goal_controller.begin_query()
+        self._turn_usage = dict(_ZERO_USAGE)  # 轮级统计重新累计
+        self._turn_switches = []  # 本轮切换序列归零（空闲期切换已在发生时即时上行）
         # 仅当确有未消费的后台结果才续轮，避免空转发出无意义的一轮
         if not self.background_manager.has_completed_pending():
             return ""
-        log.info("后台续轮开始: %s%d", self.session_prefix, self.session_num)
+        log.info("后台续轮开始: %s%s", self.session_prefix, self.session_id)
+        self._in_turn = True
         self.agent_loop()
+        self._finalize_turn_usage()
         last = self.history_messages[-1].get("content", "")
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         return str(last)
 
-    def new_session(self) -> tuple[int, str]:
-        """创建新会话并绑定 todo，返回 (新会话编号, 提示语)。"""
+    def new_session(self) -> tuple[str, str]:
+        """创建新会话并绑定任务板作用域，返回 (新会话 id, 提示语)。"""
         # 方案 B：新建会话的 system message 由 SessionManager **持有**的那份产出
         # （_build_initial_messages），必须先刷新为最新构建结果，否则长生命周期
         # Agent（CLI）会拿到很久以前构建的版本。
         self._refresh_system_prompt()
-        self.session_num, self.session_file, self.history_messages = \
+        self.session_id, self.session_file, self.history_messages = \
             self.session_manager.create_initialized_session()
         self.history_messages = self._strip_subagent_rows(self.history_messages)
-        # 新会话的 todo 文件尚不存在，set_todo_manager 会建出空列表；reminder 不会注入
-        self.tools.set_todo_manager(self.session_num)
-        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
+        self.usage_totals = {**_ZERO_USAGE, "turns": 0}  # 新会话：token 计数器归零
+        # todo 已下线（2026-09-16）：不再绑定 TodoManager，也不再有 reminder
+        # self.tools.set_todo_manager(self.session_id)
+        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         # 新会话：立即注入当前记忆索引与环境上下文（新会话扫不到指纹 → 必然注入）
         self._sync_memory_index()
         self._sync_environment()
-        log.info("新会话创建: %s%d", self.session_prefix, self.session_num)
-        return self.session_num, f"已创建新会话: session_{self.session_num}.jsonl"
+        log.info("新会话创建: %s%s", self.session_prefix, self.session_id)
+        return self.session_id, f"已创建新会话: session_{self.session_id}.jsonl"
 
-    def switch_session(self, target_num: int) -> tuple[int, int]:
+    def switch_session(self, target_id: str) -> tuple[str, int]:
         """
-        切换到指定会话，绑定对应 todo 并注入 reminder。
-        返回 (会话编号, 消息数)；会话不存在时抛 FileNotFoundError。
+        切换到指定会话，绑定对应任务板作用域并按需注入提醒。
+        返回 (会话 id, 消息数)；会话不存在时抛 FileNotFoundError。
         """
         # 惰性构建（同 init_session）：桌面端 SessionRuntime.build_agent 会直接
         # 对全新 Agent 实例调 switch_session，此时 session_manager 尚为 None
         if self.session_manager is None:
             self.session_manager = SessionManager(
-                CHAT_HISTORY_DIR, self.system_prompt.build_system_prompt(),
-                session_prefix=self.session_prefix,
+                self.workspace.chat_history_dir, self.system_prompt.build_system_prompt(),
+                session_prefix=self.session_prefix, project_id=self.workspace.id,
+                tasks_dir=self.workspace.tasks_dir,
             )
-        self.session_num, self.session_file, self.history_messages = \
-            self.session_manager.switch_session(target_num)
+        self.session_id, self.session_file, self.history_messages = \
+            self.session_manager.switch_session(target_id)
         self.history_messages = self._strip_subagent_rows(self.history_messages)
         # 方案 B：与 init_session 同理 —— 换成最新构建的 system prompt
         self._refresh_system_prompt()
-        self.tools.set_todo_manager(self.session_num)
-        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_num}")
-        self._inject_todo_reminder()
+        # todo 已下线（2026-09-16）：见 init_session 同处注释
+        # self.tools.set_todo_manager(self.session_id)
+        self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
+        # 中断/恢复提示改由 _sync_task_board() 承接（见 Step 3）
         # L2 尾部注入：若离开期间记忆/日期变过，这里会补注（指纹从本会话历史恢复）
         self._sync_memory_index()
         self._sync_environment()
-        log.info("会话切换: %s%d -> %s%d (messages=%d)",
-                 self.session_prefix, target_num, self.session_prefix,
-                 self.session_num, len(self.history_messages))
-        return self.session_num, len(self.history_messages)
+        # 任务板注入：切回会话时提示"还有活没干完"（去重，见 _history_has_task_board）
+        self._sync_task_board()
+        self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
+        log.info("会话切换: %s%s -> %s%s (messages=%d)",
+                 self.session_prefix, target_id, self.session_prefix,
+                 self.session_id, len(self.history_messages))
+        return self.session_id, len(self.history_messages)
 
     def clear_session(self) -> int:
-        """清空当前会话（todo 同步重置），返回被删除的消息数。"""
+        """清空当前会话（任务板同步清空），返回被删除的消息数。"""
         deleted_count = self.session_manager.clear_session(self.session_file)
-        log.info("会话清空: %s%d (删除消息=%d)",
-                 self.session_prefix, self.session_num, deleted_count)
-        # todo 与 chat history 同生共死：清空 chat 的同时把当前 session 的 todo 也重置为空
-        self.tools.get_todo_manager().update([], fresh_start=False)
+        log.info("会话清空: %s%s (删除消息=%d)",
+                 self.session_prefix, self.session_id, deleted_count)
+        # 任务板清理已下沉到 SessionManager.clear_session：因为 ws_bridge 的
+        # session_clear 分支是**直接调 sm.clear_session** 的，不经过本方法；
+        # 只在此处清理会漏掉那条路径。故这里不再重复调用 clear_scope()。
         self.history_messages = self._strip_subagent_rows(
             self.session_manager.load_session_history(self.session_file)
         )
+        # 会话内容清空 → token 累计统计同步归零（元数据由 SessionManager 侧清理）
+        self.usage_totals = {**_ZERO_USAGE, "turns": 0}
         return deleted_count
 
     def show_tasks(self) -> str:
-        """返回当前会话待办看板文本。"""
-        return self.tools.get_todo_manager().render()
+        """返回当前会话任务看板文本（todo 已下线，改用 task 看板）。"""
+        return self.tools.task_manager.run_list_tasks()
 
     # ═══════════════════════════════════════════════════════════
     #  目标循环（s17 goal loop，CLI 斜杠命令共用接缝）
@@ -565,28 +1056,116 @@ class Agent:
     #  工具执行辅助
     # ═══════════════════════════════════════════════════════════
 
-    def _inject_todo_reminder(self) -> None:
-        """
-        会话恢复/切换时，若当前 session 有未完成的 todo，注入一条 reminder
-        让模型意识到"上次有活没干完"。
+    # ── 已下线（2026-09-16）：原 todo reminder ────────────────────────
+    #
+    # 原实现：会话恢复/切换时，若当前 session 有未完成的 todo，注入一条
+    # <system-reminder> 让模型意识到"上次有活没干完"。
+    #
+    # 下线原因（三个都是硬伤）：
+    # 1. 只读 TodoManager，对 task 看板零感知 —— 而 todo 已下线，它必然永不触发；
+    # 2. 只在 init_session / switch_session 触发，**同一会话内中断后再发消息不经过
+    #    这两个入口** → 最高频的"中断续跑"场景它根本不工作；
+    # 3. 注入的是整份 todo 清单，粒度太粗。
+    #
+    # 替代实现：_sync_task_board()（尾部注入 + 指纹去重，见本文件）
+    #   - 判据改为「存在未完成任务组」且「当前上下文里找不到该组的任务板注入」
+    #   - 调用点覆盖 init_session / switch_session / agent_loop 每轮开头
+    #
+    # def _inject_todo_reminder(self) -> None:
+    #     """
+    #     会话恢复/切换时，若当前 session 有未完成的 todo，注入一条 reminder
+    #     让模型意识到"上次有活没干完"。
+    #
+    #     reminder 写在 user query 之前、system / 旧 history 之后，
+    #     模型下一轮必能直接看到。reminder 同时落盘 session_file，
+    #     保证下次启动 reload 仍可见。
+    #     """
+    #     mgr = self.tools.get_todo_manager()
+    #     if not mgr.has_open_items():
+    #         return
+    #     reminder = (
+    #         "<system-reminder>本次会话检测到上次有未完成的待办事项：\n"
+    #         f"{mgr.render()}\n"
+    #         "请在继续之前确认是否继续执行；如果任务已不再相关，请用 todo 工具把对应项标记为 completed，"
+    #         "或开启新计划（fresh_start=true 整体替换）。</system-reminder>"
+    #     )
+    #     self.history_messages.append({"role": "user", "content": reminder})
+    #     self.session_manager.append_message_to_session(
+    #         self.session_file, self.history_messages[-1]
+    #     )
 
-        reminder 写在 user query 之前、system / 旧 history 之后，
-        模型下一轮必能直接看到。reminder 同时落盘 session_file，
-        保证下次启动 reload 仍可见。
+    # ── 尾部注入：任务板（中断续跑的可见性保障）──────────────────────
+
+    def _sync_task_board(self) -> None:
+        """有未完成任务组、且当前上下文里看不到它的注入时，注入一份任务板。
+
+        **为什么必须有**（原 `_inject_todo_reminder` 的两个硬伤）：
+        1. 原机制只读 TodoManager —— todo 已下线，它必然永不触发；
+        2. 它只在 init_session / switch_session 触发，而**同一会话内中断后再发
+           一条消息不经过这两个入口** —— 那恰恰是最高频的"中断续跑"场景。
+
+        **去重口径**：注入条件是「有未完成组」**且**「历史里找不到该 group_id 的
+        `<task_board>` 注入」。于是：
+        - 进会话 / 重启 resume → 历史里没有 → 注入一次
+        - 同会话中断后再发消息 → 旧注入还在历史里 → 不重复（不刷屏）
+        - 上下文压缩把注入段裁掉 → 自动补注
+
+        **判据用"是否存在未完成组"，而不是"是否发生过中断"**：前端切换会话不会
+        中断会话（每会话一个独立 SessionRuntime），而"模型自己收尾时留了尾巴"
+        同样需要续跑 —— 用中断做判据会漏掉这种情况。
         """
-        mgr = self.tools.get_todo_manager()
-        if not mgr.has_open_items():
+        tm = getattr(self.tools, "task_manager", None)
+        if tm is None or self.session_manager is None:
             return
+        try:
+            # 任务板按**本空间**的 .tasks 目录读（模块级 TASKS_DIR 只代表 default）。
+            # 用 getattr 兜底：离线测试桩常以 `Agent.__new__` 手工填字段，
+            # 缺 workspace 时语义上就是 default 空间（传 None 即回落 TASKS_DIR）。
+            ws = getattr(self, "workspace", None)
+            board = current_board(tm.scope, ws.tasks_dir if ws is not None else None)
+        except Exception as e:
+            log.error("读取任务板失败: %s: %s", type(e).__name__, e)
+            return
+        if board is None:
+            return  # 无未完成组：不注入，也不清理旧标记
+        gid = board["group_id"]
+        if self._history_has_task_board(gid):
+            return
+        pending_rows = [t for t in board["tasks"] if t["derived_status"] != "completed"]
+        if not pending_rows:
+            return
+        lines = "\n".join(
+            f"- [{t['derived_status']}] {t['subject']}  ({t['id']})" for t in pending_rows
+        )
         reminder = (
-            "<system-reminder>本次会话检测到上次有未完成的待办事项：\n"
-            f"{mgr.render()}\n"
-            "请在继续之前确认是否继续执行；如果任务已不再相关，请用 todo 工具把对应项标记为 completed，"
-            "或开启新计划（fresh_start=true 整体替换）。</system-reminder>"
+            f'<system-reminder><task_board group="{gid}">\n'
+            f"本会话还有未完成的任务（共 {board['counts']['total']} 项，"
+            f"剩 {len(pending_rows)} 项）：\n{lines}\n"
+            "请接着把这些做完再开新活。剩余项状态是 pending，直接 claim_task 即可；"
+            "被阻塞的项要等依赖完成；"
+            "若某项已不再需要或依赖填错了，用 update_task 就地修（blockedBy 传 [] 可清空依赖）"
+            "或 delete_task 删掉 —— 不要另建\"修正版\"新任务，也别留下无人认领的残留项，"
+            "否则任务面板会一直停在未完成状态。\n"
+            "</task_board></system-reminder>"
         )
         self.history_messages.append({"role": "user", "content": reminder})
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
         )
+        log.info("注入任务板提醒: group=%s 剩余=%d 项", gid, len(pending_rows))
+
+    def _history_has_task_board(self, group_id: str) -> bool:
+        """历史里是否已存在该组的任务板注入（去重依据）。
+
+        只认注入头部的 `<task_board group="...">` 标记，不做自然语言匹配 ——
+        模型自己在正文里提到任务时不能被误判成"已经注入过"。
+        """
+        marker = f'<task_board group="{group_id}">'
+        for msg in self.history_messages:
+            content = msg.get("content")
+            if isinstance(content, str) and marker in content:
+                return True
+        return False
 
     # ── 方案 B：进会话时刷新 system prompt ─────────────────────────────
     #
@@ -620,8 +1199,8 @@ class Agent:
         if first.get("role") != "system" or first.get("content") == fresh:
             return False
         self.history_messages[0] = {"role": "system", "content": fresh}
-        log.info("刷新 system prompt: %s%d (%d 字符)",
-                 self.session_prefix, self.session_num, len(fresh))
+        log.info("刷新 system prompt: %s%s (%d 字符)",
+                 self.session_prefix, self.session_id, len(fresh))
         return True
 
     # ── 尾部按需注入（L2 热段）────────────────────────────────────────
@@ -681,8 +1260,8 @@ class Agent:
         self._append_injection(
             MEMORY_INDEX_TAG, revision, index_text or "（暂无记忆）"
         )
-        log.info("注入记忆索引: %s%d revision=%s (条目=%d)",
-                 self.session_prefix, self.session_num, revision,
+        log.info("注入记忆索引: %s%s revision=%s (条目=%d)",
+                 self.session_prefix, self.session_id, revision,
                  len([ln for ln in index_text.splitlines() if ln.strip()]))
 
     # ── 环境与上下文（日期 / 星期 / 平台）──────────────────────────────
@@ -711,8 +1290,8 @@ class Agent:
         if revision == self._last_injection_revision(ENV_TAG):
             return
         self._append_injection(ENV_TAG, revision, body)
-        log.info("注入环境上下文: %s%d revision=%s (%s)",
-                 self.session_prefix, self.session_num, revision,
+        log.info("注入环境上下文: %s%s revision=%s (%s)",
+                 self.session_prefix, self.session_id, revision,
                  " | ".join(v for _, v in snapshot))
 
     # ── 方案 C：工作区指令文件变更时的尾部注入 ────────────────────────
@@ -742,25 +1321,32 @@ class Agent:
             "工作区指令文件已在本次会话期间变更，以下为**最新版本**；"
             "与之冲突时以本条为准。\n\n" + body,
         )
-        log.info("注入工作区指令更新: %s%d revision=%s",
-                 self.session_prefix, self.session_num, revision)
+        log.info("注入工作区指令更新: %s%s revision=%s",
+                 self.session_prefix, self.session_id, revision)
 
-    def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = ""):
+    def _make_executor(self, tool_name: str, tool_args: dict, tool_call_id: str = "",
+                       stop_event=None):
         """
         把"执行一个工具调用"包成无参闭包，供 background_manager 在后台线程调用。
 
         tool_name / tool_args 是 _make_executor 的形参（独立作用域、每次调用绑一次），
         所以 lambda 直接闭包捕获即可，无须 def 嵌套，也不会出现 for 循环闭包共享
         变量导致所有闭包都引用最后一次迭代值的经典坑。
+
+        stop_event：协作式停止事件。后台路径由 _execute_tool_call 每任务新建一个
+        （随 start_background_task 登记，request_stop_all 置位）；同步路径传主
+        智能体自身的 _stop_evt（子智能体也能被"停止"打断）。仅 sub_agent 会读它。
         """
         if tool_name == "sub_agent":
-            return lambda: self._run_subagent(tool_args, tool_call_id)
+            return lambda: self._run_subagent(tool_args, tool_call_id,
+                                              stop_event=stop_event)
         elif self.tools.resolve_handler(tool_name) is not None:
             return lambda: self.tools.execute(tool_name, **tool_args)
         else:
             return lambda: f"Error: Unknown tool {tool_name}"
 
-    def _run_subagent(self, tool_args: dict, tool_call_id: str = "") -> str:
+    def _run_subagent(self, tool_args: dict, tool_call_id: str = "",
+                      stop_event=None) -> str:
         """派发 sub_agent。若传了 workdir（worktree 名称），解析为路径并注入。
 
         子智能体返回 (摘要, transcript)：摘要作为工具结果回传主上下文；
@@ -779,12 +1365,14 @@ class Agent:
                 allowed_tools=tool_args.get("allowed_tools"),
                 workdir=wt,
                 tool_call_id=tool_call_id,
+                stop_event=stop_event,
             )
         else:
             summary, transcript = self.subagent_runner.spawn_subagent(
                 prompt,
                 allowed_tools=tool_args.get("allowed_tools"),
                 tool_call_id=tool_call_id,
+                stop_event=stop_event,
             )
         if tool_call_id:
             # 边通道暂存（供 _persist_pending_subagent_rows 兜底去重）
@@ -792,6 +1380,8 @@ class Agent:
             # 发起它的 assistant 消息下（而非最近的末条 assistant）。
             transcript = {**transcript, "tool_call_id": tool_call_id}
             self._subagent_transcripts[tool_call_id] = transcript
+            # 子智能体 token 消耗记账（同步路径并入本轮；迟到完成只补会话级）
+            self._record_subagent_usage(transcript.get("usage") or {})
             # 立即落盘 role=subagent 行：同步路径在主线程写，后台路径由
             # worker 线程写（append_subagent_to_session 内部持锁，不会与
             # agent_loop 的写入交错）。立即写盘保证后台子智能体即使在
@@ -842,15 +1432,19 @@ class Agent:
         tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         tool_id = tool_call.id
         started = time.monotonic()
-        log.info("工具执行开始: %s%d %s args=%s",
-                 self.session_prefix, self.session_num, tool_name,
+        log.info("工具执行开始: %s%s %s args=%s",
+                 self.session_prefix, self.session_id, tool_name,
                  json.dumps(tool_args, ensure_ascii=False)[:200])
 
         # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式
         if self.background_manager.should_run_background(tool_name, tool_args):
-            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
+            # 每个后台任务一个停止事件：同时交给 executor（sub_agent 在迭代
+            # 边界读取）与 background_manager（request_stop_all 置位）。
+            bg_stop = threading.Event()
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id,
+                                           stop_event=bg_stop)
             bg_id = self.background_manager.start_background_task(
-                tool_name, tool_args, tool_id, executor
+                tool_name, tool_args, tool_id, executor, stop_event=bg_stop
             )
             cmd_text = (
                 tool_args.get("command")
@@ -863,23 +1457,49 @@ class Agent:
                 f"Result will be available when complete."
             )
             self._print(f">> {tool_name} 后台分发: {bg_id}")
-            log.info("工具后台分发: %s%d %s -> %s (%.2fs)",
-                     self.session_prefix, self.session_num, tool_name, bg_id,
+            log.info("工具后台分发: %s%s %s -> %s (%.2fs)",
+                     self.session_prefix, self.session_id, tool_name, bg_id,
                      time.monotonic() - started)
         else:
-            # 同步路径：直接走原逻辑
-            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id)
-            tool_output = executor()
-            log.info("工具执行完成: %s%d %s (%.2fs, 输出 %d 字符)",
-                     self.session_prefix, self.session_num, tool_name,
+            # 同步路径：直接走原逻辑。同步子智能体也接入协作式停止：
+            # 传主智能体自身的 _stop_evt（request_stop 时被置位），
+            # 长时间执行的子智能体在迭代边界感知并收束为 aborted。
+            executor = self._make_executor(tool_name, tool_args, tool_call_id=tool_id,
+                                           stop_event=self._stop_evt)
+            # 单条工具失败绝不能杀死整轮对话（2026-09-18 事故）。
+            # 反例：bash 输出解码抛 UnicodeDecodeError → 异常穿透 agent_loop →
+            # 本轮剩余 tool_call 的 tool_result 一条都没写回 → 会话文件留下
+            # "有 tool_calls 无 tool_result" 的孤儿 assistant；若发生在后台续轮里，
+            # 还会连带把整个后台守望打断、会话被静默判 done（用户看不到最终总结、
+            # 任务面板永久停摆）。工具层契约是"永远返回字符串"，这里补齐最后一道闸：
+            # 把异常转成模型可见的 Error 结果，让它自己看到失败并换命令重试。
+            try:
+                tool_output = executor()
+            except Exception as e:
+                log.error("工具执行异常: %s%s %s: %s: %s",
+                          self.session_prefix, self.session_id, tool_name,
+                          type(e).__name__, e, exc_info=True)
+                tool_output = (
+                    f"Error: {type(e).__name__}: {e}\n"
+                    f"（该工具调用自身失败，本轮其余调用与对话继续；"
+                    f"请据此调整命令或换用其他工具。）"
+                )
+            log.info("工具执行完成: %s%s %s (%.2fs, 输出 %d 字符)",
+                     self.session_prefix, self.session_id, tool_name,
                      time.monotonic() - started, len(str(tool_output)))
 
+        # 工具读图（run_read 读到图片/页图，2026-09-21）：这是**唯一**不返回字符串的
+        # 工具。必须原样保留它的中性图片块 —— 一旦被 str() 掉，模型只会看到一段
+        # Python dict 的 repr，图彻底丢失（而这正是它存在的全部意义）。
+        # 判定放在**形状**上（`is_tool_image_result`）而不是工具名：将来若有别的
+        # 工具也产出图片，这里无需再改。所有其它工具（含全部错误路径）仍是字符串。
+        content = tool_output if is_tool_image_result(tool_output) else str(tool_output)
         return {
             "role": "tool",
             "tool_name": tool_name,
             "tool_args": tool_args,
             "tool_call_id": tool_id,
-            "content": str(tool_output),
+            "content": content,
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -918,9 +1538,18 @@ class Agent:
         self._sync_memory_index()
         self._sync_environment()
         self._sync_project_rules()
+        # 任务板兜底注入：这是"同会话中断后再发一条消息"这类场景的**唯一**覆盖点
+        #（那条路径不经过 init_session / switch_session）。去重由 _history_has_task_board
+        # 负责，压缩把注入段裁掉后也会在这里自动补注。
+        self._sync_task_board()
 
         iteration = 0  # 循环迭代计数
-        rounds_since_todo = 0  # 记录距离上次调用 todo 工具的轮数，用于 nag reminder
+        # 原 rounds_since_todo（连续 3 轮未更新 todo 就注入 "Update your tasks."）已整段删除。
+        # 理由：与 Claude Code 删掉的"每 5 轮提醒看清单"完全同构，会把计划变成不可违背的剧本；
+        # 且其注入用的是 <reminder> 而非 <system-reminder>，会漏成用户气泡（违反注入契约）。
+        # 「承诺未兑现」守卫的本轮拦截次数（局部量，天然随本轮 agent_loop 重置；
+        # 上限 PROMISE_GUARD_MAX，默认 1 —— 只拉一把，绝不反复纠缠）
+        promise_guard_hits = 0
 
         while True:
             # 协作式停止：请求停止后，在进入下一轮（再次调 LLM/工具）前提前收尾
@@ -934,8 +1563,8 @@ class Agent:
                 self._print(
                     f"\033[31m[警告] 智能体循环达到最大迭代次数 ({self.max_agent_iterations})，强制结束\033[0m"
                 )
-                log.warning("%s%d 达到最大迭代次数 (%d)，强制结束 turn",
-                            self.session_prefix, self.session_num, self.max_agent_iterations)
+                log.warning("%s%s 达到最大迭代次数 (%d)，强制结束 turn",
+                            self.session_prefix, self.session_id, self.max_agent_iterations)
                 break
 
             # 在调用 LLM 前检查上下文，达到阈值时阻塞执行压缩并同步会话文件。
@@ -951,6 +1580,8 @@ class Agent:
                 # 控制器在循环里可能会通过 ESCALATE / FALLBACK 改变这些值，但本轮 lambda 已固定。
                 # 返回 (message, finish_reason, usage)，message 接口兼容 OpenAI message，
                 # 下游历史追加 / 截断恢复 / goal 评估无需改动。
+                # 消息走 _model_messages 白名单投影：history_messages 里的 usage 等
+                # 展示元数据在发送边界统一剔除，jsonl 新增字段不会漏进 API。
                 llm_response = self.recovery.with_retry(
                     lambda mt=self.recovery.current_max_tokens, mdl=self.recovery.current_model:
                     streamed_create(
@@ -958,7 +1589,7 @@ class Agent:
                         sinks=[self.stream_sink],
                         should_stop=self._stop_evt.is_set,
                         model=mdl,
-                        messages=self.history_messages,
+                        messages=self._model_messages(),
                         max_tokens=mt,
                         tools=self.tools.build_agent_tools(team_mode=self.team_mode),
                         tool_choice="auto",  # 工具选择，值域 none、auto、required，默认 auto
@@ -975,6 +1606,8 @@ class Agent:
                 if usage:
                     self.total_tokens += int(usage.get("prompt_tokens", 0) or 0) \
                         + int(usage.get("completion_tokens", 0) or 0)
+                    # 轮级/会话级统计（含缓存命中，主循环与子智能体统一口径）
+                    self._accumulate_usage(usage)
 
             except TurnStopped:
                 # 协作式停止：中途打断流式，不写入错误消息、不重试，
@@ -986,8 +1619,8 @@ class Agent:
             except Exception as e:
                 # 外层异常处理：内层 with_retry 主动 raise 出来的"非临时错误"会到这一层。
                 # 控制器根据错误类型决定：继续重试（CONTINUE）或退出（ABORT）。
-                log.error("%s%d LLM 调用异常: %s: %s",
-                          self.session_prefix, self.session_num, type(e).__name__, e)
+                log.error("%s%s LLM 调用异常: %s: %s",
+                          self.session_prefix, self.session_id, type(e).__name__, e)
                 if self.recovery.handle_exception(
                     e, self.history_messages, self.session_manager, self.session_file
                 ) == RecoveryAction.ABORT:
@@ -1017,6 +1650,31 @@ class Agent:
             )
 
             if len(response_tool_calls) == 0:
+                # ── 「承诺未兑现」守卫（2026-09-14 事故后新增，先于 goal 裁决）──
+                # 模型只写了一句"我派/我这就去…"却没发起任何工具调用就停 —— 这不是
+                # 真正的收尾，而是任务从未开始。回注一条提醒让它本轮把话说圆；
+                # 每轮最多拦 PROMISE_GUARD_MAX 次（默认 1），不会死循环。
+                if promise_guard_hits < PROMISE_GUARD_MAX:
+                    promise_hit = _looks_like_unfulfilled_promise(
+                        _text_of_message(response_msg_dict)
+                    )
+                    if promise_hit:
+                        promise_guard_hits += 1
+                        log.warning(
+                            "promise guard: %s%s 拦截第 %d/%d 次 —— 模型承诺了动作"
+                            "（命中 %r）却没发起任何工具调用，回注提醒后继续本轮；"
+                            "正文 %d 字",
+                            self.session_prefix, self.session_id, promise_guard_hits,
+                            PROMISE_GUARD_MAX, promise_hit,
+                            len(_text_of_message(response_msg_dict)),
+                        )
+                        guard_msg = {"role": "user", "content": PROMISE_GUARD_REMINDER}
+                        self.history_messages.append(guard_msg)
+                        self.session_manager.append_message_to_session(
+                            self.session_file, guard_msg
+                        )
+                        continue
+
                 # ── 停止边界（goal 的唯一拦截点，教程称"会话级 Stop 钩子"）──
                 # 模型不再调工具 = 它想停下来。无目标时 evaluate_after_turn
                 # 直接放行（allow），行为与原来完全一致；有目标时先裁决再放行。
@@ -1044,16 +1702,16 @@ class Agent:
                     self.session_manager.append_message_to_session(
                         self.session_file, block_msg
                     )
-                    log.info("goal block: %s%d 评估未达成，回注反馈继续 (%s)",
-                             self.session_prefix, self.session_num, decision.reason[:120])
+                    log.info("goal block: %s%s 评估未达成，回注反馈继续 (%s)",
+                             self.session_prefix, self.session_id, decision.reason[:120])
                     continue
                 if decision.action == "defer":
                     # 后台任务仍在跑：此刻判"达成"不可靠（证据未回来），本轮先结束；
                     # 后台结果由下轮 turn 起点的 collect_background_results 预热
                     # 注入上下文，用户下次输入后再续判。目标保持激活。
                     self._print(f"\033[33m[goal] defer: {decision.reason}\033[0m")
-                    log.info("goal defer: %s%d 后台任务在跑，暂缓判定 (%s)",
-                             self.session_prefix, self.session_num, decision.reason[:120])
+                    log.info("goal defer: %s%s 后台任务在跑，暂缓判定 (%s)",
+                             self.session_prefix, self.session_id, decision.reason[:120])
                     return
                 # 终止态只打印结论供用户感知，目标状态已由控制器内部处理：
                 #   achieved（达成，清目标）/ failed（无法完成，清目标）/
@@ -1061,20 +1719,20 @@ class Agent:
                 #   error（评估器调用出错，目标保持激活）
                 if decision.action == "achieved":
                     self._print(f"\033[33m[goal] achieved: {decision.reason}\033[0m")
-                    log.info("goal achieved: %s%d %s",
-                             self.session_prefix, self.session_num, decision.reason[:120])
+                    log.info("goal achieved: %s%s %s",
+                             self.session_prefix, self.session_id, decision.reason[:120])
                 elif decision.action == "failed":
                     self._print(f"\033[31m[goal] failed: {decision.reason}\033[0m")
-                    log.warning("goal failed: %s%d %s",
-                                self.session_prefix, self.session_num, decision.reason[:120])
+                    log.warning("goal failed: %s%s %s",
+                                self.session_prefix, self.session_id, decision.reason[:120])
                 elif decision.action == "limit":
                     self._print(f"\033[31m[goal] limit: {decision.reason}\033[0m")
-                    log.warning("goal limit: %s%d 连续 block 超上限，强制结束 (%s)",
-                                self.session_prefix, self.session_num, decision.reason[:120])
+                    log.warning("goal limit: %s%s 连续 block 超上限，强制结束 (%s)",
+                                self.session_prefix, self.session_id, decision.reason[:120])
                 elif decision.action == "error":
                     self._print(f"\033[31m[goal] evaluation error: {decision.reason}\033[0m")
-                    log.error("goal 评估器出错: %s%d %s",
-                              self.session_prefix, self.session_num, decision.reason[:120])
+                    log.error("goal 评估器出错: %s%s %s",
+                              self.session_prefix, self.session_id, decision.reason[:120])
                 # allow（无目标）与各终止态 → 走原有 Stop hook 流程
                 # （钩子返回非 None 仍可强制续跑，goal 之外的第二道拦截不受影响）
                 force = self.hook_system.trigger("Stop", self.history_messages)
@@ -1093,11 +1751,9 @@ class Agent:
             # 结果用 {tool_call_id: result} 收集, 最后按 LLM 原始声明顺序回放到 history,
             # 保证 tool 消息顺序与 tool_calls 顺序一致(OpenAI 协议硬约束)。
             tool_call_results: dict[str, dict] = {}
-            used_todo = False
             background_calls, parallel_calls, serial_calls = [], [], []
             for tool_call in response_tool_calls:
-                if tool_call.function.name == "todo":
-                    used_todo = True
+                # （原 used_todo 追踪已随 todo nag 一并删除）
                 # 解析一次参数, 后面复用, 避免每阶段都重复 json.loads
                 raw_args = tool_call.function.arguments
                 tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -1171,6 +1827,20 @@ class Agent:
                 self.hook_system.trigger("PostToolUse", tool_call, tool_call_result)
 
             # 按 LLM 声明顺序回放 tool 消息(三桶结果合并, 严格保序)
+            #
+            # 工具读图（run_read 读到图片/页图，2026-09-21）：它返回的是**图片块**，而
+            # Chat Completions 的 `tool` 消息 `content` 只接受 text part ——
+            # 图片塞不进 tool 消息本身（只有 Anthropic Messages / OpenAI
+            # Responses 支持工具结果带图）。所以职责拆成两半：
+            #   · tool 消息只承载一句**元数据说明**（"已读取 x.png，128KB"），
+            #     用来回答 tool_call_id；
+            #   · 图片块收集起来，在**这一批 tool 消息全部落盘之后**，追加
+            #     **一条**聚合的合成 user 消息。
+            # ⚠️ 顺序是硬约束：绝不能把图片消息插在两条 tool 消息之间 ——
+            # 那会打断 assistant.tool_calls ↔ tool 消息链（协议风险）。
+            # 合成消息带 `_tool_images` marker：落 jsonl 供回放辨认，
+            # 但不在 MODEL_MSG_FIELDS 白名单里，**不会漏进请求体**。
+            tool_image_values: list = []
             for tc in response_tool_calls:
                 result = tool_call_results.get(tc.id)
                 if result is None:
@@ -1178,13 +1848,28 @@ class Agent:
                     result = {"role": "tool", "tool_call_id": tc.id,
                               "content": f"Error: no result for {tc.id}"}
                 content = result.get("content", "")
-                if not isinstance(content, str):
+                if is_tool_image_result(content):
+                    tool_image_values.append(content)
+                    content = tool_image_text(content)
+                elif not isinstance(content, str):
                     content = json.dumps(content, ensure_ascii=False)
                 tool_msg = {"role": "tool", "content": content, "tool_call_id": tc.id}
                 self.history_messages.append(tool_msg)
                 self.session_manager.append_message_to_session(
                     self.session_file, tool_msg
                 )
+
+            if tool_image_values:
+                image_msg = build_tool_images_message(tool_image_values)
+                if image_msg is not None:
+                    self.history_messages.append(image_msg)
+                    self.session_manager.append_message_to_session(
+                        self.session_file, image_msg
+                    )
+                    self._print(
+                        f"  \033[36m[run_read] {len(tool_image_values)} "
+                        f"张图片随下一跳请求发出\033[0m"
+                    )
 
             # 工具回放完成后落盘子智能体执行记录（role=subagent 行，不进 history_messages）
             self._persist_pending_subagent_rows()
@@ -1213,15 +1898,7 @@ class Agent:
             # 后台结果注入后，把已完成后台子智能体的执行记录一并落盘
             self._persist_pending_subagent_rows()
 
-            # todo 更新追踪: 本轮用了 todo 就清零, 否则累加;
-            # 连续 3 轮未更新且仍有 open items 时, 注入提醒作为本轮最后一条消息, 并清零避免重复打扰
-            rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-            if rounds_since_todo >= 3 and self.tools.get_todo_manager().has_open_items():
-                reminder_msg = {"role": "user", "content": "<reminder>Update your tasks.</reminder>"}
-                self.history_messages.append(reminder_msg)
-                self.session_manager.append_message_to_session(
-                    self.session_file, reminder_msg
-                )
-                rounds_since_todo = 0
+            # （原 todo nag 注入块已整段删除 —— 见 rounds_since_todo 声明处注释。
+            #   断点续跑提示现由 _sync_task_board() 在每轮开头按需注入。）
 
         self._print("\033[2;93m[****一个turn循环结束****]\n \033[0m\n")

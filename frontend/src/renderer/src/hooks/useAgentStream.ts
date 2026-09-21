@@ -24,8 +24,9 @@ export function useAgentStream(): void {
       .getConnectionStatus?.()
       .then((s) => setConnection(s as ConnState))
       .catch(() => undefined)
-    // 初次进入查询一次连接与会话
+    // 初次进入查询一次连接与会话（工作空间列表同查：它是侧边栏树的骨架）
     useAgentStore.getState().refreshSessions().catch(() => undefined)
+    useAgentStore.getState().refreshProjects().catch(() => undefined)
     return () => {
       offEvent()
       offStatus()
@@ -41,6 +42,9 @@ export function useAgentStream(): void {
   useEffect(() => {
     if (connection === 'connected') {
       useAgentStore.getState().refreshSessions().catch(() => undefined)
+      // 工作空间列表同样补拉：HMR/Cmd+R 后 store 归零，主进程连接未重建，
+      // 拿不到"新连接重放"的那份 projects，否则侧边栏树整棵消失。
+      useAgentStore.getState().refreshProjects().catch(() => undefined)
       window.agent?.queryStatus?.().catch(() => undefined)
     }
   }, [connection])

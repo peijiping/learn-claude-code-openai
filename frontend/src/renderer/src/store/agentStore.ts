@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ContextStats, HistoryMessage, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, UiEvent, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryMessage, MessageRef, ModelSwitch, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -16,43 +16,84 @@ export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
 export type SettingsTab = 'general' | 'model' | 'trash' | 'about'
 
-/** 会话显示名：无标题（未生成/老会话）回退 session_N */
+/** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
-  return s.title?.trim() || `session_${s.num}`
+  return s.title?.trim() || `session_${s.id}`
+}
+
+/** 默认工作空间 id（后端常量同值；前端用它判"是否默认空间"与兜底分组） */
+export const DEFAULT_PROJECT_ID = 'default'
+
+/** 工作空间显示名：按 id 查名称；查不到（列表未到/已删除）回退 id 本身 */
+export function projectDisplayName(projects: ProjectMeta[], id?: string | null): string {
+  if (!id) return '默认'
+  return projects.find((p) => p.id === id)?.name ?? (id === DEFAULT_PROJECT_ID ? '默认' : id)
+}
+
+/** 会话所属工作空间 id（存量会话缺字段 → default） */
+export function sessionProjectId(s: SessionMeta): string {
+  return s.project || DEFAULT_PROJECT_ID
+}
+
+/** 每个空间默认最多展示的会话条数（超出折叠，末尾给"展开全部"入口） */
+export const SESSION_PREVIEW_LIMIT = 15
+
+/** 展开态持久化（按空间 id 记；缺省 = 展开） */
+const EXPANDED_KEY = 'aigent.workspace.expanded'
+const PREVIEW_KEY = 'aigent.workspace.previewExpanded'
+
+function loadFlagMap(key: string): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, boolean>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveFlagMap(key: string, map: Record<string, boolean>): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(map))
+  } catch {
+    /* 隐私模式等场景忽略：持久化失败不影响本次会话内的展开态 */
+  }
 }
 
 /** 把会话级覆盖（思考档位 + 标准/扩展上下文）解析成后端 chat payload 的 overrides。
  * maxContextOption 的 standard/extended 需结合模型元数据换算成具体窗口字符串。
- * 覆盖参数按模型 id 保存在 overridesByModel map 里，取绑定模型（modelId 缺省回落
- * 全局 active_model_id）对应条目；新建任务（无会话号）同样携带：用户可在空态/新会话
- * 预设对话参数，随首条消息下发生效。 */
+ * 上下文窗口只要模型元数据可查就**始终显式携带**（未选择 = 标准窗口）：
+ * 历史 bug——未选择时不上送 max_context，后端 set_max_context(None) 回落全局
+ * env（如 MAX_CONTEXT_TOKENS=1M），统计/压缩阈值与所选模型真实窗口（如 128k）不符。
+ * 思考档位仍只在用户显式选择时携带；覆盖参数按模型 id 保存在 overridesByModel
+ * map 里，取绑定模型（modelId 缺省回落全局 active_model_id）对应条目；新建任务
+ * （无会话号）同样携带：用户可在空态/新会话预设对话参数，随首条消息下发生效。 */
 export function resolveOverridesPayload(
   llmConfig: LlmConfig | null,
   overridesByModel: SessionOverridesMap | null,
   modelId?: string | null
 ): { thinking_strength?: string; max_context?: string } | undefined {
-  if (!overridesByModel) return undefined
   const modelOf = modelId || llmConfig?.active_model_id
-  const overrides = (modelOf && overridesByModel[modelOf]) || undefined
-  if (!overrides) return undefined
+  const overrides = (modelOf && overridesByModel?.[modelOf]) || undefined
   const payload: { thinking_strength?: string; max_context?: string } = {}
   let hasOverride = false
-  if (overrides.thinkingStrength) {
+  if (overrides?.thinkingStrength) {
     hasOverride = true
     payload.thinking_strength = overrides.thinkingStrength
   }
-  if (overrides.maxContextOption) {
-    // 依据该模型元数据（max_context / max_context_extended）换算窗口字符串
-    const activeModel = (llmConfig?.models ?? []).find((m) => m.id === modelOf)
-    const meta = resolveModelMeta(llmConfig, activeModel)
-    if (meta) {
-      const window = overrides.maxContextOption === 'extended'
-        ? meta.max_context_extended
-        : meta.max_context
-      if (window) {
-        hasOverride = true
-        payload.max_context = window
-      }
+  // 依据该模型元数据（max_context / max_context_extended）换算窗口字符串；
+  // 元数据缺失（无窗口声明的模型）才不携带，后端走全局默认
+  const activeModel = modelOf ? (llmConfig?.models ?? []).find((m) => m.id === modelOf) : undefined
+  const meta = resolveModelMeta(llmConfig, activeModel)
+  if (meta) {
+    const option = overrides?.maxContextOption ?? 'standard'
+    const window = option === 'extended'
+      ? meta.max_context_extended
+      : meta.max_context
+    if (window) {
+      hasOverride = true
+      payload.max_context = window
     }
   }
   return hasOverride ? payload : undefined
@@ -144,10 +185,22 @@ export interface SubAgentMsg {
   error?: string
 }
 
+/** 消息 footer 的 token 统计：turn=本轮消耗（主 + 子智能体），
+ *  session=turn 收尾时的会话级累计快照（实时事件携带；回放仅恢复 turn，缺省不显示第二段），
+ *  model=本轮模型快照（usage_stats 事件 model 字段 / 回放 jsonl model_info 节点） */
+export interface MessageUsage {
+  turn: UsageStats
+  session?: UsageStats
+  model?: TurnModelInfo
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /** 消息记录时间：回放来自 jsonl created_at，实时消息在创建时本地打点
+   *  （秒级 ISO 本地时间，与后端 _now_iso 同构；老会话行缺省不显示） */
+  created_at?: string
   thinking: string
   /** 思考过程是否正在流式输出：thinking_delta 期间 true，正文/工具调用/turn_end 后 false */
   thinkingActive: boolean
@@ -159,27 +212,118 @@ export interface Message {
   subAgentToolIds?: string[]
   activeToolId: string | null
   streaming: boolean
-  usage: Record<string, number>
+  usage: MessageUsage | null
+  /** 模型切换提示（空闲期 model_switch 事件 / 本轮 usage_stats.model.switch /
+   *  回放 model_info.switch），挂到「切换发生时」那条 assistant 消息上 */
+  switch?: ModelSwitch
+  /** user 消息携带的附件（实时由草稿项转成，回放由后端 harvest 而来）。
+   *  图片经 `attachmentUrl()` 转成自定义协议 URL 显示缩略图。 */
+  attachments?: AttachmentRef[]
+  /** user 消息引用的工作空间路径（实时由 `serializeDoc` 收集，回放由后端 harvest）。
+   *  **只有引用没有正文也是合法发送**。与 attachments 是并列且独立的通道。 */
+  refs?: MessageRef[]
 }
+
+/** 输入区的附件草稿项。
+ *  staging = 已提交给后端、等 `attachments_staged` 回填（用 pendingPath 配对）；
+ *  ready = 后端已复制并解析完成，可随消息发送；failed = 该文件被拒（不可发送）。 */
+export interface DraftAttachment {
+  /** 列表 key：staging 期用本地 id（同一文件选两次不会撞），就绪后换成 att_id */
+  key: string
+  /** staging = 已提交给后端、等 `attachments_staged` 回填（用 pendingPath 配对）；
+   *  ready = 后端已复制并解析完成，可随消息发送；
+   *  degraded = 同样可发送，但后端给了 `warnings`（扫描件 / 截断 / 渲染失败…）
+   *             → chip 标琥珀并说明原因，避免发出"解析成功"的假信号；
+   *  failed = 该文件被拒（不可发送）。 */
+  status: 'staging' | 'ready' | 'degraded' | 'failed'
+  attId: string
+  kind: AttachmentKind | ''
+  name: string
+  mime: string
+  ext: string
+  size: number
+  /** 用户原始路径（staging 期是本地路径，就绪后仍是原始路径） */
+  sourcePath: string
+  /** 后端登记时所属工作空间（发送时带上，跨空间也能找回草稿） */
+  projectId: string
+  /** 会话内副本路径（就绪后才有；图片缩略图 / 打开文件用它） */
+  storedPath: string
+  textChars: number
+  textTruncated: boolean
+  /** 解析统计（见 `AttachmentStats`）：chip 文案与降级提示都用它 */
+  pages: number | null
+  images: number
+  tables: number
+  converter: string
+  /** 非空 = 已降级（status 为 'degraded'） */
+  warnings: string[]
+  /** failed 原因（UI 直接展示，不吞掉） */
+  error?: string
+}
+
+/** 该草稿附件是否可随消息发送。
+ *
+ *  只有 `ready` 与 `degraded` 可发：`degraded` = "解析不完整但能用"（扫描件已按图像
+ *  发送、内容被截断…），用户看过琥珀提示后仍应能发出；`staging` 还是半成品、
+ *  `failed` 已被后端拒绝，两者都不能进 payload。
+ *
+ *  **这个判据必须只有一处** —— 曾经 InputBox（按钮可用性）与 ChatPanel（真正构造
+ *  payload）各写了一遍，加 `degraded` 之后只改了前者，于是附件被**静默**从 payload
+ *  里丢掉（后端日志表现为 `chat 派发 … attachments=0`）。这正是本项目要消灭的
+ *  "附件没到模型手里、却没有任何提示"。
+ */
+export function isSendableAttachment(a: DraftAttachment): boolean {
+  return a.status === 'ready' || a.status === 'degraded'
+}
+
+/** 本轮有没有**可发送的内容** —— 正文 / 就绪附件 / 引用 三者任一非空。
+ *
+ *  **这个判据必须只有一处**（与 `isSendableAttachment` 同理，见其上方注释）：
+ *  InputBox 的发送按钮、InputBox 的 Enter 守卫、ChatPanel 构造 payload、
+ *  store.send 的内部守卫，四处都调它；主进程 `agent:send` 的守卫因为跨进程
+ *  无法 import，只能镜像同一条件（多一个 `refs`）—— 那里漏判就等于把消息
+ *  静默丢掉，是本项目已经踩过一次的坑。 */
+export function hasSendableContent(
+  text: string,
+  attachments: DraftAttachment[],
+  refs?: RefInput[] | null
+): boolean {
+  return (
+    (text ?? '').trim().length > 0 ||
+    attachments.some(isSendableAttachment) ||
+    (refs?.length ?? 0) > 0
+  )
+}
+
+let draftSeq = 0
 
 interface AgentState {
   connection: ConnState
   python: PythonState
   /** 当前激活会话的消息投影（= messagesBySession[activeSession] ?? []），组件直接读取 */
   messages: Message[]
-  /** 每个会话各自的独立消息缓冲（单一事实源），多会话并发各自累积、互不覆盖 */
-  messagesBySession: Record<number, Message[]>
-  /** 正在执行 turn 的会话号集合（脉冲运行指示 + 停止按钮状态） */
-  runningSessions: number[]
-  /** turn 已结束但后台任务（如后台子智能体）仍在执行的会话号集合（脉冲运行指示，无停止按钮） */
-  bgSessions: number[]
-  /** 后台完成且尚未查看的会话号集合（侧边栏绿点未读） */
-  completedBg: number[]
-  /** 新建任务（activeSession==null）首条消息的临时草稿缓冲，后端回发 session 号后迁移 */
+  /** 每个会话各自的独立消息缓冲（单一事实源），多会话并发各自累积、互不覆盖；
+   *  键为会话 id（短随机串 / 存量编号字符串） */
+  messagesBySession: Record<string, Message[]>
+  /** 正在执行 turn 的会话 id 集合（脉冲运行指示 + 停止按钮状态） */
+  runningSessions: string[]
+  /** turn 已结束但后台任务（如后台子智能体）仍在执行的会话 id 集合（脉冲运行指示，无停止按钮） */
+  bgSessions: string[]
+  /** 新建任务（activeSession==null）首条消息的临时草稿缓冲，后端回发 session id 后迁移 */
   pendingFresh: Message[] | null
   sessions: SessionMeta[]
+  /** 全部工作空间（`projects` 信封驱动；default 恒第一） */
+  projects: ProjectMeta[]
+  /** 当前活动工作空间 id（后端持久化；chip 显示与新建任务归属的默认值） */
+  activeProject: string
+  /** 侧边栏空间节点的展开态（localStorage 持久化；缺省 = 展开） */
+  expandedProjects: Record<string, boolean>
+  /** 会话列表"超过 15 条折叠"的展开态（按空间记；localStorage 持久化） */
+  previewExpanded: Record<string, boolean>
+  /** 新建任务的目标工作空间（点哪个空间的「+」/ chip 选哪个空间；首条消息随 chat 带上） */
+  pendingProjectId: string | null
   trashSessions: SessionMeta[]
-  activeSession: number | null
+  activeSession: string | null
   isSending: boolean
   settingsOpen: boolean
   settingsTab: SettingsTab
@@ -187,6 +331,14 @@ interface AgentState {
   llmSaving: boolean
   /** 当前激活会话的上下文统计（每轮 turn_end / 切会话时后端下发） */
   currentContextStats: ContextStats | null
+  /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
+   *  圆圈 tooltip 数据源，按会话 id 键控，多会话互不覆盖） */
+  sessionUsageBySession: Record<string, UsageStats>
+  /** 每个会话当前的任务面板快照（task_board 事件**整份替换**，键控会话 id）。
+   *  null = 该会话当前没有未完成任务组（面板不显示）。
+   *  注意 session_history 到来时会先置 null 再等随后的 task_board 覆盖 ——
+   *  否则"切走再切回"会残留上一轮那版 done 快照。 */
+  taskBoardBySession: Record<string, TaskBoardSnapshot | null>
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -196,21 +348,54 @@ interface AgentState {
   lastOverridesByModel: SessionOverridesMap
   toast: string | null
   toastType: 'info' | 'error'
+  /** 输入区附件草稿（三条入口都汇入这里；随消息发送后清空）。
+   *  「仅附件无正文」是合法发送，判定依据就是这里有没有 ready 项。 */
+  draftAttachments: DraftAttachment[]
 
   setConnection: (c: ConnState) => void
   setPython: (p: PythonState) => void
-  send: (text: string) => void
+  /** 发送一轮消息。`attachments` = 本轮随消息发出的**已就绪**草稿附件
+   *  （调用方从 draftAttachments 里筛 status==='ready'）；缺省 = 无附件，
+   *  存量调用不受影响。`refs` = 本轮引用的工作空间路径（零复制，只传路径）。
+   *  正文 / 附件 / 引用**三者不能同时为空**（调用方先用 `hasSendableContent` 判）。 */
+  send: (text: string, attachments?: DraftAttachment[], refs?: RefInput[]) => void
+  /** 把本地绝对路径登记为草稿附件（原生对话框 / 拖拽 / 粘贴三条入口的唯一汇合点）。
+   *  结果经 `attachments_staged` 信封回填（本函数只放占位项，不等回包）。 */
+  stageAttachments: (paths: string[], projectId?: string | null) => Promise<void>
+  /** 移除一个草稿附件（staging 期也可移除；后端草稿由 GC 兜底回收） */
+  removeDraftAttachment: (key: string) => void
+  /** 清空附件草稿（发送后 / 切会话 / 新建任务时调用） */
+  clearDraftAttachments: () => void
   stop: () => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
+  /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
+  refreshProjects: () => Promise<void>
   refreshTrash: () => Promise<void>
-  newSession: () => Promise<void>
-  switchSession: (num: number) => Promise<void>
+  /** 新建任务：清空当前显示回到欢迎空态（可指定归属工作空间）。会话仍由首条消息惰性创建 */
+  newSession: (projectId?: string) => Promise<void>
+  /** 展开/折叠某工作空间的会话列表 */
+  toggleProject: (projectId: string) => void
+  /** 折叠全部工作空间的会话列表（任务列表头部「收起」） */
+  collapseAllProjects: () => void
+  /** 展开/收起某工作空间"超过 15 条折叠"的完整会话列表 */
+  toggleSessionPreview: (projectId: string) => void
+  /** 切换活动工作空间（后端持久化 + 广播 projects） */
+  openProject: (projectId: string) => Promise<void>
+  /** 弹目录选择框并登记为新工作空间（成功则打开并回到新任务态） */
+  addProjectFromPicker: () => Promise<void>
+  renameProject: (projectId: string, name: string) => Promise<void>
+  /** 删除工作空间（只删元数据；调用方需先确认） */
+  removeProject: (projectId: string) => Promise<void>
+  /** 在系统文件管理器中定位该工作空间的真实目录 */
+  revealProject: (projectId: string) => Promise<void>
+  switchSession: (sessionId: string) => Promise<void>
+  setSessionUnread: (sessionId: string, unread?: boolean) => Promise<void>
   clearSession: () => Promise<void>
-  renameSession: (num: number, title: string) => Promise<void>
-  trashSession: (num: number) => Promise<void>
-  restoreSession: (num: number) => Promise<void>
-  deleteSessions: (nums: number[]) => Promise<void>
+  renameSession: (sessionId: string, title: string) => Promise<void>
+  trashSession: (sessionId: string) => Promise<void>
+  restoreSession: (sessionId: string) => Promise<void>
+  deleteSessions: (ids: string[]) => Promise<void>
   openSettings: (tab?: SettingsTab) => void
   closeSettings: () => void
   loadLlConfig: () => Promise<void>
@@ -232,12 +417,120 @@ interface AgentState {
 let msgSeq = 0
 const mid = (): string => `m${++msgSeq}`
 
+/** 本地时间秒级 ISO（与后端 _now_iso 同构：2026-09-18T10:30:00），
+ *  实时消息创建时打点；回放时以 jsonl created_at 为准 */
+function nowLocalIso(): string {
+  const d = new Date()
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 /** 去重追加（不可变数组） */
-function addUnique(arr: number[], n: number): number[] {
+function addUnique(arr: string[], n: string): string[] {
   return arr.includes(n) ? arr : [...arr, n]
 }
 
-function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
+/** 就地更新某会话的 unread 标记（值无变化时返回原数组，避免触发重渲染） */
+function patchSessionUnread(sessions: SessionMeta[], sessionId: string, unread: boolean): SessionMeta[] {
+  if (!sessions.some((x) => x.id === sessionId && x.unread !== unread)) return sessions
+  return sessions.map((x) => (x.id === sessionId ? { ...x, unread } : x))
+}
+
+/**
+ * 会话内附件副本 → 渲染层可用的 URL。
+ *
+ * 渲染层拿不到 `file://`（contextIsolation + CSP），所以走主进程注册的
+ * `aigent-att://` 自定义协议。**按 (空间, att_id) 寻址而不是按路径**：附件在发送
+ * 时会从 `.attachments/_draft/` 迁到 `.attachments/<会话>/`，路径会变；按 id 检索
+ * 由主进程负责，缩略图因此跨越迁移稳定。主进程只放行 `.attachments` 目录内的
+ * 真实文件（形状白名单 + 符号链接解引后复检），非法一律 404。
+ */
+export function attachmentUrl(projectId: string, attId: string): string | null {
+  if (!projectId || !attId) return null
+  return `aigent-att://local/?pid=${encodeURIComponent(projectId)}&id=${encodeURIComponent(attId)}`
+}
+
+/** 附件大小显示（与后端 attachments.human_size 口径一致） */
+export function humanSize(size: number): string {
+  if (!size || size < 0) return ''
+  let v = size
+  for (const unit of ['B', 'KB', 'MB', 'GB']) {
+    if (v < 1024 || unit === 'GB') {
+      return unit === 'B' ? `${Math.round(v)}B` : `${v.toFixed(1)}${unit}`
+    }
+    v /= 1024
+  }
+  return `${v.toFixed(1)}GB`
+}
+
+/** 路径 → 文件名（错误提示用；不判平台，两种分隔符都切） */
+function fileBaseName(p: string): string {
+  return p.split(/[/\\]/).pop() || p
+}
+
+/** 草稿附件 → 发送用的最小线索（后端以磁盘上的 meta.json 为准，这些只是线索） */
+function draftToInput(a: DraftAttachment): ChatAttachmentInput {
+  return {
+    att_id: a.attId,
+    kind: a.kind,
+    name: a.name,
+    mime: a.mime,
+    ext: a.ext,
+    size: a.size,
+    ...(a.projectId ? { project_id: a.projectId } : {})
+  }
+}
+
+/** 草稿附件 → 消息附件（乐观渲染用：发送时立刻把缩略图显示出来，不等回放） */
+function draftToRef(a: DraftAttachment): AttachmentRef {
+  return {
+    id: a.attId,
+    kind: a.kind,
+    name: a.name,
+    mime: a.mime,
+    ext: a.ext,
+    size: a.size,
+    source_path: a.sourcePath,
+    stored_path: a.storedPath,
+    text_chars: a.textChars,
+    text_truncated: a.textTruncated,
+    pages: a.pages,
+    images: a.images,
+    tables: a.tables,
+    converter: a.converter,
+    warnings: a.warnings
+  }
+}
+
+/** `attachments_staged` 的一条成功项 → 草稿项 */
+function stagedToDraft(it: StagedAttachment): DraftAttachment {
+  // 后端给了 warnings 就是"能发，但解析不完整" —— 标 degraded 而不是 ready，
+  // 否则 chip 会显示成"解析成功"，正是本次事故里误导性反馈的来源。
+  // 兼容没有该字段的老后端：`?? []`。
+  const warnings = it.warnings ?? []
+  return {
+    key: it.att_id,
+    status: warnings.length > 0 ? 'degraded' : 'ready',
+    attId: it.att_id,
+    kind: it.kind,
+    name: it.name,
+    mime: it.mime,
+    ext: it.ext,
+    size: it.size,
+    sourcePath: it.source_path,
+    projectId: it.project_id,
+    storedPath: '',
+    textChars: it.text_chars,
+    textTruncated: it.text_truncated,
+    pages: it.pages ?? null,
+    images: it.images ?? 0,
+    tables: it.tables ?? 0,
+    converter: it.converter ?? '',
+    warnings
+  }
+}
+
+function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
   return hist.map((m, i) => {
     // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
     // 数据未落盘），则从主 toolCalls 里的 sub_agent 调用派生一张基础卡片，
@@ -249,7 +542,7 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
       thinkingActive: false,
       // 工具 id 优先用后端给出的 tool_id（实时/回放同一 id，便于按 id 归位）
       toolCalls: (s.toolCalls ?? []).map((t, l) => ({
-        id: t.tool_id || `h${num}_${i}_s${k}_${l}`,
+        id: t.tool_id || `h${sid}_${i}_s${k}_${l}`,
         name: t.name,
         args: t.args,
         status: t.status === 'running' ? ('running' as const) : ('done' as const)
@@ -264,7 +557,7 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
     // 主 toolCalls 里的 sub_agent 调用 → 从中派生兜底卡片（含 prompt 作为名称），并从 toolCalls 剥离
     const subCalls = (m.toolCalls ?? []).filter((t) => t.name === 'sub_agent')
     const derivedSubs = subCalls.map((call, k) => ({
-      id: `h${num}_${i}_submain_${k}`,
+      id: `h${sid}_${i}_submain_${k}`,
       name: subAgentNameFromArgs(call.args),
       thinking: '',
       thinkingActive: false,
@@ -275,13 +568,15 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
     const subagents = backendSubs.length ? backendSubs : derivedSubs
     const normalCalls = (m.toolCalls ?? []).filter((t) => t.name !== 'sub_agent')
     return {
-      id: `h${num}_${i}`,
+      id: `h${sid}_${i}`,
       role: m.role,
       content: m.content ?? '',
+      // 回放：消息记录时间来自 jsonl created_at（老行缺省 → 右下角不显示）
+      created_at: m.created_at ?? undefined,
       thinking: m.thinking ?? '',
       thinkingActive: false,
       toolCalls: normalCalls.map((t, j) => ({
-        id: `h${num}_${i}_${j}`,
+        id: `h${sid}_${i}_${j}`,
         name: t.name,
         args: t.args,
         status: t.status === 'running' ? ('running' as const) : ('done' as const)
@@ -289,7 +584,22 @@ function historyToMessage(num: number, hist: HistoryMessage[]): Message[] {
       activeToolId: null,
       streaming: false,
       subagents,
-      usage: {}
+      // 回放：jsonl 轮末 assistant 行携带的 usage / model_info / usage_session →
+      // footer 第一段（本轮 + 本轮模型）+ 第二段「本会话累计」（usage_session 快照，
+      // 与实时 usage_stats 同构，老会话缺省不显示第二段）
+      usage: m.usage && m.usage.total_tokens
+        ? {
+            turn: m.usage,
+            model: m.model_info ?? undefined,
+            session: m.usage_session ?? undefined
+          }
+        : null,
+      // 回放：空闲期/本轮切换提示，落到「切换发生时」的 assistant 消息上
+      switch: m.model_info?.switch ?? undefined,
+      // 回放：user 消息携带的附件（后端从 content 引用块 harvest；无附件不带该字段）
+      ...(m.attachments && m.attachments.length ? { attachments: m.attachments } : {}),
+      // 回放：user 消息引用的工作空间路径（同上，无引用时后端连字段都不发）
+      ...(m.refs && m.refs.length ? { refs: m.refs } : {})
     }
   })
 }
@@ -310,8 +620,7 @@ function subAgentNameFromArgs(args: string): string {
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 
 /** 显示 Toast 并自动消失（info 默认 3s，error 默认 4s）。函数声明提升，运行时 useAgentStore 已初始化 */
-export function showToast(msg: string, type: 'info' | 'error' = 'info', ms = 3000): void {
-  if (toastTimer) clearTimeout(toastTimer)
+export function showToast(msg: string, type: 'info' | 'error' = 'info', ms = 3000): void {  if (toastTimer) clearTimeout(toastTimer)
   useAgentStore.setState({ toast: msg, toastType: type })
   toastTimer = setTimeout(() => {
     toastTimer = null
@@ -336,7 +645,7 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso() }
     ]
     return id
   }
@@ -406,12 +715,26 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
       }))
       break
     case 'turn_end':
+      // usage 不在此写：轮级/会话级统计由随后的 usage_stats 事件统一携带
+      //（避免显示"最后一次 LLM 调用"的错误数字）
       msgs = msgs.map((m) =>
         m.role === 'assistant' && m.streaming
-          ? { ...m, streaming: false, usage: ev.usage ?? {}, activeToolId: null, thinkingActive: false }
+          ? { ...m, streaming: false, activeToolId: null, thinkingActive: false }
           : m
       )
       break
+    case 'model_switch': {
+      // 空闲期切换：把切换提示挂到「切换时最后一条 assistant 消息」（即当前
+      // 缓冲末尾那条 assistant）上，先于用户下一条指令展示；无 assistant 不挂。
+      const sw = ev.switch
+      if (!sw || sw.from_id === sw.to_id) break
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role !== 'assistant') continue
+        msgs = msgs.map((m, idx) => (idx === i ? { ...m, switch: sw } : m))
+        break
+      }
+      break
+    }
   }
   return msgs
 }
@@ -446,7 +769,7 @@ function applySubagentEvent(msgs: Message[], ev: AgentEvent): Message[] {
     const id = mid()
     msgs = [
       ...msgs,
-      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {} }
+      { id, role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso() }
     ]
     return id
   }
@@ -613,9 +936,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   messagesBySession: {},
   runningSessions: [],
   bgSessions: [],
-  completedBg: [],
   pendingFresh: null,
   sessions: [],
+  projects: [],
+  activeProject: DEFAULT_PROJECT_ID,
+  expandedProjects: loadFlagMap(EXPANDED_KEY),
+  previewExpanded: loadFlagMap(PREVIEW_KEY),
+  pendingProjectId: null,
   trashSessions: [],
   activeSession: null,
   isSending: false,
@@ -624,12 +951,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   llmConfig: null,
   llmSaving: false,
   currentContextStats: null,
+  sessionUsageBySession: {},
+  taskBoardBySession: {},
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
   lastOverridesByModel: {},
   toast: null,
   toastType: 'info',
+  draftAttachments: [],
 
   setConnection: (c) =>
     set((s) => {
@@ -644,38 +974,117 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }),
   setPython: (p) => set({ python: p }),
 
-  send: (text) => {
+  send: (text, attachments, refInputs) => {
     const t = text.trim()
-    if (!t || get().isSending) return
-    const num = get().activeSession
+    const atts = attachments ?? []
+    const refs = refInputs ?? []
+    // 「仅附件无正文」「仅引用无正文」都是合法发送：三者同时为空才拦下。
+    // （历史 bug：后端 main/index.ts 曾用 !payload.text 直接丢弃这类消息。）
+    if (!hasSendableContent(t, atts, refs) || get().isSending) return
+    const sid = get().activeSession
     const modelId = get().sessionModelId
+    // 新建任务的归属工作空间（点「+」/ chip 选定；未指定 = 后端当前活动空间）
+    const projectId = sid === null ? (get().pendingProjectId ?? get().activeProject) : null
     const ov = resolveOverridesPayload(get().llmConfig, get().overridesByModel, modelId)
+    // 乐观渲染：把本轮附件与引用直接挂到 user 消息上（缩略图 / 引用胶囊立即出现）。
+    // 缩略图按 (空间, att_id) 寻址 → 草稿区→会话目录的迁移不会让它失效；
+    // 后端回放时的形状一致，切走再切回不跳变。
+    const attRefs = atts.map(draftToRef)
+    // 引用没有 id 概念，按 path 去重（与后端 normalize_refs 同一口径）
+    const msgRefs: MessageRef[] = []
+    const seenRefs = new Set<string>()
+    for (const r of refs) {
+      const path = String(r?.path ?? '')
+      if (!path || seenRefs.has(path)) continue
+      seenRefs.add(path)
+      msgRefs.push({ path, name: String(r?.name ?? ''), is_dir: !!r?.is_dir })
+    }
     const userMsg: Message = {
-      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: {}
+      id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso(),
+      ...(attRefs.length ? { attachments: attRefs } : {}),
+      ...(msgRefs.length ? { refs: msgRefs } : {})
     }
     const assMsg: Message = {
-      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: {}
+      id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso()
     }
     set((s) => {
-      // 新建任务（尚无会话号）：首条消息进临时草稿缓冲，等后端 session 信封迁移
-      if (num === null) {
+      const cleared = { draftAttachments: [] as DraftAttachment[] }
+      // 新建任务（尚无会话 id）：首条消息进临时草稿缓冲，等后端 session 信封迁移
+      if (sid === null) {
         const pendingFresh = [userMsg, assMsg]
-        return { ...s, pendingFresh, messages: pendingFresh, isSending: true }
+        return { ...s, ...cleared, pendingFresh, messages: pendingFresh, isSending: true }
       }
-      const buf = s.messagesBySession[num] ?? []
-      const messagesBySession = { ...s.messagesBySession, [num]: [...buf, userMsg, assMsg] }
-      const messages = messagesBySession[num]
-      return { ...s, messagesBySession, messages, isSending: true }
+      const buf = s.messagesBySession[sid] ?? []
+      const messagesBySession = { ...s.messagesBySession, [sid]: [...buf, userMsg, assMsg] }
+      const messages = messagesBySession[sid]
+      return { ...s, ...cleared, messagesBySession, messages, isSending: true }
     })
-    // 发送实际交给后端：fresh 时后端领号并回发 session 信封，前端据此迁移草稿
-    window.agent.send(t, num, ov, modelId).catch(() => set({ isSending: false }))
+    // 发送实际交给后端：fresh 时后端生成短 id 并回发 session 信封，前端据此迁移草稿；
+    // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）；
+    // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位；
+    // refs 只带路径，后端做越界校验后挂中性引用块（**不复制、不读内容**）。
+    window.agent
+      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs)
+      .catch(() => set({ isSending: false }))
   },
 
+  stageAttachments: async (paths, projectId) => {
+    const list = (paths ?? []).map((p) => String(p || '').trim()).filter(Boolean)
+    if (list.length === 0) return
+    // 目标工作空间口径与发送一致：已有会话跟随其归属，新建任务用「+」/chip 选定值
+    const sid = get().activeSession
+    const pid =
+      projectId ??
+      (sid === null ? (get().pendingProjectId ?? get().activeProject) : get().activeProject)
+    // 占位项：让用户立刻看到"正在读取…"，后端回包按 source_path 配对替换
+    const placeholders: DraftAttachment[] = list.map((p) => ({
+      key: `d${++draftSeq}`,
+      status: 'staging',
+      attId: '',
+      kind: '',
+      name: fileBaseName(p),
+      mime: '',
+      ext: '',
+      size: 0,
+      sourcePath: p,
+      projectId: pid,
+      storedPath: '',
+      textChars: 0,
+      textTruncated: false,
+      pages: null,
+      images: 0,
+      tables: 0,
+      converter: '',
+      warnings: []
+    }))
+    set((s) => ({ ...s, draftAttachments: [...s.draftAttachments, ...placeholders] }))
+    try {
+      await window.agent.stageAttachments({ paths: list, projectId: pid })
+    } catch {
+      // IPC 层就失败了：把这批占位项就地标失败（否则永远转圈）
+      const failedPaths = new Set(list)
+      set((s) => ({
+        ...s,
+        draftAttachments: s.draftAttachments.map((a) =>
+          a.status === 'staging' && failedPaths.has(a.sourcePath)
+            ? { ...a, status: 'failed' as const, error: '添加失败：后端无响应' }
+            : a
+        )
+      }))
+      showToast('添加附件失败：后端无响应', 'error', 4000)
+    }
+  },
+
+  removeDraftAttachment: (key) =>
+    set((s) => ({ ...s, draftAttachments: s.draftAttachments.filter((a) => a.key !== key) })),
+
+  clearDraftAttachments: () => set({ draftAttachments: [] }),
+
   stop: () => {
-    const num = get().activeSession
+    const sid = get().activeSession
     const clearStreaming = (m: Message): Message =>
       m.role === 'assistant' && m.streaming ? { ...m, streaming: false, activeToolId: null } : m
-    if (num === null) {
+    if (sid === null) {
       // 新建任务草稿态：仅本地清流式标记（后端会话尚未建立，无需 stop 命令）
       set((s) => {
         if (!s.pendingFresh) return s
@@ -684,15 +1093,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       })
       return
     }
-    // 真实停止：通知后端只停当前显示会话这一轮（其它后台会话不受影响）
-    window.agent.stop(num)
+    // 真实停止：通知后端只停当前显示会话这一轮与它的后台任务（其它会话不受影响）。
+    // background 态（turn 已结束、后台子智能体还在跑）也在停止范围内。
+    window.agent.stop(sid)
     set((s) => {
-      const buf = (s.messagesBySession[num] ?? []).map(clearStreaming)
+      const buf = (s.messagesBySession[sid] ?? []).map(clearStreaming)
       return {
         ...s,
-        messagesBySession: { ...s.messagesBySession, [num]: buf },
-        messages: s.activeSession === num ? buf : s.messages,
-        runningSessions: s.runningSessions.filter((n) => n !== num),
+        messagesBySession: { ...s.messagesBySession, [sid]: buf },
+        messages: s.activeSession === sid ? buf : s.messages,
+        runningSessions: s.runningSessions.filter((n) => n !== sid),
+        bgSessions: s.bgSessions.filter((n) => n !== sid),
         isSending: false
       }
     })
@@ -700,15 +1111,40 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   handleEvent: (ev) => {
     if (ev.kind === 'event') {
-      // 按 session_num 路由到对应会话缓冲；后台会话增量各自累积，显示会话投影实时更新
+      // 按 session_id 路由到对应会话缓冲；后台会话增量各自累积，显示会话投影实时更新
       const aev = ev.payload as AgentEvent
-      const num = aev.session_num
-      if (typeof num !== 'number') return
+      const sid = aev.session_id
+      if (typeof sid !== 'string' || !sid) return
       set((s) => {
-        const next = applyAgentEventBuffer(s.messagesBySession[num] ?? [], aev)
-        const messagesBySession = { ...s.messagesBySession, [num]: next }
-        const messages = s.activeSession === num ? next : s.messages
-        return { ...s, messagesBySession, messages }
+        const next = applyAgentEventBuffer(s.messagesBySession[sid] ?? [], aev)
+        let messagesBySession = { ...s.messagesBySession, [sid]: next }
+        let messages = s.activeSession === sid ? next : s.messages
+        // token 消耗统计：session 级写入圆圈 tooltip 数据源；带 turn 时同步写入
+        // 该会话末条 assistant 消息 footer（{turn, session} 快照，回放同构）。
+        // turn 缺省 = 后台子智能体迟到完成的补发（只刷 tooltip，不动 footer）。
+        let sessionUsageBySession = s.sessionUsageBySession
+        if (aev.type === 'usage_stats') {
+          const u = aev.usage as UsageStatsEventUsage | undefined
+          if (u && u.session && u.session.total_tokens !== undefined) {
+            sessionUsageBySession = { ...sessionUsageBySession, [sid]: u.session }
+            if (u.turn && u.turn.total_tokens) {
+              const buf = messagesBySession[sid] ?? []
+              for (let i = buf.length - 1; i >= 0; i--) {
+                if (buf[i].role !== 'assistant') continue
+                const patched = [...buf]
+                patched[i] = {
+                  ...patched[i],
+                  usage: { turn: u.turn, session: u.session, model: u.model },
+                  switch: u.model?.switch ?? patched[i].switch
+                }
+                messagesBySession = { ...messagesBySession, [sid]: patched }
+                messages = s.activeSession === sid ? patched : s.messages
+                break
+              }
+            }
+          }
+        }
+        return { ...s, messagesBySession, messages, sessionUsageBySession }
       })
       return
     }
@@ -717,26 +1153,58 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         const payload = ev.payload as { sessions?: SessionMeta[] } | SessionMeta[] | null
         const raw = Array.isArray(payload) ? payload : payload?.sessions
         if (!Array.isArray(raw)) break
-        set({ sessions: raw as SessionMeta[] })
+        const list = raw as SessionMeta[]
+        // 活动空间与"当前正在看的会话"必须一致：列表是权威（每条带真实 project），
+        // 若两者不符（比如别处把活动空间改了），以会话归属为准 —— 否则 chip 会
+        // 显示成另一个空间，接下来的「+」会把新任务建到那个空间去。
+        const cur = get().activeSession
+        const curPid = cur ? list.find((x) => x.id === cur)?.project : undefined
+        set((s) => ({
+          sessions: list,
+          ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
+        }))
+        break
+      }
+      case 'projects': {
+        // 工作空间列表（连接重放 / 增删改后广播）。**整份替换**（幂等）。
+        // 会话列表不在这里动：它是另一条信封（sessions），两者独立刷新。
+        const payload = ev.payload as ProjectsPayload | null
+        if (!payload || !Array.isArray(payload.projects)) break
+        const active = payload.active || DEFAULT_PROJECT_ID
+        set((s) => {
+          // 活动空间被删/失效时后端已回落到 default（payload.active），跟随即可；
+          // 若前端"新建任务"停在了一个已消失的空间，一并复位到 default，
+          // 否则首条消息会带着一个不存在的 project_id 发出去。
+          const alive = payload.projects.some((p) => p.id === s.pendingProjectId)
+          return {
+            projects: payload.projects,
+            activeProject: active,
+            pendingProjectId: alive ? s.pendingProjectId : null
+          }
+        })
         break
       }
       case 'session': {
-        const num = (ev.payload as { num?: number })?.num
-        if (typeof num !== 'number') break
+        const sp = ev.payload as { session_id?: string; project_id?: string } | null
+        const sid = sp?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        const newPid = typeof sp?.project_id === 'string' && sp.project_id ? sp.project_id : null
         const wasFresh = get().pendingFresh !== null
         set((s) => {
-          // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话号）
+          // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话 id）
           let messagesBySession = s.messagesBySession
-          if (s.pendingFresh !== null && s.activeSession !== num) {
-            messagesBySession = { ...messagesBySession, [num]: s.pendingFresh }
+          if (s.pendingFresh !== null && s.activeSession !== sid) {
+            messagesBySession = { ...messagesBySession, [sid]: s.pendingFresh }
           }
           return {
             ...s,
-            activeSession: num,
+            activeSession: sid,
             pendingFresh: null,
             messagesBySession,
-            messages: messagesBySession[num] ?? [],
-            isSending: s.runningSessions.includes(num)
+            messages: messagesBySession[sid] ?? [],
+      isSending: s.runningSessions.includes(sid) || s.bgSessions.includes(sid),
+      // 活动空间对齐到新会话的归属（点空间 B 的「+」新建时，活动空间可能还停在 A）
+            ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {})
           }
         })
         // 新建会话由首条消息落号：把当前选定的模型与按模型参数覆盖写入该会话元数据
@@ -744,40 +1212,47 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         // 单轮 resolved overrides，不写元数据）。
         if (wasFresh) {
           window.agent.setSessionModel({
-            num,
+            session_id: sid,
             model_id: get().sessionModelId,
             overrides: toBackendOverrides(get().overridesByModel)
           }).catch(() => {})
         }
+        // 让后端"活动空间"跟上新会话的归属：否则下一次 projects 广播会把 chip 拉回旧空间
+        if (newPid) void window.agent.openProject(newPid)
         break
       }
       case 'session_status': {
-        const p = ev.payload as { num: number; status: SessionRunStatus }
+        const p = ev.payload as { session_id: string; status: SessionRunStatus }
+        // 会话完整结束（done/stopped）：用户当前不在查看它 → 标记未读并持久化；
+        // 正在查看它 → 保持/置为已读（未读语义 = 「有新产出但还没点到它」）。
+        if (p.status === 'done' || p.status === 'stopped') {
+          const unread = p.session_id !== get().activeSession
+          void get().setSessionUnread(p.session_id, unread)
+        }
         set((s) => {
-          // running：turn 执行中（脉冲点 + 停止按钮）；background：turn 已结束
-          // 但后台任务仍在执行（脉冲点，无停止按钮）；done/stopped：全部复位
+          // running：turn 执行中；background：turn 已结束但后台任务仍在执行。
+          // 两者都算"执行中"——侧栏脉冲点与发送按钮的停止态共用同一判据
+          // （2026-09-21 起 background 也显示停止按钮，点击会连后台任务一起停）；
+          // done/stopped：全部复位。未读/已读状态由元数据（sessions[].unread）
+          // 持久化驱动，不做前端内存态。
           const runningSessions =
             p.status === 'running'
-              ? addUnique(s.runningSessions, p.num)
-              : s.runningSessions.filter((n) => n !== p.num)
+              ? addUnique(s.runningSessions, p.session_id)
+              : s.runningSessions.filter((n) => n !== p.session_id)
           const bgSessions =
             p.status === 'background'
-              ? addUnique(s.bgSessions, p.num)
+              ? addUnique(s.bgSessions, p.session_id)
               : p.status === 'done' || p.status === 'stopped'
-                ? s.bgSessions.filter((n) => n !== p.num)
+                ? s.bgSessions.filter((n) => n !== p.session_id)
                 : s.bgSessions
-          let completedBg = s.completedBg
-          if (p.status === 'done' || p.status === 'stopped') {
-            // 执行完成（后台任务也结束后）且当前显示的不是它 → 绿点未读；切到该会话即清除
-            if (p.num !== s.activeSession) completedBg = addUnique(completedBg, p.num)
-            else completedBg = completedBg.filter((n) => n !== p.num)
-          }
           return {
             ...s,
             runningSessions,
             bgSessions,
-            completedBg,
-            isSending: runningSessions.includes(s.activeSession ?? -1)
+            isSending:
+              s.activeSession !== null &&
+              (runningSessions.includes(s.activeSession) ||
+                bgSessions.includes(s.activeSession))
           }
         })
         break
@@ -788,40 +1263,82 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_delete_result': {
-        const payload = ev.payload as { deleted?: number[]; failed?: number[] } | null
+        const payload = ev.payload as { deleted?: string[]; failed?: string[] } | null
         const deleted = payload?.deleted?.length ?? 0
         const failed = payload?.failed?.length ?? 0
         if (deleted > 0) showToast(`已彻底删除 ${deleted} 个会话`, 'info')
         if (failed > 0) showToast(`${failed} 个会话删除失败`, 'error', 4000)
         break
       }
+      case 'attachments_staged': {
+        // 附件登记结果（应答 attachment_stage）：按 source_path 与本地占位项配对。
+        // 单条失败不影响整批 —— 成功项照常可用，失败项就地标红并给出原因，
+        // 用户不必猜"为什么这个文件没了"。
+        const p = ev.payload as AttachmentsStagedPayload | null
+        if (!p || !Array.isArray(p.items)) break
+        const okByPath = new Map(p.items.map((it) => [it.source_path, it]))
+        const failByPath = new Map((p.failed ?? []).map((f) => [f.path, f.reason]))
+        set((s) => ({
+          ...s,
+          draftAttachments: s.draftAttachments.map((a) => {
+            if (a.status !== 'staging') return a
+            const it = okByPath.get(a.sourcePath)
+            if (it) return stagedToDraft(it)
+            const reason = failByPath.get(a.sourcePath)
+            if (reason !== undefined) {
+              return { ...a, status: 'failed' as const, error: reason }
+            }
+            // 不属于本批（另一批仍在途中）→ 保持 staging 等自己的回包
+            return a
+          })
+        }))
+        for (const f of p.failed ?? []) {
+          showToast(`无法添加「${fileBaseName(f.path)}」：${f.reason}`, 'error', 5000)
+        }
+        break
+      }
       case 'session_history': {
-        const payload = ev.payload as { num?: number; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null } | null
-        if (typeof payload?.num !== 'number' || !Array.isArray(payload.messages)) break
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } | null
+        if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { num: number; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null }
+          // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
+          // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
+          // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
+          // 违反"会话切换/复现时仅显示正在执行的组"。
+          const taskBoardBySession = { ...s.taskBoardBySession, [p.session_id]: null }
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
-          const buf = s.messagesBySession[p.num] ?? []
+          const buf = s.messagesBySession[p.session_id] ?? []
           const hasLive =
-            (s.runningSessions.includes(p.num) || s.bgSessions.includes(p.num)) &&
+            (s.runningSessions.includes(p.session_id) || s.bgSessions.includes(p.session_id)) &&
             buf.length > 0
-          if (hasLive) return s
-          const histBuf = historyToMessage(p.num, p.messages)
-          const messagesBySession = { ...s.messagesBySession, [p.num]: histBuf }
-          const messages = s.activeSession === p.num ? histBuf : s.messages
+          if (hasLive) return { ...s, taskBoardBySession }
+          const histBuf = historyToMessage(p.session_id, p.messages)
+          const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
+          const messages = s.activeSession === p.session_id ? histBuf : s.messages
+          // 会话级累计从元数据恢复（null=老会话无统计，清除避免残留旧值）
+          let sessionUsageBySession = s.sessionUsageBySession
+          if (p.usage_totals) {
+            sessionUsageBySession = { ...sessionUsageBySession, [p.session_id]: p.usage_totals }
+          } else {
+            const { [p.session_id]: _drop, ...rest } = sessionUsageBySession
+            sessionUsageBySession = rest
+          }
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
-          if (s.activeSession !== p.num) {
-            return { ...s, messagesBySession, messages }
+          if (s.activeSession !== p.session_id) {
+            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession }
           }
           return {
             ...s,
             messagesBySession,
             messages,
+            sessionUsageBySession,
             sessionModelId: p.model_id || s.sessionModelId,
             overridesByModel,
+            taskBoardBySession,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
             lastOverridesByModel: overridesByModel,
           }
@@ -840,9 +1357,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'context_stats': {
-        const p = ev.payload as { num: number } & ContextStats
+        const p = ev.payload as { session_id: string } & ContextStats
         // 仅当是本会话（当前显示会话）时更新，避免后台会话统计串台
-        if (p.num !== get().activeSession) break
+        if (p.session_id !== get().activeSession) break
         set({
           currentContextStats: {
             used_tokens: p.used_tokens,
@@ -850,6 +1367,22 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             used_percent: p.used_percent,
             max_label: p.max_label,
           }
+        })
+        break
+      }
+      case 'task_board': {
+        const p = ev.payload as { session_id?: string; board?: TaskBoardSnapshot | null } | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const prev = s.taskBoardBySession[sid]
+          const next = p?.board ?? null
+          // 同组内丢弃乱序/过期快照：后台子智能体在 daemon 线程里改任务，
+          // 多线程推送可能乱序到达；revision 组内单调递增，更小的直接丢。
+          if (prev && next && prev.group_id === next.group_id && next.revision < prev.revision) {
+            return s
+          }
+          return { ...s, taskBoardBySession: { ...s.taskBoardBySession, [sid]: next } }
         })
         break
       }
@@ -871,6 +1404,18 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 
+  /** 工作空间列表：后端收到 projects_list 后会广播 `projects`（主进程同管道转发），
+   *  渲染层在 handleEvent 的 'projects' 分支落库；这里的返回值只作兜底。 */
+  refreshProjects: async () => {
+    try {
+      const payload = (await window.agent.listProjects()) as ProjectsPayload | null
+      if (!payload?.projects) return
+      set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
+    } catch {
+      /* 后端未就绪时忽略：连接建立后后端会主动重放 projects */
+    }
+  },
+
   refreshTrash: async () => {
     try {
       const list = (await window.agent.listTrash()) as SessionMeta[]
@@ -882,8 +1427,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   /** 新建任务：纯前端行为——清空当前显示与草稿、回到欢迎空态；jsonl 由首条消息发送时惰性创建。
-   * 继承上一会话最后选择的模型与按模型参数覆盖（主流智能体行为），随首条消息持久化进新会话元数据。 */
-  newSession: () => {
+   * 继承上一会话最后选择的模型与按模型参数覆盖（主流智能体行为），随首条消息持久化进新会话元数据。
+   * `projectId`：目标工作空间（侧边栏「+」/ chip 下拉）；缺省沿用当前活动空间。 */
+  newSession: (projectId) => {
     set((s) => ({
       messages: [],
       activeSession: null,
@@ -891,60 +1437,187 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       isSending: false,
       currentContextStats: null,
       sessionModelId: s.lastSessionModelId,
-      overridesByModel: s.lastOverridesByModel
+      overridesByModel: s.lastOverridesByModel,
+      pendingProjectId: projectId ?? s.pendingProjectId ?? s.activeProject,
+      // 新建任务 = 换一条消息，附件草稿必须跟着清（否则会把上一个任务的附件带过去）。
+      // 未发送的草稿文件由后端 GC 兜底回收。
+      draftAttachments: []
     }))
     return Promise.resolve()
   },
-  switchSession: async (num) => {
+
+  toggleProject: (projectId) => {
+    set((s) => {
+      // 缺省（未记录）= 展开：首次点击变成"折叠"，符合直觉
+      const expanded = s.expandedProjects[projectId] !== false
+      const next = { ...s.expandedProjects, [projectId]: !expanded }
+      saveFlagMap(EXPANDED_KEY, next)
+      return { expandedProjects: next }
+    })
+  },
+
+  /** 一键收起：把所有工作空间节点都置为折叠态并持久化 */
+  collapseAllProjects: () => {
+    const ids = get().projects.map((p) => p.id)
+    if (ids.length === 0) return
+    set((s) => {
+      const next = { ...s.expandedProjects }
+      for (const id of ids) next[id] = false
+      saveFlagMap(EXPANDED_KEY, next)
+      return { expandedProjects: next }
+    })
+  },
+
+  toggleSessionPreview: (projectId) => {
+    set((s) => {
+      const next = { ...s.previewExpanded, [projectId]: !s.previewExpanded[projectId] }
+      saveFlagMap(PREVIEW_KEY, next)
+      return { previewExpanded: next }
+    })
+  },
+
+  openProject: async (projectId) => {
+    // 本地即时切换（chip 立刻反映），后端持久化后再以 projects 广播校准
+    set({ activeProject: projectId })
+    try {
+      await window.agent.openProject(projectId)
+    } catch {
+      showToast('切换工作空间失败', 'error', 4000)
+    }
+  },
+
+  /** 选择文件夹 → 登记为新工作空间 → 打开它并回到"新建任务"态。
+   *  失败（目录不可写 / 已选过 / 取消）由后端 error 信封 toast 提示。 */
+  addProjectFromPicker: async () => {
+    let path: string | null = null
+    try {
+      path = await window.agent.pickFolder()
+    } catch {
+      showToast('无法打开目录选择框', 'error', 4000)
+      return
+    }
+    if (!path) return
+    let payload: ProjectsPayload | null = null
+    try {
+      payload = (await window.agent.addProject(path)) as ProjectsPayload | null
+    } catch {
+      showToast('新增工作空间失败', 'error', 4000)
+      return
+    }
+    if (!payload?.projects) return  // 失败时后端回 error 信封（已 toast），这里不再重复报错
+    set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
+    await get().newSession(payload.active || DEFAULT_PROJECT_ID)
+  },
+
+  renameProject: async (projectId, name) => {
+    const n = name.trim()
+    if (!n) return
+    try {
+      const payload = (await window.agent.renameProject(projectId, n)) as ProjectsPayload | null
+      if (payload?.projects) set({ projects: payload.projects })
+    } catch {
+      showToast('重命名失败', 'error', 4000)
+    }
+  },
+
+  /** 删除工作空间：**只删元数据目录**（会话/任务/记忆/回收站一并消失，不可恢复），
+   *  用户选定的真实目录保留。调用方（右键菜单）必须先弹确认。 */
+  removeProject: async (projectId) => {
+    try {
+      const payload = (await window.agent.removeProject(projectId)) as ProjectsPayload | null
+      if (!payload?.projects) return  // 被拒（空间有会话在跑 / 删 default）时后端回 error 信封
+      set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
+      // 该空间的会话已随目录消失：本地列表里清掉，避免点进去报"会话不存在"
+      set((s) => ({ sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId) }))
+      if (get().pendingProjectId === projectId) await get().newSession(DEFAULT_PROJECT_ID)
+      showToast('已删除工作空间（仅元数据，真实目录已保留）', 'info', 4000)
+    } catch {
+      showToast('删除工作空间失败', 'error', 4000)
+    }
+  },
+
+  revealProject: async (projectId) => {
+    const p = get().projects.find((x) => x.id === projectId)
+    if (!p?.path) {
+      showToast('默认工作空间没有真实目录', 'info')
+      return
+    }
+    const r = await window.agent.openInFinder(p.path)
+    if (r && !r.ok) showToast(`无法打开目录：${r.error ?? ''}`, 'error', 4000)
+  },
+  switchSession: async (sid) => {
+    // 进入会话 = 已读。先本地即时置已读（即时反馈），再持久化到后端元数据。
+    void get().setSessionUnread(sid, false)
     // 立即高亮 + 切换到该会话缓冲（后台会话继续执行不受影响，仅换投影）。
     // 模型/参数不在此处清空：由后端回发的 session_history 按元数据异步恢复。
+    // 同时也把"活动工作空间"对齐到该会话的归属 —— chip 显示的必须是当前会话所在空间。
+    const target = get().sessions.find((x) => x.id === sid)
+    const pid = target ? sessionProjectId(target) : null
+    const prevPid = get().activeProject
     set((s) => ({
-      activeSession: num,
+      activeSession: sid,
       pendingFresh: null,
-      completedBg: s.completedBg.filter((n) => n !== num),
-      messages: s.messagesBySession[num] ?? [],
-      isSending: s.runningSessions.includes(num)
+      messages: s.messagesBySession[sid] ?? [],
+      isSending: s.runningSessions.includes(sid) || s.bgSessions.includes(sid),
+      ...(pid ? { activeProject: pid, pendingProjectId: pid } : {}),
+      // 切会话清空附件草稿：草稿属于"正在编辑的这条消息"，不能跨会话漂移
+      //（文本草稿沿用既有行为不清，差异见 docs/frontend/12 的取舍一节）
+      draftAttachments: []
     }))
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
-    await window.agent.switchSession(num)
+    // 切到别的空间时同步后端"活动空间"：否则下一次 projects 广播会把 chip 拉回去
+    if (pid && pid !== prevPid) void window.agent.openProject(pid)
+    await window.agent.switchSession(sid)
+  },
+  /** 标记某会话未读/已读：本地即时生效 + 后端写入元数据持久化（跨窗口/重启随 sessions 同步）。
+   *  进入会话=已读；非当前查看的会话完整结束后置未读。调用各处通过 get().setSessionUnread 触发。 */
+  setSessionUnread: async (sessionId: string, unread?: boolean) => {
+    set((s) => ({ sessions: patchSessionUnread(s.sessions, sessionId, Boolean(unread)) }))
+    try {
+      await window.agent.setSessionUnread({ session_id: sessionId, unread: Boolean(unread) })
+    } catch {
+      /* 后端未就绪时忽略；sessions 重播时会以元数据为准校准 */
+    }
   },
   clearSession: async () => {
-    const num = get().activeSession
-    if (num === null) return
+    const sid = get().activeSession
+    if (sid === null) return
     await window.agent.clearSession()
     set((s) => {
       const messagesBySession = { ...s.messagesBySession }
-      delete messagesBySession[num]
-      return { ...s, messagesBySession, messages: [], activeSession: num }
+      delete messagesBySession[sid]
+      // 清空会话同步清掉 token 统计（后端 meta 的 usage_totals 已一并清除）
+      const { [sid]: _drop, ...sessionUsageBySession } = s.sessionUsageBySession
+      return { ...s, messagesBySession, messages: [], activeSession: sid, sessionUsageBySession }
     })
     get().refreshSessions()
   },
 
-  renameSession: async (num, title) => {
+  renameSession: async (sid, title) => {
     const t = title.trim()
     if (!t) return
     try {
-      await window.agent.renameSession(num, t)
+      await window.agent.renameSession(sid, t)
     } catch {
       showToast('重命名失败', 'error', 4000)
     }
     await get().refreshSessions()
   },
-  trashSession: async (num) => {
+  trashSession: async (sid) => {
     try {
-      await window.agent.trashSession(num)
+      await window.agent.trashSession(sid)
     } catch {
-      showToast('删除失败', 'error', 4000)
+      showToast('归档失败', 'error', 4000)
       return
     }
-    if (get().activeSession === num) await get().newSession()
+    if (get().activeSession === sid) await get().newSession()
     await get().refreshSessions()
     await get().refreshTrash()
-    showToast('已移入回收站', 'info')
+    showToast('已归档，可在设置 → 归档中还原', 'info')
   },
-  restoreSession: async (num) => {
+  restoreSession: async (sid) => {
     try {
-      await window.agent.restoreSession(num)
+      await window.agent.restoreSession(sid)
     } catch {
       showToast('还原失败', 'error', 4000)
       return
@@ -953,15 +1626,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     await get().refreshTrash()
     showToast('已还原会话', 'info')
   },
-  deleteSessions: async (nums) => {
-    if (nums.length === 0) return
-    let deleted: number[] = []
+  deleteSessions: async (ids) => {
+    if (ids.length === 0) return
+    let deleted: string[] = []
     try {
-      const res = (await window.agent.deleteSessions(nums)) as {
-        deleted?: number[]
-        failed?: number[]
+      const res = (await window.agent.deleteSessions(ids)) as {
+        deleted?: string[]
+        failed?: string[]
       } | null
-      deleted = res?.deleted ?? nums
+      deleted = res?.deleted ?? ids
     } catch {
       showToast('删除失败', 'error', 4000)
       return
@@ -971,8 +1644,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 避免删除后重建整张列表（逐个重数 message_count）造成的刷新延迟
       const remove = new Set(deleted)
       set((s) => ({
-        sessions: s.sessions.filter((x) => !remove.has(x.num)),
-        trashSessions: s.trashSessions.filter((x) => !remove.has(x.num)),
+        sessions: s.sessions.filter((x) => !remove.has(x.id)),
+        trashSessions: s.trashSessions.filter((x) => !remove.has(x.id)),
       }))
     }
   },
@@ -1032,11 +1705,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
   setSessionModel: (id) => {
     set({ sessionModelId: id, lastSessionModelId: id })
-    const num = get().activeSession
-    if (num !== null) {
+    const sid = get().activeSession
+    if (sid !== null) {
       // 选模型的会话级持久化：写会话元数据；无会话（新建预设）由首条 chat 落号后持久化
       window.agent.setSessionModel({
-        num,
+        session_id: sid,
         model_id: id,
         overrides: toBackendOverrides(get().overridesByModel)
       }).catch(() => {})
@@ -1054,10 +1727,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       delete last[modelId]
     }
     set({ overridesByModel: next, lastOverridesByModel: last })
-    const num = get().activeSession
-    if (num !== null) {
+    const sid = get().activeSession
+    if (sid !== null) {
       window.agent.setSessionModel({
-        num,
+        session_id: sid,
         model_id: get().sessionModelId,
         overrides: toBackendOverrides(next)
       }).catch(() => {})

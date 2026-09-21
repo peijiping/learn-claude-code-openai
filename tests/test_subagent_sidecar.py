@@ -46,7 +46,30 @@ def _load_history_to_ui():
     """
     src = (AGENTS_DIR / "ws_bridge.py").read_text(encoding="utf-8")
     seg = src[src.index("def _text_of("):src.index("async def handle(ws):")]
-    ns: dict = {}
+    # 该片段内已出现类型标注（如 Optional[...]）。exec 的命名空间是裸 dict，
+    # 而注解在 def 处即求值 → 会 NameError。预置整个 typing 命名空间兜住。
+    # （2026-09-16 修复：片段随 ws_bridge 演进引入 Optional，本测试一度加载失败）
+    #
+    # 切片里的其它模块级引用同样必须显式预置（**ws_bridge 演进时在此补名**）：
+    # - SessionManager / WorkspacePaths：附件辅助函数的参数注解，def 处即求值；
+    # - harvest_attachments：`_history_to_ui` 会实际调用（回放时从 content 里
+    #   取附件元数据）。
+    # （2026-09-20 修复：附件功能上线，本测试二次因同一原因加载失败）
+    # - harvest_refs：同上，引用（@-mention）回放用（2026-09-21）。
+    # - is_tool_images_message：工具读图（view_image）的合成消息判据，
+    #   `_history_to_ui` 用它跳过那条由 agent_loop 追加的假 user 消息（2026-09-21）。
+    import typing
+    from attachments import harvest_attachments, is_tool_images_message
+    from paths import WorkspacePaths
+    from refs import harvest_refs
+    ns: dict = {n: getattr(typing, n) for n in dir(typing) if not n.startswith("_")}
+    ns.update({
+        "SessionManager": SessionManager,
+        "WorkspacePaths": WorkspacePaths,
+        "harvest_attachments": harvest_attachments,
+        "harvest_refs": harvest_refs,
+        "is_tool_images_message": is_tool_images_message,
+    })
     exec(compile(seg, "ws_bridge_hist", "exec"), ns)  # noqa: S102 - 测试内自用
     return ns["_history_to_ui"]
 

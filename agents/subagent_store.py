@@ -27,7 +27,7 @@ subagent_store.py - 子智能体执行过程的旁路记录（sidecar）存储
 ## 记录字段（v1）
 
 ```json
-{"v": 1, "subagent_id": "sub_xxx", "tool_call_id": "call_xxx", "session_num": 6,
+{"v": 1, "subagent_id": "sub_xxx", "tool_call_id": "call_xxx", "session_id": "Kx7mQ2vT8p",
  "name": "任务名", "status": "running|done|error|aborted", "source": "sync|background",
  "prompt": "……", "started_at": "2026-09-11T09:31:02", "ended_at": null,
  "duration_ms": null, "thinking": "", "text": "", "toolCalls": [], "error": ""}
@@ -95,7 +95,7 @@ class SubagentStore:
     # ── 路径推导 ────────────────────────────────────────────────
     @staticmethod
     def sidecar_path(session_file: Path) -> Path:
-        """由主会话文件推出旁路文件路径（session_6.jsonl → session_6.subagents.jsonl）。"""
+        """由主会话文件推出旁路文件路径（session_Kx7.jsonl → session_Kx7.subagents.jsonl）。"""
         session_file = Path(session_file)
         return session_file.with_name(session_file.stem + SIDECAR_SUFFIX)
 
@@ -104,9 +104,13 @@ class SubagentStore:
         return SubagentStore.sidecar_path(session_file).exists()
 
     @staticmethod
-    def _session_num(session_file: Path) -> Optional[int]:
+    def _session_id(session_file: Path) -> Optional[str]:
+        """从主文件 stem 解析会话 id（"session_6"/"session_Kx7mQ2vT8p"/"cron_12"
+        → "6"/"Kx7mQ2vT8p"/"12"；base62 id 不含下划线，rsplit 安全）。
+        旧字段名为 session_num（int 编号），2026-09-14 起统一为字符串 id。"""
         try:
-            return int(Path(session_file).stem.rsplit("_", 1)[1])
+            sid = Path(session_file).stem.rsplit("_", 1)[1]
+            return sid or None
         except (IndexError, ValueError):
             return None
 
@@ -127,7 +131,7 @@ class SubagentStore:
             "v": 1,
             "subagent_id": subagent_id,
             "tool_call_id": tool_call_id,
-            "session_num": self._session_num(session_file),
+            "session_id": self._session_id(session_file),
             "name": name,
             "status": "running",
             "source": source,
@@ -154,7 +158,7 @@ class SubagentStore:
             "v": 1,
             "subagent_id": transcript.get("subagent_id", ""),
             "tool_call_id": transcript.get("tool_call_id", ""),
-            "session_num": self._session_num(session_file),
+            "session_id": self._session_id(session_file),
             "name": transcript.get("name", ""),
             "status": status,
             "source": transcript.get("source", "sync"),
@@ -166,6 +170,7 @@ class SubagentStore:
             "text": transcript.get("text", ""),
             "toolCalls": transcript.get("toolCalls", []),
             "error": error,
+            "usage": transcript.get("usage") or {},  # 本任务的 token 消耗（排障/回放可见）
         })
 
     # ── 读取 ───────────────────────────────────────────────────
@@ -242,7 +247,7 @@ class SubagentStore:
                 "v": 1,
                 "subagent_id": sid,
                 "tool_call_id": row.get("tool_call_id", ""),
-                "session_num": self._session_num(session_file),
+                "session_id": self._session_id(session_file),
                 "name": row.get("name", ""),
                 "status": "done",
                 "source": "migrated",

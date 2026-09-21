@@ -133,7 +133,8 @@ class SystemPromptBuilder:
 - **禁止**对二进制文件（PDF、图片、压缩包）用 strings / cat / hexdump
 - **禁止**一次读超过 500 行，用 limit 或 | head 控制
 - **禁止**单次工具输出超过 5000 字符进上下文，用 | head -100 / | tail 控制
-- 读 PDF **必须**用 run_read_pdf 工具
+- 读 PDF / 图片 / Office 文档 **必须**用 run_read 工具（它按类型自动分派：
+  PDF 同时给每页文本与含图表的整页图，图片直接给像素，docx/xlsx/pptx 给文本）
 """
 
     def _get_skills(self) -> str:
@@ -196,23 +197,38 @@ class SystemPromptBuilder:
 
 ## sub_agent（子智能体）
 **强制使用**（主对话不得直接执行）：读 ≥3 文件 / 读 PDF / 工具调用 ≥5 步 / 探索代码库。
-- 默认不含 todo/task 工具（只由主智能体维护）
-- 只读场景设 `allowed_tools=["bash","run_read","run_read_pdf"]`（**名字必须与 API 下发的完全一致**，写错会拿不到该工具）
+- 默认不含 task 工具（只由主智能体维护）
+- 只读场景设 `allowed_tools=["bash","run_read"]`（**名字必须与 API 下发的完全一致**，写错会拿不到该工具。run_read 已含 PDF / 图片 / Office 的读取，不需要别的读工具名）
 - 无依赖想省时间 → `parallel=true` 并发；有依赖 → `parallel=false` 串行
 - 想拿 ID 后回头查 → `run_in_background=true`（立即返回 bg_id；不参与并行/串行桶，永远独立后台化）
 
-{worktree_block}# 待办与任务（两套并存，按任务特征自选）
-轻量 **TodoWrite** 与重型 **Task 全家桶**（create / list / get / claim / complete）可共存。
+{worktree_block}# 任务看板（task）
 
-## L1：TodoWrite（单响应内的轻量进度）
-适用：步骤 ≤7、本响应内完成、不派 subagent、不需跨子任务共享。
-规范：动手前列全（pending）→ 开做标 in_progress（同时仅 1 个）→ 完成立刻标 completed → 换计划用 fresh_start 整体替换 → 收尾调一次 render。
+会话级任务看板，**只活在当前会话**，不承担跨会话续接。
 
-## L2：Task 全家桶（会话内看板，支持依赖）
-**满足任一即用 L2**：步骤 >7 / 要派 subagent / 多 agent（或队友）共享同一份清单 / 任务间有依赖（创建时声明 blockedBy，被阻塞任务须等依赖完成才能认领）。
-规范：派 subagent 前先拆好任务 → 让 subagent 认领 → 完成后回填状态 → 主对话收尾汇总。
+**何时用**：步骤 >7 / 要派 subagent / 多 agent（或队友）共享同一份清单 / 任务间有依赖。
+步骤 ≤7 且单线程一次能做完的小事不必建板，直接做完即可。
 
-**任务板只活在当前会话**，不承担跨会话续接：跨会话的"干到哪、下一步"一律用 `write_memory` 落盘（`project` 类），不要依赖任务板，也不要直接改记忆文件。
+**规范**：
+- 动手前先 `create_task` 把计划铺开；有从属关系用 `parent_id` 拆成子树
+- 有依赖的任务在创建时声明 `blockedBy`，**必须填真实 task id**（从工具返回里复制
+  `t_<时间戳>_<随机数>`）。写序号（`"1"`、`"任务1"`）会被直接拒绝创建 ——
+  运行期只能把"依赖未完成"当阻塞，区分不了"依赖写错了"，所以写错就等于该任务
+  **永久**无法认领。要依赖同批新建的前序任务时：先建它、拿到 id 后再建本任务
+  （同一次响应里并行发出的多个 `create_task` 互相拿不到 id）
+- 被阻塞的任务在依赖完成前无法认领，这是预期行为，**不要绕过**
+- 任务写错、依赖填错、或已不再照原计划做 → 用 `update_task` **就地改**
+  （`blockedBy` 传 `[]` 可清空依赖）、`delete_task` 删除。
+  **禁止另建"修正版"新任务**：旧任务会永久留在面板上，整组永远回不到「全部完成」
+- 派 subagent 前先拆好任务 → 让 subagent 用 `claim_task` 认领 → 完成后 `complete_task` 回填
+- **中断后继续**：若上下文里出现 `<task_board>` 提醒，说明本会话有未完成的任务，
+  先接着把它们做完（剩下的项会标成 pending，直接 claim 即可），不要另起一套新计划；
+  提醒里出现"悬空引用"字样时，先用 `update_task` 修依赖或 `delete_task` 收尾
+- 收尾用 `list_tasks` 汇总一次。**收工时板上不该留 pending / blocked 项** ——
+  留下的每一项都会让面板继续停在进行中/待继续状态
+
+**跨会话**：跨会话的"干到哪、下一步"一律用 `write_memory` 落盘（`project` 类），
+不要依赖任务板，也不要直接改记忆文件。
 """
 
     def _get_memory_rules(self) -> str:

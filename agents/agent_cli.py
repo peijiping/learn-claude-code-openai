@@ -64,7 +64,7 @@ def main() -> None:
         try:
             label = agent.context_label()
             mode_tag = "|teams" if agent.team_mode else ""
-            query = input(f"\033[36m[session_{agent.session_num} ({label}{mode_tag})] >> \033[0m")
+            query = input(f"\033[36m[session_{agent.session_id} ({label}{mode_tag})] >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -74,7 +74,7 @@ def main() -> None:
                 ("/help", "显示本帮助信息"),
                 ("/q 或 /exit", "退出程序"),
                 ("/newsession", "新建一个会话"),
-                ("/switchsession N", "切换到第 N 个会话"),
+                ("/switchsession <id>", "切换到指定会话（id 为短随机串或存量编号）"),
                 ("/clearsession", "清空当前会话的全部历史消息"),
                 ("/tasks", "查看当前任务列表"),
                 ("/compact", "压缩当前会话上下文"),
@@ -90,16 +90,19 @@ def main() -> None:
         if cmd in ("/q", "/exit", ""):
             break
         if cmd == "/newsession":
-            num, _ = agent.new_session()
-            print(f"\033[33m已创建新会话: session_{num}.jsonl\033[0m")
+            sid, _ = agent.new_session()
+            print(f"\033[33m已创建新会话: session_{sid}.jsonl\033[0m")
             continue
         if cmd.startswith("/switchsession "):
+            # 参数为会话 id：新会话为 10 位短随机 id，存量会话为原编号字符串
             try:
-                target_num = int(cmd.split()[1])
-                num, msg_count = agent.switch_session(target_num)
-                print(f"\033[33m已切换到会话: session_{num}.jsonl ({msg_count} 条消息)\033[0m")
-            except (ValueError, IndexError):
-                print("\033[31m用法: /switchsession <数字>\033[0m")
+                target_id = cmd.split(maxsplit=1)[1].strip()
+                if not target_id:
+                    raise IndexError
+                sid, msg_count = agent.switch_session(target_id)
+                print(f"\033[33m已切换到会话: session_{sid}.jsonl ({msg_count} 条消息)\033[0m")
+            except IndexError:
+                print("\033[31m用法: /switchsession <会话id>\033[0m")
             except FileNotFoundError as e:
                 print(f"\033[31m{e}\033[0m")
             continue

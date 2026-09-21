@@ -146,17 +146,23 @@ class BrowserAgentBridge implements AgentApi {
 
   send(
     text: string,
-    num?: number | null,
+    sessionId?: string | null,
     overrides?: { thinking_strength?: string; max_context?: string } | null,
-    modelId?: string | null
+    modelId?: string | null,
+    projectId?: string | null,
+    attachments?: Parameters<AgentApi['send']>[5],
+    refs?: Parameters<AgentApi['send']>[6]
   ): Promise<void> {
     this.sendRaw(JSON.stringify({
       kind: 'chat',
       payload: {
         text,
-        ...(typeof num === 'number' ? { num } : {}),
+        ...(typeof sessionId === 'string' && sessionId ? { session_id: sessionId } : {}),
+        ...(typeof projectId === 'string' && projectId ? { project_id: projectId } : {}),
         ...(overrides ? { overrides } : {}),
-        ...(modelId ? { model_id: modelId } : {})
+        ...(modelId ? { model_id: modelId } : {}),
+        ...(attachments?.length ? { attachments } : {}),
+        ...(refs?.length ? { refs } : {})
       }
     }))
     return Promise.resolve()
@@ -165,25 +171,29 @@ class BrowserAgentBridge implements AgentApi {
     this.sendRaw(JSON.stringify({
       kind: 'session_model',
       payload: {
-        ...(typeof payload?.num === 'number' ? { num: payload.num } : {}),
+        ...(typeof payload?.session_id === 'string' && payload.session_id ? { session_id: payload.session_id } : {}),
         ...(payload?.model_id ? { model_id: payload.model_id } : {}),
         ...(payload?.overrides ? { overrides: payload.overrides } : {})
       }
     }))
     return Promise.resolve()
   }
-  stop(num: number): Promise<void> {
-    this.sendRaw(JSON.stringify({ kind: 'stop', payload: { num } }))
+  stop(sessionId: string): Promise<void> {
+    this.sendRaw(JSON.stringify({ kind: 'stop', payload: { session_id: sessionId } }))
     return Promise.resolve()
   }
-  switchSession(num: number): Promise<{ num: number; message_count: number }> {
+  switchSession(sessionId: string): Promise<{ session_id: string; message_count: number }> {
     // 历史回放经由 session / session_history 事件信封驱动 store，无需等待应答
-    this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { num } }))
-    return Promise.resolve({ num, message_count: 0 })
+    this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { session_id: sessionId } }))
+    return Promise.resolve({ session_id: sessionId, message_count: 0 })
   }
   clearSession(): Promise<{ deleted: number }> {
     this.sendRaw(JSON.stringify({ kind: 'session_clear' }))
     return Promise.resolve({ deleted: 0 })
+  }
+  async setSessionUnread(payload: Parameters<AgentApi['setSessionUnread']>[0]): Promise<unknown> {
+    if (typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    return this.request('session_set_unread', 'sessions', { session_id: payload.session_id, unread: Boolean(payload.unread) })
   }
 
   async listSessions(): Promise<unknown[]> {
@@ -199,17 +209,96 @@ class BrowserAgentBridge implements AgentApi {
       | null
     return payload?.sessions ?? []
   }
-  async renameSession(num: number, title: string): Promise<unknown> {
-    return this.request('session_rename', 'sessions', { num, title })
+  async renameSession(sessionId: string, title: string): Promise<unknown> {
+    return this.request('session_rename', 'sessions', { session_id: sessionId, title })
   }
-  trashSession(num: number): Promise<unknown> {
-    return this.request('session_trash', 'sessions', { num })
+  trashSession(sessionId: string): Promise<unknown> {
+    return this.request('session_trash', 'sessions', { session_id: sessionId })
   }
-  restoreSession(num: number): Promise<unknown> {
-    return this.request('session_restore', 'sessions', { num })
+  restoreSession(sessionId: string): Promise<unknown> {
+    return this.request('session_restore', 'sessions', { session_id: sessionId })
   }
-  async deleteSessions(nums: number[]): Promise<unknown> {
-    return this.request('session_delete', 'session_delete_result', { nums })
+  async deleteSessions(ids: string[]): Promise<unknown> {
+    return this.request('session_delete', 'session_delete_result', { ids })
+  }
+
+  // ── 工作空间（浏览器无宿主能力，降级为可用的最小实现）────────────
+  /** 浏览器无原生目录选择框：退化为输入路径（仍是本机后端进程去读写，语义一致） */
+  pickFolder(): Promise<string | null> {
+    const p = window.prompt('输入工作空间目录的绝对路径：')
+    return Promise.resolve(p && p.trim() ? p.trim() : null)
+  }
+  /** 浏览器无法调起 Finder：仅记录告警，不阻断调用方 */
+  openInFinder(_path: string): Promise<{ ok: boolean; error?: string }> {
+    console.warn('[browserAgent] openInFinder 仅在 Electron 宿主中可用')
+    return Promise.resolve({ ok: false, error: 'not supported in browser' })
+  }
+
+  // ── 会话附件（浏览器无宿主能力，降级为可用的最小实现）──────────────
+  /** 浏览器拿不到本地文件路径（File 对象没有 path，也不允许 JS 读取磁盘）：
+   *  与 pickFolder 同款降级 —— 让用户直接输入绝对路径，后端仍在同机读盘。 */
+  pickFiles(): Promise<string[]> {
+    const raw = window.prompt('输入要添加的文件绝对路径（多个用换行或逗号分隔，多个文件不可点击添加）：')
+    if (!raw || !raw.trim()) return Promise.resolve([])
+    return Promise.resolve(
+      raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
+    )
+  }
+  /** 浏览器里 DOM File 没有磁盘路径 → 恒为空串（调用方会改走 readClipboardImage 兜底） */
+  getPathForFile(_file: File): string {
+    return ''
+  }
+  /** 浏览器无法把字节写成临时文件（无 fs 权限）→ 明确降级 */
+  saveClipboardImage(_payload: { bytes: ArrayBuffer | Uint8Array; mime?: string }): Promise<string | null> {
+    console.warn('[browserAgent] 粘贴图片仅在 Electron 宿主中可用')
+    return Promise.resolve(null)
+  }
+  async stageAttachments(payload: { paths: string[]; projectId?: string | null }): Promise<unknown> {
+    if (!Array.isArray(payload?.paths) || payload.paths.length === 0) return null
+    return this.request(
+      'attachment_stage',
+      'attachments_staged',
+      {
+        paths: payload.paths,
+        ...(payload.projectId ? { project_id: payload.projectId } : {})
+      },
+      20000
+    )
+  }
+  async listProjects(): Promise<unknown> {
+    return this.request('projects_list', 'projects')
+  }
+
+  // ── 引用文件或文件夹（@-mention）────────────────────────────────
+  /** 浏览器预览里同样能跑通：桥本身就连着 ws_bridge，直接发 refs_list 即可
+   *  （后端同机读盘，与 Electron 路径语义一致；超时放宽到大仓库遍历的量级）。 */
+  async listRefs(payload?: { projectId?: string | null; sessionId?: string | null }): Promise<unknown> {
+    return this.request(
+      'refs_list',
+      'refs',
+      {
+        ...(typeof payload?.projectId === 'string' && payload.projectId
+          ? { project_id: payload.projectId }
+          : {}),
+        ...(typeof payload?.sessionId === 'string' && payload.sessionId
+          ? { session_id: payload.sessionId }
+          : {})
+      },
+      20000
+    )
+  }
+  async addProject(path: string): Promise<unknown> {
+    return this.request('project_add', 'projects', { path })
+  }
+  openProject(projectId: string): Promise<void> {
+    this.sendRaw(JSON.stringify({ kind: 'project_open', payload: { project_id: projectId } }))
+    return Promise.resolve()
+  }
+  async renameProject(projectId: string, name: string): Promise<unknown> {
+    return this.request('project_rename', 'projects', { project_id: projectId, name })
+  }
+  async removeProject(projectId: string): Promise<unknown> {
+    return this.request('project_remove', 'projects', { project_id: projectId })
   }
 
   async goalStatus(): Promise<string> {

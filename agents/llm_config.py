@@ -57,7 +57,10 @@ LLM_CONFIG_FILE = AIGENT_HOME / "llmconfig.json"
 PROVIDER_CATALOG_FILE = AIGENT_HOME / "providers.json"
 
 CONFIG_VERSION = 2
-CATALOG_VERSION = 1
+# 出厂预置目录版本。提升它 = 声明"内置目录改版"，既有 providers.json 会按内置
+# 重建（详见 load_provider_catalog）—— 修正既有模型的能力声明时必须提升，
+# 否则文件里的旧值会把内置值永久压住。
+CATALOG_VERSION = 2
 DEFAULT_API_FORMAT = "chat_completions"
 
 # API 格式选项（前端下拉展示；当前仅 chat_completions 参与运行）
@@ -80,14 +83,18 @@ _DEFAULT_CATALOG: dict = {
             "api_key_env": "DEEPSEEK_API_KEY",
             "docs_url": "https://platform.deepseek.com/api_keys",
             "models": [
+                # 图像理解：官方「模型 & 价格」表明确 deepseek-flash 支持、
+                # deepseek-v4-pro 不支持（2026-09 核对）。
                 {"id": "deepseek-flash", "display_name": "deepseek-flash",
-                 "tags": ["1M"], "max_context": "128k", "max_context_extended": "1M",
-                 "capabilities": {"input": ["text"], "output": ["text"]},
+                 "tags": ["1M", "图片"], "max_context": "128k", "max_context_extended": "1M",
+                 "capabilities": {"input": ["text", "image"], "output": ["text"]},
                  "thinking_strengths": ["low", "high", "very_high"],
                  "default_thinking": "high"},
+                # 已下线：官方说明 v4-flash / v4-flash-vision-exp 仍可调用，但请求由
+                # DeepSeek-V4.1-Flash 承接并按 Flash 计费 —— 因此能力同 deepseek-flash。
                 {"id": "deepseek-v4-flash", "display_name": "deepseek-v4-flash",
-                 "tags": ["1M"], "max_context": "128k", "max_context_extended": "1M",
-                 "capabilities": {"input": ["text"], "output": ["text"]},
+                 "tags": ["1M", "图片"], "max_context": "128k", "max_context_extended": "1M",
+                 "capabilities": {"input": ["text", "image"], "output": ["text"]},
                  "thinking_strengths": ["low", "high", "very_high"],
                  "default_thinking": "high"},
                 {"id": "deepseek-v4-pro", "display_name": "deepseek-v4-pro",
@@ -206,8 +213,15 @@ def _merge_provider(base: dict, override: dict) -> dict:
 def load_provider_catalog() -> dict:
     """读取预置厂商目录；文件缺失时物化写出内置默认值（首次可用、可手工编辑）。
 
-    合并策略：内置目录为底，文件中的厂商/模型逐条覆盖（可随官方更新覆盖该文件）；
-    文件中新增的自定义厂商追加保留。
+    合并策略按**目录版本**分两档：
+    - 同版本：内置为底、文件逐条覆盖 —— 保留用户对 providers.json 的手工微调；
+    - 版本落后（`CATALOG_VERSION` 被提升 = 出厂目录改版）：**内置值全量覆盖**，
+      只保留文件里内置没有的厂商（用户自建的 custom:*）。
+
+    为什么必须分档：`_merge_provider` 是「文件为准」，所以官方**修正既有模型**
+    的能力声明时（不是新增模型），旧 providers.json 会把它永久压住；而且自愈
+    回写也会失效 —— merge 结果恒等于文件，被判成"一致"不写回。没有版本闸门，
+    改内置目录等于没改。
     """
     providers: dict = {}
     for key, val in _DEFAULT_CATALOG["providers"].items():
@@ -216,15 +230,22 @@ def load_provider_catalog() -> dict:
     if PROVIDER_CATALOG_FILE.exists():
         try:
             stored = json.loads(PROVIDER_CATALOG_FILE.read_text(encoding="utf-8"))
+            same_version = stored.get("version") == CATALOG_VERSION
             for key, val in (stored.get("providers") or {}).items():
                 if not isinstance(val, dict):
                     continue
-                providers[key] = (
-                    _merge_provider(providers[key], val) if key in providers else val
-                )
-            # 自愈回写：本次合并结果与磁盘不一致（内置上新 / 文件被裁剪）时写回，
-            # 使文件始终等于「生效中的目录」，便于用户直接查看与编辑。
-            if (stored.get("providers") or {}) != providers:
+                if key not in providers:
+                    providers[key] = val                    # 用户自建厂商：两档都保留
+                elif same_version:
+                    providers[key] = _merge_provider(providers[key], val)
+                # 版本落后且内置已有该厂商 → 丢弃文件值，改用内置
+            if not same_version:
+                save_provider_catalog(providers)
+                log.info("预置厂商目录版本 %s → %s，已按出厂目录重建 %s",
+                         stored.get("version"), CATALOG_VERSION, PROVIDER_CATALOG_FILE)
+            elif (stored.get("providers") or {}) != providers:
+                # 自愈回写：文件被裁剪 / 内置上新时写回，使文件始终等于「生效中的
+                # 目录」，便于用户直接查看与编辑。
                 save_provider_catalog(providers)
                 log.info("已更新预置厂商目录 %s", PROVIDER_CATALOG_FILE)
         except (json.JSONDecodeError, OSError):
@@ -279,14 +300,26 @@ def _normalize_model(m: dict, catalog: dict, conn: dict | None = None) -> dict:
     # tags / 能力 / 上下文：用户显式值优先，缺省时从预置目录继承
     tags = m.get("tags")
     out["tags"] = list(tags) if isinstance(tags, list) else list(preset.get("tags") or [])
-    caps = m.get("capabilities")
-    if not isinstance(caps, dict) or not caps:
-        caps = preset.get("capabilities") or {"input": ["text"], "output": ["text"]}
+    source = str(m.get("capability_source") or ("auto" if preset else "manual"))
+    preset_caps = preset.get("capabilities")
+    stored_caps = m.get("capabilities")
+    # capability_source 的语义（与前端 AddModelModal 的「自动识别 / 手动指定」对齐）：
+    # - auto：能力是当初从预置目录**推断**出来的，每次加载都重新推导。否则首轮
+    #   归一化写回的 capabilities 会永远压住预置值，providers.json「可随官方整体
+    #   更新」的设计就失效了（官方改能力声明，既有安装收不到）。
+    # - manual：用户在 UI 里显式指定过，一律尊重，绝不覆盖。
+    if source == "auto" and isinstance(preset_caps, dict) and preset_caps:
+        caps = preset_caps
+    elif isinstance(stored_caps, dict) and stored_caps:
+        caps = stored_caps
+    else:
+        caps = preset_caps if isinstance(preset_caps, dict) else None
+    caps = caps or {"input": ["text"], "output": ["text"]}
     out["capabilities"] = {
         "input": list(caps.get("input") or ["text"]),
         "output": list(caps.get("output") or ["text"]),
     }
-    out["capability_source"] = m.get("capability_source") or ("auto" if preset else "manual")
+    out["capability_source"] = source
 
     # 上下文窗口：模型级 context_in/out 优先；兼容旧 advanced.context_in/out
     adv = m.get("advanced") if isinstance(m.get("advanced"), dict) else {}
@@ -687,3 +720,76 @@ def apply_model_to_env(model_id: str | None) -> bool:
     }
     apply_to_env(ephemeral)
     return True
+
+
+def get_model_by_id(model_id: str | None) -> dict | None:
+    """按 id 查归一化模型条目（llmconfig.json v2）。
+
+    id 为空（会话绑定的是全局 active 模型，会话元数据 model_id 为 None）时
+    回落全局 active 模型条目；模型未配置/找不到返回 None。
+    供轮级 model_info 快照、会话上下文窗口解析等按 id 反查模型元数据
+    （display_name / max_context / default_thinking 等）的场景使用。
+    """
+    data = _load_normalized()
+    if not model_id:
+        model_id = data.get("active_model_id")
+    if not model_id:
+        return None
+    for m in data.get("models") or []:
+        if m.get("id") == model_id:
+            return m
+    return None
+
+
+def caps_allow_image(caps) -> bool:
+    """能力声明是否允许图片输入 —— **纯函数**，只吃 capabilities 那一小块。
+
+    三态（与前端 `modelSupportsImage`、`ws_bridge._model_supports_image` 同口径）：
+    - 明确声明 input 含 image → True；
+    - 明确声明了 input 列表但不含 image → False（应把图片降级为占位）；
+    - 元数据缺失 / 形状不认识 → True。
+
+    最后一条是刻意的：本地目录可能没收录用户新加的模型，**不能因为"我们不知道"
+    就当作不支持** —— 宁可让 provider 回一个真实错误，也不要本地静默吞掉图片。
+
+    单独抽出来是为了让 ws_bridge 与引擎共用同一套规则，而各自保留自己的
+    `get_model_by_id` 调用点（ws_bridge 的测试在该名字上打桩）。
+    """
+    if not isinstance(caps, dict):
+        return True
+    inputs = caps.get("input")
+    if not isinstance(inputs, list) or not inputs:
+        return True
+    return "image" in inputs
+
+
+def model_supports_image(model_id: str | None) -> bool:
+    """按模型条目 id（m_xxx）查图片能力；空 id 回落全局 active 模型。
+
+    读配置失败一律按"支持"处理（发送边界的调用方依赖本函数不抛异常）。
+    """
+    try:
+        model = get_model_by_id(model_id)
+    except Exception as exc:  # noqa: BLE001 - 能力查询失败不阻断对话
+        log.warning("读取模型能力失败（按支持图片处理）: %s: %s",
+                    type(exc).__name__, exc)
+        return True
+    if not isinstance(model, dict):
+        return True
+    return caps_allow_image(model.get("capabilities"))
+
+
+def resolve_model_window(model_id: str | None, extended: bool = False) -> str | None:
+    """按模型元数据解析上下文窗口字符串（如 "128k" / "1M"）。
+
+    extended=True 且模型声明了扩展窗口时取扩展值，否则取标准窗口；
+    模型未配置/无窗口声明返回 None（调用方回落全局默认）。
+    统计与压缩阈值以「所选模型的真实窗口」为准，避免全局 env
+    MAX_CONTEXT_TOKENS 与模型实际窗口不符导致的误统计。
+    """
+    m = get_model_by_id(model_id)
+    if not m:
+        return None
+    if extended:
+        return str(m.get("max_context_extended") or "").strip() or None
+    return str(m.get("max_context") or "").strip() or None

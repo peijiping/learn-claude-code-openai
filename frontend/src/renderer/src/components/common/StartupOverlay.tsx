@@ -24,7 +24,7 @@ export default function StartupOverlay(): JSX.Element | null {
     <div className={`startup-overlay${leaving ? ' startup-overlay-leave' : ''}`}>
       <div className="startup-brand">AIGENT</div>
       <div className="startup-spinner" />
-      <div className="startup-text">正在启动后端…</div>
+      <div className="startup-text">正在启动智能体…</div>
     </div>
   )
 }

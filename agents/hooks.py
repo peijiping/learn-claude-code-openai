@@ -86,9 +86,12 @@ class HookSystem:
         "chmod 777",  # 权限过度开放
     ]
 
-    def __init__(self, silent: bool = False):
+    def __init__(self, silent: bool = False, workdir=None):
         # silent 模式：抑制所有钩子打印（cron 定时任务用，避免输出混淆主终端）
         self.silent = silent
+        # 工作根（沙箱根）：越界写判定与提示用。多工作空间下每个 Agent 传自己的
+        # 空间根；不传时沿用遗留 WORKDIR（= default 空间的沙箱根），行为不变。
+        self.workdir = workdir if workdir is not None else WORKDIR
         # 事件→回调列表注册表。顺序敏感:PreToolUse 中 permission_hook 必须
         # 排在 log_hook 之前,这样一旦权限被阻断,日志才会记录"被阻断"的状态。
         self._hooks: dict[str, list] = {
@@ -160,7 +163,8 @@ class HookSystem:
               a) 命令匹配 self.deny_list 任一项 → 硬阻断 (返回拒绝原因)
               b) 命令匹配 self.destructive 任一项 → 弹窗询问用户,默认拒绝
           ② 若工具是 write_file / edit_file:
-              目标路径解析后必须位于 WORKDIR 之内,否则弹窗询问用户。
+              目标路径解析后必须位于工作根（`self.workdir`，默认 WORKDIR）之内,
+              否则弹窗询问用户。
 
         参数:
             tool_call — LangChain 风格的工具调用字典,结构为
@@ -197,11 +201,16 @@ class HookSystem:
                         return "Permission denied by user"
 
         # ── 规则 2:文件写入必须在工作目录之内 (防越权写入) ───────────────
+        # ⚠️ 已知失效点（2026-09-18 记录，未在本轮修改）：工具名是 run_write /
+        # run_edit，而这里是 write_file / edit_file（s03 遗留命名）→ 本规则实际
+        # **永不命中**。要修得先确认产品上是否希望"越界写弹窗确认"。
         if tool_name in ("write_file", "edit_file"):
-            # 把相对路径与 WORKDIR 拼接,再 resolve() 消除 ../ 之类的逃逸,
-            # 最后用 is_relative_to 校验解析后的绝对路径是否仍在 WORKDIR 内。
+            # 把相对路径与工作根拼接,再 resolve() 消除 ../ 之类的逃逸,
+            # 最后用 is_relative_to 校验解析后的绝对路径是否仍在工作根内。
+            # 工作根来自本实例注入的 workdir（多工作空间：每个 Agent 传自己的空间根）。
+            root = self.workdir
             path = tool_args.get("path", "")
-            if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            if not (root / path).resolve().is_relative_to(root):
                 print(f"\n\033[2;95m⚠  Writing outside workspace\033[0m")
                 print(f"\033[2;95m   Tool: {tool_name}({tool_args})\033[0m")
                 choice = input("   Allow? [y/N] ").strip().lower()
@@ -286,7 +295,7 @@ class HookSystem:
             None (不修改 query,只打印日志)。
         """
         if not self.silent:
-            print(f"\033[2;95m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+            print(f"\033[2;95m[HOOK] UserPromptSubmit: working in {self.workdir}\033[0m")
         return None
 
     def summary_hook(self, messages: list):

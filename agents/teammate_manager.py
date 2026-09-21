@@ -27,6 +27,17 @@ from paths import INBOX_DIR
 from tools import ToolRegistry
 from streaming_client import streamed_create
 from logger import get_logger
+from llm_config import model_supports_image
+# 工具读图（2026-09-21）：`run_read` 读到图片 / PDF 页图时返回中性图片块。
+# 队友这条循环**没有**独立的发送边界（不像主智能体有 `_model_messages`），
+# 所以图片必须在这里就地展开成线格式（见工具循环里的 tool_image_values）。
+from attachments import (
+    TOOL_IMAGES_MARKER,
+    build_tool_images_message,
+    expand_content_for_model,
+    is_tool_image_result,
+    tool_image_text,
+)
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("teammate")
@@ -393,6 +404,7 @@ class TeammateManager:
                 if finish_reason != "tool_calls" or not tool_calls:
                     break  # 非工具调用 → 停止本轮
 
+                tool_image_values: list = []
                 for tc in tool_calls:
                     tool_name = tc.function.name
                     try:
@@ -400,12 +412,33 @@ class TeammateManager:
                     except json.JSONDecodeError:
                         tool_args = {}
                     output = self._exec(name, tool_name, tool_args)
+                    is_image = is_tool_image_result(output)
+                    if is_image:
+                        tool_image_values.append(output)
                     # OpenAI 要求每个工具结果作为独立 tool 消息返回，
-                    # 不能再打包进 content（会导致 missing field `type` 400）
+                    # 不能再打包进 content（会导致 missing field `type` 400）。
+                    # run_read 读到图片时返回的是**中性图片块**：tool 消息只放说明
+                    # 文本，图片本体随后由合成 user 消息带上。
                     messages.append({"role": "tool",
                                      "tool_call_id": tc.id,
                                      "name": tool_name,
-                                     "content": str(output)})
+                                     "content": (tool_image_text(output) if is_image
+                                                 else str(output))})
+
+                # 图片在**所有 tool 消息之后**追加（顺序硬约束，与主智能体的
+                # agent_loop 同款）。这里必须**就地展开**成线格式：队友没有主智能体
+                # 那样的 `_model_messages` 发送边界，中性块直接进请求体会被 provider
+                # 拒绝。能力门控同样不能省 —— text-only 模型下会降级为占位文本。
+                if tool_image_values:
+                    image_msg = build_tool_images_message(tool_image_values)
+                    if image_msg:
+                        expanded = expand_content_for_model(
+                            image_msg, None,
+                            supports_image=model_supports_image(
+                                getattr(self, "model", "") or ""))
+                        # marker 只用于主智能体回放辨认，这里没有投影层，自己摘掉
+                        expanded.pop(TOOL_IMAGES_MARKER, None)
+                        messages.append(expanded)
 
             if should_shutdown:
                 break
@@ -441,7 +474,9 @@ class TeammateManager:
         团队协议/任务工具是 teammate 角色独有，与 MessageBus / TaskManager /
         ProtocolState 绑定，保留在本地。
         """
-        wanted = {"bash", "run_read", "run_write", "run_read_pdf"}
+        # run_read 是读文件的唯一入口（2026-09-21）：文本 / 图片 / PDF / Office
+        # 都由它分派，所以队友的白名单里不再需要退役的那两个读工具名。
+        wanted = {"bash", "run_read", "run_write"}
         base = [t for t in self.tools.base_tools
                 if t["function"]["name"] in wanted]
         protocol = [
@@ -479,14 +514,20 @@ class TeammateManager:
         ]
         return base + protocol
 
-    def _exec(self, name: str, tool_name: str, args: dict) -> str:
-        """执行队友的工具调用。"""
+    def _exec(self, name: str, tool_name: str, args: dict):
+        """执行队友的工具调用。
+
+        返回值通常是 `str`（失败也是 `"Error: ..."`）；**唯一例外是 `run_read`**
+        —— 读到图片或读带页图的 PDF 时返回中性图片块 dict，由调用方按形状分流
+        （tool 消息只放说明文本，图片本体走随后的合成 user 消息）。
+        """
         # s18：若无绑定 worktree，base=None → 主目录；有则文件操作落在 worktree 内
         base = self._member_worktrees.get(name)
         if tool_name == "bash":
             return self.tools.run_bash(args.get("command", ""), base=base)
         if tool_name == "run_read":
-            return self.tools.run_read(args.get("path", ""), args.get("limit"), base=base)
+            return self.tools.run_read(args.get("path", ""), args.get("limit"),
+                                       args.get("max_pages"), base=base)
         if tool_name == "run_write":
             return self.tools.run_write(args.get("path", ""), args.get("content", ""), base=base)
         if tool_name == "run_edit":
@@ -495,13 +536,6 @@ class TeammateManager:
                 args.get("new_text", ""), base=base)
         if tool_name == "run_glob":
             return self.tools.run_glob(args.get("pattern", ""), base=base)
-        if tool_name == "run_read_pdf":
-            kwargs = {"path": args.get("path", "")}
-            if args.get("max_pages") is not None:
-                kwargs["max_pages"] = args["max_pages"]
-            if args.get("chars_per_page") is not None:
-                kwargs["chars_per_page"] = args["chars_per_page"]
-            return self.tools.run_read_pdf(**kwargs, base=base)
         if tool_name == "send_message":
             self._send(name, args.get("to", ""), args.get("content", ""))
             return "Sent"

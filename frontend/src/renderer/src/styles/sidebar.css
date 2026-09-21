@@ -57,6 +57,9 @@
   display: flex;
   gap: var(--sp-1);
 }
+/* 图标按钮：固定 24×24，**只放 Icon，不放文字** ——
+   中文会被压成一字一行并溢出（任务面板的「继续执行」曾踩此坑，2026-09-16 删除）。
+   需要带文字的紧凑按钮请另起自适应宽度 + white-space: nowrap 的类。 */
 .mini-btn {
   display: flex;
   align-items: center;
@@ -82,14 +85,14 @@
 .tasktree-list {
   flex: 1;
   overflow-y: auto;
-  padding: 0 var(--sp-2);
+  padding: 0 var(--sp-1);
 }
 .tree-node {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: var(--sp-1);
   width: 100%;
-  padding: var(--sp-2);
+  padding: var(--sp-2) var(--sp-1);
   border-radius: var(--radius-md);
   font-size: var(--fs-sm);
   color: var(--color-text-primary);
@@ -107,20 +110,29 @@
 .tree-chevron {
   transition: transform 0.15s;
 }
-/* 会话状态点：运行中青色脉冲 / 后台完成绿色未读，flex-none 防止挤压标题 */
+/* 会话状态点：运行中青色脉冲 / 未读橙色实心 / 已读空心小圆圈。flex-none 防止挤压标题
+   优先级：运行中（running/bg）→ 脉冲；否则未读（unread）= 橙色实心，已读 = 空心圆圈。 */
 .tree-dot {
   flex: none;
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  box-sizing: border-box;
+  background: transparent;
+  border: 1.5px solid var(--color-text-secondary);
+  opacity: 0.55;
+}
+.tree-dot.unread {
+  border-color: transparent;
+  background: #ff9500;
+  opacity: 1;
 }
 .tree-dot.running {
+  border-color: transparent;
   background: var(--color-accent, #4facfe);
+  opacity: 1;
   box-shadow: 0 0 0 0 rgba(79, 172, 254, 0.5);
   animation: tree-dot-pulse 1.2s ease-out infinite;
-}
-.tree-dot.done {
-  background: #34c759;
 }
 @keyframes tree-dot-pulse {
   0% {
@@ -139,10 +151,6 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-.tree-count {
-  color: var(--color-text-secondary);
-  font-size: var(--fs-xs);
 }
 .tasktree-empty {
   padding: var(--sp-3);
@@ -208,6 +216,49 @@
   color: var(--color-danger);
 }
 
+/* 会话行悬停信息卡：fixed 定位于悬停行右缘；纯展示不拦截鼠标（pointer-events: none），
+   避免"移出行 → 卡片消失"的闪烁；z-index 低于弹出菜单(950) */
+.session-tip {
+  position: fixed;
+  z-index: 900;
+  width: 280px;
+  padding: var(--sp-3);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.2));
+  pointer-events: none;
+}
+.session-tip-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  word-break: break-all;
+  margin-bottom: var(--sp-2);
+}
+.session-tip-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 3px 0;
+  font-size: var(--fs-sm);
+}
+.session-tip-icon {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+.session-tip-label {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+.session-tip-value {
+  min-width: 0;
+  color: var(--color-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* 用户卡 */
 .usercard {
   flex: none;
@@ -242,14 +293,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.badge-lite {
-  background: var(--color-badge);
-  color: #fff;
-  font-size: var(--fs-xs);
-  padding: 1px 6px;
-  border-radius: var(--radius-pill);
-  flex: none;
-}
 .usercard-settings {
   display: flex;
   align-items: center;
@@ -261,5 +304,155 @@
 }
 .usercard-settings:hover {
   background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+/* ═══════════════════════════════════════════════════════════════
+   工作空间树（多工作空间，2026-09-18；见 docs/frontend/11）
+   - .ws-node：空间行（文件夹图标 + 名称 + 折叠箭头 + 行内「+」）
+   - .ws-sessions：其下的会话列表（带左侧竖线缩进，复用 .tree-node 会话行）
+   - .ws-more-sessions：超 15 条折叠后的「展开全部 N 条」入口
+   ═══════════════════════════════════════════════════════════════ */
+.ws-group {
+  margin-bottom: 2px;
+}
+.ws-node {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-1);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+.ws-node:hover {
+  background: var(--color-bg-hover);
+}
+.ws-node.missing {
+  opacity: 0.6;
+}
+.ws-node.active .ws-name {
+  font-weight: 600;
+}
+.ws-node.active .ws-folder,
+.ws-node.active .ws-chevron {
+  color: var(--color-accent);
+}
+.ws-chevron,
+.ws-folder {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-secondary);
+}
+.ws-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 行内重命名输入框（与 .tree-rename-input 同款，作用在空间行） */
+.ws-rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+/* 「+」= 在该空间新建任务：默认透明，hover / 激活空间时浮现 */
+.ws-add {
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.ws-node:hover .ws-add,
+.ws-node.active .ws-add {
+  opacity: 1;
+}
+/* 空间徽标：未读计数 / 目录失效 */
+.ws-badge {
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+.ws-badge.unread {
+  background: #ff9500;
+  color: #fff;
+}
+.ws-badge.missing {
+  background: var(--color-danger, #e5534b);
+  color: #fff;
+  font-weight: 600;
+}
+/* 空间级运行指示（子会话运行状态上浮；折叠时也能看出"还有活没干完"） */
+.ws-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-accent, #4facfe);
+  animation: tree-dot-pulse 1.2s ease-out infinite;
+}
+.ws-sessions {
+  margin-left: 9px;
+  padding-left: 3px;
+  border-left: 1px solid var(--color-border);
+}
+.ws-empty {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+.ws-more-sessions {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.ws-more-sessions:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-accent);
+}
+
+/* 空间右键菜单（复用 .session-menu 外壳，故只补差异部分） */
+.ws-menu {
+  min-width: 168px;
+}
+.ws-menu-sep {
+  height: 1px;
+  margin: var(--sp-1) 0;
+  background: var(--color-border);
+}
+/* 二次确认态：整项变红加粗，与设置页回收站的 arm-confirm 同一语言 */
+.session-menu-item.armed,
+.session-menu-item.armed:hover {
+  color: var(--color-danger);
+  font-weight: 600;
+}
+.ws-menu-hint {
+  padding: var(--sp-1) var(--sp-2) var(--sp-2);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+.ws-menu-path {
+  word-break: break-all;
   color: var(--color-text-primary);
 }

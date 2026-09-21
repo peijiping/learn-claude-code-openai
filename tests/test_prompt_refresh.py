@@ -68,7 +68,7 @@ def _make_agent(builder, history=None, with_revision=True) -> Agent:
     agent.session_file = Path("/tmp/_unittest_never_written.jsonl")
     agent.session_manager = _StubSessionManager()
     agent.session_prefix = "session_"
-    agent.session_num = 1
+    agent.session_id = "1"
     if with_revision:
         agent._prompt_workspace_revision = builder.workspace_revision
     return agent
