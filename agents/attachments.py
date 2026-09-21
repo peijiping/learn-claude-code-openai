@@ -1247,7 +1247,14 @@ def _expand_document(att: dict, files: dict, session_dir: Path | None,
     tail = ""
     original = files.get("original")
     if (att.get("text_truncated") or total_truncated) and original is not None:
-        tail = f"\n…（上方为节选，完整文件：{original}，可用工具继续读取）"
+        # 2026-09-20：旧文案是「完整文件：{path}，可用工具继续读取」——**假承诺**。
+        # 附件目录恒在 `~/.aigent/projects/<id>/.attachments/` 下（工作空间之外），
+        # `safe_path()` 的 `is_relative_to(base)` 一律拒绝，`run_read`/`run_read_pdf`
+        # 必然失败（模型随后就会说"读不到/找不到"）。只有 `bash` 不经过沙箱校验。
+        # 所以这里如实说明"在哪、为什么读不了、怎么才能读"。
+        tail = (f"\n…（以上为节选，完整原件位于 {original}。"
+                f"该路径在本会话工作空间之外，run_read / run_read_pdf 会被沙箱拒绝；"
+                f"需要完整内容时，可先用 bash 把它复制到工作空间内再读）")
 
     blocks = _document_blocks(body, assets, supports_image)
     # 头部说明并入首块、续读提示并入末块 —— 无页图的文档因此仍是单块，
@@ -1271,10 +1278,19 @@ def _document_header(att: dict, name: str, total_truncated: bool,
     `image_count` 由**磁盘上的资产目录**现数，不读 meta：目录才是真相，meta 丢了
     也能说出正确的数量。表格数刻意**不写进头部** —— `find_tables` 对无框线表格
     命中 0，说一个偏小的数字会让模型以为表格已尽收眼底；表格的视觉真相在页图里。
+
+    **2026-09-20 修复（模型"找不到我上传的文件"）**：旧头部只写 `[附件: 名字]`，
+    对模型而言这更像"这里有个叫这个名字的东西"的**路标**，而不是"正文在此"的
+    **载体** —— 于是模型拿到 word/excel 后第一反应是去工作空间 `glob`/`find` 核对
+    原文件（图片附件走 `image_url` 直给像素，没有这个歧义，所以只有文档类中招）。
+    而附件目录恒在 `~/.aigent/...`（工作空间之外），必然全空手而归，
+    最后对用户说"文件在工作空间里没有实体文件"。修法：头部**自己说清正文在哪**，
+    未截断时明确"正文已完整给出，不必再找磁盘"，截断时才给出可继续读取的路径。
     """
+    truncated = bool(att.get("text_truncated") or total_truncated)
     header = f"[附件: {name}]"
     notes = []
-    if att.get("text_truncated") or total_truncated:
+    if truncated:
         notes.append("内容已截断")
     if att.get("pages"):
         notes.append(f"共 {att['pages']} 页")
@@ -1282,6 +1298,11 @@ def _document_header(att: dict, name: str, total_truncated: bool,
         notes.append(f"含 {image_count} 张图片，已随附")
     if notes:
         header += "（" + "，".join(notes) + "）"
+    if truncated:
+        header += "\n（下方仅为节选，完整原件路径见本条附件文本末尾）"
+    else:
+        header += ("\n（以下就是该文件的完整正文，已随消息一并给出；"
+                   "无需再在磁盘或工作空间中查找、读取这个文件）")
     return header
 
 
