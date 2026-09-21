@@ -13,6 +13,13 @@
   --color-action-right: #4f8ef7;     /* 渐变终点(蓝) */
   --color-thinking: #9a9a9a;         /* thinking 灰 */
   --color-thinking-bg: #f0f7ff;      /* thinking 框底色（浅蓝） */
+  /* 引用胶囊配色：**输入区胶囊与消息气泡 chip 共用同一套**。
+     同一个引用在"正在引用"（输入区）与"这轮引用了什么"（气泡）两个时刻
+     长得不一样会让人以为是两种东西，故底色/文字色都收敛到这两个变量。 */
+  --color-ref-bg: #e8f1ff;           /* 浅蓝底 */
+  --color-ref-bg-hover: #d7e7ff;     /* 悬浮加深一档（仍是浅蓝） */
+  --color-ref-fg: #1e63c8;           /* 深蓝字：在浅蓝底上对比度 ≥ 4.5:1 */
+  --color-ref-rgb: 30, 99, 200;
   --color-danger: #e0533d;
   --color-ok: #34a853;
   /* 琥珀：介于成功与失败之间的"降级"态（附件解析不完整、可发送但需用户知情）。

@@ -1259,7 +1259,9 @@
   color: var(--color-accent);
 }
 
-/* ── 输入区里的引用胶囊（ProseMirror NodeView）──────────────────── */
+/* ── 输入区里的引用胶囊（ProseMirror NodeView）────────────────────
+   底色与消息气泡里的 `.ref-chip` **共用同一组变量**（--color-ref-*）：
+   同一个引用在输入区与气泡里必须长得一模一样。 */
 .ref-capsule {
   display: inline-flex;
   align-items: center;
@@ -1268,8 +1270,8 @@
   padding: 0 8px 0 2px;
   margin: 0 1px;
   border-radius: var(--radius-pill);
-  background: var(--color-bg-active);
-  color: var(--color-accent);
+  background: var(--color-ref-bg);
+  color: var(--color-ref-fg);
   font-size: var(--fs-sm);
   line-height: 20px;
   vertical-align: baseline;
@@ -1311,7 +1313,7 @@
 }
 
 .ref-capsule-icon:hover {
-  background: rgba(var(--color-accent-rgb), 0.18);
+  background: rgba(var(--color-ref-rgb), 0.18);
 }
 
 .ref-capsule-name {
@@ -1392,7 +1394,11 @@
   font-size: var(--fs-xs);
 }
 
-/* ── 消息气泡里的只读引用 chip ──────────────────────────────── */
+/* ── 消息气泡里的只读引用胶囊 ──────────────────────────────────
+   两个用法共用一套配色（浅蓝底 + 深蓝字，与输入区 `.ref-capsule` 同一组变量）：
+   - `.ref-chip.inline`：**内联在正文里**（`@路径` token 就地替换，只显示文件名）；
+   - `.ref-chip`：正文里没能内联渲染时的**兜底行**（`.ref-bar` 内）。
+   两种情况都无边框 —— 有边框会让它看起来像"按钮"，而它只是一个引用标记。 */
 .ref-bar {
   display: flex;
   flex-wrap: wrap;
@@ -1406,18 +1412,28 @@
   gap: 4px;
   max-width: 100%;
   padding: 2px 8px;
-  border: 1px solid var(--color-border);
+  border: none;
   border-radius: var(--radius-pill);
-  background: var(--color-bg-main);
-  color: var(--color-text-secondary);
+  background: var(--color-ref-bg);
+  color: var(--color-ref-fg);
   font-size: var(--fs-sm);
   line-height: 18px;
   cursor: pointer;
 }
 
+/* 正文内联：与输入区胶囊同高（20px 行高、左右各 8px 内边距），
+   且以 baseline 对齐 —— 行内元素必须跟着文字基线走，否则一行里胶囊会上下跳。 */
+.ref-chip.inline {
+  padding: 0 8px;
+  margin: 0 1px;
+  line-height: 20px;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
 .ref-chip:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
+  background: var(--color-ref-bg-hover);
+  color: var(--color-ref-fg);
 }
 
 .ref-chip-name {

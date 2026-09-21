@@ -1,6 +1,8 @@
 # 13 · 引用文件与文件夹（@-mention）
 
 > 状态：**已实施**（2026-09-21）。本文是该功能的设计与落地依据。
+> 2026-09-21 增补 §2.9 / §3.5：**气泡里只显示胶囊**（`@相对路径` token 就地还原，
+> 裸路径不再出现；两组胶囊统一浅蓝配色）。
 > 相关文档：[12-附件与文件输入](12-附件与文件输入.md)（**另一条通道**，务必对照阅读）、
 > [03-前后端通信协议](03-前后端通信协议.md) §2.9、[11-工作空间管理](11-工作空间管理.md)。
 
@@ -186,8 +188,10 @@ run_glob 或 bash（工作目录即工作空间根）。
 | `components/Chat/editor/serializeDoc.ts` | `serializeEditor()` / `collectRefs()` —— 序列化**唯一出处**，纯函数（只有类型导入） |
 | `components/Chat/RefPicker.tsx` | 候选面板（向上弹出、封顶 280px、键盘/鼠标交互、空态/加载态/disabled 原因/截断提示） |
 | `components/Chat/RefCapsule.tsx` | 胶囊 NodeView（图标 ⇄ 悬浮变删除、tooltip 绝对路径） |
-| `components/Chat/RefBar.tsx` | 消息气泡里的**只读**引用 chip |
+| `components/Chat/RefText.tsx` | 气泡正文的**内联**胶囊渲染（只读；点击在文件管理器中定位） |
+| `components/Chat/RefBar.tsx` | 气泡里的只读引用 chip **兜底行**（只列正文没能内联渲染的引用） |
 | `lib/refFilter.ts` | 本地过滤打分 + `toCandidates` + `capsuleLabel`（纯函数） |
+| `lib/refTokens.ts` | 正文 `@相对路径` token → 「文本 / 胶囊」片段（纯函数，见 §2.9） |
 | `hooks/useWorkspaceRefs.ts` | 一次拉全量 + 按 (空间, 会话) 缓存 |
 
 **Tiptap 接入的关键取舍**
@@ -239,6 +243,58 @@ if (!isTrustedSender(e) || (!payload?.text && !payload?.attachments?.length && !
 漏掉 `refs` 就等于把"只 @ 了一个文件就发送"的消息**静默丢掉** —— 正是 doc 12 §3.2
 第 1 条踩过的同一个坑。
 
+### 2.9 气泡里只显示胶囊（2026-09-21 优化）
+
+**问题**：胶囊在输入区序列化成 `@相对路径` 存进 `chat.payload.text`。发送后气泡把这串
+token **原样显示**，于是同一件事出现两种样子：输入区是胶囊，发出去变成一条裸路径
+（`@data/attachments/full.png 这个图片里的内容是什么?`），下方还另起一行重复列一颗 chip。
+
+**做法**：渲染时把 token 就地还原成胶囊（只显示文件名，与输入区同款），
+`RefBar` 退化为**兜底行**（只画正文里没能内联的引用，正常为空）。
+
+```
+user 消息 {content, refs}
+  → renderRefText(content, refs)          // lib/refTokens.ts（纯函数）
+      → segments: [ {text} | {ref} ... ]  // 按正文顺序切成片段
+      → inlinePaths: 已内联渲染的 path     // 供兜底行去重
+  → RefText 渲染胶囊（.ref-chip.inline） + 文本片段
+  → RefBar(refs = refs \ inlinePaths)     // 空则不渲染
+```
+
+**匹配规则（三级优先级，全部落空就原样保留）**：
+
+| # | 判据 | 例子 |
+| --- | --- | --- |
+| 1 | `ref.path === token` | 用户手打了绝对路径 |
+| 2 | `ref.path.endsWith('/' + token)` | `@data/attachments/full.png`（token 是相对路径） |
+| 3 | 去掉 token **尾部标点**后再走 1/2 | `@a.ts，帮我看看` → 胶囊 + `，帮我看看` 留在正文 |
+| 4 | **文件名前缀**匹配，且其后字符不属于 `[A-Za-z0-9_.\-/]` | `@a.ts这个图片`（用户删掉了胶囊后的空格） |
+
+两条硬约定：
+
+- **只认 `refs[]` 里存在的路径**。`@` 在这套输入里是普通字符（`me@example.com`、
+  手打 `@nope/zzz` 都可能出现），"看到 `@` 就当引用"会把正文吃掉。实测里这两种
+  输入都**逐字原样**渲染。
+- **不从 text 反解权威路径**：命中的是 `refs[]` 那条记录（path 由后端以磁盘为准
+  规范化过），token 只用来**定位位置**。这守住了"权威在 `refs[]`"的既定口径。
+
+**配色统一（浅蓝）**：输入区胶囊与气泡胶囊**共用同一组变量**（`--color-ref-bg`
+`--color-ref-bg-hover` `--color-ref-fg` `--color-ref-rgb`）：
+
+- `.ref-capsule`（输入区 NodeView）与 `.ref-chip`（气泡）同底色同文字色 ——
+  「正在引用」和「这轮引用了什么」是同一件事的两个时刻，两套配色会让人以为是两种东西；
+- **无边框**：带边框看起来像按钮，而它只是一个标记；与附件的 `.att-*` 仍能一眼区分
+  （引用零复制、不是"已上传"）；
+- `.ref-chip.inline` 用 20px 行高 + `vertical-align: baseline`，与正文文字同一基线，
+  不会把行高撑开、也不会上下跳。
+
+**为什么要单独一个纯函数模块**：切分逻辑（token 边界、标点、前缀回退）是纯字符串
+处理，放在组件里既难读也难验证；`lib/refTokens.ts` 只有类型导入，可单独跑。
+
+> 边界：`@` 密集或路径含空格时按"到空白为止"切分（与 serializer 的 `@相对路径`
+> 形态一致）。路径本身含空格的文件引用后 token 会被切断 —— 这是 v1 既有取舍，
+> 不是本次引入的。
+
 ***
 
 ## 三、落地
@@ -266,6 +322,19 @@ if (!isTrustedSender(e) || (!payload?.text && !payload?.attachments?.length && !
 + `index.d.ts`、`main/index.ts`、`lib/browserAgent.ts`、`styles/chat.css`、`package.json`
 （Tiptap 依赖）、`tsconfig.web.json` + `electron.vite.config.ts`（加 `@lib` 别名）。
 
+**前端 · 气泡内联胶囊优化（2026-09-21，§2.9）**（新增 2 个 + 修改 4 个）：
+
+| 文件 | 类型 | 改动 |
+| --- | --- | --- |
+| `lib/refTokens.ts` | 新增 | `renderRefText`：token → 片段序列 + `inlinePaths`（纯函数） |
+| `components/Chat/RefText.tsx` | 新增 | 正文内联胶囊渲染（`.ref-chip.inline`，只读） |
+| `components/Chat/MessageItem.tsx` | 修改 | user 正文 `{msg.content}` → `<RefText>`；`RefBar` 改收"未内联的引用" |
+| `components/Chat/RefBar.tsx` | 修改 | 语义改为兜底行 + `data-ref-path` |
+| `styles/tokens.css` | 修改 | 新增 `--color-ref-bg/-hover/-fg/-rgb`（两组胶囊共用） |
+| `styles/chat.css` | 修改 | `.ref-capsule` 改浅蓝底；`.ref-chip` 去边框 + 浅蓝底；新增 `.ref-chip.inline` |
+
+**后端零改动**（本次纯渲染层），`chat.payload.text`、`refs[]`、账本块全部不变。
+
 ### 3.2 勿回退要点
 
 1. `chat.payload.text` 恒为字符串；引用只走 `refs` 兄弟字段。
@@ -280,6 +349,12 @@ if (!isTrustedSender(e) || (!payload?.text && !payload?.attachments?.length && !
 10. 面板条目每次渲染现算，不存快照。
 11. 输入区的拖拽三硬约束、粘贴"只在真取到文件时才拦"保持原样。
 12. 跳过符号链接；越界路径一律丢弃且不阻断发送。
+13. **气泡正文只渲染胶囊，不再出现裸路径**；`RefBar` 只作兜底（空则不渲染），
+    别改回"`msg.refs` 全列一遍" —— 那会让同一批引用在气泡里出现两次。
+14. **只认 `refs[]` 里存在的路径**：匹配不上的 `@xxx` 必须逐字原样保留
+    （邮箱、手打 `@nope` 都靠这条），绝不做"看到 `@` 就替换"。
+15. 两组胶囊（输入区 `.ref-capsule` / 气泡 `.ref-chip`）**共用 `--color-ref-*` 变量**，
+    改配色改变量、不要在某一处写死颜色。
 
 ### 3.3 可调参数
 
@@ -320,6 +395,28 @@ if (!isTrustedSender(e) || (!payload?.text && !payload?.attachments?.length && !
 
 > 提示：`handlePaste` / `onDrop` 都是 `async`，登记发生在微任务之后 —— 用合成事件测它们时
 > **派发后必须再等一拍**才能读结果，同步读会永远读到空（本次实测踩过一次）。
+
+### 3.5 气泡内联胶囊专项实测（2026-09-21，§2.9）
+
+同一套 harness（headless Chromium + 裸 CDP + 真实构建产物 + 桩 `window.agent`），
+但这次走**真实发送链路**：点输入框 → 打 `@` → 面板选引用 → 打字 → Enter 发送，
+再读气泡 DOM（外加一组 `session_history` 注入覆盖回放路径）。
+
+| 项 | 实测数字 | 结论 |
+| --- | --- | --- |
+| 正文形态 | 气泡子节点 `[<span.ref-chip inline>, TEXT:" 这个图片里的内容是什么?"]`，`@data/attachments/full.png` **不再出现** | 裸路径消失 |
+| 两组胶囊配色 | 输入区 `.ref-capsule` 与气泡 `.ref-chip` 的 `background-color` 同为 `rgb(232, 241, 255)`、`color` 同为 `rgb(30, 99, 200)`；`border: 0px none`；`border-radius: 999px` | 浅蓝统一、零边框 |
+| 内联几何 | 胶囊 `height = 20`、`line-height: 20px`、`vertical-align: baseline`，与相邻文本 `sameLine = true` | 与文字同一行、不撑行高 |
+| 兜底行 | 5 个正常场景 `refBarPresent = false`；注入"正文无 token 但带 refs"的消息时 RefBar 出现 1 颗 chip | 不再重复列一遍 |
+| 中文标点紧跟 | `@README.md，帮我看看` → 胶囊 + `，帮我看看` | 标点没被吞 |
+| 无分隔紧贴 | `@README.md这个图片` → 胶囊 + `这个图片` | 前缀回退生效 |
+| 未匹配 `@` | `@nope/zzz 无关内容`、`me@example.com 是邮箱` 逐字原样，内联胶囊 **0** 颗 | 不误吃正文 |
+| 回放路径 | `session_history` 注入 3 条：单文件内联 / 目录渲染成 `src/`（尾斜杠）/ 一条消息两颗胶囊 | 回放与实时同源 |
+| 点击胶囊 | `openInFinder` 收到 `/Users/pei/proj/data/attachments/full.png` | 定位可用 |
+| 发送载荷 | `text = "@data/attachments/full.png  这个图片里的内容是什么?"`，`refs[0] = {path,name,is_dir}` | 协议零变化 |
+| 控制台 | 0 报错、0 CSP violation | — |
+
+**门槛**：`npm run typecheck` / `npm run build` 全绿（后端零改动，未跑 Python 全量）。
 
 ***
 

@@ -1,12 +1,14 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
+import { renderRefText } from '@lib/refTokens'
 import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
 import { attachmentUrl, useAgentStore, type Message, type SubAgentMsg, type ToolCallMsg } from '@store/agentStore'
 import MessageMenu from './MessageMenu'
 import AttachmentBar, { isDegraded } from './AttachmentBar'
 import RefBar from './RefBar'
+import RefText from './RefText'
 
 /** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
 function fmtTokens(n: number): string {
@@ -165,6 +167,17 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     return s.sessions.find((x) => x.id === sid)?.project ?? s.activeProject
   })
 
+  /** 正文里的 `@相对路径` token → 内联胶囊（与输入区同款视觉，见 lib/refTokens）。
+   *
+   *  `segments` 给正文用；`leftover` 是"没能内联渲染"的引用（正文里找不到对应 token，
+   *  例如只有引用块的老数据）—— 只把它们交给下方那行 RefBar 兜底，
+   *  正常路径下 RefBar 为空、不再重复列一遍。 */
+  const refRender = useMemo(() => {
+    const r = renderRefText(msg.content || '', msg.refs)
+    const inline = new Set(r.inlinePaths)
+    return { segments: r.segments, leftover: (msg.refs ?? []).filter((x) => x?.path && !inline.has(x.path)) }
+  }, [msg.content, msg.refs])
+
   /** 右键打开消息菜单 */
   const openMenu = (e: ReactMouseEvent): void => {
     e.preventDefault()
@@ -215,10 +228,18 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
                 onOpen={(v) => v.sourcePath && void window.agent.openInFinder(v.sourcePath)}
               />
             )}
-            {msg.content}
-            {/* 引用（@-mention）：与附件并列但**形状与语义都不同** —— 引用是
-                "指向工作空间里的某个路径"，零复制，故用独立组件与独立样式渲染 */}
-            <RefBar refs={msg.refs} onOpen={(p) => void window.agent.openInFinder(p)} />
+            {/* 正文：`@相对路径` token 就地渲染成胶囊（只显示文件名，与输入区一致） */}
+            <RefText
+              segments={refRender.segments}
+              onOpen={(p) => void window.agent.openInFinder(p)}
+            />
+            {/* 引用（@-mention）兜底行：只列"正文里没能内联渲染"的引用（正常为空）。
+                引用与附件是**两条独立通道**（形状与语义都不同）—— 引用零复制、
+                只指向工作空间里的路径，故用独立组件与独立样式渲染 */}
+            <RefBar
+              refs={refRender.leftover}
+              onOpen={(p) => void window.agent.openInFinder(p)}
+            />
             <div className="msg-meta">
               {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}
               <button
