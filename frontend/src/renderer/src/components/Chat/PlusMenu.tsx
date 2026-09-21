@@ -9,7 +9,6 @@ import { Icon } from '@components/common/Icon'
 export type PlusMenuKey =
   | 'attachFile' // 添加文件或图片
   | 'refPath' // 引用文件或文件夹
-  | 'refSession' // 引用历史会话
   | 'command' // 使用命令或 Skill
   | 'planMode' // 计划模式
   | 'goalMode' // 目标模式
@@ -34,7 +33,6 @@ export const PLUS_MENU_SECTIONS: PlusMenuSection[] = [
     items: [
       { key: 'attachFile', icon: 'filePlus', label: '添加文件或图片' },
       { key: 'refPath', icon: 'at', label: '引用文件或文件夹' },
-      { key: 'refSession', icon: 'hash', label: '引用历史会话' },
       { key: 'command', icon: 'slash', label: '使用命令或 Skill' }
     ]
   },
