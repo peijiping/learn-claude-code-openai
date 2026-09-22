@@ -19,7 +19,6 @@ agent_full_v2.py - 主智能体引擎（Agent 类）
 import hashlib
 import json
 import os
-import platform
 import re
 import threading
 import time
@@ -79,11 +78,8 @@ log = get_logger("agent")
 # 所以这类注入不会出现在前端回放 / 聊天界面里（与 _sync_task_board / _sync_memory_index 的约定一致）。
 # 每个 tag 各自独立判指纹，互不影响。
 MEMORY_INDEX_TAG = "memory_index"   # 记忆索引（L2 热段，变化最频繁）
-ENV_TAG = "env"                     # 环境与上下文：日期 / 星期 / 平台（L2 热段）
+ENV_TAG = "env"                     # 运行环境（日期 / 星期 / 平台）的**会话期间变化**（L2 热段）
 PROJECT_RULES_TAG = "project_rules"  # 工作区指令文件（AGENTS.md）会话期间的变更全文
-
-# 星期中文名（time.localtime().tm_wday：0 = 周一）
-_WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
 # ── 「承诺未兑现」守卫（2026-09-14 事故后新增）──────────────────────
@@ -354,6 +350,10 @@ class Agent:
         # _refresh_system_prompt() 刷新；_sync_project_rules() 据此判断是否需要
         # 把变更后的指令全文追加到消息尾部（方案 C）。
         self._prompt_workspace_revision = self.system_prompt.workspace_revision
+        # 当前「已进入 system prompt」的环境段（日期/星期/平台）指纹。
+        # 由 _refresh_system_prompt() 刷新；_sync_environment() 据此判断会话期间
+        # 环境是否又变了 —— 变了只做**尾部追加**，绝不改写历史消息。
+        self._prompt_env_revision = self.system_prompt.environment_revision
 
         # LLM 客户端 + S11 错误恢复控制器
         self.llm_client = LLMClient().llm
@@ -668,6 +668,7 @@ class Agent:
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         # 中断/恢复提示改由 _sync_task_board() 承接（见 Step 3），原 _inject_todo_reminder 已移除
         # L2 尾部注入：首次注入落在用户提问之前（指纹已在历史里则是 no-op）
+        # 环境段（日期/星期/平台）已随 _refresh_system_prompt() 进入 system prompt
         self._sync_memory_index()
         self._sync_environment()
         # 任务板注入：恢复会话时提示"还有活没干完"（判据=存在未完成组，非"是否中断"）
@@ -1001,9 +1002,9 @@ class Agent:
         # todo 已下线（2026-09-16）：不再绑定 TodoManager，也不再有 reminder
         # self.tools.set_todo_manager(self.session_id)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
-        # 新会话：立即注入当前记忆索引与环境上下文（新会话扫不到指纹 → 必然注入）
+        # 新会话：立即注入当前记忆索引（新会话扫不到指纹 → 必然注入）；
+        # 环境段（日期/星期/平台）已随上面 _refresh_system_prompt() 进入 system prompt。
         self._sync_memory_index()
-        self._sync_environment()
         log.info("新会话创建: %s%s", self.session_prefix, self.session_id)
         return self.session_id, f"已创建新会话: session_{self.session_id}.jsonl"
 
@@ -1029,7 +1030,8 @@ class Agent:
         # self.tools.set_todo_manager(self.session_id)
         self.tools.task_manager.set_scope(f"{self.session_prefix}{self.session_id}")
         # 中断/恢复提示改由 _sync_task_board() 承接（见 Step 3）
-        # L2 尾部注入：若离开期间记忆/日期变过，这里会补注（指纹从本会话历史恢复）
+        # L2 尾部注入：若离开期间记忆变过，这里会补注（指纹从本会话历史恢复）；
+        # 环境段已随上面 _refresh_system_prompt() 进入 system prompt，故此处为 no-op。
         self._sync_memory_index()
         self._sync_environment()
         # 任务板注入：切回会话时提示"还有活没干完"（去重，见 _history_has_task_board）
@@ -1243,6 +1245,9 @@ class Agent:
         if self.session_manager is not None:
             self.session_manager.system_prompt = fresh
         self._prompt_workspace_revision = self.system_prompt.workspace_revision
+        # 环境段（日期 / 星期 / 平台）也随本次重建进入 system prompt，记录其指纹，
+        # 供 _sync_environment() 判断会话**期间**环境是否又变了（变了才尾部追加，不改历史）。
+        self._prompt_env_revision = self.system_prompt.environment_revision
 
         if not self.history_messages:
             return False
@@ -1317,33 +1322,39 @@ class Agent:
 
     # ── 环境与上下文（日期 / 星期 / 平台）──────────────────────────────
     #
-    # 每次判定都**现场取值**（不是会话创建时固化），所以：
-    #   - 跨天时日期自动更新；当天内指纹不变 → 不重复注入，零开销；
-    #   - 会话被搬到另一台机器 resume 时，平台会自动纠正；
-    #   - git 状态**故意不纳入** —— 它随每次 commit / 切分支变化，是缓存杀手，
-    #     真需要时让模型跑一条 git status 更划算。
-
-    @staticmethod
-    def _environment_snapshot() -> list[tuple[str, str]]:
-        """现场采集环境信息，返回 [(标签, 值)]（顺序固定 → 指纹稳定）。"""
-        now = time.localtime()
-        return [
-            ("当前日期", time.strftime("%Y-%m-%d", now)),
-            ("星期", _WEEKDAY_CN[now.tm_wday]),
-            ("运行平台", platform.system().lower() or "unknown"),
-        ]
+    # 两级处理，**任何情况下都不改写已落盘的历史消息**（改写 = 整段前缀缓存失效）：
+    #   1. 进会话时（init / switch / new）→ 由 _refresh_system_prompt() 把当前环境
+    #      写进 system prompt 的 `# 运行环境` 段（L1'）。这是"建会话/换会话"这个
+    #      本就允许替换 messages[0] 的时刻（方案 B），环境因此不占一条 user 消息。
+    #   2. 会话**期间**环境变了（跨天、或会话被搬到另一台机器 resume）→ 绝不重建
+    #      messages[0]，改为**尾部追加**一条 `<env>` 注入（与 memory_index /
+    #      project_rules 同构），块内声明"以本条为准"。
+    #
+    # 每次判定都**现场取值**（不是会话创建时固化）：当天内指纹不变 → 零开销。
+    # git 状态**故意不纳入** —— 它随每次 commit / 切分支变化，是缓存杀手，
+    # 真需要时让模型跑一条 git status 更划算。
 
     def _sync_environment(self) -> None:
-        """环境上下文尾部按需注入：内容变了才追加（通常一天一次）。"""
-        snapshot = self._environment_snapshot()
-        body = "\n".join(f"{label}：{value}" for label, value in snapshot)
-        revision = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
+        """环境在会话期间变化时**尾部追加**注入（绝不改写历史消息）。
+
+        与 `_sync_project_rules()` 完全同构：
+        - 与 system prompt 里那份一致 → 无事可做（进会话时已由方案 B 写入）；
+        - 这一版已经追加过（指纹在历史里）→ 不重复追加；
+        - 否则尾部追加 `<env>`，块内声明以本条为准。
+        """
+        revision = self.system_prompt.environment_revision
+        if revision == getattr(self, "_prompt_env_revision", None):
+            return  # 与 system prompt 里那份一致，无需注入
         if revision == self._last_injection_revision(ENV_TAG):
-            return
-        self._append_injection(ENV_TAG, revision, body)
-        log.info("注入环境上下文: %s%s revision=%s (%s)",
-                 self.session_prefix, self.session_id, revision,
-                 " | ".join(v for _, v in snapshot))
+            return  # 这一版已经注入过
+        self._append_injection(
+            ENV_TAG,
+            revision,
+            "运行环境已在本次会话期间变化（跨天或换了机器），以下为**最新**；"
+            "与之冲突时以本条为准。\n\n" + self.system_prompt.get_environment_body(),
+        )
+        log.info("注入运行环境更新: %s%s revision=%s",
+                 self.session_prefix, self.session_id, revision)
 
     # ── 方案 C：工作区指令文件变更时的尾部注入 ────────────────────────
     #
@@ -1599,12 +1610,12 @@ class Agent:
         # 预热注入后，把上一 turn 结束时仍在跑、此刻已完成的后台子智能体记录落盘
         self._persist_pending_subagent_rows()
 
-        # ── L2 尾部注入同步（turn 起点）────────────────────────────────
-        # 放在这里而不是去刷新 system prompt：这些内容走「尾部追加」，不碰 [0]，
-        # 所以已缓存的前缀继续命中，只有新增那一条是未缓存的（而它本来就是本轮新内容）。
-        # 位置覆盖 run_turn / run_background_followup / CLI 全路径；会话中途的
-        # write_memory / forget_memory、跨天导致的日期变化、以及 AGENTS.md 被改动，
-        # 都在下一轮由这里捕获。
+        # ── 按需同步（turn 起点）────────────────────────────────────────
+        # 全部走「尾部追加」，**不碰 messages[0]**，所以已缓存的前缀继续命中，
+        # 只有新增那一条是未缓存的（而它本来就是本轮新内容）。位置覆盖 run_turn /
+        # run_background_followup / CLI 全路径；会话中途的 write_memory / forget_memory、
+        # 跨天导致的环境变化、以及 AGENTS.md 被改动，都在下一轮由这里捕获。
+        # （进会话时的 system prompt 替换属方案 B，只发生在 init / switch / new。）
         self._sync_memory_index()
         self._sync_environment()
         self._sync_project_rules()

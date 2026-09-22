@@ -6,6 +6,12 @@
 - L0 冻结段：身份 / 输出格式 / 上下文保护规则、工具使用策略、技能列表。
   永不变化（除非改代码或装/删技能），所有会话逐字节相同 → 可跨会话共享前缀缓存。
 - L1 冷段：workspace 指令文件（AGENTS.md 等）。改文件才变，故排在静态段最末尾。
+- L1' 环境段：运行环境（当前日期 / 星期 / 运行平台）。**内联在 system prompt 最末尾**
+  （见 `_get_environment`），主流 Agent（如 Claude Code 的 "Today's date"）同样把日期放在
+  system prompt 里，好处是不占用一条 user 消息。它只在**进会话时**（init / switch / new，
+  方案 B 本就会替换 `messages[0]`）写入；会话**期间**环境变化（跨天 / 换机器）**绝不重建**
+  `messages[0]`，而是由 `agent_full_v2._sync_environment()` 以 `<env>` **尾部追加**通知模型
+  —— 已落盘的历史消息永远不被改写，前缀缓存不受影响。
 - L2 热段：记忆索引**不在这里**。它每轮都可能变，由
   `agent_full_v2._sync_memory_index()` 在指纹变化时以**尾部追加**的方式注入
   （尾部追加不破坏已缓存前缀；改动 system message 会让整个前缀失效）。
@@ -17,6 +23,8 @@
 
 import hashlib
 import os
+import platform
+import time
 from pathlib import Path
 
 from paths import WORKDIR, SKILLS_DIR
@@ -30,6 +38,23 @@ DEFAULT_WORKSPACE_FILES: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", "AGENT.md"
 # 技能列表在静态段中的单条描述最大字符数（超出截断为 …）。
 # 完整描述仍可通过 list_skills 工具按需获取。
 SKILL_DESC_MAX_CHARS = int(os.environ.get("SKILL_DESC_MAX_CHARS") or 120)
+
+# 星期中文名（time.localtime().tm_wday：0 = 周一）
+_WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def environment_snapshot() -> list[tuple[str, str]]:
+    """现场采集运行环境信息，返回 [(标签, 值)]（顺序固定 → 指纹稳定）。
+
+    **每次调用都现场取值**（不是会话创建时固化），所以跨天时日期自动更新、
+    会话被搬到另一台机器 resume 时平台自动纠正。
+    """
+    now = time.localtime()
+    return [
+        ("当前日期", time.strftime("%Y-%m-%d", now)),
+        ("星期", _WEEKDAY_CN[now.tm_wday]),
+        ("运行平台", platform.system().lower() or "unknown"),
+    ]
 
 
 class SystemPromptBuilder:
@@ -245,25 +270,61 @@ class SystemPromptBuilder:
 **当前索引**：以对话上下文中的 `<memory_index>` 块为准；看不到即暂无记忆。
 """
 
+    def _environment_body(self) -> str:
+        """环境信息正文（不含标题），供 `_get_environment` 与指纹计算共用。"""
+        return "\n".join(f"{label}：{value}" for label, value in environment_snapshot())
+
+    def get_environment_body(self) -> str:
+        """公开入口：当前运行环境正文（**每次现场取值**）。
+
+        供 `agent_full_v2._sync_environment()` 在会话**期间**环境变化（跨天 / 换机器）时
+        把最新环境**尾部追加**到消息末尾 —— 绝不改写已落盘的历史消息。
+        """
+        return self._environment_body()
+
+    def _get_environment(self) -> str:
+        """L1' 段（sections 最末尾）：运行环境（当前日期 / 星期 / 运行平台）。
+
+        为什么放进 system prompt 而不是尾部注入一条 user 消息：
+        - 这是主流 Agent 的做法（Claude Code 把 "Today's date" 放在 system 里），
+          模型对"今天几号、什么平台"的认知属于**身份上下文**，不是用户说的话；
+        - 不占用一条 user 消息。
+        注意：本段只在**进会话时**（init / switch / new）随 `messages[0]` 一并写入；
+        会话**期间**跨天不会重跑本段 —— `_sync_environment()` 改为尾部追加 `<env>`，
+        以保证已落盘的历史消息永不被改写（缓存命中优先）。
+        """
+        return f"# 运行环境\n{self._environment_body()}\n"
+
+    @property
+    def environment_revision(self) -> str:
+        """当前运行环境内容的指纹（**每次读取都现场取值**，不缓存）。
+
+        供 `agent_full_v2._sync_environment()` 判断 system prompt 里的环境段是否过期：
+        指纹不同 → 重建 `messages[0]`；相同 → 零开销、不触碰 system message。
+        """
+        return hashlib.sha1(self._environment_body().encode("utf-8")).hexdigest()[:12]
+
     def build_system_prompt(self) -> str:
-        """组装并返回完整的 system prompt（纯静态，无动态段）。
+        """组装并返回完整的 system prompt。
 
         分层与字节级稳定性保证：
         1. section 顺序用 list-of-tuples 写死，跨进程稳定。顺序即「变化频率」
-           从低到高：identity → tools → skills → memory 规则 → workspace。
-           workspace 指令（AGENTS.md）在开发期改动最频繁，故排在静态段最末尾。
+           从低到高：identity → tools → skills → memory 规则 → workspace → environment。
+           workspace 指令（AGENTS.md）在开发期改动最频繁，environment（日期）每天最多
+           变一次，故这两段依次排在末尾。
         2. 空 section 整体跳过，不输出占位符。
-        3. 全部为静态内容 → 同一项目的不同会话产出逐字节相同，
-           可跨会话共享前缀缓存（这是把记忆索引移出 system prompt 的主要收益）。
+        3. L0/L1 段为静态内容 → 同一项目的不同会话产出逐字节相同，
+           可跨会话共享前缀缓存（environment 段按天变，但它只在进会话时构建一次）。
         4. 记忆索引不在本函数内（L2 热段），见 agent_full_v2._sync_memory_index()。
         """
         # 1. 顺序写死：list-of-tuples 而非 dict
         sections = [
-            ("identity",  self._get_identity()),                # L0
-            ("tools",     self._get_tools()),                   # L0
-            ("skills",    self._get_skills()),                  # L0
-            ("memory",    self._get_memory_rules()),            # L0（仅机制说明，无索引）
-            ("workspace", self._get_workspace_instructions()),  # L1（静态段最末尾）
+            ("identity",    self._get_identity()),                # L0
+            ("tools",       self._get_tools()),                   # L0
+            ("skills",      self._get_skills()),                  # L0
+            ("memory",      self._get_memory_rules()),            # L0（仅机制说明，无索引）
+            ("workspace",   self._get_workspace_instructions()),  # L1（冷段最末尾）
+            ("environment", self._get_environment()),             # L1'（按天变，排最后）
         ]
         # 2. 过滤空段（无技能 / 找不到 workspace 指令文件时整段消失）
         parts = [f"{v}\n" for _, v in sections if v]
