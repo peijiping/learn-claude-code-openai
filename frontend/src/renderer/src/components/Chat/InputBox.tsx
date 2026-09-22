@@ -49,6 +49,13 @@ interface InputBoxProps {
   onRemoveAttachment: (key: string) => void
   /** 在系统文件管理器中定位附件原文件 */
   onOpenAttachment: (sourcePath: string) => void
+  /** 输入区被临时"让位"（本会话有在途的 ask_user 提问）时为 true。
+   *
+   *  隐藏由父级的 CSS 承担（`.chat--asking`），这里只做一件事：**把焦点收回来**。
+   *  否则用户盲打的内容会进到一个看不见的编辑器里 —— 敲 Enter 时虽然被
+   *  store 的 isSending / 父级的发送守卫拦下，但"字打进去了却看不见"本身就是事故。
+   *  编辑器**不卸载**：它是非受控的（内容只在内部），卸载即丢草稿。 */
+  suspended?: boolean
 }
 
 /** 草稿附件 → 统一视图（图片走自定义协议显示缩略图） */
@@ -95,7 +102,8 @@ export default function InputBox({
   attachments,
   onStagePaths,
   onRemoveAttachment,
-  onOpenAttachment
+  onOpenAttachment,
+  suspended = false
 }: InputBoxProps): JSX.Element {
   const isSending = useAgentStore((s) => s.isSending)
   const stop = useAgentStore((s) => s.stop)
@@ -350,6 +358,12 @@ export default function InputBox({
     []
   )
   editorRef.current = editor
+
+  // 让位期间把手上的焦点收回（见 props.suspended）：编辑器仍挂在 DOM 里，
+  // 只是被父级 CSS 藏起来 —— 留着焦点的结果是"盲打"。
+  useEffect(() => {
+    if (suspended && editor?.isFocused) editor.commands.blur()
+  }, [suspended, editor])
 
   // 发送完成 → 清空正文与胶囊并聚焦。**不用 setContent 做同步**（见 props 注释）
   useEffect(() => {

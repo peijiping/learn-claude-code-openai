@@ -1451,3 +1451,351 @@
 .plus-menu-item.disabled:hover {
   background: transparent;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   结构化提问 ask_user（2026-09-21）
+
+   两条展示通道，**视觉上刻意区分**：
+   - `.ask-panel`（输入框上方）：**待作答**的交互面板 —— 一题一屏，
+     紫调强调（"需要你现在做决定"）；
+   - `.ask-block`（消息下方）：**已结算**的只读小结 —— 中性灰底，
+     是历史凭证而不是可操作的东西（灰色 = 没什么可点的）。
+
+   布局约定与 `.task-card` 一致：外层负责 940px 上限 + 左右 24px 留白，
+   内层卡片描边 —— 两个面板的左右边界因此严格对齐。
+   ══════════════════════════════════════════════════════════════ */
+/* 输入区让位（2026-09-22）：本会话有在途提问时，输入区整块隐藏 ——
+   面板与输入框并存等于同时给出两条作答路径（用户可能在输入框里打一半又去点选项，
+   两边都像"已经答了"）。用 display:none 而**不是卸载**：编辑器是非受控的，
+   卸载即丢草稿（答案提交后草稿原样回来）。
+   面板同时补上原本由 .composer-wrap 承担的底部留白，否则会贴着窗口下沿。 */
+.chat--asking .composer-wrap {
+  display: none;
+}
+.chat--asking .ask-panel {
+  padding-bottom: var(--sp-4);
+}
+
+.ask-panel {
+  flex: none;
+  width: 100%;
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 0 var(--sp-5);
+}
+.ask-panel__card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(var(--color-accent-rgb), 0.35);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+.ask-panel__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 38px;
+  padding: 0 var(--sp-3);
+  background: var(--color-bg-active);
+  border-bottom: 1px solid rgba(var(--color-accent-rgb), 0.18);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.ask-panel__icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-accent);
+}
+.ask-panel__title {
+  font-weight: 500;
+}
+.ask-panel__step,
+.ask-panel__hint {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.ask-panel__hint {
+  padding: 1px var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-hover);
+  font-size: var(--fs-xs);
+}
+.ask-panel__spacer {
+  flex: 1;
+}
+.ask-panel__cancel {
+  padding: 2px var(--sp-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.ask-panel__cancel:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-danger);
+}
+
+/* 步骤条：一题一屏时它是唯一的"全局视角"（已答/未答一目了然，且可跳题） */
+.ask-panel__steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3) 0;
+}
+.ask-step {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  max-width: 180px;
+  padding: 2px var(--sp-2) 2px 2px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.ask-step:hover {
+  background: var(--color-bg-hover);
+}
+.ask-step--active {
+  border-color: rgba(var(--color-accent-rgb), 0.4);
+  background: var(--color-bg-active);
+  color: var(--color-text-primary);
+}
+.ask-step__dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-bg-hover);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.ask-step--done .ask-step__dot {
+  background: var(--color-ok);
+  color: #fff;
+}
+.ask-step--active .ask-step__dot {
+  background: var(--color-accent);
+  color: #fff;
+}
+.ask-step__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 题目 + 选项：固定视口高度内滚动（选项描述可能很长，不能把输入框顶出屏幕） */
+.ask-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  max-height: 260px;
+  overflow-y: auto;
+  padding: var(--sp-3);
+}
+.ask-q {
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  color: var(--color-text-primary);
+}
+.ask-q__header {
+  display: inline-block;
+  margin-right: var(--sp-2);
+  padding: 1px var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-active);
+  color: var(--color-accent);
+  font-size: var(--fs-xs);
+}
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.ask-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.ask-option:hover {
+  border-color: rgba(var(--color-accent-rgb), 0.5);
+  background: var(--color-bg-active);
+}
+.ask-option--on {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+/* 单选＝圆点，多选＝方框：形状直接告诉用户"能不能多选"，不必读文字提示 */
+.ask-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  color: #fff;
+}
+.ask-mark--box {
+  border-radius: 4px;
+}
+.ask-option--on .ask-mark {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+}
+.ask-option__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ask-option__label {
+  line-height: 1.4;
+}
+.ask-option__desc {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+.ask-custom {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  font-family: inherit;
+  outline: none;
+}
+
+.ask-panel__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--color-border);
+}
+.ask-panel__tip {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.ask-btn {
+  padding: var(--sp-1) var(--sp-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ask-btn:hover {
+  background: var(--color-bg-hover);
+}
+.ask-btn--primary {
+  border-color: transparent;
+  background: linear-gradient(90deg, var(--color-action-left), var(--color-action-right));
+  color: #fff;
+}
+.ask-btn--primary:hover {
+  background: linear-gradient(90deg, var(--color-action-left), var(--color-action-right));
+  opacity: 0.9;
+}
+.ask-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── 消息下的只读小结块 ──────────────────────────────────────── */
+.ask-block {
+  margin: var(--sp-2) 0;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-text-secondary);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-sidebar);
+  font-size: var(--fs-sm);
+}
+.ask-block__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  background: transparent;
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.ask-block__icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-secondary);
+}
+.ask-block__title {
+  font-weight: 500;
+}
+.ask-block__meta {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.ask-block__spacer {
+  flex: 1;
+}
+/* 正文与回填给模型的 tool_result 逐字节相同 → 原样保留换行，不重排、不解析 */
+.ask-block__body {
+  padding: 0 var(--sp-3) var(--sp-3);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ask-block__empty {
+  padding: 0 var(--sp-3) var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+/* 结局用左侧色条区分（比满屏底色克制；四种结局一眼可辨） */
+.ask-block--answered {
+  border-left-color: var(--color-ok);
+}
+.ask-block--answered .ask-block__icon {
+  color: var(--color-ok);
+}
+.ask-block--cancelled {
+  border-left-color: var(--color-warn);
+}
+.ask-block--cancelled .ask-block__icon {
+  color: var(--color-warn);
+}
+.ask-block--stopped {
+  border-left-color: var(--color-danger);
+}
+.ask-block--stopped .ask-block__icon {
+  color: var(--color-danger);
+}
+.ask-block--incomplete {
+  border-left-color: var(--color-text-secondary);
+}
+

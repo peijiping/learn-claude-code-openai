@@ -178,6 +178,57 @@ PROMISE_GUARD_REMINDER = (
 )
 
 
+def _tool_args_of(tool_call) -> dict:
+    """取一次工具调用的参数字典（容忍各种残缺形状，绝不抛异常）。
+
+    优先读 `_args_cache`（agent_loop 在分桶前已经 json.loads 过一次，避免重复解析）；
+    没有则现场解析 `function.arguments`（单测直接喂假对象时走这条）。
+    """
+    cached = getattr(tool_call, "_args_cache", None)
+    if isinstance(cached, dict):
+        return cached
+    raw = getattr(getattr(tool_call, "function", None), "arguments", None)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _partition_tool_calls(tool_calls) -> tuple[list, list, list, list]:
+    """把一轮 LLM 返回的 tool_calls 按执行语义分成四桶（纯函数，便于单测）。
+
+    返回 `(background, parallel, serial, ask)`，四桶互斥，执行顺序即此序。
+
+    **ask_user 单独成桶、且忽略 parallel / run_in_background**（2026-09-21）：
+    它要**阻塞等待用户点击**。
+    - 落进 parallel 桶 → 在线程池里阻塞等一个用户动作，占住 worker 且与并行语义无关；
+    - 落进 background 桶 → 在守护线程里等一个永远无人应答的回复（前端根本看不到卡）；
+    - 落进 serial 桶 → 会排在普通工具**之前/之中**执行，用户作答前本轮其它工具都还没跑。
+
+    两者都会挂死执行线程，所以这里最优先判定并强制独占。放最后执行保证
+    "本轮其它工具都已跑完，用户作答后模型才在下一迭代继续" —— 即"问完再干"。
+
+    ⚠️ 改变执行次序**不会**造成 tool 消息与 tool_calls 错位：回放循环严格按
+    `response_tool_calls` 的声明顺序取结果（OpenAI 硬约束），与执行顺序无关。
+    """
+    background, parallel, serial, ask = [], [], [], []
+    for tool_call in tool_calls:
+        name = getattr(getattr(tool_call, "function", None), "name", "") or ""
+        if name == "ask_user":
+            ask.append(tool_call)
+            continue
+        tool_args = _tool_args_of(tool_call)
+        if tool_args.get("run_in_background"):
+            background.append(tool_call)
+        elif tool_args.get("parallel"):
+            parallel.append(tool_call)
+        else:
+            serial.append(tool_call)
+    return background, parallel, serial, ask
+
+
 class Agent:
     """
     主智能体引擎：持有全部依赖与会话状态，支持多实例隔离。
@@ -1335,11 +1386,24 @@ class Agent:
 
         stop_event：协作式停止事件。后台路径由 _execute_tool_call 每任务新建一个
         （随 start_background_task 登记，request_stop_all 置位）；同步路径传主
-        智能体自身的 _stop_evt（子智能体也能被"停止"打断）。仅 sub_agent 会读它。
+        智能体自身的 _stop_evt（子智能体也能被"停止"打断）。仅 sub_agent 与
+        ask_user 会读它。
         """
         if tool_name == "sub_agent":
             return lambda: self._run_subagent(tool_args, tool_call_id,
                                               stop_event=stop_event)
+        elif tool_name == "ask_user":
+            # 唯一需要把 tool_call_id / stop_event 透传进工具层的工具：
+            # - tool_call_id：前端把只读小结块锚回"发起它的那条 assistant 消息"；
+            # - stop_event  ：让 ask() 的阻塞等待能被"停止"在轮询切片内收束
+            #                 （主路仍是 broker.cancel_all，这只是兜底二次检查）。
+            # 两个键以 `_` 前缀递交给 handler，**不在模型可见的 schema 里**。
+            return lambda: self.tools.execute(
+                "ask_user",
+                questions=tool_args.get("questions") or [],
+                _tool_call_id=tool_call_id,
+                _stop_event=stop_event,
+            )
         elif self.tools.resolve_handler(tool_name) is not None:
             return lambda: self.tools.execute(tool_name, **tool_args)
         else:
@@ -1436,8 +1500,14 @@ class Agent:
                  self.session_prefix, self.session_id, tool_name,
                  json.dumps(tool_args, ensure_ascii=False)[:200])
 
-        # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式
-        if self.background_manager.should_run_background(tool_name, tool_args):
+        # 判定是否走后台：模型显式 run_in_background=True 优先，否则启发式。
+        # ⚠️ ask_user **永不后台**：它要阻塞等用户点击，而这里是守护线程 +
+        # 立即返回占位结果 —— 用户压根看不到那张卡，工作线程永久挂住。
+        # （分桶阶段已保证它走"提问桶"，这里再拦一道是为了防御非 agent_loop
+        # 的调用方，例如将来新增的直接执行路径。）
+        if tool_name != "ask_user" and self.background_manager.should_run_background(
+            tool_name, tool_args
+        ):
             # 每个后台任务一个停止事件：同时交给 executor（sub_agent 在迭代
             # 边界读取）与 background_manager（request_stop_all 置位）。
             bg_stop = threading.Event()
@@ -1744,26 +1814,26 @@ class Agent:
 
             # 注：工具调用的工具行已由 PrintSink 在流式阶段预测式渲染（P3），
             # 这里不再重复打印汇总，避免同一工具调用出现两行。
-            # 三阶段执行：后台 → 并行 → 串行, 互斥分桶。
+            # 四阶段执行：后台 → 并行 → 串行 → 提问, 互斥分桶。
             #   后台桶: args.run_in_background=true, 立即分发给 background_manager 守护线程
             #   并行桶: args.parallel=true (且非后台), 线程池并发, 全部完成才走下一步
             #   串行桶: args.parallel=false 或缺省 (且非后台), 按声明顺序逐个执行
+            #   提问桶: ask_user —— 独占串行且**排最后**，忽略 parallel/run_in_background
+            #           （它要阻塞等用户点击，进线程池/守护线程都会挂死；详见
+            #            _partition_tool_calls 的注释）
             # 结果用 {tool_call_id: result} 收集, 最后按 LLM 原始声明顺序回放到 history,
-            # 保证 tool 消息顺序与 tool_calls 顺序一致(OpenAI 协议硬约束)。
+            # 保证 tool 消息顺序与 tool_calls 顺序一致(OpenAI 协议硬约束) ——
+            # 所以四桶之间的**执行次序**不影响正确性。
             tool_call_results: dict[str, dict] = {}
-            background_calls, parallel_calls, serial_calls = [], [], []
+            # 解析一次参数并缓存, 后面分桶/各阶段复用, 避免重复 json.loads
             for tool_call in response_tool_calls:
                 # （原 used_todo 追踪已随 todo nag 一并删除）
-                # 解析一次参数, 后面复用, 避免每阶段都重复 json.loads
                 raw_args = tool_call.function.arguments
                 tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                 tool_call._args_cache = tool_args
-                if tool_args.get("run_in_background"):
-                    background_calls.append(tool_call)
-                elif tool_args.get("parallel"):
-                    parallel_calls.append(tool_call)
-                else:
-                    serial_calls.append(tool_call)
+            background_calls, parallel_calls, serial_calls, ask_calls = (
+                _partition_tool_calls(response_tool_calls)
+            )
 
             # 阶段 1: 后台分发——立即拿到 bg_id 占位 result, 不阻塞当前 turn
             for tool_call in background_calls:
@@ -1826,7 +1896,29 @@ class Agent:
                 tool_call_results[tool_call.id] = tool_call_result
                 self.hook_system.trigger("PostToolUse", tool_call, tool_call_result)
 
-            # 按 LLM 声明顺序回放 tool 消息(三桶结果合并, 严格保序)
+            # 阶段 4: ask_user —— 独占串行, 且**排在最后**。
+            # 这里会**阻塞本工作线程**直到用户作答/取消/停止（turn 跑在
+            # asyncio.to_thread 的工作线程里，不卡事件循环）。放最后是为了让
+            # 本轮其它工具先跑完：用户作答后，模型在**下一迭代**拿到答案继续，
+            # 语义上就是"问完再干"。
+            # ask() 保证返回字符串（含停止/取消的占位文案），因此无论用户怎么退出，
+            # 这里都会给这个 tool_call 回填一条 tool 消息 —— 不会留下孤儿 tool_call
+            # （孤儿会触发 load_session_history 的原子重写自愈）。
+            for tool_call in ask_calls:
+                blocked = self.hook_system.trigger("PreToolUse", tool_call)
+                if blocked:
+                    tool_call_results[tool_call.id] = {
+                        "role": "tool", "tool_call_id": tool_call.id, "content": str(blocked)
+                    }
+                    continue
+                tool_call_result = self._execute_tool_call(tool_call)
+                self._print(
+                    f"\033[2;93m [工具执行结果(提问)]\n {truncate_chars(str(tool_call_result.get("content", "")))}\n [/工具执行结果]\033[0m"
+                )
+                tool_call_results[tool_call.id] = tool_call_result
+                self.hook_system.trigger("PostToolUse", tool_call, tool_call_result)
+
+            # 按 LLM 声明顺序回放 tool 消息(四桶结果合并, 严格保序)
             #
             # 工具读图（run_read 读到图片/页图，2026-09-21）：它返回的是**图片块**，而
             # Chat Completions 的 `tool` 消息 `content` 只接受 text part ——

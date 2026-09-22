@@ -182,6 +182,22 @@ class BrowserAgentBridge implements AgentApi {
     this.sendRaw(JSON.stringify({ kind: 'stop', payload: { session_id: sessionId } }))
     return Promise.resolve()
   }
+  // 结构化提问作答 / 取消（ask_user）：与 stop 同类，后端无点对点应答信封，
+  // 回执走 `ask_resolved` 广播 → fire-and-forget。
+  answerAsk(sessionId: string, requestId: string, answers: unknown[]): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'ask_answer',
+      payload: { session_id: sessionId, request_id: requestId, answers: Array.isArray(answers) ? answers : [] }
+    }))
+    return Promise.resolve()
+  }
+  cancelAsk(sessionId: string, requestId: string): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'ask_cancel',
+      payload: { session_id: sessionId, request_id: requestId }
+    }))
+    return Promise.resolve()
+  }
   switchSession(sessionId: string): Promise<{ session_id: string; message_count: number }> {
     // 历史回放经由 session / session_history 事件信封驱动 store，无需等待应答
     this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { session_id: sessionId } }))

@@ -3,6 +3,7 @@ import { hasSendableContent, isSendableAttachment, useAgentStore } from '@store/
 import MessageList from './MessageList'
 import InputBox from './InputBox'
 import TaskBoard from './TaskBoard'
+import AskUserPanel from './AskUserPanel'
 import type { EditorSnapshot } from './editor/serializeDoc'
 
 /** 空草稿（模块级常量：身份稳定，避免每次渲染都造新对象） */
@@ -20,8 +21,22 @@ export default function ChatPanel(): JSX.Element {
   const [draft, setDraft] = useState<EditorSnapshot>(EMPTY_DRAFT)
   // 自增即"清空输入框"信号（清空走编辑器命令，不做受控同步）
   const [clearSignal, setClearSignal] = useState(0)
+  /** 本会话是否有**在途提问**（ask_user 面板正在等作答）。
+   *
+   *  此时输入区整块让位：面板与输入框并存会同时给出两条作答路径 ——
+   *  用户可能在输入框里把答案打一半、又去点选项，两边都像"已经答了"。
+   *  判据与 AskUserPanel 的渲染条件同源（同一个 `interactionBySession` 条目），
+   *  不做第二份推断：面板渲染出来的那一刻，输入框就收起。 */
+  const askOpen = useAgentStore((s) => {
+    if (!s.activeSession) return false
+    const it = s.interactionBySession[s.activeSession]
+    return !!it && it.questions.length > 0
+  })
 
   const doSend = (): void => {
+    // 在途提问期间输入区已被隐藏（见 askOpen）—— 这里再兜一道：
+    // 万一有残留焦点 / 快捷键把发送打进来，也绝不与作答面板抢答。
+    if (askOpen) return
     // 用共享判据而不是 `status === 'ready'`：degraded（分析不完整但可用）也必须随
     // payload 发出，否则扫描件会被静默丢掉（见 isSendableAttachment 的说明）。
     const ready = draftAttachments.filter(isSendableAttachment)
@@ -47,7 +62,8 @@ export default function ChatPanel(): JSX.Element {
   }, [])
 
   return (
-    <main className="chat">
+    // `chat--asking` = 输入区让位给作答面板（隐藏 composer，面板自身承担底部留白）
+    <main className={`chat${askOpen ? ' chat--asking' : ''}`}>
       {messages.length === 0 ? (
         <div className="empty-state">
           <div className="brand-logo">&lt;/&gt;</div>
@@ -60,12 +76,18 @@ export default function ChatPanel(): JSX.Element {
       {/* 任务面板：固定在输入框上方（有未完成任务组时才渲染） */}
       <TaskBoard />
 
+      {/* 结构化提问作答面板（ask_user）：同样固定在输入框上方，紧贴输入框 ——
+          它是"必须现在做决定"的交互，位置越靠近手边越好。有在途提问时才渲染。
+          它出现时输入区**整块隐藏**（`chat--asking`），面板因此落在最底部 */}
+      <AskUserPanel />
+
       <div className="composer-wrap">
         <InputBox
           value={draft}
           onChange={setDraft}
           onSend={doSend}
           clearSignal={clearSignal}
+          suspended={askOpen}
           attachments={draftAttachments}
           onStagePaths={(paths) => void stageAttachments(paths)}
           onRemoveAttachment={removeDraftAttachment}

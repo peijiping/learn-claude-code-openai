@@ -164,6 +164,65 @@ export interface TaskBoardSnapshot {
  *  侧边栏同样亮运行脉冲点，但不显示停止按钮（stop 只能停 turn）。 */
 export type SessionRunStatus = 'running' | 'done' | 'stopped' | 'background'
 
+/** ── 结构化提问 ask_user（2026-09-21）─────────────────────────────────
+ *
+ *  模型用 `ask_user` 工具提出 1–4 个选择题并**阻塞等待**作答；前端在输入框
+ *  上方弹面板（一题一屏、「下一步」逐步作答），结果作为 tool_result 回填，
+ *  模型在**同一个回合内**据此继续。
+ *
+ *  两条通道的职责划分（重要）：
+ *  - **实时**：`ask_request`（下发问题，弹面板）→ `ask_resolved`（清面板 + 落只读小结）；
+ *  - **回放**：assistant 行的 `askUsers[]`（问题来自工具参数、答案来自配对上的
+ *    tool 行 content）→ 渲染同一个只读小结块。
+ *
+ *  `result_text` 是**唯一展示载体**：由后端 broker 生成，与回填给模型的
+ *  tool_result **逐字节相同**，实时与回放共用同一份文本 —— 所以前端**不做
+ *  任何解析**，只原样展示（`white-space: pre-wrap`）。
+ */
+export interface AskOption {
+  label: string
+  description?: string
+}
+
+export interface AskQuestion {
+  /** 批内唯一稳定标识；作答按它对号入座 */
+  id: string
+  /** ≤12 字短标签，用于步骤条与只读小结块标题 */
+  header: string
+  question: string
+  multi_select: boolean
+  /** 是否额外提供「其他」自由文本输入。
+   *  **显式字段** —— 不靠 `label === '其他'` 这类隐式约定判断。 */
+  allow_custom: boolean
+  custom_label: string
+  options: AskOption[]
+}
+
+/** 一次提问的结局：已作答 / 用户主动取消 / 本轮被停止 */
+export type AskStatus = 'answered' | 'cancelled' | 'stopped'
+
+/** 单题作答：`selected` 是命中的 `option.label`（后端会再过滤一次脏值） */
+export interface AskAnswer {
+  question_id: string
+  selected: string[]
+  custom_text?: string
+}
+
+/** 回放用：按 tool_call_id 配回 assistant 的提问。
+ *  `args` 是工具参数 JSON（含 questions），`result` 是配对上的 tool 行 content
+ *  （= result_text；空串表示未完成，如进程被杀）。
+ *
+ *  `status` 由后端 `interaction.status_of_result()` 从 `result` 反推
+ *  （jsonl 不存 outcome）—— **前端只搬运、不猜文案**：徽标文案的唯一真相
+ *  在后端 interaction 模块，前端 `startswith` 一改常量就会静默错位。 */
+export interface HistoryAskUser {
+  tool_call_id: string
+  args: string
+  result: string
+  /** completed 结局；`incomplete` = result 为空（未完成） */
+  status?: AskStatus | 'incomplete'
+}
+
 /** 面向 UI 的产物事件（非增量），由 bridge 把底层 event 聚合/透传而来 */
 export type UiEvent =
   | { kind: 'event'; payload: AgentEvent }
@@ -192,6 +251,15 @@ export type UiEvent =
    *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
    *  会话切换/回放时后端只发未完成组，故已结束的组切回来不会显示。 */
   | { kind: 'task_board'; payload: { session_id: string; board: TaskBoardSnapshot | null } }
+  /** 结构化提问下发（ask_user）：前端弹「交互提问面板」（输入框上方）。
+   *  与 task_board 同属**桥层聚合出的 UI 产物事件**，不是流式增量 ——
+   *  因此不进 StreamEventType / isKnownAgentEvent 白名单。
+   *  断线重连 / 渲染进程刷新时后代会重放在途提问（见 03 文档 §2.10）。 */
+  | { kind: 'ask_request'; payload: { session_id: string; request_id: string; tool_call_id: string; questions: AskQuestion[]; created_at: number } }
+  /** 提问已解决（作答 / 取消 / 停止）：前端撤面板 + 在该会话的消息下发只读小结。
+   *  **必须有这条**：多窗口一致性（A 窗口作答后 B 窗口的面板也要消失）、
+   *  提交窗口自身清面板、以及免去 IPC 请求-响应配对（提交是 fire-and-forget）。 */
+  | { kind: 'ask_resolved'; payload: { session_id: string; request_id: string; tool_call_id: string; status: AskStatus; answers: AskAnswer[]; result_text: string } }
 
 /** 附件种类（与后端 attachments.KIND_* 对齐） */
 export type AttachmentKind = 'image' | 'document' | 'text'
@@ -355,6 +423,11 @@ export interface HistoryMessage {
   /** user 消息引用的工作空间路径（后端 `_history_to_ui` harvest；**无引用时连字段
    *  都不带** —— 与改造前的回放形状逐字节一致） */
   refs?: MessageRef[]
+  /** assistant 消息下发起的结构化提问（ask_user，2026-09-21）。
+   *  后端 `_history_to_ui` 按 `tool_call_id` 把 tool 行的 content 配对回来；
+   *  这些提问**不会**出现在 `toolCalls` 里（不以普通工具条展示）。
+   *  **无提问时连字段都不带** —— 与改造前逐字节一致。 */
+  askUsers?: HistoryAskUser[]
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -586,6 +659,12 @@ export type ControlKind =
   | 'llm_config_get'
   | 'llm_config_save'
   | 'llm_models_fetch'
+  /** 结构化提问的作答（ask_user）。**fire-and-forget，无点对点回包** ——
+   *  回执走 `ask_resolved` 广播。刻意不走 request()：主进程 pending 表按 kind
+   *  FIFO 配对且无 id，同 kind 并发会串台、还会被广播信封误消费。 */
+  | 'ask_answer'
+  /** 取消本次提问（按"未作答、请自行选默认方案继续"回填）。同样 fire-and-forget。 */
+  | 'ask_cancel'
 
 export interface WsOutbound {
   kind: ControlKind | 'ping'
@@ -617,6 +696,20 @@ export interface ChatPayload {
    *  把「路径清单 + 内容不在上下文中、需要时用 run_read」注入模型上下文。
    *  与 attachments 是**并列且独立**的两条通道。 */
   refs?: RefInput[]
+}
+
+/** 前端 → 后端：提交选择题答案（kind='ask_answer'）。
+ *  只传命中的 label 与自定义文本；后端会按问题定义再过滤一次脏值。 */
+export interface AskAnswerPayload {
+  session_id: string
+  request_id: string
+  answers: AskAnswer[]
+}
+
+/** 前端 → 后端：取消本次提问（kind='ask_cancel'）。 */
+export interface AskCancelPayload {
+  session_id: string
+  request_id: string
 }
 
 /** chat 携带的附件线索（真实元数据以磁盘上的 meta.json 为准，前端字段只是线索） */

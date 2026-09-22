@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryMessage, MessageRef, ModelSwitch, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -185,6 +185,48 @@ export interface SubAgentMsg {
   error?: string
 }
 
+/** 结构化提问（ask_user）在 assistant 消息下的**只读小结块**数据。
+ *
+ *  两条路径产出同一形状：
+ *  - **实时**：`tool_call_start` 时先建块（status='pending'，此期间**不渲染**，
+ *    由输入框上方的面板承载）→ `tool_call`（终态参数）补 questions →
+ *    `ask_resolved` 补 resultText/status（离开 pending → 渲染）。
+ *  - **回放**：assistant 行的 `askUsers[]` 一次到位（status 由后端反推；
+ *    resultText 为空 = 'incomplete'，如进程被杀）。
+ *
+ *  `resultText` 是**唯一展示载体**（与回填给模型的 tool_result 逐字节相同）：
+ *  前端**不做任何结构化解析**，只按行原样展示（`white-space: pre-wrap`）。 */
+export interface AskUserMsg {
+  /** 配对键：发起它的 tool_call id（实时/回放同一 id） */
+  toolCallId: string
+  /** 问题（实时取自 ask_request / 工具参数；回放由 `args` 解析）。解析失败为空数组 */
+  questions: AskQuestion[]
+  /** 后端 broker 生成的 result_text；空串 = 未完成 */
+  resultText: string
+  /** 'pending' = 实时在途（不渲染）；'incomplete' = 回放发现未完成 */
+  status: AskStatus | 'pending' | 'incomplete'
+  /** 发起本次提问时**本条消息正文的长度**（2026-09-22，实时路径在 `tool_call_start`
+   *  那一刻记录；回放缺省）。
+   *
+   *  用途：把正文切回它真正的位置。模型总是"先说一句话（先跟你确认几个关键项），
+   *  再提问"—— 这句话必须显示在提问卡片**上方**；而同一个气泡里提问之后续写的
+   *  正文（实时路径整轮合并进一条消息）仍留在卡片下方（见 MessageItem 的分段规则）。
+   *
+   *  缺省（回放路径）= 正文全在提问之前：jsonl 每次 LLM 调用一行，正文只可能出自
+   *  发起该 tool_call 的那一次响应，必然在提问之前，不存在"提问后还有正文"的同一行。 */
+  contentOffset?: number
+}
+
+/** 输入框上方「待确认」面板的实时状态（一个会话至多一条在途提问）。
+ *  纯 UI 态、不落盘 —— 由 `ask_request` 建立、`ask_resolved` 清除；
+ *  **不从 session_history 恢复**（重连时后端用 `_ask_snapshot_lines()` 重放）。 */
+export interface AskInteraction {
+  requestId: string
+  /** 发起它的 tool_call id（与消息下的只读小结块配对） */
+  toolCallId: string
+  questions: AskQuestion[]
+}
+
 /** 消息 footer 的 token 统计：turn=本轮消耗（主 + 子智能体），
  *  session=turn 收尾时的会话级累计快照（实时事件携带；回放仅恢复 turn，缺省不显示第二段），
  *  model=本轮模型快照（usage_stats 事件 model 字段 / 回放 jsonl model_info 节点） */
@@ -210,6 +252,10 @@ export interface Message {
   /** 本消息内发起过的 sub_agent 工具调用 id（实时锚点：子智能体事件据此
    *  挂回"发起它的那条 assistant 消息"，与回放规则一致，切会话不跳位） */
   subAgentToolIds?: string[]
+  /** 本消息发起过的结构化提问（ask_user）：消息下方只读小结块的数据源。
+   *  与 subagents 同理，ask_user 调用**不进普通工具条**（避免与面板/小结块重复），
+   *  但必须记在消息上 —— 实时与回放共用同一挂载规则，切会话不跳位。 */
+  askUsers?: AskUserMsg[]
   activeToolId: string | null
   streaming: boolean
   usage: MessageUsage | null
@@ -339,6 +385,12 @@ interface AgentState {
    *  注意 session_history 到来时会先置 null 再等随后的 task_board 覆盖 ——
    *  否则"切走再切回"会残留上一轮那版 done 快照。 */
   taskBoardBySession: Record<string, TaskBoardSnapshot | null>
+  /** 每个会话当前在途的结构化提问（ask_user）：输入框上方「待确认」面板的数据源。
+   *  null / 缺省 = 该会话没有待作答提问（面板不显示）。
+   *  **不落盘、不从 session_history 恢复** —— 断线重连时由后端重放 ask_request
+   *  （`_ask_snapshot_lines()`），所以在 setConnection('connected') 时整体清空，
+   *  避免断连期间已被结算的提问留下永不消失的僵尸面板。 */
+  interactionBySession: Record<string, AskInteraction | null>
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -367,6 +419,12 @@ interface AgentState {
   /** 清空附件草稿（发送后 / 切会话 / 新建任务时调用） */
   clearDraftAttachments: () => void
   stop: () => void
+  /** 提交选择题作答（ask_user）。**fire-and-forget**：不乐观关面板，
+   *  面板由随后广播的 `ask_resolved` 关闭 —— 与后端 `resolve()` 的
+   *  「迟到/重复提交无副作用」语义一致（否则会出现"面板已消失但后端丢弃了作答"）。 */
+  answerAsk: (requestId: string, answers: AskAnswer[]) => void
+  /** 取消本次提问（用户点「取消」）：同上 fire-and-forget，回执走 `ask_resolved`。 */
+  cancelAsk: (requestId: string) => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
   /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
@@ -530,6 +588,103 @@ function stagedToDraft(it: StagedAttachment): DraftAttachment {
   }
 }
 
+/** 解析 `ask_user` 工具参数里的 `questions`（参数是 JSON 文本）。
+ *  **失败返回 null**（不是空数组）—— 调用方据此保留已有值，
+ *  绝不能用"解析失败"的空数组覆盖掉从 `ask_request` 拿到的真实问题。 */
+function parseAskQuestions(args: string): AskQuestion[] | null {
+  try {
+    const parsed = JSON.parse(args || '{}')
+    const qs = parsed?.questions
+    if (!Array.isArray(qs) || qs.length === 0) return null
+    return qs as AskQuestion[]
+  } catch {
+    return null
+  }
+}
+
+/** 在指定消息上按 toolCallId 建/取「只读小结块」占位（已存在则原样返回）。
+ *  `tool_call_start` 到达时调用：此时参数可能还没流完，questions 先留空。
+ *  `contentOffset` = 此刻的正文长度（提问卡片要插在正文的这个位置之后）。 */
+function upsertAskBlock(
+  msgs: Message[],
+  msgId: string,
+  toolCallId: string,
+  contentOffset: number
+): Message[] {
+  return msgs.map((m) => {
+    if (m.id !== msgId) return m
+    const list = m.askUsers ?? []
+    if (list.some((a) => a.toolCallId === toolCallId)) return m
+    return {
+      ...m,
+      askUsers: [
+        ...list,
+        { toolCallId, questions: [], resultText: '', status: 'pending' as const, contentOffset }
+      ]
+    }
+  })
+}
+
+/** 按 toolCallId 打补丁到已存在的块（跨消息查找）。找不到时返回原数组。 */
+function patchAskBlock(msgs: Message[], toolCallId: string, patch: Partial<AskUserMsg>): Message[] {
+  if (!toolCallId) return msgs
+  return msgs.map((m) => {
+    const idx = (m.askUsers ?? []).findIndex((a) => a.toolCallId === toolCallId)
+    if (idx < 0) return m
+    const askUsers = (m.askUsers ?? []).slice()
+    askUsers[idx] = { ...askUsers[idx], ...patch }
+    return { ...m, askUsers }
+  })
+}
+
+/** `ask_resolved` → 把结果落进「发起它的那条 assistant 消息」的只读小结块。
+ *
+ *  找不到块时回落到**末尾那条 assistant 消息**（例如工具参数流被中断、
+ *  `tool_call_start` 丢失）；连 assistant 都没有就原样返回 —— **绝不凭空新建气泡**
+ *  （否则会出现一条只有提问、没有上下文的消息）。
+ */
+function appendAskResult(
+  msgs: Message[],
+  toolCallId: string,
+  data: { questions: AskQuestion[] | null; resultText: string; status: AskStatus }
+): Message[] {
+  const tcid = toolCallId || ''
+  if (tcid && msgs.some((m) => (m.askUsers ?? []).some((a) => a.toolCallId === tcid))) {
+    return msgs.map((m) => {
+      const idx = (m.askUsers ?? []).findIndex((a) => a.toolCallId === tcid)
+      if (idx < 0) return m
+      const askUsers = (m.askUsers ?? []).slice()
+      const prev = askUsers[idx]
+      askUsers[idx] = {
+        ...prev,
+        // 已有问题（ask_request / 工具参数）优先，只在为空时用兜底值
+        questions: prev.questions.length ? prev.questions : (data.questions ?? []),
+        resultText: data.resultText,
+        status: data.status
+      }
+      return { ...m, askUsers }
+    })
+  }
+  // 兜底：挂到末尾那条 assistant
+  let lastAssistant = -1
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') {
+      lastAssistant = i
+      break
+    }
+  }
+  if (lastAssistant < 0) return msgs
+  const block: AskUserMsg = {
+    toolCallId: tcid,
+    questions: data.questions ?? [],
+    resultText: data.resultText,
+    status: data.status
+  }
+  return msgs.map((m, idx) =>
+    idx === lastAssistant ? { ...m, askUsers: [...(m.askUsers ?? []), block] } : m
+  )
+}
+
 function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
   return hist.map((m, i) => {
     // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
@@ -567,6 +722,19 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
     }))
     const subagents = backendSubs.length ? backendSubs : derivedSubs
     const normalCalls = (m.toolCalls ?? []).filter((t) => t.name !== 'sub_agent')
+    // 结构化提问（ask_user）：不进普通工具条，改由消息下的只读小结块承载。
+    // 后端的 `_history_to_ui` 已把它从 toolCalls 里摘出放进 askUsers[]（问题=工具参数，
+    // 结果=配对上的 tool 行 content），这里只做形状映射 + 兜底过滤（老后端/旁路数据）。
+    const askUsers: AskUserMsg[] = (m.askUsers ?? [])
+      .filter((a) => !!a && typeof a.tool_call_id === 'string')
+      .map((a: HistoryAskUser) => ({
+        toolCallId: a.tool_call_id,
+        questions: parseAskQuestions(a.args) ?? [],
+        resultText: a.result ?? '',
+        // status 由后端 `interaction.status_of_result()` 反推；老后端缺字段时按
+        // "有结果=已作答 / 无结果=未完成"退化（**不在前端猜具体是哪一种结局**）
+        status: a.status ?? (a.result ? ('answered' as const) : ('incomplete' as const))
+      }))
     return {
       id: `h${sid}_${i}`,
       role: m.role,
@@ -599,7 +767,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       // 回放：user 消息携带的附件（后端从 content 引用块 harvest；无附件不带该字段）
       ...(m.attachments && m.attachments.length ? { attachments: m.attachments } : {}),
       // 回放：user 消息引用的工作空间路径（同上，无引用时后端连字段都不发）
-      ...(m.refs && m.refs.length ? { refs: m.refs } : {})
+      ...(m.refs && m.refs.length ? { refs: m.refs } : {}),
+      // 回放：结构化提问的只读小结块（无提问时连字段都不多一个）
+      ...(askUsers.length ? { askUsers } : {})
     }
   })
 }
@@ -679,6 +849,18 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
         )
         return msgs
       }
+      // ask_user 同理不进主工具条：提问由输入框上方的面板承载、结果由消息下的
+      // 只读小结块承载。这里先按 tool_call_id 建块占位（status='pending' →
+      // 在途期间**不渲染**，避免与面板重复），问题/结果随后由 `tool_call`
+      // 与 `ask_resolved` 补齐。**必须记锚点**：ask_resolved 据此落回本条消息。
+      if (ev.tool_name === 'ask_user') {
+        const tcid = ev.tool_id || ''
+        if (!tcid) return msgs
+        // 记录"此刻正文有多长"：提问卡片要插在正文的这个位置之后 ——
+        // 模型先说的那句话属于卡片上方，提问后（同轮）续写的正文留在卡片下方。
+        msgs = upsertAskBlock(msgs, id, tcid, current(id).content.length)
+        return msgs
+      }
       msgs = msgs.map((m) => {
         if (m.id !== id) return m
         const hasRunning = m.toolCalls.some((t) => t.status === 'running')
@@ -703,6 +885,15 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
       })
       break
     case 'tool_call':
+      // ask_user 终态：参数已完整，补进只读小结块（流式下 tool_call_start 时
+      // 参数可能只到了一半，解析不出问题，所以在这里补一次）。
+      // `ask_resolved` 通常**先于**本事件到达（broker 在工具返回前就广播了结果），
+      // 因此这里是"事后补问题"而不是"覆盖结果"—— patch 只带 questions。
+      if (ev.tool_name === 'ask_user') {
+        const qs = parseAskQuestions(ev.args ?? '')
+        if (qs) msgs = patchAskBlock(msgs, ev.tool_id || '', { questions: qs })
+        break
+      }
       msgs = msgs.map((m) => ({
         ...m,
         toolCalls: m.toolCalls.map((t) =>
@@ -953,6 +1144,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   currentContextStats: null,
   sessionUsageBySession: {},
   taskBoardBySession: {},
+  interactionBySession: {},
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
@@ -967,8 +1159,18 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 断线重连（→ connected）：清空陈旧运行态。后端会在新连接上重放
       // 仍在运行会话的 session_status（running/background），重新点亮真实
       // 运行指示；清空防止断连期间的状态残留（如永远转圈的僵尸会话）。
+      // 待作答的提问同理清空：重连时后端会重放 ask_request 快照
+      //（`_ask_snapshot_lines()`）—— 不断连期间若已被结算，前端拿不到
+      // ask_resolved，留下的面板会永远消不掉。
       if (c === 'connected' && s.connection !== 'connected') {
-        return { ...s, connection: c, runningSessions: [], bgSessions: [], isSending: false }
+        return {
+          ...s,
+          connection: c,
+          runningSessions: [],
+          bgSessions: [],
+          isSending: false,
+          interactionBySession: {}
+        }
       }
       return { ...s, connection: c }
     }),
@@ -1107,6 +1309,24 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         isSending: false
       }
     })
+    // 面板**不在此处本地清空**：停止会走后端 `request_stop()` → `cancel_all()`
+    // → 广播 `ask_resolved`（status='stopped'）→ 由该事件清面板并落只读小结。
+    // 本地清会让随后到达的 ask_resolved 找不到 in-flight 的问题文本
+    //（小结块只剩结果行、丢标题），所以坚持"单一出口"。
+  },
+
+  /** 提交选择题作答。fire-and-forget —— 见 AgentState 上的注释。 */
+  answerAsk: (requestId, answers) => {
+    const sid = get().activeSession
+    if (!sid || !requestId) return
+    window.agent.answerAsk(sid, requestId, answers)
+  },
+
+  /** 取消本次提问。fire-and-forget —— 见 AgentState 上的注释。 */
+  cancelAsk: (requestId) => {
+    const sid = get().activeSession
+    if (!sid || !requestId) return
+    window.agent.cancelAsk(sid, requestId)
   },
 
   handleEvent: (ev) => {
@@ -1383,6 +1603,67 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             return s
           }
           return { ...s, taskBoardBySession: { ...s.taskBoardBySession, [sid]: next } }
+        })
+        break
+      }
+      case 'ask_request': {
+        // 模型发起结构化提问（ask_user）→ 弹「待确认」面板（输入框上方）。
+        // 这是桥层聚合出的 UI 产物事件（同 task_board），**不是流式增量**。
+        // 纯 UI 态：不落盘、不进 messages —— 消息里只有 tool_call_start 建好的
+        // 只读小结块占位（status='pending' 期间不渲染，避免与面板重复）。
+        const p = ev.payload as
+          | { session_id?: string; request_id?: string; tool_call_id?: string; questions?: AskQuestion[] }
+          | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid || !p?.request_id) break
+        set((s) => ({
+          ...s,
+          interactionBySession: {
+            ...s.interactionBySession,
+            [sid]: {
+              requestId: p.request_id as string,
+              toolCallId: typeof p.tool_call_id === 'string' ? p.tool_call_id : '',
+              questions: Array.isArray(p.questions) ? p.questions : []
+            }
+          }
+        }))
+        break
+      }
+      case 'ask_resolved': {
+        // 提问已结算（作答 / 取消 / 被停止）：清面板 + 把结果落进消息下的只读小结块。
+        // **result_text 原样展示**（与回填给模型的 tool_result 逐字节相同），
+        // 前端不做任何结构化解析。
+        const p = ev.payload as
+          | {
+              session_id?: string
+              request_id?: string
+              tool_call_id?: string
+              status?: AskStatus
+              answers?: AskAnswer[]
+              result_text?: string
+            }
+          | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const cur = s.interactionBySession[sid] ?? null
+          const sameRequest = cur !== null && (!p?.request_id || cur.requestId === p.request_id)
+          const interactionBySession = { ...s.interactionBySession }
+          // 只清「同一条请求」：迟到/重复的 ask_resolved（例如作答后又被停止路径
+          // 结算）不能误清新发起的提问面板。
+          if (sameRequest || cur === null) interactionBySession[sid] = null
+          const buf = appendAskResult(s.messagesBySession[sid] ?? [], p?.tool_call_id ?? '', {
+            questions: sameRequest && cur ? cur.questions : null,
+            resultText: p?.result_text ?? '',
+            status: p?.status ?? 'answered'
+          })
+          const messagesBySession = { ...s.messagesBySession, [sid]: buf }
+          return {
+            ...s,
+            interactionBySession,
+            messagesBySession,
+            messages: s.activeSession === sid ? buf : s.messages
+          }
         })
         break
       }

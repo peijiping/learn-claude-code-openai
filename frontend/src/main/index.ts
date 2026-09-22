@@ -301,6 +301,34 @@ function createWindow(): void {
     ws.send(JSON.stringify({ kind: 'stop', payload: { session_id: payload.session_id } }))
   })
 
+  // 结构化提问（ask_user）作答 / 取消 —— 2026-09-21。
+  // **fire-and-forget，不用 request()**：主进程 `pending` 表按 kind FIFO 配对、
+  // 不带 id，同类并发会串台；而且回执本来就走 `ask_resolved` **广播**，
+  // 主进程拿它没有意义（渲染层直接从 WS 广播收）。这里只做形状校验 + 转发。
+  ipcMain.handle('agent:answerAsk', (e, payload: { session_id?: string; request_id?: string; answers?: unknown[] }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) return
+    ws.send(JSON.stringify({
+      kind: 'ask_answer',
+      payload: {
+        session_id: payload.session_id,
+        request_id: payload.request_id,
+        // answers 的结构由后端 normalize_answers 收敛（脏值一律过滤），
+        // 主进程只保证是数组，不在这里重复实现一遍 schema 校验。
+        answers: Array.isArray(payload.answers) ? payload.answers : []
+      }
+    }))
+  })
+
+  ipcMain.handle('agent:cancelAsk', (e, payload: { session_id?: string; request_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) return
+    ws.send(JSON.stringify({
+      kind: 'ask_cancel',
+      payload: { session_id: payload.session_id, request_id: payload.request_id }
+    }))
+  })
+
   ipcMain.handle('agent:switchSession', (e, payload: { session_id?: string }) => {
     if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
     ws.send(JSON.stringify({ kind: 'session_switch', payload: { session_id: payload.session_id } }))

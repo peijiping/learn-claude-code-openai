@@ -41,6 +41,15 @@ const agent = {
   /** 停止指定会话正在执行的那一轮（其它后台会话不受影响） */
   stop: (sessionId: string): Promise<void> => ipcRenderer.invoke('agent:stop', { session_id: sessionId }),
 
+  /** ── 结构化提问作答（ask_user，2026-09-21）─────────────────────────
+   * 模型用 `ask_user` 工具提问并阻塞等待；这里提交答案 / 取消。
+   * **fire-and-forget**：回执走 `ask_resolved` 广播（渲染层从 onEvent 收），
+   * 这两个 invoke 的返回值无意义、也不该等 —— 别改成 request()。 */
+  answerAsk: (sessionId: string, requestId: string, answers: unknown[]): Promise<void> =>
+    ipcRenderer.invoke('agent:answerAsk', { session_id: sessionId, request_id: requestId, answers }),
+  cancelAsk: (sessionId: string, requestId: string): Promise<void> =>
+    ipcRenderer.invoke('agent:cancelAsk', { session_id: sessionId, request_id: requestId }),
+
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (sessionId: string): Promise<{ session_id: string; message_count: number }> =>
     ipcRenderer.invoke('agent:switchSession', { session_id: sessionId }),

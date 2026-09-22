@@ -26,6 +26,9 @@ export interface AgentApi {
   send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>
+  /** 结构化提问作答 / 取消（ask_user）。fire-and-forget：回执走 `ask_resolved` 广播。 */
+  answerAsk: (sessionId: string, requestId: string, answers: unknown[]) => Promise<void>
+  cancelAsk: (sessionId: string, requestId: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>

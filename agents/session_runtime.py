@@ -26,6 +26,7 @@ import time
 from typing import Awaitable, Callable, Dict, Optional
 
 from agent_full_v2 import Agent
+from interaction import InteractionBroker
 from llm_config import (
     ENV_LLM_LOCK, apply_model_to_env, resolve_model_window, restore_llm_env,
     snapshot_llm_env,
@@ -94,6 +95,12 @@ class SessionRuntime:
         self.workspace = workspace
         self.busy = False  # 本会话当前是否有一个 turn 在跑（拒绝同会话并发）
         self.stop_evt = threading.Event()
+        # 交互提问 broker（2026-09-21）：会话级对象，天然持有 session_id 与事件
+        # 投递出口；在 build_agent() 里注入给该会话 Agent 的 ToolRegistry。
+        # 它自己管"在途提问"的生命周期（ask 阻塞 / resolve 唤醒 / cancel 解锁），
+        # 与 busy / stop_evt 正交 —— 但 request_stop 必须同步 cancel_all，
+        # 否则停止后 ask 线程会一直阻塞到用户再点一次。
+        self._interaction = InteractionBroker(sid, deliver)
         self._pending_overrides: tuple = (None, None)  # (reasoning_effort, max_context)
         self._bg_watch_task: Optional[asyncio.Task] = None  # 后台任务完成守望
         self._deliver = deliver
@@ -248,6 +255,10 @@ class SessionRuntime:
             # 任务板推送必须在 switch_session 之后：set_scope 在 switch_session 里完成，
             # 而 TaskManager 的 scope 决定快照读哪个会话的文件。
             self._bind_task_board(self.agent)
+            # 交互提问 broker（会话级）注入给本会话 Agent 的工具注册表。
+            # 放这里而不是 Agent.__init__：broker 需要 session_id 与 deliver 出口，
+            # 都是 runtime 才知道的东西；Agent 侧因此零构造改动。
+            self.agent.tools.set_interaction_broker(self._interaction)
             log.info("session_%s agent 构建完成 (model=%s)",
                      self.sid, model_id or "global-default")
             return self.agent
@@ -270,8 +281,16 @@ class SessionRuntime:
            sub_agent 在迭代边界收束为 aborted；任务状态立即标 stopped，
            has_running() 变 False → bg watch 退出 → 状态收敛为 done，
            已被放弃的结果不会被复活注入。
+
+        另有第四件事（2026-09-21 起）：`ask_user` 正阻塞等用户作答时，必须
+        立刻结算为 stopped —— 否则那个工作线程会一直卡在 `done.wait()` 上，
+        直到用户再点一次提交/取消（停止按钮形同失效）。**放在 if 之外**：
+        agent 尚未构造（例如刚切进会话就被停）也可能有在途提问。
         """
         self.stop_evt.set()
+        # 在途提问立即结算为 stopped（返回"本轮已被用户停止"占位文本，
+        # 保证那个 tool_call 仍有 tool_result 回填，不留孤儿）。
+        self._interaction.cancel_all("stopped")
         if self.agent is not None:
             self.agent.request_stop()
             self.agent.background_manager.request_stop_all()
@@ -284,6 +303,43 @@ class SessionRuntime:
         """
         if self.agent is not None and model_id is not None:
             self.agent.record_model_switch(model_id)
+
+    # ── 交互提问（ask_user）的会话级转发（2026-09-21）─────────────
+    def resolve_ask(self, request_id: str, answers: list) -> bool:
+        """前端提交答案 → 唤醒阻塞中的 ask_user。
+
+        幂等：迟到/重复提交（含"提交与停止同时到达"里后到的那个）返回 False，
+        broker 内部不会二次唤醒、也不会二次广播。
+        """
+        return self._interaction.resolve(request_id, answers)
+
+    def resolve_ask_free_text(self, text: str) -> bool:
+        """用户在输入框直接发消息 = 放弃选择题，把自由文本原样回填为答案。
+
+        **不另起 turn**：原 turn 的 ask() 拿到答案后在同一回合继续。
+        返回 False 表示当前并无在途提问 —— 调用方据此回落到正常 chat 流程。
+        """
+        return self._interaction.resolve_free_text_any(text)
+
+    def cancel_ask(self, request_id: str, reason: str = "cancelled") -> bool:
+        """用户点「取消」：按"未作答、请自行选最合理的默认方案继续"回填。"""
+        return self._interaction.cancel(request_id, reason)
+
+    def has_pending_interaction(self) -> bool:
+        """是否有在途提问（ws_bridge 的 chat 分支据此把消息转成自由作答）。"""
+        return self._interaction.has_pending()
+
+    def pending_interactions(self) -> list[dict]:
+        """新连接重放 / status_query 用：所有在途提问的 ask_request 载荷。"""
+        return self._interaction.pending_payloads()
+
+    def close(self) -> None:
+        """会话被移除时收尾：标记 broker 关闭并解锁所有阻塞中的 ask 线程。
+
+        不做这一步的话，删除会话时那个 ask 工作线程会永远卡在 done.wait() 上
+        （守护线程，进程结束时才被强杀），白白占着资源且日志里看不出原因。
+        """
+        self._interaction.close()
 
     def current_status(self) -> Optional[str]:
         """新连接状态重放用（ws_bridge.handle）：
@@ -541,8 +597,14 @@ class SessionRuntimeRegistry:
         return rt.agent is not None and rt.agent.background_manager.has_running()
 
     def remove(self, sid: str) -> None:
-        """会话被删除/回收后移除其运行时（运行中会被上层拒绝后才到达这里）。"""
-        self._sessions.pop(sid, None)
+        """会话被删除/回收后移除其运行时（运行中会被上层拒绝后才到达这里）。
+
+        移除前先 `close()`：若有 ask_user 正阻塞等用户作答，必须先把那个工作
+        线程解锁（否则它永远卡在 done.wait()）。
+        """
+        rt = self._sessions.pop(sid, None)
+        if rt is not None:
+            rt.close()
 
     def reload_llm_bindings(self) -> None:
         """模型配置热切换后重绑所有已构造的运行时会话 Agent。

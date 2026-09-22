@@ -4,9 +4,17 @@ import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
 import { renderRefText } from '@lib/refTokens'
 import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
-import { attachmentUrl, useAgentStore, type Message, type SubAgentMsg, type ToolCallMsg } from '@store/agentStore'
+import {
+  attachmentUrl,
+  useAgentStore,
+  type AskUserMsg,
+  type Message,
+  type SubAgentMsg,
+  type ToolCallMsg
+} from '@store/agentStore'
 import MessageMenu from './MessageMenu'
 import AttachmentBar, { isDegraded } from './AttachmentBar'
+import AskUserBlock from './AskUserBlock'
 import RefBar from './RefBar'
 import RefText from './RefText'
 
@@ -150,6 +158,33 @@ function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
   )
 }
 
+/** 正文段（Markdown 渲染）。提问块把正文切成前后两段时各渲染一段，
+ *  样式与改造前的单块完全一致（同一个 `.markdown-body` 容器 + 同一条表格包裹规则）。
+ *  `cursor` = 流式光标，只在**最后一段**上出现，位置与改造前相同（正文末尾）。 */
+function MarkdownBody({ text, cursor }: { text: string; cursor?: boolean }): JSX.Element {
+  return (
+    <div className="markdown-body">
+      {text ? (
+        // 表格外包一层横向滚动框（.table-scroll）：列多时表格自身横向滚动，
+        // 不把整块对话区撑宽（外层 .msgscroll 为 overflow-x: hidden）。
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            table: ({ children }) => (
+              <div className="table-scroll">
+                <table>{children}</table>
+              </div>
+            )
+          }}
+        >
+          {text}
+        </ReactMarkdown>
+      ) : null}
+      {cursor && <span className="cursor" />}
+    </div>
+  )
+}
+
 /** 消息时间展示：jsonl 秒级 ISO（2026-09-18T10:30:00）→ 年月日时分秒（2026-09-18 10:30:00）；
  *  空值（老会话行无 created_at）不渲染 */
 function fmtMsgTime(iso?: string): string {
@@ -177,6 +212,35 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     const inline = new Set(r.inlinePaths)
     return { segments: r.segments, leftover: (msg.refs ?? []).filter((x) => x?.path && !inline.has(x.path)) }
   }, [msg.content, msg.refs])
+
+  /** 正文 × 提问小结块的**交错序列**（2026-09-22）。
+   *
+   *  模型的话总在提问之前（"先跟你确认几个关键项"，然后才问），所以卡片必须插在
+   *  正文里**发起提问那一刻**的位置：之前的正文在卡片上方，之后的留在下方。
+   *  切点取自 `AskUserMsg.contentOffset`（实时在 `tool_call_start` 记录）；
+   *  回放缺省 → 视作全量正文在卡片上方（jsonl 每次 LLM 调用一行，正文必在提问之前）。
+   *
+   *  只在有**已结算**的提问块时才切（`pending` 不渲染，见下面的过滤规则）。 */
+  const parts = useMemo(() => {
+    const content = msg.content ?? ''
+    const asks = (msg.askUsers ?? []).filter((a) => a.status !== 'pending')
+    const out: Array<{ kind: 'text'; text: string } | { kind: 'ask'; block: AskUserMsg }> = []
+    let cursor = 0
+    for (const block of asks) {
+      // 偏移可能越界（老数据 / 回放缺省）：夹到 [cursor, 正文长度]，保证单调不减
+      const off =
+        typeof block.contentOffset === 'number'
+          ? Math.min(Math.max(block.contentOffset, cursor), content.length)
+          : content.length
+      if (off > cursor) out.push({ kind: 'text', text: content.slice(cursor, off) })
+      out.push({ kind: 'ask', block })
+      cursor = off
+    }
+    if (cursor < content.length) out.push({ kind: 'text', text: content.slice(cursor) })
+    return out
+  }, [msg.content, msg.askUsers])
+  // 光标只挂在最后一段正文上（正文段为空的纯文字流：单独渲染一段空正文兜住光标）
+  const lastText = parts.length > 0 && parts[parts.length - 1].kind === 'text'
 
   /** 右键打开消息菜单 */
   const openMenu = (e: ReactMouseEvent): void => {
@@ -295,27 +359,27 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
           {msg.subagents.map((s) => (
             <SubAgentBlock key={s.id} block={s} />
           ))}
-          <div className="markdown-body">
-            {msg.content ? (
-              // 表格外包一层横向滚动框（.table-scroll）：列多时表格自身横向滚动，
-              // 不把整块对话区撑宽（外层 .msgscroll 为 overflow-x: hidden）。
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={{
-                  table: ({ children }) => (
-                    <div className="table-scroll">
-                      <table>{children}</table>
-                    </div>
-                  )
-                }}
-              >
-                {msg.content}
-              </ReactMarkdown>
+          {/* 正文与结构化提问小结块（ask_user）按**当时的先后**交错渲染：
+              提问之前说的话在卡片上方，提问之后续写的正文（实时路径整轮合并进
+              一条消息）留在卡片下方 —— 见上面 `parts` 的切分规则。
+              `pending` 的那条**不渲染**：此刻输入区上方的面板正承载交互，
+              这里再挂一条空小结就是重复表达。结算后（answered/cancelled/stopped）
+              与回放路径都走到这里，展示的是后端生成的同一份 result_text
+              （前端不解析、只原样展示）。 */}
+          {parts.map((p, i) =>
+            p.kind === 'ask' ? (
+              <AskUserBlock key={`ask-${p.block.toolCallId || i}`} block={p.block} />
             ) : (
-              msg.streaming && <span className="cursor" />
-            )}
-            {msg.streaming && msg.content && <span className="cursor" />}
-          </div>
+              <MarkdownBody
+                key={`md-${i}`}
+                text={p.text}
+                cursor={msg.streaming && i === parts.length - 1}
+              />
+            )
+          )}
+          {/* 全文都是提问、没有正文（或正文还没开吐）时，光标单独兜一块空正文：
+              与改造前的 `content` 为空时的渲染一致 */}
+          {msg.streaming && !lastText && <MarkdownBody text="" cursor />}
           {!msg.streaming && usage}
           {!msg.streaming && switchText && (
             <div className="model-switch-notice" title="已切换模型">

@@ -121,6 +121,10 @@ class ToolRegistry:
         self._worktree_manager = None  # worktree 管理器（holder，s18）
         self._mcp_manager = None  # MCP 管理器（holder，s19）
         self._workflow_manager = None  # 工作流运行时管理器（holder，s16）
+        # 交互提问 broker（holder，2026-09-21）：由 SessionRuntime 在 build_agent 时
+        # 按会话注入（InteractionBroker 需要 session_id 与 deliver，属会话级状态）。
+        # 未注入时 ask_user 返回明确的 Error 文本（绝不做阻塞式 input() 兜底）。
+        self._interaction_broker = None
 
         # ── 懒加载缓存 ──
         self._handlers_cache = None
@@ -199,6 +203,24 @@ class ToolRegistry:
                 "WorkflowManager 未初始化。请先调用 set_workflow_manager(...)。"
             )
         return mgr
+
+    def set_interaction_broker(self, broker) -> None:
+        """由 SessionRuntime.build_agent 调用一次，挂上本会话的 InteractionBroker。
+
+        holder 而非构造参数：ToolRegistry 是 Agent 级对象，而交互提问是**会话级**
+        能力（需要 session_id 与事件投递出口），且要在 Agent 构造之后才拿得到。
+        """
+        self._interaction_broker = broker
+
+    def get_interaction_broker(self):
+        """获取 InteractionBroker；未注入返回 None（**不抛错**）。
+
+        与 background/teammate 的 holder 不同，这里刻意不抛 RuntimeError：
+        `ask_user` 在无前端场景（子智能体、cron、headless）属于"能力不可用"，
+        应当由 handler 返回一句可读的 Error 文本给模型，而不是炸掉整轮。
+        getattr 兜底是为了兼容测试里 `ToolRegistry.__new__()` 手搭的桩。
+        """
+        return getattr(self, "_interaction_broker", None)
 
     def set_todo_manager(self, session_id: str) -> "TodoManager":
         """
@@ -763,7 +785,37 @@ class ToolRegistry:
                 self.get_workflow_manager().run_sync(
                     kw["name"], kw.get("args"), kw.get("resume_from_run_id"))
             ),
+            # ── 交互提问（2026-09-21）──
+            # `_tool_call_id` / `_stop_event` 由 agent_full_v2 的 `_make_executor`
+            # 注入（只有这一个工具需要它们：前者给前端锚定小结块，后者让等待
+            # 可被停止唤醒）。模型侧 schema 里**没有**这两个字段。
+            "ask_user": lambda **kw: self._run_ask_user(kw),
         }
+
+    # ── ask_user：向用户提出结构化选择题并阻塞等待作答 ──────────────
+    def _run_ask_user(self, kw: dict) -> str:
+        """ask_user 处理器：透传给本会话的 InteractionBroker。
+
+        工具层铁律：**永远返回字符串、绝不向上抛异常**。
+        broker 未注入（子智能体 / cron / headless / 后端未接线）时返回明确
+        Error 文本，让模型改为"在回复里直接提问并结束回合"，而不是挂死。
+        """
+        broker = self.get_interaction_broker()
+        if broker is None:
+            return (
+                "Error: ask_user 当前不可用（没有可交互的前端会话；"
+                "子智能体/后台任务不支持向用户提问）。"
+                "请改为在回复中直接向用户提问，并结束本回合。"
+            )
+        try:
+            return broker.ask(
+                questions=kw.get("questions") or [],
+                tool_call_id=str(kw.get("_tool_call_id") or ""),
+                stop_event=kw.get("_stop_event"),
+            )
+        except Exception as e:  # noqa: BLE001 - 工具层绝不向上抛
+            log.error("ask_user 处理器异常: %s: %s", type(e).__name__, e, exc_info=True)
+            return f"Error: ask_user 执行失败: {type(e).__name__}: {e}"
 
     @property
     def handlers(self) -> dict:
@@ -1111,6 +1163,11 @@ class ToolRegistry:
                                                           "传入后续跑：未变化的步骤直接命中缓存重放。"}},
                                    "required": ["name"]}
                 }},
+                # ── 交互提问（2026-09-21）──────────────────────────────
+                # 只进主智能体工具集（tools），**绝不进 base_tools**：
+                # 子智能体只有单向事件上行、没有下行应答通道，常跑在后台 daemon
+                # 线程里 —— 拿到它就会调用到一个永远无人应答的接口并挂住线程。
+                self._ask_user_tool_def(),
             ]
         return self._tools_cache
 
@@ -1375,6 +1432,106 @@ class ToolRegistry:
                 },
                 "required": ["prompt"]
             }
+        }}
+
+    # ── ask_user 工具定义 ────────────────────────────────────────
+    def _ask_user_tool_def(self) -> dict:
+        """ask_user 工具定义（向用户提出结构化选择题并等待作答）。
+
+        ⚠️ 三条硬约束（改动前必读）：
+        1. **本定义只进 `tools`（主智能体），绝不进 `base_tools`**。子智能体只有
+           单向事件上行、没有下行应答通道，且常跑在后台 daemon 线程里 ——
+           拿到它就会调用到一个永远无人应答的接口，把线程挂死。
+        2. **schema 里不得出现 `parallel` / `run_in_background`**。`_execute_tool_call`
+           与分桶逻辑都硬编码"ask_user 永远串行且独占"，若 schema 里给了这两个
+           字段，就复刻了 sub_agent 那次"required 里必填、description 里又禁止"
+           的自相矛盾事故（模型每次都必须违规）。
+        3. **description 必须写明"禁止索取敏感信息"**。这是唯一一个能把模型输出
+           直接引向用户的通道，凭证/隐私必须走别的路。
+        """
+        return {"type": "function", "function": {
+            "name": "ask_user",
+            "description": (
+                "向用户提出 1–4 个结构化选择题，并**阻塞等待**用户在前端作答；"
+                "答案会作为本工具的结果返回，你在**同一个回合内**据此继续。\n\n"
+                "【何时该用】仅当你确实无法从用户消息、工作空间文件、记忆或既有约定"
+                "中推断，且不同选择会导致**明显不同且代价高**的实现路径时。"
+                "例如：技术栈/存储方案二选一、删除还是保留、范围与优先级取舍。\n\n"
+                "【何时不该用】\n"
+                "- 用户已给出答案，或能从文件/约定推断出来 —— 直接推断并说明即可；\n"
+                "- 只是「确认我理解得对不对」这类客套确认 —— 直接干活并在回复里说明你的假设；\n"
+                "- 一次想问超过 4 个问题 —— 拆成多轮，或先做能确定的部分；\n"
+                "- 需要开放式的长文本回答 —— 那属于普通对话，不该用本工具。\n\n"
+                "【禁止】绝不用它索取任何敏感信息：密码、API Key/令牌、身份证/银行卡号、"
+                "私人联系方式、医疗隐私等。本工具**禁止用于收集凭据**。\n\n"
+                "【重要限制】本工具会**阻塞当前回合**直到用户点提交/取消/停止；"
+                "`run_in_background` / `parallel` 对它无效，它永远串行且独占执行"
+                "（你无需也不应传这两个字段）。用户也可能直接在输入框打字发送 —— "
+                "那会被当作本题的自由文本答案，此时你收到的结果形如"
+                "「用户没有选择选项，而是直接回复了：…」。"
+                "若当前没有可交互的前端（例如在子智能体/后台任务里），本工具会返回 "
+                "Error 文本，请改用普通提问并结束回合。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "1–4 个问题。前端**一题一屏、点「下一步」逐步作答**，"
+                                       "最后一题点提交时一次性回传全部答案。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "本题的稳定标识（小写英文+下划线，批内唯一），"
+                                                   "答案按它对号入座"},
+                                "header": {
+                                    "type": "string",
+                                    "description": "不超过 12 字的短标签，用于分屏步骤条与结果小结的标题；"
+                                                   "不要用整句"},
+                                "question": {
+                                    "type": "string",
+                                    "description": "完整问题，一句话说清要用户决定什么"},
+                                "multi_select": {
+                                    "type": "boolean", "default": False,
+                                    "description": "false=单选（点选项即选中）；true=多选（可勾多项）。"
+                                                   "默认单选"},
+                                "allow_custom": {
+                                    "type": "boolean", "default": True,
+                                    "description": "是否额外提供「其他」自由文本输入。默认 true"
+                                                   "（用户可能有你没想到的答案）；"
+                                                   "仅当你已穷举所有可能时才设为 false"},
+                                "custom_label": {
+                                    "type": "string",
+                                    "description": "自定义输入项的显示文案，默认「其他」"},
+                                "options": {
+                                    "type": "array", "minItems": 2, "maxItems": 4,
+                                    "description": "2–4 个候选。label 必须彼此可区分；"
+                                                   "description 写清该选项的后果/代价"
+                                                   "（用户看不懂的选项不如不提供）",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "description": "选项短文案（建议不超过 16 字），中文优先"},
+                                            "description": {
+                                                "type": "string",
+                                                "description": "一句话解释该选项的含义/影响，可省略"},
+                                        },
+                                        "required": ["label"],
+                                    },
+                                },
+                            },
+                            "required": ["id", "header", "question", "options"],
+                        },
+                    },
+                },
+                "required": ["questions"],
+            },
         }}
 
     # ═══════════════════════════════════════════════════════════

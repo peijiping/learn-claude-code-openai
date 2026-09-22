@@ -32,6 +32,7 @@ from attachments import (
     stage as stage_attachments,
 )
 from config import load as load_config
+from interaction import status_of_result
 from llm_config import (
     caps_allow_image, fetch_remote_models, get_config, get_model_by_id,
     load_llm_config, resolve_model_window, save_config,
@@ -598,6 +599,28 @@ async def _refs_payload(project_id: str, session_id: str = "") -> dict:
     return out
 
 
+def _ask_snapshot_lines() -> list[str]:
+    """所有在途 `ask_user` 提问的 ask_request 信封列表（2026-09-21）。
+
+    与 `_status_snapshot_lines` 同构，供"连接建立重放"与 `status_query` 共用：
+    用户关窗 / 刷新 / 断线重连时，turn 可能仍**阻塞在"等用户作答"**上。
+    不重放的话，前端面板永远不会再出现，而后端还在等 —— 用户看到的就是
+    "卡住不动"，且没有任何办法恢复（除了点停止）。
+
+    ⚠️ 本函数必须定义在 `_text_of` **之前**：从 `_text_of` 到 `handle` 之间的
+    代码会被两个守卫测试（test_subagent_sidecar / test_system_injection_contract）
+    抽出来 exec 到裸命名空间，那片区域只能放 def、不能有模块级可执行语句，
+    且 def 的注解在 def 处即求值 —— 在切片内新增模块级函数是最常见的踩雷方式。
+    """
+    if registry is None:
+        return []
+    lines = []
+    for rt in registry.all_runtimes():
+        for payload in rt.pending_interactions():
+            lines.append(_envelope("ask_request", payload))
+    return lines
+
+
 def _text_of(content) -> str:
     """历史消息 content 兼容转换：str 直接返回，list（多模态 blocks）拼接 text。"""
     if isinstance(content, str):
@@ -812,6 +835,13 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
     """
     ui: list[dict] = []
     legacy_rows: list[dict] = []
+    # 工具结果索引（2026-09-21）：`role=tool` 行整体不上屏（已聚合进 assistant
+    # 工具条），但 `ask_user` 的**答案**要按 tool_call_id 配回发起它的那条
+    # assistant 消息（渲染成只读小结块）。索引是廉价的，且只被 ask_user 用到。
+    tool_contents: dict[str, str] = {}
+    for m in messages:
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            tool_contents[m["tool_call_id"]] = _text_of(m.get("content"))
     for m in messages:
         role = m.get("role")
         if role == "user":
@@ -846,11 +876,29 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
         elif role == "assistant":
             tool_calls = []
             tc_ids: list[str] = []
+            ask_users: list[dict] = []
             for tc in (m.get("tool_calls") or []):
                 tc_ids.append(tc.get("id", "") if isinstance(tc, dict) else "")
+                fn = (tc.get("function") or {})
+                if fn.get("name", "") == "ask_user":
+                    # 结构化提问**不进普通工具条**：由消息下的只读小结块承载。
+                    # 问题 = 工具参数（questions），答案 = 配对上的 tool 行 content。
+                    # 实时路径（ask_request / ask_resolved 事件）与回放路径展示的是
+                    # **同一份 result_text**，所以前端不做任何解析、只原样展示 ——
+                    # 这也消除了"实时/回放文案不一致"的风险。
+                    # `result` 为空串表示该提问未完成（进程被杀等）。
+                    # `status` 由 interaction.status_of_result 反推（jsonl 不存 outcome）
+                    # —— 让前端只搬运、不猜文案，徽标文案的唯一真相留在 interaction 模块。
+                    ask_users.append({
+                        "tool_call_id": tc_ids[-1],
+                        "args": fn.get("arguments", ""),
+                        "result": tool_contents.get(tc_ids[-1], ""),
+                        "status": status_of_result(tool_contents.get(tc_ids[-1], "")),
+                    })
+                    continue
                 tool_calls.append({
-                    "name": (tc.get("function") or {}).get("name", ""),
-                    "args": (tc.get("function") or {}).get("arguments", ""),
+                    "name": fn.get("name", ""),
+                    "args": fn.get("arguments", ""),
                 })
             ui_msg = {
                 "role": "assistant",
@@ -859,6 +907,10 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
                 "_tc_ids": tc_ids,
                 "toolCalls": tool_calls,
             }
+            if ask_users:
+                # 只在确有 ask_user 时加字段 —— 无提问的 assistant 消息连字段都
+                # 不多一个，与改造前的回放形状逐字节一致。
+                ui_msg["askUsers"] = ask_users
             if m.get("created_at"):
                 ui_msg["created_at"] = m["created_at"]
             # 轮级 token 消耗 + 本轮模型快照 + 会话级累计快照（UI 展示元数据，
@@ -900,6 +952,13 @@ async def handle(ws):
     if replay:
         log.info("WS 状态重放: %d 个运行中会话", len(replay))
     for line in replay:
+        line_q.put_nowait(line)
+    # 在途提问重放（2026-09-21）：turn 可能正阻塞在"等用户作答"上，新连接
+    # （含断线重连）必须能把提问面板重建出来，否则用户再也看不到那张卡。
+    ask_replay = _ask_snapshot_lines()
+    if ask_replay:
+        log.info("WS 在途提问重放: %d 条", len(ask_replay))
+    for line in ask_replay:
         line_q.put_nowait(line)
 
     async def writer():
@@ -1018,6 +1077,18 @@ async def handle(ws):
                         meta = await asyncio.to_thread(sm.load_meta, sid)
                         ws_session = _workspace_for_session(pid, meta)
                     rt = registry.get_or_create(sid, workspace=ws_session)
+                # ── 在途提问期间"直接发消息" = 放弃选择题，自由文本原样回填 ──
+                # （2026-09-21）必须放在 `rt.busy` 守卫**之前**：提问期间 turn 正
+                # 阻塞等待，busy=True，落到下面只会回一句"正在执行，请先停止"——
+                # 而用户的真实意图恰恰是作答。回填成功后**不另起 turn**（原 turn
+                # 拿到答案后在同一回合继续），所以这里 continue。
+                # 纯附件 / 纯引用消息（text 为空）不拦截：落到 busy 守卫被拒，
+                # 符合"作答必须打字"的直觉。
+                if (rt.has_pending_interaction()
+                        and isinstance(text, str) and text.strip()):
+                    if await asyncio.to_thread(rt.resolve_ask_free_text, text):
+                        log.info("chat 转作 ask_user 自由作答: session_%s", sid)
+                        continue
                 if rt.busy:
                     # 同会话并发 turn 拒绝：避免两线程同时写同一会话 jsonl
                     await safe_send(ws, _envelope("error", {
@@ -1169,15 +1240,54 @@ async def handle(ws):
                 log.info("停止请求: session_%s", sid)
                 rt = registry.get(sid)
                 if rt is not None:
+                    # request_stop 内部会先 cancel_all("stopped") 结算在途提问：
+                    # 否则正阻塞在 ask_user 里的工作线程要等用户再点一次才醒。
                     rt.request_stop()
+
+            elif kind == "ask_answer":
+                # 提交选择题答案（2026-09-21）。**fire-and-forget，无回包**：
+                # 结果由广播的 ask_resolved 事件驱动，前端据此清面板 + 落只读小结。
+                # 刻意不走 request()/点对点回包 —— 主进程的 pending 表按 kind
+                # FIFO 配对且无 id，同 kind 并发会串台、还会被广播信封误消费。
+                # 幂等：迟到/重复提交由 broker 丢弃（resolve 返回 False）。
+                sid = str(payload.get("session_id") or "")
+                rid = str(payload.get("request_id") or "")
+                rt = registry.get(sid) if registry is not None else None
+                if rt is not None and sid and rid:
+                    ok = await asyncio.to_thread(
+                        rt.resolve_ask, rid, payload.get("answers") or [])
+                    log.info("ask_answer: session_%s rid=%s -> %s", sid, rid,
+                             "已结算" if ok else "丢弃（迟到/重复）")
+                else:
+                    log.warning("ask_answer 丢弃：未知会话或空 rid (sid=%s rid=%s)",
+                                sid, rid)
+
+            elif kind == "ask_cancel":
+                # 用户点「取消」：按"未作答、请自行选默认方案继续"回填，
+                # 同样 fire-and-forget（回执走 ask_resolved 广播）。
+                sid = str(payload.get("session_id") or "")
+                rid = str(payload.get("request_id") or "")
+                rt = registry.get(sid) if registry is not None else None
+                if rt is not None and sid and rid:
+                    ok = await asyncio.to_thread(rt.cancel_ask, rid)
+                    log.info("ask_cancel: session_%s rid=%s -> %s", sid, rid,
+                             "已结算" if ok else "丢弃（迟到/重复）")
+                else:
+                    log.warning("ask_cancel 丢弃：未知会话或空 rid (sid=%s rid=%s)",
+                                sid, rid)
 
             elif kind == "status_query":
                 # 前端主动拉取运行状态（渲染进程刷新/HMR 不重建 WS 连接，
                 # 连接建立时的重放覆盖不到该场景）。回包走本连接的 writer
                 # 队列，与其它事件同管道保序；无运行会话时回空（前端自然复位）。
                 lines = _status_snapshot_lines()
-                log.info("status_query: %d 个运行中会话", len(lines))
+                ask_lines = _ask_snapshot_lines()
+                log.info("status_query: %d 个运行中会话, %d 条在途提问",
+                         len(lines), len(ask_lines))
                 for line in lines:
+                    line_q.put_nowait(line)
+                # 在途提问一并重放：渲染进程刷新后提问面板要能重建
+                for line in ask_lines:
                     line_q.put_nowait(line)
 
             elif kind == "session_switch":
