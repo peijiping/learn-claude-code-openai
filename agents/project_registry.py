@@ -186,16 +186,37 @@ class WorkspaceRegistry:
     #  写
     # ═══════════════════════════════════════════════════════════
     def set_active(self, project_id: str) -> ProjectInfo:
-        """记录"当前活动空间"（跨重启保留，前端 chip 恢复用）。"""
+        """记录"当前活动空间"（跨重启保留，前端 chip 恢复用）。
+
+        **只写 `active`，不动 `last_opened_at`**（2026-09-22）：排序语义是
+        「空间内真实创建过会话的时间」，切换空间（新建任务下拉 / 切会话对齐）
+        不改变侧边栏空间顺序 —— 否则"新建任务界面里切个下拉，左侧空间列表
+        立刻重排"，与"会话真实产生才重排"的体验矛盾。
+        """
         with self._lock:
             data = self._load()
             info = self._find(data, project_id)
             if info is None:
                 raise WorkspaceError(f"工作空间不存在：{project_id}")
-            info["last_opened_at"] = _now_iso()
             data["active"] = info["id"]
             self._write(data)
         return self._to_info(info)
+
+    def touch_opened(self, project_id: str) -> ProjectInfo:
+        """刷新空间的 `last_opened_at`（侧边栏排序依据，新→旧）。
+
+        唯一调用时机：**该空间内真实创建了会话**（ws_bridge 收到首条消息、
+        create_new_session 落号之后）。仅切换活动空间（set_active）不刷新 ——
+        顺序只随真实会话产生而变动。
+        """
+        with self._lock:
+            data = self._load()
+            info = self._find(data, str(project_id or ""))
+            if info is None:
+                raise WorkspaceError(f"工作空间不存在：{project_id}")
+            info["last_opened_at"] = _now_iso()
+            self._write(data)
+            return self._to_info(info)
 
     def create(self, real_path: str, name: str | None = None) -> ProjectInfo:
         """把一个真实目录登记为工作空间（幂等：同一目录已登记则直接复用）。
@@ -336,11 +357,16 @@ class WorkspaceRegistry:
             entries = []
         cleaned: list[dict] = []
         seen: set[str] = set()
+        disk_default: dict | None = None
         for e in entries:
             if not isinstance(e, dict):
                 continue
             pid = str(e.get("id") or "").strip()
-            if not pid or pid in seen or pid == DEFAULT_PROJECT_ID:
+            if not pid or pid in seen:
+                continue
+            if pid == DEFAULT_PROJECT_ID:
+                # 记下磁盘上的 default 条目（下面补回时以其为准），不从 cleaned 走
+                disk_default = e
                 continue
             seen.add(pid)
             cleaned.append({
@@ -352,9 +378,20 @@ class WorkspaceRegistry:
                 # 权限模式（存量条目无此字段 → None = 未改过，继承链继续下落）
                 "permission_mode": e.get("permission_mode"),
             })
-        # default 恒在且恒第一（索引被手改删掉也要补回，否则老会话全成孤儿）
+        # default 恒在且恒第一（索引被手改删掉也要补回，否则老会话全成孤儿）。
+        # ⚠️ 磁盘上已有 default 条目时必须**沿用其可变字段**（name /
+        # permission_mode）—— 曾在这里无脑用 _default_entry() 重建，导致
+        # default 的 permission_mode 每次读索引都被抹回 None：
+        # project_permission / session_permission 写了也白写（2026-09-22 修复）。
+        base_default = _default_entry()
+        if disk_default:
+            for key in ("name", "permission_mode"):
+                if disk_default.get(key) is not None:
+                    base_default[key] = disk_default[key]
+        # 其余空间按 last_opened_at 新→旧（排序依据只在 touch_opened 刷新，
+        # set_active 不动它 —— 见 set_active docstring 的排序语义说明）。
         cleaned.sort(key=lambda e: (e.get("last_opened_at") or ""), reverse=True)
-        cleaned.insert(0, _default_entry())
+        cleaned.insert(0, base_default)
         active = str(raw.get("active") or DEFAULT_PROJECT_ID)
         if active != DEFAULT_PROJECT_ID and active not in {e["id"] for e in cleaned}:
             active = DEFAULT_PROJECT_ID

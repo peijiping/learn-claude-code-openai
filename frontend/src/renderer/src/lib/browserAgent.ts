@@ -215,6 +215,13 @@ class BrowserAgentBridge implements AgentApi {
     }))
     return Promise.resolve()
   }
+  projectPermission(projectId: string, mode: string): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'project_permission',
+      payload: { project_id: projectId, mode }
+    }))
+    return Promise.resolve()
+  }
   switchSession(sessionId: string): Promise<{ session_id: string; message_count: number }> {
     // 历史回放经由 session / session_history 事件信封驱动 store，无需等待应答
     this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { session_id: sessionId } }))
@@ -361,6 +368,13 @@ class BrowserAgentBridge implements AgentApi {
   }
   llmConfigSave(config: unknown): Promise<unknown> {
     return this.request('llm_config_save', 'llm_config', { config })
+  }
+  /** 权限配置（设置页「权限」页，docs/frontend/18） */
+  async permissionConfigGet(): Promise<unknown> {
+    return this.request('permission_config_get', 'permission_config')
+  }
+  permissionConfigSave(config: unknown): Promise<unknown> {
+    return this.request('permission_config_save', 'permission_config', { config })
   }
   /** 刷新远端模型列表：GET /models 可能较慢，超时放宽到 30s */
   llmModelsFetch(payload: {

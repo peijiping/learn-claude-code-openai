@@ -171,7 +171,7 @@ _ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
 # ══════════════════════════════════════════════════════════════════
-#  可调参数（环境变量 / ~/.aigent/config.json，读在调用点而非导入点）
+#  可调参数（环境变量 / ~/.aigent/config/config.json，读在调用点而非导入点）
 # ══════════════════════════════════════════════════════════════════
 # 刻意写成函数而非常量：config.load() 合并配置进 os.environ 的时机可能晚于本模块
 # 被导入（agent_full_v2 → attachments 的导入链），常量会在配置生效前被固化。

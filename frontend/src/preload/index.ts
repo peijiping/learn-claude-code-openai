@@ -58,6 +58,8 @@ const agent = {
     ipcRenderer.invoke('agent:approvalAnswer', { session_id: sessionId, request_id: requestId, decision }),
   sessionPermission: (sessionId: string, mode: string): Promise<void> =>
     ipcRenderer.invoke('agent:sessionPermission', { session_id: sessionId, mode }),
+  projectPermission: (projectId: string, mode: string): Promise<void> =>
+    ipcRenderer.invoke('agent:projectPermission', { project_id: projectId, mode }),
 
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (sessionId: string): Promise<{ session_id: string; message_count: number }> =>
@@ -148,6 +150,12 @@ const agent = {
   llmConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:llmConfigGet'),
   llmConfigSave: (config: unknown): Promise<unknown> =>
     ipcRenderer.invoke('agent:llmConfigSave', { config }),
+
+  /** 权限配置（~/.aigent/config/permissions.json）：读 / 保存。
+   *  保存后判定侧即时生效（无需重启后端），额外目录会推给在途会话。 */
+  permissionConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:permissionConfigGet'),
+  permissionConfigSave: (config: unknown): Promise<unknown> =>
+    ipcRenderer.invoke('agent:permissionConfigSave', { config }),
 
   /** 刷新某连接的可用模型列表（GET {base_url}/models）；api_key 留空时后端回退已保存密钥 */
   llmModelsFetch: (payload: {

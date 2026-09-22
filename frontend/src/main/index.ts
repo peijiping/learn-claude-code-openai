@@ -355,6 +355,18 @@ function createWindow(): void {
     }))
   })
 
+  // 新建任务（无会话）态切换目标工作空间权限档位：只写 projects.json「最后更改值」，
+  // 成功后后端广播 projects 刷新（无会话号，不走 permission_changed）。同样 fire-and-forget。
+  ipcMain.handle('agent:projectPermission', (e, payload: { project_id?: string; mode?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.project_id !== 'string' || !payload.project_id) return
+    const mode = payload.mode
+    if (mode !== 'default' && mode !== 'full_access') return
+    ws.send(JSON.stringify({
+      kind: 'project_permission',
+      payload: { project_id: payload.project_id, mode }
+    }))
+  })
+
   ipcMain.handle('agent:switchSession', (e, payload: { session_id?: string }) => {
     if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
     ws.send(JSON.stringify({ kind: 'session_switch', payload: { session_id: payload.session_id } }))
@@ -529,6 +541,18 @@ function createWindow(): void {
   ipcMain.handle('agent:llmConfigSave', (e, payload: { config?: unknown }) => {
     if (!isTrustedSender(e) || payload?.config === undefined) return null
     return request('llm_config_save', 'llm_config', { config: payload.config })
+  })
+  // 权限配置（设置弹窗「权限」页，docs/frontend/18）：读 / 保存。
+  // 只挡「不是对象」这类明显非法载荷 —— 字段级语义归一化是后端 `_normalize` 的职责
+  // （单一出处，与 llm_config_save 同策略）。
+  ipcMain.handle('agent:permissionConfigGet', (e) =>
+    isTrustedSender(e) ? request('permission_config_get', 'permission_config') : null
+  )
+  ipcMain.handle('agent:permissionConfigSave', (e, payload: { config?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.config !== 'object' || payload.config === null) {
+      return null
+    }
+    return request('permission_config_save', 'permission_config', { config: payload.config })
   })
   // 「刷新模型列表」：远端 GET /models 可能较慢，超时放宽到 30s
   ipcMain.handle(

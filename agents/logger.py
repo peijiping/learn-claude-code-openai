@@ -13,7 +13,7 @@ logger.py - 统一日志模块
 
 设计要点：
 - 文件命名固定 agent_ 前缀（后端单文件流，方便按天排查）；
-- 级别经 LOG_LEVEL 控制（~/.aigent/config.json / 环境变量，默认 INFO）；
+- 级别经 LOG_LEVEL 控制（~/.aigent/config/config.json / 环境变量，默认 INFO）；
 - 不打印到 stdout/stderr：CLI/桌面端 stdout 是交互输出通道，
   print 已承担控制台职责，日志走文件互不干扰；
 - logging 模块自带 handler 锁，多线程（run_turn 工作线程 / 后台子智能体）
@@ -32,7 +32,7 @@ from pathlib import Path
 
 from paths import LOG_DIR
 
-# 日志级别（可调参数：~/.aigent/config.json 或环境变量 LOG_LEVEL）
+# 日志级别（可调参数：~/.aigent/config/config.json 或环境变量 LOG_LEVEL）
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # 日志文件前缀（后端统一 agent_；前端 Electron 侧另有 frontend_ 前缀）

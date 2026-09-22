@@ -5,10 +5,17 @@ config.py - 应用配置管理（用户级配置目录 ~/.aigent）
 将配置从「项目根 .env」迁移到主流「用户级配置目录」模式（对齐
 Claude Code ~/.claude、Codex ~/.codex 的做法）：
 
-    ~/.aigent/config.json         用户级非敏感配置（扁平键，键名与 .env 一致）
-    ~/.aigent/credentials.json    密钥（OPENAI_API_KEY 等，权限 0600）
-    [项目根]/.aigent/config.json  项目级覆盖（可选，加入 .gitignore）
-    .env                          遗留兜底（过渡期保留）
+    ~/.aigent/config/config.json         用户级非敏感配置（扁平键，键名与 .env 一致）
+    ~/.aigent/config/credentials.json    密钥（OPENAI_API_KEY 等，权限 0600）
+    [项目根]/.aigent/config.json          项目级覆盖（可选，加入 .gitignore）
+    .env                                  遗留兜底（过渡期保留）
+
+配置文件统一收在 `~/.aigent/config/` 目录下（2026-09-22 迁移）：
+`config.json` / `credentials.json` / `llmconfig.json` / `providers.json` /
+`permissions.json` 全部集中在 config/，`~/.aigent/` 顶层只留**目录**
+（logs / projects / skills / mcp / worktrees）。好处：用户「备份 / 审计 /
+迁移配置」只需看一个目录；顶层不再是一堆文件名混杂。旧顶层路径由
+`migrate_config_dir()` 一次性搬入（幂等）。
 
 加载优先级（高 → 低）：
     真实环境变量 > 项目级 config.json > 用户级 config.json > .env > 代码默认值
@@ -22,14 +29,28 @@ os.environ.get(KEY, default) 内联读取，零改动即可切换到新配置源
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 from dotenv import dotenv_values, load_dotenv
 
 # ── 用户级应用 home ──────────────────────────────────────────────
 AIGENT_HOME = Path.home() / ".aigent"
-CONFIG_FILE = AIGENT_HOME / "config.json"
-CREDENTIALS_FILE = AIGENT_HOME / "credentials.json"
+# 配置文件目录（2026-09-22）：所有 *.json 配置集中于此，顶层只留目录。
+CONFIG_DIR = AIGENT_HOME / "config"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+
+# 迁移清单：旧顶层 `~/.aigent/<name>` → `~/.aigent/config/<name>`（保序，便于日志）
+_LEGACY_CONFIG_FILES = (
+    "config.json",
+    "credentials.json",
+    "llmconfig.json",
+    "providers.json",
+    "permissions.json",
+)
+# 随主文件一起搬迁的备份变体（glob 前缀 → 文件名前缀）
+_LEGACY_CONFIG_BACKUP_PREFIXES = ("providers.json.bak-",)
 
 # 密钥键判定：以 _API_KEY / _TOKEN / _SECRET 结尾的键视为密钥。
 # 注意 _TOKEN$ 锚定结尾，MAX_CONTEXT_TOKENS 等以 _TOKENS 结尾的键不会误判。
@@ -53,9 +74,66 @@ def _merge_json_into_env(path: Path) -> None:
             os.environ.setdefault(str(key), str(value))
 
 
+def migrate_config_dir(home: Path | None = None) -> list[Path]:
+    """把 home 顶层的配置文件搬进 `home/config/`（幂等，可重复执行）。
+
+    规则（2026-09-22，配置收口到 config/ 目录）：
+    - 源不存在 → 跳过；
+    - 目标已存在 → **跳过且不删源**（新位置的才是当前生效版本；删旧文件属于
+      不可逆操作，宁可留个孤儿文件让用户自己清理。旧路径仍被 `permission.py`
+      的敏感路径黑名单拦截，残留副本不会变成读取后门）；
+    - 源在、目标不在 → `rename`；跨设备等 `OSError` 时退化为 copy2 + unlink；
+    - `providers.json` 的备份变体（`providers.json.bak-*`）随主文件一并搬迁；
+    - `credentials.json` 落位后收紧 0600。
+
+    返回实际搬迁的**目标路径**列表（空 = 无动作）。`home` 可注入（测试传临时
+    目录，避免触碰真实 `~/.aigent`），缺省 = 真实用户目录。
+    """
+    root = Path(home) if home is not None else AIGENT_HOME
+    dst_dir = root / "config"
+    candidates: list[Path] = []
+    for name in _LEGACY_CONFIG_FILES:
+        candidates.append(root / name)
+    for prefix in _LEGACY_CONFIG_BACKUP_PREFIXES:
+        candidates.extend(sorted(root.glob(f"{prefix}*")))
+    pending = [
+        (src, dst_dir / src.name)
+        for src in candidates
+        if src.is_file() and not (dst_dir / src.name).exists()
+    ]
+    if not pending:
+        return []
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[Path] = []
+    for src, dst in pending:
+        try:
+            src.rename(dst)
+        except OSError:
+            # 跨设备 / 权限受限：退化为「复制 + 删源」，仍保证旧路径不留副本
+            try:
+                shutil.copy2(src, dst)
+                src.unlink()
+            except OSError as e:
+                print(f"[config] 配置文件迁移失败，保持原位：{src} → {dst}（{e}）")
+                continue
+        moved.append(dst)
+    if moved:
+        print(f"[config] 配置文件已迁入 {dst_dir}：" + "、".join(p.name for p in moved))
+    cred = dst_dir / "credentials.json"
+    if cred.exists():
+        try:
+            os.chmod(cred, 0o600)
+        except OSError:
+            pass
+    return moved
+
+
 def load() -> None:
     """启动时调用：按优先级把配置合并进 os.environ。幂等。"""
     AIGENT_HOME.mkdir(parents=True, exist_ok=True)
+    # 0) 配置文件收口到 config/（首次自动搬迁旧顶层文件，幂等）
+    migrate_config_dir()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     # 1) 真实环境变量优先；.env 仅填充空缺（遗留兜底）
     load_dotenv(override=False)
     # 2) 用户级配置 + 密钥
@@ -96,7 +174,7 @@ def _seed_from_env_file() -> None:
 
 def _print_first_run_guide() -> None:
     """全新首次启动：目录骨架已建好，打印配置引导。"""
-    print(f"[config] 首次启动：已创建配置目录 {AIGENT_HOME}")
+    print(f"[config] 首次启动：已创建配置目录 {CONFIG_DIR}")
     print(f"[config]   非敏感配置 → {CONFIG_FILE}（键名参考 .env.example）")
     print(f"[config]   API Key/密钥 → {CREDENTIALS_FILE}（权限 0600），或用同名环境变量")
     print("[config]   未配置项将使用代码默认值")
@@ -105,12 +183,17 @@ def _print_first_run_guide() -> None:
 def migrate_legacy(legacy_home: Path) -> None:
     """
     一次性迁移（幂等）：legacy_home（WorkSpace/HomeDir）下的 skills/worktrees/mcp
-    搬迁到 ~/.aigent/ 对应目录；config.json 缺失时从 .env 生成种子。
+    搬迁到 ~/.aigent/ 对应目录；顶层散落的配置文件收口到 ~/.aigent/config/；
+    config.json 缺失时从 .env 生成种子。
     全新环境（~/.aigent 不存在）时预建目录骨架并打印首次启动引导。
     由 paths.py 的 ensure_dirs() 在导入期调用，传 ROOT_DIR/"WorkSpace/HomeDir"。
     """
     first_run = not AIGENT_HOME.exists()
     AIGENT_HOME.mkdir(parents=True, exist_ok=True)
+    # 配置文件收口到 ~/.aigent/config/（必须早于下面的 CONFIG_FILE.exists() 判定，
+    # 否则「旧位置有配置」的用户会被误判为首次运行、再种一份空配置）
+    migrate_config_dir()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("skills", "worktrees", "mcp"):
         src = legacy_home / name
         dst = AIGENT_HOME / name

@@ -124,6 +124,7 @@ export default function InputBox({
   const openProject = useAgentStore((s) => s.openProject)
   const addProjectFromPicker = useAgentStore((s) => s.addProjectFromPicker)
   const switchPermission = useAgentStore((s) => s.switchPermission)
+  const switchProjectPermission = useAgentStore((s) => s.switchProjectPermission)
   /** 权限档位（2026-09-22 权限管控，docs/frontend/17）：盾牌 chip 的选中态。
    *  fallback 链：permissionModeBySession（permission_changed 广播 /
    *  session_history 恢复）→ sessions 列表该会话的 permission_mode →
@@ -557,9 +558,9 @@ export default function InputBox({
           </span>
           {/* 权限档位盾牌 chip（2026-09-22 权限管控，docs/frontend/17）：两档
               （默认 = 敏感操作逐次审批 / 完全访问 = 跳过审批）。切换是
-              fire-and-forget —— chip 选中态只认 permission_changed 广播；
-              无会话（新建任务）时只读展示目标空间档位（新会话的默认值来源），
-              不可点（切换命令需要会话号）。 */}
+              fire-and-forget —— 会话态 chip 选中态只认 permission_changed 广播；
+              无会话（新建任务）时也可切换，写的是**目标工作空间**的最后更改值
+              （projects.json，该空间新会话的默认档位），chip 由 projects 广播驱动。 */}
           <span className="perm-select">
             <button
               className={`tool-btn access perm-chip${permMode === 'full_access' ? ' full' : ''}`}
@@ -569,19 +570,18 @@ export default function InputBox({
                     ? '完全访问：跳过审批（硬拒绝仍生效）。点击切换'
                     : '默认：敏感操作逐次审批。点击切换'
                   : permMode === 'full_access'
-                    ? `完全访问（继承自工作空间，新会话默认档位）`
-                    : `默认：敏感操作逐次审批（新会话默认档位）`
+                    ? '完全访问：跳过审批（硬拒绝仍生效）。点击切换本工作空间新会话的默认档位'
+                    : '默认：敏感操作逐次审批。点击切换本工作空间新会话的默认档位'
               }
               aria-haspopup="menu"
               aria-expanded={permOpen}
-              disabled={!hasSession}
-              onClick={hasSession ? () => setPermOpen((v) => !v) : undefined}
+              onClick={() => setPermOpen((v) => !v)}
             >
               <Icon name="shieldCheck" size={13} />
               {permMode === 'full_access' ? '完全访问' : '默认'}
-              {hasSession && <Icon name="chevronDown" size={11} />}
+              <Icon name="chevronDown" size={11} />
             </button>
-            {permOpen && hasSession && (
+            {permOpen && (
               <>
                 <div className="perm-menu-mask" onClick={() => setPermOpen(false)} />
                 <div className="perm-menu">
@@ -590,7 +590,10 @@ export default function InputBox({
                     className={`perm-menu-item ${permMode === 'default' ? 'active' : ''}`}
                     onClick={() => {
                       setPermOpen(false)
-                      if (permMode !== 'default') switchPermission('default')
+                      if (permMode !== 'default') {
+                        if (hasSession) switchPermission('default')
+                        else switchProjectPermission('default')
+                      }
                     }}
                   >
                     <Icon name="shieldCheck" size={13} />
@@ -603,7 +606,10 @@ export default function InputBox({
                     className={`perm-menu-item ${permMode === 'full_access' ? 'active' : ''}`}
                     onClick={() => {
                       setPermOpen(false)
-                      if (permMode !== 'full_access') switchPermission('full_access')
+                      if (permMode !== 'full_access') {
+                        if (hasSession) switchPermission('full_access')
+                        else switchProjectPermission('full_access')
+                      }
                     }}
                   >
                     <Icon name="shieldCheck" size={13} />

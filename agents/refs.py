@@ -61,7 +61,7 @@ REF_BLOCK_TYPE = "ref"
 # ── 默认忽略清单 ──────────────────────────────────────────────────
 # 按**目录名整棵剪枝**：命中即不进入该目录，也不列出该目录本身。
 # 依据是「列出来对用户没有价值，反而会淹没有效项」：依赖目录、构建产物、
-# 版本控制内部结构、各种缓存。用户可在 ~/.aigent/config.json 用
+# 版本控制内部结构、各种缓存。用户可在 ~/.aigent/config/config.json 用
 # REF_LIST_IGNORE（逗号分隔）追加，但**不能**移除默认项。
 DEFAULT_IGNORE_DIRS = frozenset({
     ".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -80,7 +80,7 @@ DEFAULT_IGNORE_FILES = frozenset({".DS_Store"})
 
 
 # ══════════════════════════════════════════════════════════════════
-#  可调参数（环境变量 / ~/.aigent/config.json，读在调用点而非导入点）
+#  可调参数（环境变量 / ~/.aigent/config/config.json，读在调用点而非导入点）
 # ══════════════════════════════════════════════════════════════════
 # 与 attachments 同款：写成函数而非常量，因为 config.load() 合并配置进 os.environ
 # 的时机可能晚于本模块被导入（agent_full_v2 → ws_bridge → refs 的导入链），

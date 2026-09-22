@@ -158,7 +158,7 @@ class SessionManager:
         """设置会话级上下文窗口覆盖（如 "1M" / "128k"）。
 
         空串/None 时恢复默认窗口（DEFAULT_MAX_CONTEXT_TOKENS 兜底）。
-        LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+        LLM 模型/窗口配置统一由 ~/.aigent/config/llmconfig.json 按模型元数据解析
         （SessionRuntime 每轮把解析结果传入），不再读全局 env
         MAX_CONTEXT_TOKENS（历史 bug：该值与所选模型真实窗口不符导致统计误用 1M）。
         同步影响 ContextCompact 的压缩阈值与前端展示的上下文上限。

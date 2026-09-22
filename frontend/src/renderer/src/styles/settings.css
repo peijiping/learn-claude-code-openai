@@ -1111,3 +1111,369 @@
 .addprovider-foot .addmodel-foot-hint {
   flex: 1;
 }
+
+/* ══════════════════════════════════════════════════════════════════════
+   权限管理页（docs/frontend/18，2026-09-22）
+   独立 `.perm-*` 前缀：**不复用**附件 / 引用 / 审批卡的 chip 类名 ——
+   那些有自己的语义（引用胶囊表示"这条消息引用了什么"），混用会让两处
+   样式互相牵制（13 篇记录的教训）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+.perm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.perm-loading,
+.perm-empty {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+
+/* 顶部说明条 */
+.perm-intro {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-sidebar);
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.perm-intro p {
+  margin: 0;
+  line-height: 1.7;
+}
+.perm-intro code {
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+}
+.perm-intro-note {
+  margin-top: var(--sp-2) !important;
+  color: var(--color-warn);
+}
+
+/* 分区 */
+.perm-sec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+}
+.perm-sec-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0;
+  font-size: var(--fs-md);
+  color: var(--color-text-primary);
+}
+.perm-sec-desc {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+.perm-sub {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+
+/* 单选卡片（模式 / MCP） */
+.perm-cards {
+  display: flex;
+  gap: var(--sp-3);
+}
+.perm-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  text-align: left;
+  padding: var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.perm-card:hover {
+  border-color: var(--color-accent);
+}
+.perm-card.active {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.perm-card-label {
+  font-size: var(--fs-md);
+  color: var(--color-text-primary);
+}
+.perm-card-desc {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+/* 行内输入行 */
+.perm-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.perm-inline .input {
+  flex: 1;
+  min-width: 180px;
+}
+.perm-input-num {
+  flex: none;
+  max-width: 110px;
+  text-align: right;
+}
+.perm-input-num.invalid {
+  border-color: var(--color-danger);
+}
+.perm-unit,
+.perm-invalid {
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.perm-invalid {
+  font-size: var(--fs-xs);
+  color: var(--color-danger);
+}
+
+/* 路径列表（额外目录 / 敏感路径） */
+.perm-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.perm-list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+}
+.perm-path {
+  flex: 1;
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.perm-del {
+  flex: none;
+}
+
+/* 模式 chip 列表 */
+.perm-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.perm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+.perm-chip.builtin {
+  background: var(--color-bg-sidebar);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+.perm-chip.custom {
+  background: var(--color-bg-active);
+  border-color: rgba(var(--color-accent-rgb), 0.35);
+  color: var(--color-accent);
+}
+.perm-chip.warn {
+  background: rgba(200, 134, 13, 0.1);
+  border-color: rgba(200, 134, 13, 0.35);
+  color: var(--color-warn);
+}
+.perm-chip.deny {
+  background: rgba(224, 83, 61, 0.08);
+  border-color: rgba(224, 83, 61, 0.35);
+  color: var(--color-danger);
+}
+.perm-chip-del {
+  padding: 0 0 0 2px;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+}
+.perm-chip-del:hover {
+  opacity: 1;
+}
+
+/* 硬拒绝警示块 */
+.perm-danger-note {
+  padding: var(--sp-3);
+  border: 1px solid rgba(224, 83, 61, 0.28);
+  border-radius: var(--radius-sm);
+  background: rgba(224, 83, 61, 0.07);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: var(--color-danger);
+}
+
+/* 判定顺序（数据来自后端 builtin.order，与 evaluate 的实现次序同源）。
+   左侧色条编码"严格程度"：红=拒绝 / 琥珀=必问 / 绿=免问 / 灰=兜底。 */
+.perm-order {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-sidebar);
+}
+.perm-order-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-md);
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+.perm-order-sub {
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+.perm-order-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.perm-order-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--color-border);
+  background: var(--color-bg-main);
+}
+.perm-order-item.order-deny {
+  border-left-color: var(--color-danger);
+}
+.perm-order-item.order-dangerous {
+  border-left-color: var(--color-warn);
+}
+.perm-order-item.order-safe {
+  border-left-color: var(--color-ok);
+}
+.perm-order-rank {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-hover);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.perm-order-body {
+  flex: 1;
+  min-width: 0;
+}
+.perm-order-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.perm-order-label {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+.perm-order-effect {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.perm-order-pos {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  opacity: 0.85;
+}
+.perm-order-note {
+  margin: 2px 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+.perm-order-tail {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+.perm-add {
+  align-self: flex-start;
+}
+
+/* 保存结果提示（后端归一化 warnings） */
+.perm-warns {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid rgba(200, 134, 13, 0.3);
+  border-radius: var(--radius-sm);
+  background: rgba(200, 134, 13, 0.08);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.perm-warns-title {
+  margin-bottom: var(--sp-1);
+  color: var(--color-warn);
+}
+.perm-warns ul {
+  margin: 0;
+  padding-left: var(--sp-4);
+  line-height: 1.7;
+}
+
+/* 底部保存栏：sticky 贴住滚动区底边（负 margin 抵消 .settings-body 的 24px padding） */
+.perm-foot {
+  position: sticky;
+  bottom: calc(var(--sp-5) * -1);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) calc(var(--sp-5) * -1) calc(var(--sp-5) * -1);
+  padding: var(--sp-3) var(--sp-5);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+}
+.perm-foot-status {
+  flex: 1;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.perm-foot-status.dirty {
+  color: var(--color-accent);
+}

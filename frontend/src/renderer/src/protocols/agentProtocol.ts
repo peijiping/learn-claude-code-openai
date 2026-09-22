@@ -287,6 +287,10 @@ export type UiEvent =
   /** 引用候选列表（应答 `refs_list`）。**点对点信封，不进 isKnownAgentEvent 白名单** */
   | { kind: 'refs'; payload: RefsPayload }
   | { kind: 'llm_config'; payload: LlmConfigResult }
+  /** 权限配置（设置页「权限」页，docs/frontend/18）。**点对点信封**：只回执给发起
+   *  窗口、不广播 —— 广播会把另一个窗口正在编辑的未保存 draft 冲掉（对比
+   *  permission_changed 必须广播）。因此不进 isKnownAgentEvent 白名单。 */
+  | { kind: 'permission_config'; payload: PermissionConfigResult }
   | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
   /** 任务面板快照（整份替换，不做增量）。
    *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
@@ -598,7 +602,7 @@ export interface LlmConfig {
   connections: LlmConnection[]
   /** 扁平模型视图（兼容既有链路） */
   models: LlmModel[]
-  /** 预置厂商目录（~/.aigent/providers.json） */
+  /** 预置厂商目录（~/.aigent/config/providers.json） */
   providers?: Record<string, LlmProvider>
   /** API 格式选项 */
   api_formats?: LlmApiFormat[]
@@ -612,6 +616,95 @@ export interface LlmConfigResult {
 export interface LlmConfigPayload {
   active_model_id: string | null
   connections: LlmConnection[]
+}
+
+// ── 权限配置（docs/frontend/17 §5.4 / 18，2026-09-22）────────────────────
+// 规则文件是 ~/.aigent/config/permissions.json（与 llmconfig.json 同级的完整结构化
+// 配置）。下面这些键与设置页七分区一一对应（18 篇 §3.2）—— 原「⑦ 自定义规则」
+// 已于 2026-09-22 下线，`rules` 键保留但恒为空（迁移规则见 agents/permission.py）。
+
+/** **已下线（2026-09-22）**：自定义规则区已从设置页移除，它的三种动作分别由
+ *  ⑥ 硬拒绝 / ⑤ 危险命令 / ④ 安全命令白名单 承担（同一语义不再有两个写入口）。
+ *  保留类型仅为兼容旧回执；后端 `_normalize` 会把存量 `rules` 迁移进上述三处，
+ *  并让该字段恒为空数组。 */
+export interface PermissionRule {
+  /** 匹配动作：allow=跳过审批直接放行 / deny=硬拒绝 / ask=送审批 */
+  action: 'allow' | 'deny' | 'ask'
+  /** 匹配模式（与内置清单同语法，见 17 篇 §3.4） */
+  pattern: string
+  /** 备注（仅展示） */
+  note?: string
+}
+
+export interface PermissionSafeCommands {
+  /** 白名单总开关（false = 命令一律进审批流程；**不是**清空 list） */
+  enabled: boolean
+  /** 自定义白名单。**空数组会回落到内置全量** —— 想关白名单要用 enabled=false */
+  list: string[]
+}
+
+/** 归一化后的权限配置（后端 `PermissionStore._normalize` 的权威输出） */
+export interface PermissionConfig {
+  version: number
+  /** 全局兜底档位：**只影响新建会话**（已有会话各有自己的档位） */
+  default_mode: PermissionMode
+  /** 审批等待超时（秒，60–3600） */
+  approval_timeout_seconds: number
+  /** MCP 破坏性工具策略：ask=始终询问（完全访问下也问）/ allow=完全访问自动放行 */
+  mcp_destructive: 'ask' | 'allow'
+  /** 全局额外目录（其内读写视同工作区；敏感路径仍被硬拒） */
+  additional_dirs: string[]
+  safe_commands: PermissionSafeCommands
+  /** 追加的硬拒绝模式（任何模式不可放行，含完全访问） */
+  deny_patterns: string[]
+  /** 追加的危险模式（默认模式送审批；完全访问放行） */
+  dangerous_patterns: string[]
+  /** **已下线（2026-09-22）**：后端恒返回空数组，设置页不再渲染该区。
+   *  存量内容已按 action 迁入 deny_patterns / dangerous_patterns / safe_commands。 */
+  rules: PermissionRule[]
+}
+
+/** 内置清单（只读展示）。**由后端下发，前端零硬编码** —— 前端自建一份就会与后端
+ *  常量漂移，正是 17 篇 §1.1「两份黑名单不同步」缺陷模式的重演。 */
+/** 判定顺序的一档（设置页「判定顺序」区块）。**由后端下发** —— 它与
+ *  `evaluate` / `_bash_category_decision` 的实现次序同源，前端自建一份必然漂移。 */
+export interface PermissionOrderItem {
+  /** 档次标识：deny / dangerous / safe / other（用于样式区分） */
+  key: string
+  /** 展示名（如「硬拒绝」） */
+  label: string
+  /** 命中后的处置（如「直接拒绝」） */
+  effect: string
+  /** 它在链上的位置说明（如「最先判定 · 不可越过」） */
+  rank: string
+  /** 一句话解释，含典型用法 */
+  note: string
+}
+
+export interface PermissionBuiltin {
+  safe_commands: string[]
+  dangerous: string[]
+  deny: string[]
+  /** 敏感路径黑名单的人类可读描述（展示用） */
+  deny_paths: string[]
+  timeout: { default: number; min: number; max: number }
+  /** 判定顺序（数组顺序即判定先后）。旧后端不下发时调用方需兜底为空数组。 */
+  order?: PermissionOrderItem[]
+}
+
+export interface PermissionConfigResult {
+  config: PermissionConfig
+  /** 内置清单（get 回执有；save 回执可省） */
+  builtin?: PermissionBuiltin
+  /** 配置文件绝对路径（「配置文件位置」展示用） */
+  path?: string
+  /** 是否已存在配置文件；false → 首屏提示「尚未保存过自定义配置」 */
+  exists?: boolean
+  /** 保存回执：false 只在写盘失败时出现 */
+  applied?: boolean
+  /** 归一化修正说明（人话），保存后内联展示 */
+  warnings?: string[]
+  msg?: string
 }
 /** 「刷新模型列表」结果（GET {base_url}/models） */
 export interface LlmModelsResult {
@@ -721,6 +814,9 @@ export type ControlKind =
   | 'refs_list'
   | 'llm_config_get'
   | 'llm_config_save'
+  /** 权限配置读 / 保存（设置页「权限」页；回执为 permission_config 点对点信封） */
+  | 'permission_config_get'
+  | 'permission_config_save'
   | 'llm_models_fetch'
   /** 结构化提问的作答（ask_user）。**fire-and-forget，无点对点回包** ——
    *  回执走 `ask_resolved` 广播。刻意不走 request()：主进程 pending 表按 kind
@@ -735,6 +831,10 @@ export type ControlKind =
   /** 切换会话权限档位（默认 / 完全访问）。fire-and-forget：成功后后端广播
    *  `permission_changed`（多窗口一致）。 */
   | 'session_permission'
+  /** 新建任务（无会话）态切换**目标工作空间**的权限档位（2026-09-22，§5.2）。
+   *  fire-and-forget：成功后后端广播 `projects` 刷新（无会话号，不带
+   *  permission_changed）—— chip 选中态由 projects 广播驱动。 */
+  | 'project_permission'
 
 export interface WsOutbound {
   kind: ControlKind | 'ping'
@@ -794,6 +894,13 @@ export interface ApprovalAnswerPayload {
  *  成功后后端广播 permission_changed（前端以后端广播为准更新 chip）。 */
 export interface SessionPermissionPayload {
   session_id: string
+  mode: PermissionMode
+}
+
+/** 前端 → 后端：新建任务态切换目标工作空间权限档位（kind='project_permission'）。
+ *  只写 projects.json 的「最后更改值」；成功后后端广播 projects 刷新。 */
+export interface ProjectPermissionPayload {
+  project_id: string
   mode: PermissionMode
 }
 

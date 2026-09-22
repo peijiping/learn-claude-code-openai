@@ -7,7 +7,7 @@ permission.py - 权限管控引擎（两档模式 + 八步判定链，2026-09-22
 
 三个组成部分
 ────────────
-1. `PermissionStore` —— `~/.aigent/permissions.json` 的唯一读写门面。
+1. `PermissionStore` —— `~/.aigent/config/permissions.json` 的唯一读写门面。
    结构化配置（列表/嵌套），`config.py` 的 `load()` 只合并扁平字符串键，
    不支持这类结构，故规则文件独立成篇（先例：llmconfig.json）。
    判定线程读缓存 + mtime 检查热加载（保存后下一轮判定即生效，无需重启）。
@@ -26,11 +26,25 @@ permission.py - 权限管控引擎（两档模式 + 八步判定链，2026-09-22
                   → deny。**任何模式（含完全访问）、任何记忆都不可越过**
 ③ 完全访问        mode == full_access → allow（mcp_destructive=ask 的例外除外）
 ④ 预授权目录      文件工具目标在额外目录集（全局额外目录 ∪ 会话批准）内 → allow
-⑤ 自定义允许规则  rules 按序匹配（allow → 放行；ask → 送审批）
+⑤ 自定义允许规则  **已于 2026-09-22 下线**，判定链不再走此步：存量 `rules` 按
+                  action 迁移进 ②`deny_patterns` / ⑦b`dangerous_patterns` /
+                  ⑦a`safe_commands`（迁移表见 `_normalize`）。编号保留不重排，
+                  以便与既有文档、记录对照。
 ⑥ 会话内允许      session_allows 匹配（bash_prefix / pattern / path / mcp_tool）
-⑦ 类别规则        安全命令白名单 / 区内读写 → allow；危险模式 / 目录外 / 其他
-                  bash / MCP destructive → approve
-⑧ 审批            approve → ApprovalBroker（阻塞）或 CLI input() / silent 自动拒绝
+⑦ 类别规则        **先危险模式（approve）→ 再安全白名单（allow）**；区内读写
+                  → allow；目录外 / 其他 bash / MCP destructive → approve
+⑧ 审批            **有交互通道**（broker 已注入 / CLI）→ 阻塞等用户三选一；
+                  **无通道**（cron / 纯后台，且 silent）→ 自动拒绝（确定性结局）
+
+⑦ 内两步的**次序即安全语义**（2026-09-22 修正，勿回退）
+──────────────────────────────────────────────────────
+危险模式必须先于白名单判定。两个理由缺一不可：
+  a) 安全：白名单命中即 `continue` 会跳过本段剩余检查 —— `cat x > /etc/passwd`
+     这类「白名单只读命令 + 重定向」曾因此被**静默放行**；而同类的
+     `echo x > /dev/sda` 因 `> /dev/sd` 在硬拒绝清单里反被拦住，明显不自洽。
+  b) 能力：次序一致后，「白名单写大类 + 危险清单写特例」即可表达
+     「大类放行 + 特例除外」（白名单 `git ` + 危险 `git push`）。
+     用户只需记住：**越严的越先判，冲突时更严的一方赢**。
 
 线程模型
 ──────
@@ -50,7 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from config import AIGENT_HOME
+from config import AIGENT_HOME, CONFIG_DIR
 from logger import get_logger
 from paths import WORKTREE_DIR
 
@@ -121,10 +135,22 @@ def _deny_path_roots() -> list[Path]:
     home = Path.home()
     return [
         home / ".ssh",
+        # 配置文件目录（2026-09-22 起配置文件统一收在 ~/.aigent/config/）：
+        # 只拦其中含凭证/规则的三份 —— config.json（纯参数）与 providers.json
+        # （公共厂商元数据）不含密钥，维持既有「不拦」语义。
+        CONFIG_DIR / "credentials.json",
+        CONFIG_DIR / "llmconfig.json",
+        CONFIG_DIR / "permissions.json",
+        # 迁移前的顶层旧路径：一并拦截。迁移是 rename，正常情况下旧文件已不存在；
+        # 但若搬迁失败（跨设备/权限）或用户手工同步回一份副本，这里的兜底能避免
+        # 「新路径已生效、旧文件却成了可读取后门」的安全退化。
         AIGENT_HOME / "credentials.json",
         AIGENT_HOME / "llmconfig.json",
         AIGENT_HOME / "permissions.json",
-        AIGENT_HOME / "logs",
+        # 注：`AIGENT_HOME / "logs"` 已于 2026-09-22 移出硬拒绝 —— 日志不含密钥，
+        # 而"读自己的日志排障"是 agent 的刚需（此前 run_read 读 agent_日期.log 会被
+        # deny，排查"前端状态断了"反而无路可走）。写入不受影响：logs 不在工作空间内，
+        # run_write/run_edit 走 ⑦ 的 outside_workspace 审批，不是静默放行。
     ]
 
 
@@ -146,6 +172,79 @@ def deny_path_hit(target: Path) -> str | None:
         except (OSError, TypeError):
             continue
     return None
+
+
+def _tilde(path: Path) -> str:
+    """home 下的路径显示成 `~/...`（设置页展示用；非 home 路径原样返回）。"""
+    try:
+        return "~/" + str(Path(path).relative_to(Path.home()))
+    except (ValueError, TypeError):
+        return str(path)
+
+
+def builtin_snapshot() -> dict:
+    """内置清单快照（设置页**只读**展示用）—— 与常量同文件，改常量自动跟随。
+
+    为什么必须由后端下发：八分区里 ⑤⑥ 的表单形态是「内置只读 chip + 自定义追加」。
+    前端若自己写一份内置清单常量，就制造了**第二出处** —— 以后改 `BUILTIN_DANGEROUS`
+    必然漏改前端，正是 17 篇 §1.1 记录的「hooks.py 与 tools.py 两份黑名单不同步」
+    缺陷模式重演。
+
+    `deny_paths` 由 `CONFIG_DIR` / `Path.home()` 派生（不手写字面量），与前缀拦截的
+    真实来源同源。迁移前的顶层旧路径（`~/.aigent/credentials.json` 等三份）仍在拦，
+    但**不下发** —— 那是过渡期兜底，不是用户需要理解的配置面。
+    """
+    return {
+        "safe_commands": list(BUILTIN_SAFE_COMMANDS),
+        "dangerous": list(BUILTIN_DANGEROUS),
+        "deny": list(BUILTIN_DENY),
+        "deny_paths": [
+            "*.pem / *.key（任意目录）",
+            ".env（任意目录）",
+            f"{_tilde(Path.home() / '.ssh')}/（整个目录）",
+            _tilde(CONFIG_DIR / "credentials.json"),
+            _tilde(CONFIG_DIR / "llmconfig.json"),
+            _tilde(CONFIG_DIR / "permissions.json"),
+        ],
+        "timeout": {
+            "default": DEFAULT_TIMEOUT_SECONDS,
+            "min": MIN_TIMEOUT_SECONDS,
+            "max": MAX_TIMEOUT_SECONDS,
+        },
+        # 判定次序（设置页「判定顺序」区块直接渲染，前端零硬编码）：
+        # 与 `evaluate` / `_bash_category_decision` 的**实现次序同源** ——
+        # 改判定链时必须同步改这里，否则界面会描述一个不存在的顺序。
+        "order": [
+            {
+                "key": "deny",
+                "label": "硬拒绝",
+                "effect": "直接拒绝",
+                "rank": "最先判定 · 不可越过",
+                "note": "命中即拒绝，完全访问模式也照样拦下；任何会话记忆、额外目录都不能豁免。",
+            },
+            {
+                "key": "dangerous",
+                "label": "危险命令",
+                "effect": "一律先送审批",
+                "rank": "其次判定 · 先于白名单",
+                "note": "因为先于白名单判定，它天然可以当白名单的例外：白名单写 git（大类放行），这里写 git push（特例仍要过问）。",
+            },
+            {
+                "key": "safe",
+                "label": "安全命令白名单",
+                "effect": "直接放行",
+                "rank": "再次判定 · 逐段生效",
+                "note": "逐段判定：复合命令里只有命中白名单的片段被放行，其余片段仍按「未列出」处理。",
+            },
+            {
+                "key": "other",
+                "label": "未列出的命令",
+                "effect": "同样需要审批",
+                "rank": "最后兜底",
+                "note": "不在白名单内就需要过问；想彻底免问就把它加进白名单。",
+            },
+        ],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -332,7 +431,9 @@ class Decision:
     action: str                    # "allow" | "deny" | "approve"
     reason: str = ""               # 展示原因 / 回填模型的拒绝文案
     trigger: str = ""              # dangerous_pattern | bash_not_allowed |
-                                   # outside_workspace | mcp_destructive | custom_rule
+                                   # outside_workspace | mcp_destructive
+                                   # （历史值 `custom_rule` 已随自定义规则下线，
+                                   #   仅旧会话/审批记录里可能残留）
     session_key: dict | None = field(default=None)   # 「会话内允许」记账粒度
     segment: str = ""              # 触发段（卡片高亮用）
 
@@ -351,8 +452,140 @@ def _approve(trigger: str, reason: str, session_key: dict, segment: str = "") ->
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PermissionStore：~/.aigent/permissions.json 的唯一读写门面
+#  PermissionStore：~/.aigent/config/permissions.json 的唯一读写门面
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _is_absolute_dir(value: str) -> bool:
+    """额外目录必须是绝对路径（`~` 展开后判定）。
+
+    相对路径会以**后端进程的 cwd** 为基准被 `Path(d).resolve()` 解析出意外目录
+    （设置页方案 §2.4-1）—— 宁可丢弃并提示，也不要静默放行一个用户没指定的目录。
+    路径**不存在不拦**（用户可能先配后建目录），只在这里判形态。
+    """
+    try:
+        return Path(value).expanduser().is_absolute()
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _dedup_preserve_order(items) -> list[str]:
+    """保序去重（空串由调用方先行过滤）—— 避免同一目录/模式在设置页出现两遍。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _normalize_warnings(raw, normalized: dict) -> list[str]:
+    """对比「用户提交的原值」与「归一化权威值」，产出设置页要展示的人话说明。
+
+    两类内容（都不阻断保存）：
+    - **被修正**：超时钳位、非法模式回落、非绝对路径目录被丢、重复项去重、白名单空回落。
+    - **提示无效**：追加项已在内置清单中、额外目录命中敏感路径。
+
+    为什么必须在后端生成：归一化是后端的职责（单一出处）。前端自己算一套「什么会被改」
+    就会与 `_normalize` 漂移，用户看到的解释与实际落盘不一致 —— 比不解释更糟。
+    """
+    if not isinstance(raw, dict):
+        return []
+    warns: list[str] = []
+
+    # ── 被修正 ──────────────────────────────────────────────────────
+    mode = str(raw.get("default_mode") or "").strip()
+    if mode and mode not in VALID_MODES:
+        warns.append(f"权限模式「{mode}」无法识别，已回落为「{normalized['default_mode']}」")
+
+    if "approval_timeout_seconds" in raw:
+        try:
+            given: int | None = int(raw.get("approval_timeout_seconds"))
+        except (TypeError, ValueError):
+            given = None
+        final = normalized["approval_timeout_seconds"]
+        if given is None:
+            warns.append(f"审批超时不是整数，已回落为 {final} 秒")
+        elif given != final:
+            warns.append(
+                f"审批超时 {given} 秒超出范围，已调整为 {final} 秒"
+                f"（允许 {MIN_TIMEOUT_SECONDS}–{MAX_TIMEOUT_SECONDS}）"
+            )
+
+    mcp = str(raw.get("mcp_destructive") or "").strip().lower()
+    if mcp and mcp not in ("ask", "allow"):
+        warns.append(
+            f"MCP 破坏性工具策略「{mcp}」无法识别，已回落为「{normalized['mcp_destructive']}」"
+        )
+
+    given_dirs = raw.get("additional_dirs")
+    if isinstance(given_dirs, list):
+        seen_dirs: set[str] = set()
+        for d in given_dirs:
+            if not isinstance(d, (str, int)):
+                continue
+            text = str(d).strip()
+            if not text:
+                continue
+            if text in seen_dirs:
+                warns.append(f"额外目录「{text}」重复，已去重")
+                continue
+            seen_dirs.add(text)
+            if not _is_absolute_dir(text):
+                warns.append(f"额外目录「{text}」不是绝对路径，已忽略")
+
+    sc = raw.get("safe_commands")
+    if isinstance(sc, dict):
+        raw_list = sc.get("list")
+        if isinstance(raw_list, list) and not any(str(x).strip() for x in raw_list):
+            # 最容易误解的一条：删空 ≠ 关掉白名单（空列表会回落到内置全量）
+            warns.append(
+                "安全命令白名单为空，已回落到内置默认清单"
+                "（若要关闭白名单，请用上方的开关）"
+            )
+
+    # 自定义规则已下线：只报告迁移结果。原先逐条提示「缺模式 / 动作无法识别」
+    # 已删除 —— 该区从设置页移除后用户没有对应动作可做，迁移计数才是有效信息。
+    rules = raw.get("rules")
+    if isinstance(rules, list):
+        moved = {"deny": 0, "ask": 0, "allow": 0}
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            action = str(r.get("action") or "").strip()
+            if str(r.get("pattern") or "").strip() and action in moved:
+                moved[action] += 1
+        total = sum(moved.values())
+        if total:
+            warns.append(
+                f"自定义规则已下线，{total} 条规则已按动作迁入对应分区"
+                f"（拒绝 {moved['deny']} 条 → 硬拒绝、"
+                f"询问 {moved['ask']} 条 → 危险命令、"
+                f"允许 {moved['allow']} 条 → 安全命令白名单）。"
+                "注意「允许」类规则已由原先的「整条命令放行」收严为「逐段放行」，"
+                "复合命令中的其他片段仍可能触发审批。"
+            )
+
+    # ── 提示无效（追加了也不会按预期生效）──────────────────────────
+    builtin_deny_lower = {d.strip().lower() for d in BUILTIN_DENY}
+    for item in normalized["deny_patterns"]:
+        if item.strip().lower() in builtin_deny_lower:
+            warns.append(f"「{item}」已在内置硬拒绝清单中，追加无效")
+    builtin_dangerous_lower = {d.strip().lower() for d in BUILTIN_DANGEROUS}
+    for item in normalized["dangerous_patterns"]:
+        if item.strip().lower() in builtin_dangerous_lower:
+            warns.append(f"「{item}」已在危险命令清单中，追加无效")
+    for d in normalized["additional_dirs"]:
+        try:
+            hit = deny_path_hit(Path(d).expanduser())
+        except (OSError, TypeError):
+            hit = None
+        if hit:
+            warns.append(
+                f"额外目录「{d}」与敏感路径黑名单冲突（{hit}），其内容仍会被硬拒绝"
+            )
+    return warns
+
 
 def _default_config() -> dict:
     return {
@@ -377,7 +610,7 @@ class PermissionStore:
     """
 
     def __init__(self, path: Path | str | None = None):
-        self.path = Path(path) if path else AIGENT_HOME / "permissions.json"
+        self.path = Path(path) if path else CONFIG_DIR / "permissions.json"
         self._lock = threading.Lock()
         self._cache: dict | None = None
         self._mtime: float | None = None
@@ -404,7 +637,47 @@ class PermissionStore:
 
     # ── 写（设置页保存路径）────────────────────────────────────────
     def save(self, data: dict) -> dict:
+        """落盘并返回归一化后的权威值（等价于 `save_reporting(data)[0]`）。"""
+        return self.save_reporting(data)[0]
+
+    def save_reporting(self, data: dict) -> tuple[dict, list[str]]:
+        """落盘并返回 `(归一化权威值, warnings)` —— 设置页保存路径。
+
+        warnings 是**给人看的说明**（哪一项被钳位/被丢弃/追加了也不会生效），
+        **不阻断保存**。与 `save()` 并存：后者退化为取首个元素，现有调用方与测试零改动。
+        写盘失败时 `_write` 抛 `OSError`（调用方决定怎么回执），此时不返回。
+        """
         normalized = self._normalize(data)
+        warnings = _normalize_warnings(data, normalized)
+        self._backup_legacy_rules(data)
+        self._write(normalized)
+        return normalized, warnings
+
+    def _backup_legacy_rules(self, data) -> None:
+        """迁移前把原始 `rules` 备份到 `<path>.rules-bak`（**仅首次，不覆盖**）。
+
+        迁移是单向的（`allow` 由「整条命令放行」收严为「逐段放行」），留一份原始
+        内容比事后靠猜便宜。只在备份文件不存在时写 —— 保留用户最初那份配置，
+        而不是被后续保存反复改写。备份失败只告警，不影响迁移与保存。
+        """
+        if not isinstance(data, dict):
+            return
+        rules = data.get("rules")
+        if not isinstance(rules, list) or not rules:
+            return
+        bak = self.path.with_name(self.path.name + ".rules-bak")
+        if bak.exists():
+            return
+        try:
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            bak.write_text(json.dumps(rules, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+            log.info("自定义规则已下线，原始 rules 备份至 %s", bak)
+        except OSError as e:
+            log.warning("rules 备份写入失败（不影响迁移与保存）: %s", e)
+
+    def _write(self, normalized: dict) -> None:
+        """原子写（tmp + os.replace）+ 写后立刻失效缓存（下一轮判定即生效）。"""
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(
@@ -426,7 +699,6 @@ class PermissionStore:
                 self._mtime = self.path.stat().st_mtime
             except OSError:
                 self._mtime = None
-        return normalized
 
     # ── 归一化（读与写共用同一出口，脏数据全部收敛在这里）────────────
     @staticmethod
@@ -453,39 +725,61 @@ class PermissionStore:
         elif os.environ.get("MCP_ALLOW_DESTRUCTIVE", "").lower() == "true":
             out["mcp_destructive"] = "allow"
 
+        # 额外目录：必须绝对路径（相对路径会按后端进程 cwd 解析出意外目录）+ 保序去重
         dirs = raw.get("additional_dirs")
         if isinstance(dirs, list):
-            out["additional_dirs"] = [
+            out["additional_dirs"] = _dedup_preserve_order([
                 str(d).strip() for d in dirs
                 if isinstance(d, (str, int)) and str(d).strip()
-            ]
+                and _is_absolute_dir(str(d).strip())
+            ])
 
         sc = raw.get("safe_commands")
         if isinstance(sc, dict):
+            custom_cmds = _dedup_preserve_order(
+                str(x).strip() for x in (sc.get("list") or []) if str(x).strip()
+            )
             out["safe_commands"] = {
                 "enabled": bool(sc.get("enabled", True)),
-                "list": ([str(x).strip() for x in sc.get("list") or []
-                          if str(x).strip()] or list(BUILTIN_SAFE_COMMANDS)),
+                # 空列表回落内置全量：**"删空" ≠ "关掉白名单"**（关要用 enabled=false）。
+                # 刻意的 fail-safe —— 白名单被误删空不该等于"所有命令都进审批"。
+                "list": custom_cmds or list(BUILTIN_SAFE_COMMANDS),
             }
 
         for key in ("deny_patterns", "dangerous_patterns"):
             items = raw.get(key)
             if isinstance(items, list):
-                out[key] = [str(x).strip() for x in items
-                            if isinstance(x, (str, int)) and str(x).strip()]
+                out[key] = _dedup_preserve_order(
+                    str(x).strip() for x in items
+                    if isinstance(x, (str, int)) and str(x).strip()
+                )
 
+        # ── 自定义规则（原判定链第⑤步）已下线：存量 rules 迁移进三个分类列表 ──
+        # 迁移表（等价性由测试锁定，勿凭感觉改）：
+        #   deny  → deny_patterns        同落 ②，完全等价
+        #   ask   → dangerous_patterns   同为送审批；迁移后**判定更早**（先于白名单）
+        #   allow → safe_commands.list   **收严**：由「整条命令放行」变为「逐段放行」
+        # 输出 `rules` 恒为空列表 → 写盘后再读已无可迁移项，天然幂等。
         rules = raw.get("rules")
         if isinstance(rules, list):
-            cleaned = []
             for r in rules:
                 if not isinstance(r, dict):
                     continue
                 action = str(r.get("action") or "").strip()
                 pattern = str(r.get("pattern") or "").strip()
-                if action in ("allow", "deny", "ask") and pattern:
-                    cleaned.append({"action": action, "pattern": pattern,
-                                    "note": str(r.get("note") or "")})
-            out["rules"] = cleaned
+                if not pattern:
+                    continue
+                if action == "deny":
+                    out["deny_patterns"].append(pattern)
+                elif action == "ask":
+                    out["dangerous_patterns"].append(pattern)
+                elif action == "allow":
+                    out["safe_commands"]["list"].append(pattern)
+            out["deny_patterns"] = _dedup_preserve_order(out["deny_patterns"])
+            out["dangerous_patterns"] = _dedup_preserve_order(out["dangerous_patterns"])
+            out["safe_commands"]["list"] = _dedup_preserve_order(
+                out["safe_commands"]["list"])
+        out["rules"] = []
         return out
 
     # ── 便捷访问器（判定路径用；load 缓存后的字典直读）──────────────
@@ -514,6 +808,8 @@ class PermissionGate:
     def __init__(self, workdir: Path | str, *, silent: bool = False,
                  store: PermissionStore | None = None):
         self.workdir = Path(workdir)
+        # silent：**只表示"抑制终端打印"**，不是"无人值守"的判据（后者看 broker）。
+        # 桌面端 Agent 亦为 silent=True，若拿它判无人值守会把审批卡片全部吞掉。
         self.silent = silent
         self.store = store if store is not None else PermissionStore()
         # 当前模式：内存态（gate 每次判定实时读，切换即时生效）。
@@ -594,8 +890,26 @@ class PermissionGate:
                     dirs.add(Path(str(a.get("value"))).expanduser().resolve())
                 except OSError:
                     continue
+        # 红线：必须**原地** clear + update，禁止写成 `self._extra_dirs = {...}` 重新赋值
+        # —— 这个 set 与 ToolRegistry.safe_path 的兜底层是**同一个对象**
+        # （attach_tool_registry 时共享）。换对象 = 共享断裂：判定层放行了、工具层仍按
+        # 旧集拦下，表现为「审批通过但工具报 ValueError」，且极难排查。
         self._extra_dirs.clear()
         self._extra_dirs.update(dirs)
+
+    def refresh_extra_dirs(self) -> None:
+        """重读 permissions.json 的 additional_dirs 并重建额外目录集。
+
+        设置页保存全局额外目录后，由桥层对每个**在途**会话调用 —— 其余配置项靠
+        `evaluate()` 每轮 `store.load()` 的 mtime 热加载已自动生效，**只有这个是缓存**
+        （`_extra_dirs` 原本只在 `restore_from_meta` / `record_session_allow` 时重建）。
+        未构造 agent 的会话不用管：首次构造时 `restore_from_meta` 自然读到新值。
+
+        `session_allows` 的 path 类记忆在 `_rebuild_extra_dirs_locked` 内一并重建
+        （所以刷新不会丢掉本会话已批准的目录）。
+        """
+        with self._lock:
+            self._rebuild_extra_dirs_locked()
 
     # ── 会话记忆 ───────────────────────────────────────────────────
     def record_session_allow(self, session_key: dict, source: str = "approval") -> None:
@@ -684,11 +998,9 @@ class PermissionGate:
             if target is not None and self._in_effective_dirs(target):
                 return _allow()
 
-        # ⑤ 自定义规则（按序匹配；deny 已并入②，这里只剩 allow / ask）
-        if tool_name == "bash":
-            rule_decision = self._custom_rules_decision(tool_args, store)
-            if rule_decision is not None:
-                return rule_decision
+        # ⑤ 自定义允许规则 —— **已下线（2026-09-22）**。原 `rules` 里 deny 本就并
+        # 在②生效，allow / ask 也已迁移进 ⑦a 白名单 / ⑦b 危险清单，故此步不再
+        # 判定。编号保留不重排，便于与既有文档、记录对照。
 
         # ⑥ 会话内允许（文件工具的 path 类记忆已在④生效；这里管 bash / MCP）
         if tool_name.startswith("mcp__"):
@@ -725,35 +1037,19 @@ class PermissionGate:
     def _bash_hard_deny(self, tool_args: dict, store: dict) -> Decision | None:
         command = str(tool_args.get("command") or "")
         segments = split_command_segments(command)
+        token_lists = [tokenize(s) for s in segments]
         deny_patterns = BUILTIN_DENY + list(store["deny_patterns"])
-        deny_rules = [r["pattern"] for r in store["rules"] if r["action"] == "deny"]
         for seg in segments:
-            for pattern in deny_patterns + deny_rules:
-                if pattern_matches(pattern, seg):
+            for pattern in deny_patterns:
+                # 跨段模式（`curl * | sh`）必须一并匹配：`pattern_matches` 对含 `|`
+                # 的模式恒返回 False，此前只判它 → 用户配在硬拒绝里的跨段模式
+                # **完全不生效**（2026-09-22 修复，口径与 ⑦b 危险模式对齐）。
+                if (pattern_matches(pattern, seg)
+                        or cross_pattern_matches(pattern, token_lists)):
                     return _deny(f"命令命中硬拒绝清单（{pattern}），任何模式下均不允许执行")
         hit = deny_tokens_in_command(command)
         if hit:
             return _deny(f"命令涉及敏感路径（{hit}），任何模式下均不允许访问")
-        return None
-
-    # ── ⑤ 自定义规则（allow / ask）────────────────────────────────
-    def _custom_rules_decision(self, tool_args: dict, store: dict) -> Decision | None:
-        command = str(tool_args.get("command") or "")
-        segments = split_command_segments(command)
-        token_lists = [tokenize(s) for s in segments]
-        for rule in store["rules"]:
-            pattern = rule["pattern"]
-            for seg in segments:
-                hit = (pattern_matches(pattern, seg)
-                       or cross_pattern_matches(pattern, token_lists))
-                if hit:
-                    if rule["action"] == "allow":
-                        return _allow()
-                    # ask：自定义规则要求过目
-                    return _approve(
-                        "custom_rule", f"命中自定义规则：{pattern}",
-                        {"type": "pattern", "value": pattern}, segment=seg,
-                    )
         return None
 
     # ── ⑦ bash 类别规则 ────────────────────────────────────────────
@@ -779,17 +1075,21 @@ class PermissionGate:
             if any(self._session_allows_match("pattern", p) and pattern_matches(p, seg)
                    for p in dangerous):
                 continue
-            # ⑦a 安全白名单（只读命令）
-            if safe_list and any(pattern_matches(p, seg) for p in safe_list):
-                continue
-            # ⑦b 危险模式（更具体的触发原因优先报）
+            # ⑦-1 危险模式 —— **必须先于白名单判定**（顺序即安全语义，见模块 docstring）：
+            #   ① 白名单命中即 `continue` 会跳过本段剩余检查，`cat x > /etc/passwd` 这类
+            #      「白名单只读命令 + 重定向」此前因此被**静默放行**；
+            #   ② 先判危险才能让「白名单写大类 + 危险写特例」成立（白名单 git 免问、
+            #      危险 git push 仍过问）。更严的层先判 = 冲突时更严的一方赢。
             for p in dangerous:
                 if pattern_matches(p, seg) or cross_pattern_matches(p, token_lists):
                     return _approve(
                         "dangerous_pattern", f"危险命令模式：{p}",
                         {"type": "pattern", "value": p}, segment=seg,
                     )
-            # ⑦c 白名单外普通命令
+            # ⑦-2 安全白名单（只读命令；**逐段**放行，其余片段继续判定）
+            if safe_list and any(pattern_matches(p, seg) for p in safe_list):
+                continue
+            # ⑦-3 白名单外普通命令
             if not unsafe_head:
                 unsafe_head, unsafe_seg = head, seg
         if unsafe_head:
@@ -857,14 +1157,22 @@ class PermissionGate:
                 print(f"\033[2;95m⛔ 权限拦截: {decision.reason}\033[0m")
             return f"Error: Permission denied: {decision.reason}"
 
-        # approve → 审批
-        # silent（cron/后台/无人值守）：默认模式自动拒绝（确定性结局，
-        # 防止 input()/审批弹窗永远无人应答；完全访问在③已放行不会到这）
-        if self.silent:
-            return "Error: Permission denied (non-interactive session)"
-
+        # approve → 审批。**判据是「有没有交互通道」，不是 silent**（2026-09-22 修复）。
+        #
+        # 历史 bug：此处曾以 `if self.silent: 直接拒绝` 短路，本意是"cron/无人值守
+        # 不要把 input() 挂死"。但桌面端每一会话的 Agent 也是 `silent=True`
+        # （`SessionRuntime.build_agent` —— silent 在 Agent 层只表示"抑制后端
+        # stdout 打印"），于是前端审批卡片**永远不弹**：一切待审批操作（rm /
+        # python3 / npm install / 工作区外读写 / MCP 破坏性）被静默拒绝，用户
+        # 侧表现为"权限被硬拦截、无法删除文件"。
+        #
+        # 真实区分点是 broker：SessionRuntime 注入 = 有前端可作答；cron / 纯后台 /
+        # 复现脚本不注入 = 无人值守 → 自动拒绝（确定性结局，防 input() 挂死）。
+        # CLI（agent_cli，silent=False 且无 broker）仍走终端三选一。
         broker = self.approval_broker
         if broker is None:
+            if self.silent:
+                return "Error: Permission denied (non-interactive session)"
             # CLI 终端兜底：保留三选一的终端产品体验（文档 §6 CLI 行）
             status = self._cli_confirm(tool_name, tool_args, decision)
         else:

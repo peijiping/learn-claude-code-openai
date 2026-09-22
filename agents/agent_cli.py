@@ -45,7 +45,7 @@ except ImportError:
 
 
 def main() -> None:
-    # 自举配置：真实环境变量 > 项目级 .aigent/config.json > ~/.aigent/config.json > .env > 默认值
+    # 自举配置：真实环境变量 > 项目级 .aigent/config.json > ~/.aigent/config/config.json > .env > 默认值
     load_config()
     # 存在 llmconfig.json 则加载大模型配置映射进 env（文件缺失时不影响启动）
     load_llm_config()

@@ -54,7 +54,7 @@ from refs import (
     normalize_refs,
     ref_title_hint,
 )
-from permission import VALID_MODES
+from permission import PermissionStore, VALID_MODES, builtin_snapshot
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
 from session_runtime import SessionRuntimeRegistry
@@ -639,6 +639,45 @@ def _approval_snapshot_lines() -> list[str]:
     return lines
 
 
+# ── 权限设置页（docs/frontend/18，2026-09-22）────────────────────────────
+# 判定策略本身在 agents/permission.py；桥层只做「读配置 / 写配置 / 推给在途会话」。
+
+def _permission_store() -> PermissionStore:
+    """设置页专用 store 实例。
+
+    **不要**复用某个 Agent 的 `permission_gate.store` —— 那是 per-Agent 实例，而设置页
+    可能在任何 agent 构造之前就被打开。`PermissionStore` 是无状态门面（读写各持锁 +
+    mtime 检查热加载），多个实例指向同一文件自然一致（17 篇 §5.4-E11）。
+    """
+    return PermissionStore()
+
+
+def _refresh_permission_dirs() -> int:
+    """设置页保存后：把新的全局额外目录推给所有**已构造**的在途会话 Agent。
+
+    只有 `additional_dirs` 需要这一步 —— 其余键在 `evaluate()` 里每轮 `store.load()`
+    靠 mtime 热加载天然即时生效，而额外目录进的是 gate 的**缓存集合** `_extra_dirs`。
+    未构造 agent 的会话不用管：首次构造时 `restore_from_meta` 自然读到新值。
+    返回刷新的会话数（仅用于日志）；任何异常都不得影响保存回执。
+    """
+    try:
+        runtimes = registry.all_runtimes() if registry is not None else []
+    except Exception as exc:  # noqa: BLE001 - 刷新失败绝不能影响保存回执
+        log.warning("额外目录刷新：取运行时列表失败 %s", exc)
+        return 0
+    n = 0
+    for rt in runtimes:
+        agent = getattr(rt, "agent", None)
+        if agent is None:
+            continue
+        try:
+            agent.permission_gate.refresh_extra_dirs()
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("额外目录刷新失败 session_%s: %s", rt.sid, exc)
+    return n
+
+
 def _text_of(content) -> str:
     """历史消息 content 兼容转换：str 直接返回，list（多模态 blocks）拼接 text。"""
     if isinstance(content, str):
@@ -1054,6 +1093,10 @@ async def handle(ws):
                     sid = new_sid
                     # 会话归属一建立就入缓存：后续 _load_meta / 管理操作都靠它定位空间
                     _SID_PROJECT[sid] = pid
+                    # 会话**真实产生**才刷新该空间 last_opened_at（侧边栏空间
+                    # 排序的唯一刷新点，2026-09-22）：新建任务下拉切换 / 切会话
+                    # 对齐活动空间都只走 project_open（set_active），不动排序。
+                    await asyncio.to_thread(get_registry().touch_opened, pid)
                     # 沙箱根在**新建时**解析一次并固化进元数据（work_root 快照，
                     # 「会话建成即锁空间」的姊妹规则）：
                     # - default → ~/.aigent/projects/default/scratch（草稿区，
@@ -1365,6 +1408,28 @@ async def handle(ws):
                 log.info("session_permission: session_%s(%s) -> %s", sid, pid, mode)
                 hub.broadcast("permission_changed", {
                     "session_id": sid, "mode": mode, "source": "user"})
+
+            elif kind == "project_permission":
+                # 新建任务（无会话）态切换**目标工作空间**的权限档位
+                # （docs/frontend/17 §5.2）：只写 projects.json 的「最后更改值」，
+                # 作为该空间**新会话**的默认档位；已有会话不受影响（各自的
+                # meta 已折叠）。成功后广播 projects 刷新 —— 新建任务态的
+                # chip 选中态由 projects 广播驱动（没有会话号，不带
+                # permission_changed）。
+                pid = str(payload.get("project_id") or "")
+                mode = str(payload.get("mode") or "")
+                if not pid or mode not in VALID_MODES:
+                    log.warning("project_permission 丢弃：pid=%r mode=%r", pid, mode)
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        get_registry().set_permission_mode, pid, mode)
+                except Exception as e:  # 未知空间/非法值：不广播，前端保持原档位
+                    log.error("project_permission 失败: project=%s mode=%s: %s: %s",
+                              pid, mode, type(e).__name__, e)
+                    continue
+                log.info("project_permission: %s -> %s", pid, mode)
+                await reply_projects()
 
             elif kind == "status_query":
                 # 前端主动拉取运行状态（渲染进程刷新/HMR 不重建 WS 连接，
@@ -1724,6 +1789,49 @@ async def handle(ws):
                         "msg": (f"模型配置已生效（{result.get('primary')}）"
                                 if ok else result.get("reason", "未生效")),
                     }))
+
+            elif kind == "permission_config_get":
+                # 设置页读：归一化配置 + 内置清单（只读展示）+ 文件位置/是否存在。
+                # 内置清单由后端下发 —— 前端硬编码会造第二出处（见 permission.builtin_snapshot）。
+                store = _permission_store()
+                cfg = await asyncio.to_thread(store.load)
+                await safe_send(ws, _envelope("permission_config", {
+                    "config": cfg,
+                    "builtin": builtin_snapshot(),
+                    "path": str(store.path),
+                    "exists": store.path.exists(),
+                }))
+
+            elif kind == "permission_config_save":
+                # 整份覆盖式保存（不做字段级 patch）。只回执给发起窗口、**不广播** ——
+                # 广播会把另一个窗口正在编辑的未保存 draft 冲掉（对比 permission_changed
+                # 必须广播：盾牌 chip 常驻输入区，多窗口不一致是视觉事故）。
+                raw = payload.get("config")
+                store = _permission_store()
+                if not isinstance(raw, dict):
+                    await safe_send(ws, _envelope("error", {"msg": "权限配置格式非法"}))
+                else:
+                    try:
+                        normalized, warnings = await asyncio.to_thread(
+                            store.save_reporting, raw
+                        )
+                    except OSError as exc:
+                        log.error("权限配置落盘失败: %s", exc)
+                        await safe_send(ws, _envelope("permission_config", {
+                            "config": store.load(),
+                            "applied": False,
+                            "warnings": [],
+                            "msg": f"保存失败：{exc}",
+                        }))
+                    else:
+                        refreshed = _refresh_permission_dirs()
+                        log.info("权限配置已保存（额外目录刷新 %d 个在途会话）", refreshed)
+                        await safe_send(ws, _envelope("permission_config", {
+                            "config": normalized,
+                            "applied": True,
+                            "warnings": warnings,
+                            "msg": "权限配置已保存并生效",
+                        }))
 
             elif kind == "llm_models_fetch":
                 # 「刷新」按钮：调 GET {base_url}/models 拉取该连接可用的模型 id 列表。

@@ -35,6 +35,8 @@ export interface AgentApi {
    * 回执分别走 `approval_resolved` / `permission_changed` 广播。 */
   approvalAnswer: (sessionId: string, requestId: string, decision: string) => Promise<void>
   sessionPermission: (sessionId: string, mode: string) => Promise<void>
+  /** 新建任务（无会话）态切换目标工作空间权限档位；回执走 projects 广播 */
+  projectPermission: (projectId: string, mode: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>
@@ -85,6 +87,9 @@ export interface AgentApi {
   queryStatus: () => Promise<{ ok: boolean }>
   llmConfigGet: () => Promise<unknown>
   llmConfigSave: (config: unknown) => Promise<unknown>
+  /** 权限配置（~/.aigent/config/permissions.json）读 / 保存 */
+  permissionConfigGet: () => Promise<unknown>
+  permissionConfigSave: (config: unknown) => Promise<unknown>
   /** 刷新某连接可用模型列表（GET {base_url}/models；api_key 留空回退已保存密钥） */
   llmModelsFetch: (payload: {
     base_url?: string

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionMode, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -14,7 +14,7 @@ export type SessionOverridesMap = Record<string, SessionOverrides>
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
-export type SettingsTab = 'general' | 'model' | 'trash' | 'about'
+export type SettingsTab = 'general' | 'model' | 'permission' | 'trash' | 'about'
 
 /** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
@@ -33,6 +33,25 @@ export function projectDisplayName(projects: ProjectMeta[], id?: string | null):
 /** 会话所属工作空间 id（存量会话缺字段 → default） */
 export function sessionProjectId(s: SessionMeta): string {
   return s.project || DEFAULT_PROJECT_ID
+}
+
+/** 合并 `permission_config` 回执（get / save 两种回执各只带一半字段）。
+ *
+ * **不能整份替换**：get 回执带 `builtin`/`path`/`exists`，save 回执带 `applied`/`warnings`/`msg`。
+ * 整份覆盖会让保存后 `builtin` 变 `undefined` → 权限页 `if (!builtin)` 兜底分支直接塌回
+ * 「读取权限配置…」加载态（用户点一次保存页面就没了）。
+ *
+ * 反向也要清：get 回执不带 `applied`，若沿用上一次 save 的 `applied/warnings`，
+ * 「保存成功但被调整」的提示会挂在新加载的干净配置上（假告警）。 */
+function mergePermissionResult(
+  prev: PermissionConfigResult | null,
+  next: PermissionConfigResult
+): PermissionConfigResult {
+  const base: PermissionConfigResult = { ...(prev ?? {}), ...next }
+  if (next.applied === undefined) {
+    return { ...base, applied: undefined, warnings: undefined, msg: undefined }
+  }
+  return base
 }
 
 /** 每个空间默认最多展示的会话条数（超出折叠，末尾给"展开全部"入口） */
@@ -101,7 +120,7 @@ export function resolveOverridesPayload(
 
 /** 解析某模型的元数据（窗口 / 思考档位）：
  * 模型自身字段优先（后端归一化时已从预置目录继承过来，自定义模型则来自手动填写），
- * 回落预置目录（~/.aigent/providers.json）。都拿不到时返回 null（不渲染悬浮面板）。 */
+ * 回落预置目录（~/.aigent/config/providers.json）。都拿不到时返回 null（不渲染悬浮面板）。 */
 export function resolveModelMeta(
   llmConfig: LlmConfig | null,
   model: (LlmModel | LlmConnectionModel) | null | undefined
@@ -409,6 +428,10 @@ interface AgentState {
   settingsTab: SettingsTab
   llmConfig: LlmConfig | null
   llmSaving: boolean
+  /** 权限配置（设置页「权限」页）：get 回执整份结果（含内置清单 / 路径 / exists）。
+   *  只由设置页消费 —— 它是点对点回执，不参与全局广播状态。 */
+  permissionConfig: PermissionConfigResult | null
+  permissionSaving: boolean
   /** 当前激活会话的上下文统计（每轮 turn_end / 切会话时后端下发） */
   currentContextStats: ContextStats | null
   /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
@@ -478,6 +501,10 @@ interface AgentState {
   /** 切换当前会话的权限档位（默认 / 完全访问）。fire-and-forget：**不乐观更新**，
    *  chip 选中态只认后端广播的 `permission_changed`（传输丢失时乐观 UI 会说谎）。 */
   switchPermission: (mode: PermissionMode) => void
+  /** 新建任务（无会话）态切换**目标工作空间**的权限档位（默认 / 完全访问）。
+   *  只写 projects.json 的「最后更改值」，作为该空间新会话的默认档位 ——
+   *  fire-and-forget：chip 选中态由随后的 `projects` 广播驱动（不乐观更新）。 */
+  switchProjectPermission: (mode: PermissionMode) => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
   /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
@@ -511,6 +538,11 @@ interface AgentState {
   closeSettings: () => void
   loadLlConfig: () => Promise<void>
   saveLlConfig: (config: LlmConfigPayload) => Promise<boolean>
+  /** 拉取权限配置（进「权限」页时懒加载；后端未就绪静默忽略） */
+  loadPermissionConfig: () => Promise<void>
+  /** 保存权限配置，返回 applied（false = 写盘失败）。
+   *  归一化 warnings / 权威值由 `permissionConfig` 回写，页面自行读取展示。 */
+  savePermissionConfig: (config: PermissionConfig) => Promise<boolean>
   /** 刷新某连接可用模型列表（GET {base_url}{models_path}），返回模型 id 列表（失败返回空） */
   fetchModels: (payload: {
     base_url?: string
@@ -1231,6 +1263,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   settingsTab: 'model',
   llmConfig: null,
   llmSaving: false,
+  permissionConfig: null,
+  permissionSaving: false,
   currentContextStats: null,
   sessionUsageBySession: {},
   taskBoardBySession: {},
@@ -1451,6 +1485,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const sid = get().activeSession
     if (!sid) return
     window.agent.sessionPermission(sid, mode)
+  },
+
+  /** 新建任务（无会话）态切换目标工作空间的权限档位。目标空间 = 「+」/chip
+   *  选定的 pendingProjectId（缺省跟随后端活动空间）。fire-and-forget ——
+   *  chip 只认随后的 `projects` 广播。 */
+  switchProjectPermission: (mode) => {
+    const pid = get().pendingProjectId ?? get().activeProject
+    if (!pid) return
+    window.agent.projectPermission(pid, mode)
   },
 
   handleEvent: (ev) => {
@@ -1704,6 +1747,16 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         const payload = ev.payload as { config?: LlmConfig; applied?: boolean; msg?: string }
         if (payload?.config) set({ llmConfig: payload.config })
         if (payload?.msg) showToast(payload.msg, 'info')
+        break
+      }
+      case 'permission_config': {
+        // 点对点回执（只回发起窗口、**不广播**）：整份存 store，权限页按需渲染。
+        // 刻意不 toast —— warnings 与 msg 要由页面内联展示，用户得对着它们改配置，
+        // toast 一闪而过等于没提示（见 18 篇 §3.3）。
+        const payload = ev.payload as PermissionConfigResult
+        if (payload?.config) {
+          set({ permissionConfig: mergePermissionResult(get().permissionConfig, payload) })
+        }
         break
       }
       case 'context_stats': {
@@ -2167,8 +2220,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   openSettings: (tab = 'model') => {
     set({ settingsOpen: true, settingsTab: tab })
     if (tab === 'model' && !get().llmConfig) void get().loadLlConfig()
+    if (tab === 'permission' && !get().permissionConfig) void get().loadPermissionConfig()
   },
-  closeSettings: () => set({ settingsOpen: false }),
+  // 关闭时清掉权限配置缓存：配置可能被另一个窗口改过，重进必须重新拉取
+  // （未保存的 draft 在组件内 state，随组件卸载自然丢弃）
+  closeSettings: () => set({ settingsOpen: false, permissionConfig: null }),
   loadLlConfig: async () => {
     try {
       const res = (await window.agent.llmConfigGet()) as { config?: LlmConfig } | null
@@ -2193,6 +2249,36 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       return false
     } finally {
       set({ llmSaving: false })
+    }
+  },
+  loadPermissionConfig: async () => {
+    try {
+      const res = (await window.agent.permissionConfigGet()) as PermissionConfigResult | null
+      if (res?.config) {
+        set({ permissionConfig: mergePermissionResult(get().permissionConfig, res) })
+      }
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  savePermissionConfig: async (config) => {
+    set({ permissionSaving: true })
+    try {
+      const res = (await window.agent.permissionConfigSave(config)) as
+        | PermissionConfigResult
+        | null
+      // 以后端回执为准回填（含归一化修正后的权威值与 warnings）：
+      // 保留本地 draft 会让界面显示的内容与磁盘实际存的不一致。
+      // 用 merge 而非整份替换 —— save 回执不带 builtin，替换会让权限页塌回加载态。
+      if (res?.config) {
+        set({ permissionConfig: mergePermissionResult(get().permissionConfig, res) })
+      }
+      return res?.applied ?? false
+    } catch {
+      showToast('保存权限配置失败', 'error', 4000)
+      return false
+    } finally {
+      set({ permissionSaving: false })
     }
   },
   fetchModels: async (payload) => {

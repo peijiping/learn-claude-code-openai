@@ -2,10 +2,10 @@
 """
 llm_config.py - 大模型配置管理（v2：以「连接（供应商）」为中心）
 
-文件布局
-- ~/.aigent/llmconfig.json   用户维护的模型配置（含 api_key，权限 0600）
-- ~/.aigent/providers.json   预置厂商公共元数据（DeepSeek / 硅基流动 …），
-                             与用户配置解耦，便于随时整体更新
+文件布局（2026-09-22 起统一收在 `~/.aigent/config/`）
+- ~/.aigent/config/llmconfig.json   用户维护的模型配置（含 api_key，权限 0600）
+- ~/.aigent/config/providers.json   预置厂商公共元数据（DeepSeek / 硅基流动 …），
+                                   与用户配置解耦，便于随时整体更新
 
 llmconfig.json v2 结构（连接 → 模型 两级）：
 
@@ -35,7 +35,7 @@ llmconfig.json v2 结构（连接 → 模型 两级）：
 api_key），使输入区模型下拉、会话绑定、resolveModelMeta 等既有链路零改动。
 
 启动语义（"没有配置时不加载"）与热切换语义保持不变，见旧版说明。
-依赖方向：本模块单向 import config（仅取 AIGENT_HOME / CREDENTIALS_FILE）。
+依赖方向：本模块单向 import config（仅取 CONFIG_DIR / CREDENTIALS_FILE）。
 """
 
 import json
@@ -45,16 +45,16 @@ import string
 import threading
 from pathlib import Path
 
-from config import AIGENT_HOME, CREDENTIALS_FILE
+from config import CONFIG_DIR, CREDENTIALS_FILE
 from logger import get_logger
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("llm_config")
 
-# ~/.aigent/llmconfig.json（含 api_key，权限收紧到 0600）
-LLM_CONFIG_FILE = AIGENT_HOME / "llmconfig.json"
-# ~/.aigent/providers.json（预置厂商公共元数据，无密钥，可随官方更新覆盖）
-PROVIDER_CATALOG_FILE = AIGENT_HOME / "providers.json"
+# ~/.aigent/config/llmconfig.json（含 api_key，权限收紧到 0600）
+LLM_CONFIG_FILE = CONFIG_DIR / "llmconfig.json"
+# ~/.aigent/config/providers.json（预置厂商公共元数据，无密钥，可随官方更新覆盖）
+PROVIDER_CATALOG_FILE = CONFIG_DIR / "providers.json"
 
 CONFIG_VERSION = 2
 # 出厂预置目录版本。提升它 = 声明"内置目录改版"，既有 providers.json 会按内置
@@ -69,7 +69,7 @@ API_FORMATS: list[dict] = [
     {"id": "responses", "label": "Responses (/responses)"},
 ]
 
-# ── 内置预置厂商目录（首次运行物化写出到 ~/.aigent/providers.json） ──────
+# ── 内置预置厂商目录（首次运行物化写出到 ~/.aigent/config/providers.json） ──
 # 本期仅 DeepSeek 与 硅基流动；新增厂商只需往该文件补一条（或改这里的默认值）。
 # models[].capabilities 声明输入/输出能力（text/image/video/pdf），供 UI 展示；
 # max_context(_extended) / thinking_strengths / default_thinking 供输入区悬浮面板用。

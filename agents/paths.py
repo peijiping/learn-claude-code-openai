@@ -14,7 +14,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from config import AIGENT_HOME, migrate_legacy
+from config import AIGENT_HOME, CONFIG_DIR, migrate_legacy
 
 
 # ── 根目录（启动 agent 时的当前工作目录） ──────────────────────────
@@ -22,6 +22,8 @@ ROOT_DIR = Path.cwd()
 
 # 应用自身 home 目录（用户级，存放 skills / worktree / MCP 配置 / 应用配置）。
 # 位于 ~/.aigent（config.py 定义），原 WorkSpace/HomeDir 内容由 migrate_legacy 一次性搬迁。
+# 散落的配置文件（config.json / credentials.json / llmconfig.json / providers.json /
+# permissions.json）自 2026-09-22 起统一收在 `~/.aigent/config/`（CONFIG_DIR）下。
 
 # 技能目录
 SKILLS_DIR = AIGENT_HOME / "skills"
@@ -275,6 +277,9 @@ def ensure_dirs() -> None:
         (DATA_ROOT / name).mkdir(parents=True, exist_ok=True)
     # default 草稿目录：桌面端新建 default 会话的沙箱根（2026-09-20）
     DEFAULT_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    # 配置文件目录（2026-09-22）：config.json / credentials.json / llmconfig.json /
+    # providers.json / permissions.json 的落点（migrate_legacy 已尝试搬迁旧顶层文件）
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
