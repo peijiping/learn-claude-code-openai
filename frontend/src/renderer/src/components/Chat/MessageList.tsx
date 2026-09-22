@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useAgentStore } from '@store/agentStore'
 import MessageItem from './MessageItem'
 import ApprovalCard from './ApprovalCard'
@@ -9,24 +9,32 @@ const STICKY_THRESHOLD = 48
 export default function MessageList(): JSX.Element {
   const messages = useAgentStore((s) => s.messages)
   const activeSession = useAgentStore((s) => s.activeSession)
+  /** 在途审批表（稳定引用）：zustand v5 的 useStore 直接跑在
+   *  useSyncExternalStore 上，**selector 返回值就是 getSnapshot** —— 每次
+   *  调用都新建数组/对象会触发 "getSnapshot should be cached" 无限重渲染
+   *  （Maximum update depth exceeded，切会话即崩，2026-09-22 修复）。因此
+   *  这里只取 store 里的对象引用（缺条目时 undefined，同样稳定），派生
+   *  计算放 useMemo。 */
+  const approvalTable = useAgentStore((s) =>
+    s.activeSession ? s.approvalBySession[s.activeSession] : undefined
+  )
   /** 未被任何工具条配对的在途审批卡片（2026-09-22 权限管控）：正常情况审批卡
    *  由 MessageItem 按 toolCallId 锚定到触发的工具条下；这里只兜底
    *  "锚点丢失"（流式时序错位 / 工具行尚未建出）—— 审批是必须现在做决定的
    *  交互，宁可位置不对也不能不显示。 */
-  const orphanApprovals = useAgentStore((s) => {
-    const sid = s.activeSession
-    if (!sid) return []
-    const table = s.approvalBySession[sid] ?? {}
-    return Object.values(table).filter(
-      (a) =>
-        !a.toolCallId ||
-        !s.messages.some(
-          (m) =>
-            m.toolCalls.some((t) => t.id === a.toolCallId) ||
-            m.subagents.some((x) => x.toolCalls.some((t) => t.id === a.toolCallId))
-        )
-    )
-  })
+  const orphanApprovals = useMemo(
+    () =>
+      Object.values(approvalTable ?? {}).filter(
+        (a) =>
+          !a.toolCallId ||
+          !messages.some(
+            (m) =>
+              m.toolCalls.some((t) => t.id === a.toolCallId) ||
+              m.subagents.some((x) => x.toolCalls.some((t) => t.id === a.toolCallId))
+          )
+      ),
+    [approvalTable, messages]
+  )
   const containerRef = useRef<HTMLDivElement>(null)
   const stickyRef = useRef(true)
   const prevSessionRef = useRef(activeSession)

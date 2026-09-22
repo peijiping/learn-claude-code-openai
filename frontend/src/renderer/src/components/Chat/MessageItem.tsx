@@ -224,22 +224,28 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
   /** 本条消息上需要锚定的在途审批卡片（2026-09-22 权限管控）：按 toolCallId
    *  匹配到本消息的工具行。主工具条匹配的渲染在工具条后；子智能体工具匹配的
    *  渲染在子智能体块**外**（块默认折叠，审批是"必须现在做决定"的交互，
-   *  藏在折叠块里等于没问）。未被任何工具条配对的由 MessageList 末尾兜底。 */
-  const { mainApprovals, subApprovals } = useAgentStore((s) => {
-    const sid = s.activeSession
-    if (!sid || msg.role !== 'assistant') return { mainApprovals: [], subApprovals: [] }
-    const table = s.approvalBySession[sid] ?? {}
+   *  藏在折叠块里等于没问）。未被任何工具条配对的由 MessageList 末尾兜底。
+   *  zustand v5 的 selector 返回值即 getSnapshot，不能在这里新建对象/数组
+   *  （会触发 "Maximum update depth exceeded" 死循环）—— 只取 store 里的
+   *  审批表引用（缺条目时 undefined），配对计算放 useMemo。 */
+  const approvalTable = useAgentStore((s) =>
+    s.activeSession ? s.approvalBySession[s.activeSession] : undefined
+  )
+  const { mainApprovals, subApprovals } = useMemo(() => {
+    if (msg.role !== 'assistant' || !approvalTable) {
+      return { mainApprovals: [] as ApprovalInteraction[], subApprovals: [] as ApprovalInteraction[] }
+    }
     const mainIds = new Set(msg.toolCalls.map((t) => t.id))
     const subIds = new Set(msg.subagents.flatMap((x) => x.toolCalls.map((t) => t.id)))
     const main: ApprovalInteraction[] = []
     const sub: ApprovalInteraction[] = []
-    for (const a of Object.values(table)) {
+    for (const a of Object.values(approvalTable)) {
       if (!a.toolCallId) continue
       if (mainIds.has(a.toolCallId)) main.push(a)
       else if (subIds.has(a.toolCallId)) sub.push(a)
     }
     return { mainApprovals: main, subApprovals: sub }
-  })
+  }, [msg, approvalTable])
 
   /** 正文里的 `@相对路径` token → 内联胶囊（与输入区同款视觉，见 lib/refTokens）。
    *
