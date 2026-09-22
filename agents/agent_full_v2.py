@@ -62,6 +62,14 @@ from logger import get_logger
 from system_prompt import SystemPromptBuilder
 from error_recovery import ErrorRecovery, RecoveryAction
 from hooks import HookSystem
+# 权限管控（2026-09-22，docs/frontend/17）：策略本体收敛到 permission.py 的
+# PermissionGate（八步判定链），Agent 只负责构造、接线和状态恢复。
+from permission import (
+    VALID_MODES,
+    PermissionGate,
+    PermissionStore,
+)
+from project_registry import get_registry
 from utils import truncate_chars
 from streaming_client import PrintSink, StreamEvent, streamed_create, TurnStopped
 
@@ -301,6 +309,19 @@ class Agent:
         self.hook_system = HookSystem(silent=self.silent, workdir=self.workspace.workdir)
         self.hook_system.register_default_hooks()
 
+        # 权限门（2026-09-22 权限管控，docs/frontend/17）：策略本体在 permission.py。
+        # - 额外目录集与 ToolRegistry **共享同一 set 对象**（safe_path 兜底层）；
+        # - 审批 broker 由 SessionRuntime 在 build_agent 时按会话注入（CLI 不注入
+        #   → gate 回落终端 input() 三选一；silent → 自动拒绝，见 gate.check_tool_call）；
+        # - stop 事件在下方 _stop_evt 创建后回填（broker 等待的兜底唤醒）；
+        # - MCP 破坏性查询走 hook_system 已注入的 mcp_destructive_lookup。
+        self.permission_store = PermissionStore()
+        self.permission_gate = PermissionGate(
+            self.workspace.workdir, silent=self.silent, store=self.permission_store,
+        )
+        self.permission_gate.attach_tool_registry(self.tools)
+        self.hook_system.set_permission_gate(self.permission_gate)
+
         # 后台任务管理器：挂到本实例 tools 的 holder 上（实例级，非全局）
         self.background_manager = BackgroundManager()
         self.tools.set_background_manager(self.background_manager)
@@ -428,6 +449,8 @@ class Agent:
 
         # ── 协作式停止：request_stop() 置位，run_turn/agent_loop 轮询并干净收尾 ──
         self._stop_evt = threading.Event()
+        # 权限审批等待的兜底唤醒（同 ask_user：停止按钮置位 → broker 0.2s 内收束）
+        self.permission_gate.set_stop_event(self._stop_evt)
 
     def request_stop(self) -> None:
         """请求停止当前 turn（线程安全）。只影响本会话的这次执行。"""
@@ -674,6 +697,7 @@ class Agent:
         # 任务板注入：恢复会话时提示"还有活没干完"（判据=存在未完成组，非"是否中断"）
         self._sync_task_board()
         self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
+        self._restore_permission_state()  # 权限模式/会话内允许从元数据恢复
         log.info("会话初始化: %s%s (resume=%s, messages=%d)",
                  self.session_prefix, self.session_id, resume, len(self.history_messages))
         return self.session_id
@@ -697,6 +721,58 @@ class Agent:
         except Exception:
             pass  # 统计恢复失败不影响会话加载，从零重新累计（略偏保守）
         self.usage_totals = totals
+
+    # ── 权限管控（2026-09-22，docs/frontend/17 §2.2/§7.2）─────────────────
+
+    def _restore_permission_state(self) -> None:
+        """init_session / switch_session 时恢复权限状态（继承链唯一挂载点）。
+
+        继承链（resolve 语义在 permission.restore_from_meta 内实现）：
+            会话 meta.permission_mode → 工作空间 projects.json 最后更改值
+            → permissions.json default_mode（缺省 default）。
+        session_allows 一并恢复（path 类记忆重建进共享额外目录集）；并注入
+        持久化回调 —— 之后 gate.record_session_allow 落盘走
+        SessionManager.set_session_allows（E7：失败仅告警，内存仍生效）。
+        恢复失败不阻断会话加载（降级为默认模式 + 空记忆，偏保守）。
+        """
+        try:
+            meta = None
+            project_mode = None
+            if self.session_manager is not None and self.session_id is not None:
+                meta = self.session_manager.load_meta(self.session_id)
+                info = get_registry().get(self.workspace.id)
+                project_mode = getattr(info, "permission_mode", None) if info else None
+            self.permission_gate.restore_from_meta(meta, project_mode)
+            sm, sid = self.session_manager, self.session_id
+            if sm is not None and sid is not None:
+                self.permission_gate.set_save_allows_callback(
+                    lambda allows: sm.set_session_allows(sid, allows)
+                )
+        except Exception:
+            log.exception("权限状态恢复失败（降级为默认模式 + 空记忆）")
+
+    def persist_permission_mode(self, mode: str) -> None:
+        """运行时切换权限模式：内存 + 会话 meta + 工作空间条目 三写。
+
+        - gate.set_mode：后续判定即时生效（在途审批不重判，E6）；
+        - sm.set_session_permission：会话 meta（重启/切回后恢复）；
+        - registry.set_permission_mode：本空间「最后更改值」→ 之后本空间
+          **新建会话**的继承源（用户需求 #4）。写失败仅日志（E10：继承源
+          退回旧值，无数据损坏，不阻断模式切换本身）。
+        """
+        if mode not in VALID_MODES:
+            log.warning("权限模式切换被忽略：非法值 %r", mode)
+            return
+        self.permission_gate.set_mode(mode)
+        try:
+            if self.session_manager is not None and self.session_id is not None:
+                self.session_manager.set_session_permission(self.session_id, mode)
+        except Exception:
+            log.exception("permission_mode 写会话元数据失败（内存已生效）")
+        try:
+            get_registry().set_permission_mode(self.workspace.id, mode)
+        except Exception:
+            log.warning("permission_mode 写工作空间条目失败（新建会话继承源退回旧值）")
 
     def _accumulate_usage(self, usage: dict) -> None:
         """把一次 LLM 调用（或一个子智能体任务）的 usage 累进轮级与会话级计数器。"""
@@ -1037,6 +1113,7 @@ class Agent:
         # 任务板注入：切回会话时提示"还有活没干完"（去重，见 _history_has_task_board）
         self._sync_task_board()
         self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
+        self._restore_permission_state()  # 权限模式/会话内允许从元数据恢复
         log.info("会话切换: %s%s -> %s%s (messages=%d)",
                  self.session_prefix, target_id, self.session_prefix,
                  self.session_id, len(self.history_messages))
@@ -1957,6 +2034,15 @@ class Agent:
                 elif not isinstance(content, str):
                     content = json.dumps(content, ensure_ascii=False)
                 tool_msg = {"role": "tool", "content": content, "tool_call_id": tc.id}
+                # 审批结算元数据（2026-09-22 权限管控，docs/frontend/17 §4.4）：
+                # 拒绝/超时/停止的工具调用，gate 在 check_tool_call 里按
+                # tool_call_id 暂存了 approval 记录 —— 这里在落盘前弹出挂到
+                # tool 行。纯 UI 元数据：_message_to_json_row 原样带出、
+                # load_session_history 三字段投影挡在模型上下文外；允许执行的
+                # 工具行不写（减少落盘噪音）。
+                approval = self.permission_gate.pop_approval_record(tc.id)
+                if approval:
+                    tool_msg["approval"] = approval
                 self.history_messages.append(tool_msg)
                 self.session_manager.append_message_to_session(
                     self.session_file, tool_msg

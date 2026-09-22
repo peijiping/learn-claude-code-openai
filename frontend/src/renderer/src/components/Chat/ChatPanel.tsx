@@ -32,11 +32,21 @@ export default function ChatPanel(): JSX.Element {
     const it = s.interactionBySession[s.activeSession]
     return !!it && it.questions.length > 0
   })
+  /** 本会话是否有**在途审批**（PreToolUse 判定 ask，2026-09-22 权限管控）。
+   *  与 askOpen 不同：审批**不让位输入区**（`.chat--asking` 只属于 ask 面板），
+   *  只禁用发送按钮 —— 审批挂起时停止按钮必须可用（用户可能想直接停掉本轮），
+   *  输入框也保持可打字（草稿不丢）。 */
+  const approvalPending = useAgentStore((s) =>
+    s.activeSession ? Object.keys(s.approvalBySession[s.activeSession] ?? {}).length > 0 : false
+  )
 
   const doSend = (): void => {
     // 在途提问期间输入区已被隐藏（见 askOpen）—— 这里再兜一道：
     // 万一有残留焦点 / 快捷键把发送打进来，也绝不与作答面板抢答。
     if (askOpen) return
+    // 在途审批期间发送按钮已禁用（InputBox.canSend）—— 这里同样兜一道
+    //（Enter 键路径 / 状态竞争窗口），审批未结算前不放进新消息。
+    if (approvalPending) return
     // 用共享判据而不是 `status === 'ready'`：degraded（分析不完整但可用）也必须随
     // payload 发出，否则扫描件会被静默丢掉（见 isSendableAttachment 的说明）。
     const ready = draftAttachments.filter(isSendableAttachment)

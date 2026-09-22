@@ -329,6 +329,32 @@ function createWindow(): void {
     }))
   })
 
+  // ── 权限管控（2026-09-22，docs/frontend/17）─────────────────────────
+  // 审批作答 / 切换会话权限档位 —— 与 ask_answer 同款 **fire-and-forget**：
+  // 回执走 `approval_resolved` / `permission_changed` 广播，主进程拿点对点
+  // 回包没有意义（渲染层直接从 WS 广播收）。这里只做形状校验 + 转发。
+  ipcMain.handle('agent:approvalAnswer', (e, payload: { session_id?: string; request_id?: string; decision?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) return
+    const decision = payload.decision
+    // 只放行三选一的合法裁决（后端也会再校验，这里先拦掉明显脏值）
+    if (decision !== 'allow_once' && decision !== 'allow_session' && decision !== 'deny') return
+    ws.send(JSON.stringify({
+      kind: 'approval_answer',
+      payload: { session_id: payload.session_id, request_id: payload.request_id, decision }
+    }))
+  })
+
+  ipcMain.handle('agent:sessionPermission', (e, payload: { session_id?: string; mode?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    const mode = payload.mode
+    if (mode !== 'default' && mode !== 'full_access') return
+    ws.send(JSON.stringify({
+      kind: 'session_permission',
+      payload: { session_id: payload.session_id, mode }
+    }))
+  })
+
   ipcMain.handle('agent:switchSession', (e, payload: { session_id?: string }) => {
     if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
     ws.send(JSON.stringify({ kind: 'session_switch', payload: { session_id: payload.session_id } }))

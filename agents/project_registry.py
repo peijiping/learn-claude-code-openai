@@ -75,6 +75,10 @@ class ProjectInfo:
     path: Optional[str] = None
     created_at: Optional[str] = None
     last_opened_at: Optional[str] = None
+    # 权限模式（2026-09-22 权限管控，docs/frontend/17 §2.2）：本空间**最后一次**
+    # 显式更改的模式，作为「本空间新建会话」的继承源。None = 从未改过
+    #（继承链继续下落到 permissions.json 的 default_mode）。
+    permission_mode: Optional[str] = None
     # 派生：default 空间（不可删/不可改名）
     system: bool = False
     # 派生：真实目录当前可达（default 恒 True —— 它没有真实目录，不存在"失效"）
@@ -91,6 +95,7 @@ class ProjectInfo:
             "created_at": self.created_at,
             "last_opened_at": self.last_opened_at,
             "session_count": session_count,
+            "permission_mode": self.permission_mode,
         }
 
 
@@ -106,6 +111,7 @@ def _default_entry() -> dict:
         "path": None,
         "created_at": None,
         "last_opened_at": None,
+        "permission_mode": None,
     }
 
 
@@ -257,6 +263,28 @@ class WorkspaceRegistry:
             log.info("工作空间重命名: %s -> %s", pid, new_name)
             return self._to_info(entry)
 
+    def set_permission_mode(self, project_id: str, mode: str) -> ProjectInfo:
+        """记录本空间**最后一次**更改的权限模式（2026-09-22 权限管控，§2.2）。
+
+        语义：本空间内任一会话切换模式时同步写这里 —— 之后**本空间新建的会话**
+        继承这个值（继承链中间层）。不影响既有会话（它们有自己的 meta 记录）。
+        mode ∈ {"default", "full_access"}，非法值拒绝（调用方按 E10 容错：
+        写失败仅日志，不阻断会话 meta 的写入）。
+        """
+        pid = str(project_id or "")
+        mode = str(mode or "")
+        if mode not in ("default", "full_access"):
+            raise WorkspaceError(f"非法权限模式：{mode}")
+        with self._lock:
+            data = self._load()
+            entry = self._find(data, pid)
+            if entry is None:
+                raise WorkspaceError(f"工作空间不存在：{pid}")
+            entry["permission_mode"] = mode
+            self._write(data)
+            log.info("工作空间权限模式: %s -> %s", pid, mode)
+            return self._to_info(entry)
+
     def remove(self, project_id: str) -> ProjectInfo:
         """删除工作空间：**只删元数据目录**（含其中的会话/任务/记忆/回收站），
         真实目录原样保留。
@@ -321,6 +349,8 @@ class WorkspaceRegistry:
                 "path": str(e["path"]) if e.get("path") else None,
                 "created_at": e.get("created_at"),
                 "last_opened_at": e.get("last_opened_at"),
+                # 权限模式（存量条目无此字段 → None = 未改过，继承链继续下落）
+                "permission_mode": e.get("permission_mode"),
             })
         # default 恒在且恒第一（索引被手改删掉也要补回，否则老会话全成孤儿）
         cleaned.sort(key=lambda e: (e.get("last_opened_at") or ""), reverse=True)
@@ -371,6 +401,7 @@ class WorkspaceRegistry:
             path=path,
             created_at=entry.get("created_at"),
             last_opened_at=entry.get("last_opened_at"),
+            permission_mode=entry.get("permission_mode"),
             system=(pid == DEFAULT_PROJECT_ID),
             exists=self._probe(path),
         )

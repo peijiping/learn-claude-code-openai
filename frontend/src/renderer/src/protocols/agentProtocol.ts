@@ -223,6 +223,47 @@ export interface HistoryAskUser {
   status?: AskStatus | 'incomplete'
 }
 
+/** ── 权限管控（2026-09-22，docs/frontend/17）───────────────────────────
+ *
+ *  两档权限模式（默认 / 完全访问）+ 工具执行前的审批流（范式 C）。
+ *  与 ask_user 共用同一套跨线程阻塞基建，但语义不同：ask 问的是**业务问题**
+ *  （答案回给模型），审批问的是**裁决问题**（决定不进模型上下文、不进对话历史）。
+ */
+
+/** 权限模式：default = 敏感操作逐次审批；full_access = 跳过审批（硬拒绝仍生效） */
+export type PermissionMode = 'default' | 'full_access'
+
+/** 审批触发类型（后端 permission.py 的 Decision.trigger） */
+export type ApprovalTrigger =
+  | 'dangerous_pattern'
+  | 'bash_not_allowed'
+  | 'outside_workspace'
+  | 'mcp_destructive'
+  | 'custom_rule'
+  | (string & {})
+
+/** 用户决定（approval_answer.decision） */
+export type ApprovalDecision = 'allow_once' | 'allow_session' | 'deny'
+
+/** 审批结局（approval_resolved.status；timeout/stopped 由后端自结算） */
+export type ApprovalOutcome = 'allowed_once' | 'allowed_session' | 'denied' | 'timeout' | 'stopped'
+
+/** tool 行旁挂的审批结算元数据（jsonl role=tool 行的 approval 字段，§4.4）。
+ *  只有拒绝/超时/停止才落盘（allow_* 不写，减少落盘噪音）—— 回放徽标
+ *  也只在这三种结局下出现。 */
+export interface ApprovalInfo {
+  /** 结局（范式 C 词族：denied / timeout / stopped；老数据不含 allow_*） */
+  decision: string
+  /** 触发类型（§3.6 文案映射） */
+  trigger?: string
+  /** 触发模式 / 路径 / 工具名（按 trigger 取义） */
+  pattern?: string
+  /** 当时会话模式 */
+  mode?: string
+  /** 结算时间 */
+  at?: string
+}
+
 /** 面向 UI 的产物事件（非增量），由 bridge 把底层 event 聚合/透传而来 */
 export type UiEvent =
   | { kind: 'event'; payload: AgentEvent }
@@ -238,7 +279,7 @@ export type UiEvent =
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { session_id: string; message_count: number; /** 新会话所属工作空间 id（前端据此对齐活动空间） */ project_id?: string } }
   | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
-  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } }
+  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; /** 该会话当前权限档位（2026-09-22）：切会话时恢复盾牌 chip 选中态 */ permission_mode?: PermissionMode } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
@@ -260,6 +301,18 @@ export type UiEvent =
    *  **必须有这条**：多窗口一致性（A 窗口作答后 B 窗口的面板也要消失）、
    *  提交窗口自身清面板、以及免去 IPC 请求-响应配对（提交是 fire-and-forget）。 */
   | { kind: 'ask_resolved'; payload: { session_id: string; request_id: string; tool_call_id: string; status: AskStatus; answers: AskAnswer[]; result_text: string } }
+  /** 权限审批下发（PreToolUse 判定 ask）：前端在消息流里弹审批卡片（锚定
+   *  tool_call 折叠条）。与 ask_request 同机制的桥层 UI 产物事件 —— 断线重连 /
+   *  渲染进程刷新时后端重放在途审批（`_approval_snapshot_lines()`）。
+   *  `args` 是工具参数对象（后端已把超长字符串值截断到 600 字），
+   *  `session_scope_hint` 原样展示在「本次会话内允许」按钮副文案（点前知道记什么账）。 */
+  | { kind: 'approval_request'; payload: { session_id: string; request_id: string; tool_call_id: string; tool_name: string; args: Record<string, unknown>; trigger: ApprovalTrigger; reason: string; session_scope_hint: string; mode: string; timeout_seconds: number; created_at: number } }
+  /** 审批已结算（作答 / 拒绝 / 超时 / 停止）：清卡片 + 在对应工具条上落结算徽标。
+   *  同会话多窗口都会收到（多窗口一致）；与 ask_resolved 完全同构。 */
+  | { kind: 'approval_resolved'; payload: { session_id: string; request_id: string; tool_call_id: string; status: ApprovalOutcome; decision?: string; at?: number } }
+  /** 会话权限模式已切换（session_permission 的回执广播）：前端同步盾牌 chip。
+   *  以后端广播为准（不做乐观更新）—— 传输层丢失时乐观 UI 会说谎。 */
+  | { kind: 'permission_changed'; payload: { session_id: string; mode: PermissionMode; source?: string } }
 
 /** 附件种类（与后端 attachments.KIND_* 对齐） */
 export type AttachmentKind = 'image' | 'document' | 'text'
@@ -385,6 +438,9 @@ export interface HistoryToolCall {
   tool_id?: string
   /** 工具执行状态（子智能体回放行携带；缺省按已完成处理） */
   status?: string
+  /** 审批结算元数据（§4.4：拒绝/超时/停止的工具行旁挂，回放渲染「已拒绝」徽标；
+   *  允许执行的工具行不写 —— 无字段 = 旧会话/正常流，按普通工具条渲染） */
+  approval?: ApprovalInfo
 }
 
 export interface HistorySubAgent {
@@ -587,6 +643,9 @@ export interface SessionMeta {
   usage_totals?: UsageStats | null
   /** 未读标记：会话完整结束且用户尚未进入查看时为 true（后端元数据持久化，跨重启/多窗口同步） */
   unread?: boolean
+  /** 该会话当前权限档位（2026-09-22 权限管控）：盾牌 chip 的权威数据源之一。
+   *  老会话/老后端缺省时按 "default" 处理。 */
+  permission_mode?: PermissionMode
 }
 
 /**
@@ -608,6 +667,10 @@ export interface ProjectMeta {
   exists: boolean
   created_at?: string | null
   last_opened_at?: string | null
+  /** 本空间最后更改的权限档位（2026-09-22）：**新建会话 chip 的默认档位来源**
+   *  （继承链：会话 meta ← 工作空间最后更改值 ← 全局 default_mode）。
+   *  会话内切换模式时后端会同步写回这里（用户需求 #4）。 */
+  permission_mode?: PermissionMode
 }
 
 /** `projects` 信封载荷：全部工作空间 + 当前活动空间 */
@@ -665,6 +728,13 @@ export type ControlKind =
   | 'ask_answer'
   /** 取消本次提问（按"未作答、请自行选默认方案继续"回填）。同样 fire-and-forget。 */
   | 'ask_cancel'
+  /** 权限审批作答（2026-09-22 权限管控）。**fire-and-forget，无点对点回包** ——
+   *  回执走 `approval_resolved` 广播；迟到/重复作答由后端幂等丢弃（同 ask_answer，
+   *  刻意不走 request()：主进程 pending 表按 kind FIFO 配对会串台）。 */
+  | 'approval_answer'
+  /** 切换会话权限档位（默认 / 完全访问）。fire-and-forget：成功后后端广播
+   *  `permission_changed`（多窗口一致）。 */
+  | 'session_permission'
 
 export interface WsOutbound {
   kind: ControlKind | 'ping'
@@ -710,6 +780,21 @@ export interface AskAnswerPayload {
 export interface AskCancelPayload {
   session_id: string
   request_id: string
+}
+
+/** 前端 → 后端：提交审批裁决（kind='approval_answer'，fire-and-forget）。
+ *  迟到/重复由后端幂等丢弃。 */
+export interface ApprovalAnswerPayload {
+  session_id: string
+  request_id: string
+  decision: ApprovalDecision
+}
+
+/** 前端 → 后端：切换会话权限档位（kind='session_permission'，fire-and-forget）。
+ *  成功后后端广播 permission_changed（前端以后端广播为准更新 chip）。 */
+export interface SessionPermissionPayload {
+  session_id: string
+  mode: PermissionMode
 }
 
 /** chat 携带的附件线索（真实元数据以磁盘上的 meta.json 为准，前端字段只是线索） */

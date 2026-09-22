@@ -50,6 +50,15 @@ const agent = {
   cancelAsk: (sessionId: string, requestId: string): Promise<void> =>
     ipcRenderer.invoke('agent:cancelAsk', { session_id: sessionId, request_id: requestId }),
 
+  /** ── 权限管控（2026-09-22，docs/frontend/17）────────────────────────
+   * 审批作答 / 切换会话权限档位。与 ask_answer 同款 **fire-and-forget**：
+   * 回执分别走 `approval_resolved` / `permission_changed` 广播，
+   * 这两个 invoke 的返回值无意义、也不该等 —— 别改成 request()。 */
+  approvalAnswer: (sessionId: string, requestId: string, decision: string): Promise<void> =>
+    ipcRenderer.invoke('agent:approvalAnswer', { session_id: sessionId, request_id: requestId, decision }),
+  sessionPermission: (sessionId: string, mode: string): Promise<void> =>
+    ipcRenderer.invoke('agent:sessionPermission', { session_id: sessionId, mode }),
+
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (sessionId: string): Promise<{ session_id: string; message_count: number }> =>
     ipcRenderer.invoke('agent:switchSession', { session_id: sessionId }),

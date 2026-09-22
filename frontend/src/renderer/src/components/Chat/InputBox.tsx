@@ -9,6 +9,7 @@ import History from '@tiptap/extension-history'
 import Placeholder from '@tiptap/extension-placeholder'
 import { Icon } from '@components/common/Icon'
 import { hasImageInput } from '@components/Settings/llmShared'
+import type { PermissionMode } from '@protocols/agentProtocol'
 import {
   attachmentUrl,
   hasSendableContent,
@@ -122,11 +123,37 @@ export default function InputBox({
   const newSession = useAgentStore((s) => s.newSession)
   const openProject = useAgentStore((s) => s.openProject)
   const addProjectFromPicker = useAgentStore((s) => s.addProjectFromPicker)
+  const switchPermission = useAgentStore((s) => s.switchPermission)
+  /** 权限档位（2026-09-22 权限管控，docs/frontend/17）：盾牌 chip 的选中态。
+   *  fallback 链：permissionModeBySession（permission_changed 广播 /
+   *  session_history 恢复）→ sessions 列表该会话的 permission_mode →
+   *  所属工作空间 permission_mode → 'default'。无会话（新建任务）时展示
+   *  目标空间的档位作预告（新会话默认档位取所属空间的最后更改值）。 */
+  const permMode: PermissionMode = useAgentStore((s) => {
+    const sid = s.activeSession
+    if (sid) {
+      return (
+        s.permissionModeBySession[sid] ??
+        s.sessions.find((x) => x.id === sid)?.permission_mode ??
+        'default'
+      )
+    }
+    const pid = s.pendingProjectId ?? s.activeProject
+    return s.projects.find((p) => p.id === pid)?.permission_mode ?? 'default'
+  })
+  /** 本会话是否有在途审批（PreToolUse 判定 ask）：有 → 发送按钮禁用
+   *  （title=「等待权限审批」）。与 ask 的整块让位（chat--asking）刻意不同：
+   *  审批挂起时**输入框可打字、停止可用** —— 停止按钮就在输入区。 */
+  const approvalPending = useAgentStore((s) =>
+    s.activeSession ? Object.keys(s.approvalBySession[s.activeSession] ?? {}).length > 0 : false
+  )
   const [modelOpen, setModelOpen] = useState(false)
   // 加号「添加内容」菜单：条目按 key 分发，见 handlePlusPick
   const [plusOpen, setPlusOpen] = useState(false)
   // 工作空间下拉（chip 点开）：上部分 = 已打开过的空间，末尾固定项 = 选择文件夹
   const [wsOpen, setWsOpen] = useState(false)
+  // 权限档位下拉（盾牌 chip 点开）：两档（默认 / 完全访问），仿 ws-picker
+  const [permOpen, setPermOpen] = useState(false)
   const [hoveredPanel, setHoveredPanel] = useState<{ id: string; x: number; y: number } | null>(null)
   const [ctxTooltip, setCtxTooltip] = useState(false)
   // 面板以 Portal 渲染在 body 顶层，离开菜单项会先触发 onMouseLeave，
@@ -177,6 +204,10 @@ export default function InputBox({
   useEffect(() => {
     if (hasSession) setWsOpen(false)
   }, [hasSession])
+  // 切换会话时收起权限菜单（选中项随会话变化，避免半开状态指错对象）
+  useEffect(() => {
+    setPermOpen(false)
+  }, [activeSession])
 
   // ── 引用候选（@-mention）────────────────────────────────────────
   // 一次拉全量 + 前端本地过滤；沙箱根由 (空间, 会话) 共同决定，换空间自动重拉。
@@ -398,12 +429,14 @@ export default function InputBox({
   const imageUnsupported = hasImageDraft && !hasImageInput(active?.capabilities)
   // 发送可用：正文 / 就绪附件 / 引用**任一非空**即可（判据只有一处：
   // store 里的 `hasSendableContent`，InputBox 的按钮与 ChatPanel 构造 payload 共用）；
-  // 且不能有"正在读取"的附件（避免半成品发出去）
+  // 且不能有"正在读取"的附件（避免半成品发出去）；
+  // 且本会话没有在途审批（等待权限审批期间只禁发送，输入/停止不受影响）
   const stagingCount = attachments.filter((a) => a.status === 'staging').length
   const canSend =
     hasSendableContent(value.text, attachments, value.refs) &&
     stagingCount === 0 &&
-    !imageUnsupported
+    !imageUnsupported &&
+    !approvalPending
   liveRef.current.canSend = canSend
 
   // 引用在当前空间不可用（默认草稿空间，或后端已明确 disabled）
@@ -522,9 +555,66 @@ export default function InputBox({
               />
             )}
           </span>
-          <button className="tool-btn access">
-            完全访问 <Icon name="chevronDown" size={12} />
-          </button>
+          {/* 权限档位盾牌 chip（2026-09-22 权限管控，docs/frontend/17）：两档
+              （默认 = 敏感操作逐次审批 / 完全访问 = 跳过审批）。切换是
+              fire-and-forget —— chip 选中态只认 permission_changed 广播；
+              无会话（新建任务）时只读展示目标空间档位（新会话的默认值来源），
+              不可点（切换命令需要会话号）。 */}
+          <span className="perm-select">
+            <button
+              className={`tool-btn access perm-chip${permMode === 'full_access' ? ' full' : ''}`}
+              title={
+                hasSession
+                  ? permMode === 'full_access'
+                    ? '完全访问：跳过审批（硬拒绝仍生效）。点击切换'
+                    : '默认：敏感操作逐次审批。点击切换'
+                  : permMode === 'full_access'
+                    ? `完全访问（继承自工作空间，新会话默认档位）`
+                    : `默认：敏感操作逐次审批（新会话默认档位）`
+              }
+              aria-haspopup="menu"
+              aria-expanded={permOpen}
+              disabled={!hasSession}
+              onClick={hasSession ? () => setPermOpen((v) => !v) : undefined}
+            >
+              <Icon name="shieldCheck" size={13} />
+              {permMode === 'full_access' ? '完全访问' : '默认'}
+              {hasSession && <Icon name="chevronDown" size={11} />}
+            </button>
+            {permOpen && hasSession && (
+              <>
+                <div className="perm-menu-mask" onClick={() => setPermOpen(false)} />
+                <div className="perm-menu">
+                  <div
+                    role="menuitem"
+                    className={`perm-menu-item ${permMode === 'default' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPermOpen(false)
+                      if (permMode !== 'default') switchPermission('default')
+                    }}
+                  >
+                    <Icon name="shieldCheck" size={13} />
+                    <span className="perm-menu-name">默认</span>
+                    <span className="perm-menu-desc">敏感操作逐次审批</span>
+                    {permMode === 'default' && <Icon name="check" size={13} />}
+                  </div>
+                  <div
+                    role="menuitem"
+                    className={`perm-menu-item ${permMode === 'full_access' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPermOpen(false)
+                      if (permMode !== 'full_access') switchPermission('full_access')
+                    }}
+                  >
+                    <Icon name="shieldCheck" size={13} />
+                    <span className="perm-menu-name">完全访问</span>
+                    <span className="perm-menu-desc">跳过审批（硬拒绝仍生效）</span>
+                    {permMode === 'full_access' && <Icon name="check" size={13} />}
+                  </div>
+                </div>
+              </>
+            )}
+          </span>
           <span className="ws-select">
             <span
               className={`ctx-chip ${!hasSession && wsOpen ? 'open' : ''} ${hasSession ? '' : 'clickable'}`}
@@ -721,9 +811,11 @@ export default function InputBox({
               title={
                 stagingCount > 0
                   ? '附件正在读取…'
-                  : imageUnsupported
-                    ? '当前模型不支持图片输入'
-                    : '发送'
+                  : approvalPending
+                    ? '等待权限审批'
+                    : imageUnsupported
+                      ? '当前模型不支持图片输入'
+                      : '发送'
               }
             >
               <Icon name="send" size={15} />

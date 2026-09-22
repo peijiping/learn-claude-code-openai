@@ -198,6 +198,23 @@ class BrowserAgentBridge implements AgentApi {
     }))
     return Promise.resolve()
   }
+  // 权限管控（2026-09-22）：审批作答 / 切换会话权限档位 —— 同 ask_answer 的
+  // fire-and-forget（后端无点对点应答信封，回执走 approval_resolved /
+  // permission_changed 广播）。
+  approvalAnswer(sessionId: string, requestId: string, decision: string): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'approval_answer',
+      payload: { session_id: sessionId, request_id: requestId, decision }
+    }))
+    return Promise.resolve()
+  }
+  sessionPermission(sessionId: string, mode: string): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'session_permission',
+      payload: { session_id: sessionId, mode }
+    }))
+    return Promise.resolve()
+  }
   switchSession(sessionId: string): Promise<{ session_id: string; message_count: number }> {
     // 历史回放经由 session / session_history 事件信封驱动 store，无需等待应答
     this.sendRaw(JSON.stringify({ kind: 'session_switch', payload: { session_id: sessionId } }))

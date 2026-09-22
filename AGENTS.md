@@ -113,6 +113,8 @@ agent_loop(messages):
 
 - 我自己的实现若有 bug，优先修 `agents/agent_full_v2.py` 及其同级模块。
 
+- **临时测试脚本用完即删**：为验证某个修复 / 行为而临时生成的测试脚本（一次性验证脚本、demo、复现脚本等），**验证完成后必须删除**，不得留在 `tests/`、`scripts/` 或项目根目录下积累成过时脚本。只有明确要长期保留的回归测试（跟随 `unittest discover` 运行、与实现同步维护）才允许放进 `tests/`。`scripts/` 目录只存**程序运行所需的工具脚本**，不存放测试脚本。
+
 - **路径定义统一管理**：所有工作目录相关常量（`WORKDIR`、`TODO_DIR`、`TEAM_DIR`、`INBOX_DIR`、`CHAT_HISTORY_DIR`、`TRANSCRIPT_DIRNAME`、`TOOL_RESULTS_DIRNAME` 等）一律在 `agents/paths.py` 顶部集中定义，其他模块通过 `from paths import ...` 引用，禁止在业务模块内重复声明。应用 home 常量（`AIGENT_HOME`、`CONFIG_FILE`、`CREDENTIALS_FILE`）在 `agents/config.py` 定义，`paths.py` 单向依赖 `config.py`（`config.py` 不 import `paths.py`）。
 
 - **工具统一走 ToolRegistry（实例，无全局单例）**：`agents/tools.py` 的 `ToolRegistry` 类统一管理所有工具（原 `tool_base.py` 已合并删除），由 `Agent`（`agent_full_v2.py`）实例化并持有为 `self.tools`。**不再提供全局单例** **`TOOL_REGISTRY`**，多实例各持一份。工具定义用 `self.tools.main_agent_tools`（子智能体用 `self.tools.base_tools`）、处理器用 `self.tools.handlers`、执行用 `self.tools.execute(name, **args)`；基础工具方法（`run_bash` / `run_read` / `run_write` / `run_edit` / `run_glob` / `safe_path`）与 background holder（`set_background_manager`）均通过该实例调用（原 todo holder `set_todo_manager` / `get_todo_manager` 已于 2026-09-16 随 todo 工具下线一并停用，定义保留但不再被引用）。其他模块（如 `teammate_manager` / `system_prompt`）需要工具时，由调用方注入 `ToolRegistry` 实例（构造参数），禁止再 import 被删除的 `tool_base` 或全局单例。

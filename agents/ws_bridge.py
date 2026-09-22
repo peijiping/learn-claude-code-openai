@@ -54,6 +54,7 @@ from refs import (
     normalize_refs,
     ref_title_hint,
 )
+from permission import VALID_MODES
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
 from session_runtime import SessionRuntimeRegistry
@@ -621,6 +622,23 @@ def _ask_snapshot_lines() -> list[str]:
     return lines
 
 
+def _approval_snapshot_lines() -> list[str]:
+    """所有在途权限审批的 approval_request 信封列表（2026-09-22 权限管控）。
+
+    与 `_ask_snapshot_lines` 完全同构（断线重连 / 刷新时审批卡片必须重现，
+    否则后端阻塞等作答、前端却永远看不到卡片 —— 表现为"卡住不动"）；
+    前端按 request_id 幂等恢复（E3）。同样必须定义在 `_text_of` **之前**
+    （下方到 handle 之间的切片区域只允许 def，见上方守卫测试说明）。
+    """
+    if registry is None:
+        return []
+    lines = []
+    for rt in registry.all_runtimes():
+        for payload in rt.pending_approvals():
+            lines.append(_envelope("approval_request", payload))
+    return lines
+
+
 def _text_of(content) -> str:
     """历史消息 content 兼容转换：str 直接返回，list（多模态 blocks）拼接 text。"""
     if isinstance(content, str):
@@ -842,6 +860,14 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
     for m in messages:
         if m.get("role") == "tool" and m.get("tool_call_id"):
             tool_contents[m["tool_call_id"]] = _text_of(m.get("content"))
+    # 审批结算索引（2026-09-22 权限管控）：tool 行旁挂的 approval 按 tool_call_id
+    # 配回 assistant 工具条（回放渲染「已拒绝/超时/停止」徽标，与实时路径的
+    # approval_resolved 旁挂同一形状）；允许执行的工具行不落该字段。
+    tool_approvals: dict[str, dict] = {}
+    for m in messages:
+        if (m.get("role") == "tool" and m.get("tool_call_id")
+                and isinstance(m.get("approval"), dict)):
+            tool_approvals[m["tool_call_id"]] = m["approval"]
     for m in messages:
         role = m.get("role")
         if role == "user":
@@ -896,10 +922,17 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
                         "status": status_of_result(tool_contents.get(tc_ids[-1], "")),
                     })
                     continue
-                tool_calls.append({
+                item = {
                     "name": fn.get("name", ""),
                     "args": fn.get("arguments", ""),
-                })
+                }
+                # 审批结算徽标（回放路径）：tool 行旁挂的 approval 按 id 配回该
+                # 工具条（HistoryToolCall.approval，与实时 approval_resolved 旁挂
+                # 的形状一致）；无字段 = 正常执行，按普通工具条渲染。
+                ap = tool_approvals.get(tc_ids[-1])
+                if ap:
+                    item["approval"] = ap
+                tool_calls.append(item)
             ui_msg = {
                 "role": "assistant",
                 "content": _text_of(m.get("content")),
@@ -959,6 +992,13 @@ async def handle(ws):
     if ask_replay:
         log.info("WS 在途提问重放: %d 条", len(ask_replay))
     for line in ask_replay:
+        line_q.put_nowait(line)
+    # 在途权限审批重放（2026-09-22 权限管控）：turn 可能正阻塞在"等用户审批"上，
+    # 新连接（含断线重连）必须把审批卡片重建出来，否则只能干等到超时自结算。
+    approval_replay = _approval_snapshot_lines()
+    if approval_replay:
+        log.info("WS 在途审批重放: %d 条", len(approval_replay))
+    for line in approval_replay:
         line_q.put_nowait(line)
 
     async def writer():
@@ -1276,18 +1316,72 @@ async def handle(ws):
                     log.warning("ask_cancel 丢弃：未知会话或空 rid (sid=%s rid=%s)",
                                 sid, rid)
 
+            elif kind == "approval_answer":
+                # 提交权限审批决定（2026-09-22 权限管控，docs/frontend/17）。
+                # **fire-and-forget，无回包**：结果由广播的 approval_resolved
+                # 事件驱动，前端据此清卡片 + 工具行落审批徽标。幂等：迟到/重复
+                # 提交由 broker 丢弃（resolve 返回 False）。
+                sid = str(payload.get("session_id") or "")
+                rid = str(payload.get("request_id") or "")
+                rt = registry.get(sid) if registry is not None else None
+                if rt is not None and sid and rid:
+                    ok = await asyncio.to_thread(
+                        rt.resolve_approval, rid, payload.get("decision"))
+                    log.info("approval_answer: session_%s rid=%s -> %s", sid, rid,
+                             "已结算" if ok else "丢弃（迟到/重复）")
+                else:
+                    log.warning("approval_answer 丢弃：未知会话或空 rid (sid=%s rid=%s)",
+                                sid, rid)
+
+            elif kind == "session_permission":
+                # 会话权限档位切换（两档：default / full_access，docs/frontend/17）。
+                # - 会话在跑（rt + agent 已构造）：走 Agent.persist_permission_mode
+                #   —— gate 内存即时生效 + 会话 meta + 空间索引「最后更改值」三写，
+                #   之后本空间**新建会话**默认继承该值（用户需求 #4）；
+                # - 会话未建/未跑：直写会话 meta + 空间索引 —— 会话创建时
+                #   _restore_permission_state 会读到这份 meta 恢复档位。
+                # 决定广播 permission_changed（source=user）：所有窗口同步切盾牌 chip。
+                sid = str(payload.get("session_id") or "")
+                mode = str(payload.get("mode") or "")
+                if not sid or mode not in VALID_MODES:
+                    log.warning("session_permission 丢弃：sid=%r mode=%r", sid, mode)
+                    continue
+                pid = _SID_PROJECT.get(sid) or _project_of_session(sid)
+                _SID_PROJECT[sid] = pid
+                rt = registry.get(sid) if registry is not None else None
+                try:
+                    if rt is not None and rt.agent is not None:
+                        await asyncio.to_thread(
+                            rt.agent.persist_permission_mode, mode)
+                    else:
+                        sm = _ensure_session_manager(pid)
+                        await asyncio.to_thread(sm.set_session_permission, sid, mode)
+                        await asyncio.to_thread(
+                            get_registry().set_permission_mode, pid, mode)
+                except Exception as e:  # 写失败：内存未动、广播不发，前端保持原档位
+                    log.error("session_permission 失败: session_%s mode=%s: %s: %s",
+                              sid, mode, type(e).__name__, e)
+                    continue
+                log.info("session_permission: session_%s(%s) -> %s", sid, pid, mode)
+                hub.broadcast("permission_changed", {
+                    "session_id": sid, "mode": mode, "source": "user"})
+
             elif kind == "status_query":
                 # 前端主动拉取运行状态（渲染进程刷新/HMR 不重建 WS 连接，
                 # 连接建立时的重放覆盖不到该场景）。回包走本连接的 writer
                 # 队列，与其它事件同管道保序；无运行会话时回空（前端自然复位）。
                 lines = _status_snapshot_lines()
                 ask_lines = _ask_snapshot_lines()
-                log.info("status_query: %d 个运行中会话, %d 条在途提问",
-                         len(lines), len(ask_lines))
+                approval_lines = _approval_snapshot_lines()
+                log.info("status_query: %d 个运行中会话, %d 条在途提问, %d 条在途审批",
+                         len(lines), len(ask_lines), len(approval_lines))
                 for line in lines:
                     line_q.put_nowait(line)
                 # 在途提问一并重放：渲染进程刷新后提问面板要能重建
                 for line in ask_lines:
+                    line_q.put_nowait(line)
+                # 在途审批一并重放：渲染进程刷新后审批卡片要能重建
+                for line in approval_lines:
                     line_q.put_nowait(line)
 
             elif kind == "session_switch":
@@ -1316,6 +1410,8 @@ async def handle(ws):
                         "model_id": meta.get("model_id"),
                         "overrides": meta.get("overrides") or {},
                         "usage_totals": meta.get("usage_totals"),
+                        # 权限档位（2026-09-22）：前端据此恢复盾牌 chip 的选中态
+                        "permission_mode": meta.get("permission_mode") or "default",
                     }))
                     # 任务板照常补发：只读 .tasks/，不触碰会话文件，无重写风险
                     await _reply_task_board(ws, sm, sid)
@@ -1340,6 +1436,8 @@ async def handle(ws):
                         "model_id": meta.get("model_id"),
                         "overrides": meta.get("overrides") or {},
                         "usage_totals": meta.get("usage_totals"),
+                        # 权限档位（2026-09-22）：前端据此恢复盾牌 chip 的选中态
+                        "permission_mode": meta.get("permission_mode") or "default",
                     }))
                     # 任务板补发：只发未完成组 → 已结束的组切回来不显示
                     await _reply_task_board(ws, sm, sid)

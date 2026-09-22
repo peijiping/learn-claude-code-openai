@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentEvent, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionMode, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -163,6 +163,10 @@ export interface ToolCallMsg {
   name: string
   args: string
   status: 'running' | 'done'
+  /** 审批结算元数据（2026-09-22 权限管控）：实时路径由 `approval_resolved` 旁挂、
+   *  回放路径由 HistoryToolCall.approval 映射而来。有值 → 工具条渲染审批徽标。
+   *  允许结局（allowed_*）只有实时路径可见（后端不落盘允许，回放自然没有）。 */
+  approval?: ApprovalInfo
 }
 
 /** 子智能体执行块：挂在 assistant 消息下，展示其思考过程与工具执行（可折叠） */
@@ -225,6 +229,36 @@ export interface AskInteraction {
   /** 发起它的 tool_call id（与消息下的只读小结块配对） */
   toolCallId: string
   questions: AskQuestion[]
+}
+
+/** 消息流中「在途审批卡片」的数据（2026-09-22 权限管控，范式 C）。
+ *  与 AskInteraction 同为纯 UI 态、不落盘 —— 由 `approval_request` 建立、
+ *  `approval_resolved` 清除；**不从 session_history 恢复**（断线重连时后端用
+ *  `_approval_snapshot_lines()` 重放在途审批，同 ask 机制）。
+ *  后端同会话至多一条在途审批，但仍按 request_id 键控存储 —— 迟到/乱序的
+ *  approval_resolved 只清自己那一条，且重连重放不会重置已点击的按钮。 */
+export interface ApprovalInteraction {
+  requestId: string
+  /** 发起审批的 tool_call id（卡片按它锚定到消息流的工具条） */
+  toolCallId: string
+  toolName: string
+  /** 工具参数对象（后端已把超长字符串值截断到 600 字，前端原样展示摘要） */
+  args: Record<string, unknown>
+  /** 触发类型（dangerous_pattern / bash_not_allowed / …） */
+  trigger: string
+  /** 给用户看的原因说明（后端生成，原样展示） */
+  reason: string
+  /** 「本次会话内允许」按钮的副文案（点前知道会记住什么账） */
+  sessionScopeHint: string
+  /** 发起审批时会话的权限档位 */
+  mode: string
+  /** 后端自结算超时（秒）；卡片据此显示倒计时 */
+  timeoutSeconds: number
+  /** 审批创建时间戳（秒，后端 created_at） */
+  createdAt: number
+  /** 用户已点击某个决定（命令已 fire-and-forget 发出，等广播收卡）：
+   *  置位后三按钮禁用；重连重放的 approval_request **不重置**它。 */
+  submitted: boolean
 }
 
 /** 消息 footer 的 token 统计：turn=本轮消耗（主 + 子智能体），
@@ -391,6 +425,17 @@ interface AgentState {
    *  （`_ask_snapshot_lines()`），所以在 setConnection('connected') 时整体清空，
    *  避免断连期间已被结算的提问留下永不消失的僵尸面板。 */
   interactionBySession: Record<string, AskInteraction | null>
+  /** 每个会话当前在途的权限审批（PreToolUse 判定 ask，范式 C）：消息流审批
+   *  卡片的数据源。按 request_id 键控（后端同会话至多一条在途，但迟到/乱序的
+   *  approval_resolved 只清对应条目）。空对象/缺条目 = 无在途审批。
+   *  **不落盘、不从 session_history 恢复** —— 断线重连时后端重放 approval_request
+   *  （`_approval_snapshot_lines()`），所以 setConnection('connected') 时整体清空，
+   *  避免断连期间已被结算的审批留下永不消失的僵尸卡片（同 interactionBySession）。 */
+  approvalBySession: Record<string, Record<string, ApprovalInteraction>>
+  /** 每个会话当前的权限档位（盾牌 chip 的选中态）：由 `permission_changed` 广播
+   *  与 `session_history.permission_mode` 恢复驱动。缺条目时 chip 落
+   *  sessions 列表 → 所属工作空间 → 'default' 的 fallback 链。 */
+  permissionModeBySession: Record<string, PermissionMode>
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -425,6 +470,14 @@ interface AgentState {
   answerAsk: (requestId: string, answers: AskAnswer[]) => void
   /** 取消本次提问（用户点「取消」）：同上 fire-and-forget，回执走 `ask_resolved`。 */
   cancelAsk: (requestId: string) => void
+  /** 提交审批裁决（允许一次 / 本次会话内允许 / 拒绝）。**fire-and-forget**：
+   *  只置 submitted 禁用三按钮，卡片由随后广播的 `approval_resolved` 收掉 ——
+   *  与 answerAsk 同款语义（后端对迟到/重复提交幂等丢弃，乐观收卡会在
+   *  "后端丢弃作答"时造成已批准的假象）。 */
+  answerApproval: (requestId: string, decision: ApprovalDecision) => void
+  /** 切换当前会话的权限档位（默认 / 完全访问）。fire-and-forget：**不乐观更新**，
+   *  chip 选中态只认后端广播的 `permission_changed`（传输丢失时乐观 UI 会说谎）。 */
+  switchPermission: (mode: PermissionMode) => void
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
   /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
@@ -685,6 +738,39 @@ function appendAskResult(
   )
 }
 
+/** `approval_resolved` → 把结算徽标旁挂到 tool_call_id 匹配的工具行（范式 C：
+ *  决定不进模型上下文，只落 UI 元数据）。主 toolCalls 与 subagents[].toolCalls
+ *  都要查 —— 审批可能拦在子智能体的工具上。找不到匹配行时原样返回
+ *  （工具条可能还在流式中未建出；此时徽标不补，回放时后端落盘字段会补上）。 */
+function patchToolApproval(
+  msgs: Message[],
+  toolCallId: string,
+  approval: ApprovalInfo
+): Message[] {
+  if (!toolCallId) return msgs
+  return msgs.map((m) => {
+    let mainHit = false
+    const toolCalls = m.toolCalls.map((t) => {
+      if (t.id !== toolCallId) return t
+      mainHit = true
+      return { ...t, approval }
+    })
+    let subHit = false
+    const subagents = m.subagents.map((s) => {
+      let hit = false
+      const subCalls = s.toolCalls.map((t) => {
+        if (t.id !== toolCallId) return t
+        hit = true
+        return { ...t, approval }
+      })
+      if (hit) subHit = true
+      return hit ? { ...s, toolCalls: subCalls } : s
+    })
+    if (!mainHit && !subHit) return m
+    return { ...m, ...(mainHit ? { toolCalls } : {}), ...(subHit ? { subagents } : {}) }
+  })
+}
+
 function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
   return hist.map((m, i) => {
     // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
@@ -700,7 +786,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
         id: t.tool_id || `h${sid}_${i}_s${k}_${l}`,
         name: t.name,
         args: t.args,
-        status: t.status === 'running' ? ('running' as const) : ('done' as const)
+        status: t.status === 'running' ? ('running' as const) : ('done' as const),
+        // 审批结算元数据（拒绝/超时/停止才落盘；无字段 = 正常流，按普通工具条渲染）
+        ...(t.approval ? { approval: t.approval } : {})
       })),
       activeToolId: null,
       streaming: false,
@@ -747,7 +835,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
         id: `h${sid}_${i}_${j}`,
         name: t.name,
         args: t.args,
-        status: t.status === 'running' ? ('running' as const) : ('done' as const)
+        status: t.status === 'running' ? ('running' as const) : ('done' as const),
+        // 审批结算元数据（拒绝/超时/停止才落盘；无字段 = 正常流，按普通工具条渲染）
+        ...(t.approval ? { approval: t.approval } : {})
       })),
       activeToolId: null,
       streaming: false,
@@ -1145,6 +1235,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   sessionUsageBySession: {},
   taskBoardBySession: {},
   interactionBySession: {},
+  approvalBySession: {},
+  permissionModeBySession: {},
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
@@ -1159,9 +1251,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 断线重连（→ connected）：清空陈旧运行态。后端会在新连接上重放
       // 仍在运行会话的 session_status（running/background），重新点亮真实
       // 运行指示；清空防止断连期间的状态残留（如永远转圈的僵尸会话）。
-      // 待作答的提问同理清空：重连时后端会重放 ask_request 快照
-      //（`_ask_snapshot_lines()`）—— 不断连期间若已被结算，前端拿不到
-      // ask_resolved，留下的面板会永远消不掉。
+      // 待作答的提问 / 待裁决的审批同理清空：重连时后端会重放 ask_request
+      // 与 approval_request 快照（`_ask_snapshot_lines()` / `_approval_snapshot_lines()`）
+      // —— 不断连期间若已被结算，前端拿不到 resolved 广播，留下的面板/卡片会永远消不掉。
       if (c === 'connected' && s.connection !== 'connected') {
         return {
           ...s,
@@ -1169,7 +1261,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           runningSessions: [],
           bgSessions: [],
           isSending: false,
-          interactionBySession: {}
+          interactionBySession: {},
+          approvalBySession: {}
         }
       }
       return { ...s, connection: c }
@@ -1313,6 +1406,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     // → 广播 `ask_resolved`（status='stopped'）→ 由该事件清面板并落只读小结。
     // 本地清会让随后到达的 ask_resolved 找不到 in-flight 的问题文本
     //（小结块只剩结果行、丢标题），所以坚持"单一出口"。
+    // 在途审批卡片同理**不本地清**：停止路径由后端广播 `approval_resolved`
+    //（status='stopped'）收卡并落「已停止」徽标 —— 本地清会丢失 trigger/mode
+    // 等结算徽标所需的在途元数据。
   },
 
   /** 提交选择题作答。fire-and-forget —— 见 AgentState 上的注释。 */
@@ -1327,6 +1423,34 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const sid = get().activeSession
     if (!sid || !requestId) return
     window.agent.cancelAsk(sid, requestId)
+  },
+
+  /** 提交审批裁决。fire-and-forget —— 见 AgentState 上的注释。
+   *  submitted 只在本地置位（禁按钮防重复提交），卡片与徽标的结算出口
+   *  唯一：`approval_resolved` 广播（含 timeout / stopped 的后端自结算）。 */
+  answerApproval: (requestId, decision) => {
+    const sid = get().activeSession
+    if (!sid || !requestId) return
+    set((s) => {
+      const cur = s.approvalBySession[sid]
+      const entry = cur?.[requestId]
+      if (!entry || entry.submitted) return s
+      return {
+        ...s,
+        approvalBySession: {
+          ...s.approvalBySession,
+          [sid]: { ...cur, [requestId]: { ...entry, submitted: true } }
+        }
+      }
+    })
+    window.agent.approvalAnswer(sid, requestId, decision)
+  },
+
+  /** 切换权限档位。fire-and-forget —— chip 只认 `permission_changed` 广播。 */
+  switchPermission: (mode) => {
+    const sid = get().activeSession
+    if (!sid) return
+    window.agent.sessionPermission(sid, mode)
   },
 
   handleEvent: (ev) => {
@@ -1518,16 +1642,21 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } | null
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode }
           // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
           // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
           // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
           // 违反"会话切换/复现时仅显示正在执行的组"。
           const taskBoardBySession = { ...s.taskBoardBySession, [p.session_id]: null }
+          // 权限档位：session_history 带上时落进 permissionModeBySession
+          //（盾牌 chip 的权威源；缺字段 = 老后端，chip 走 fallback 链）
+          const permissionModeBySession = p.permission_mode
+            ? { ...s.permissionModeBySession, [p.session_id]: p.permission_mode }
+            : s.permissionModeBySession
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
           const buf = s.messagesBySession[p.session_id] ?? []
@@ -1549,7 +1678,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
           if (s.activeSession !== p.session_id) {
-            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession }
+            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession, permissionModeBySession }
           }
           return {
             ...s,
@@ -1559,6 +1688,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             sessionModelId: p.model_id || s.sessionModelId,
             overridesByModel,
             taskBoardBySession,
+            permissionModeBySession,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
             lastOverridesByModel: overridesByModel,
           }
@@ -1665,6 +1795,109 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             messages: s.activeSession === sid ? buf : s.messages
           }
         })
+        break
+      }
+      case 'approval_request': {
+        // 工具执行前的审批下发（PreToolUse 判定 ask，范式 C）→ 消息流里弹审批
+        // 卡片（锚定 tool_call 折叠条，见 docs/frontend/17 §4）。纯 UI 态：
+        // 不落盘、不进 messages —— 决定不进模型上下文，只影响工具执行。
+        const p = ev.payload as
+          | {
+              session_id?: string
+              request_id?: string
+              tool_call_id?: string
+              tool_name?: string
+              args?: Record<string, unknown>
+              trigger?: string
+              reason?: string
+              session_scope_hint?: string
+              mode?: string
+              timeout_seconds?: number
+              created_at?: number
+            }
+          | null
+        const sid = p?.session_id
+        const rid = p?.request_id
+        if (typeof sid !== 'string' || !sid || typeof rid !== 'string' || !rid) break
+        set((s) => {
+          const cur = s.approvalBySession[sid] ?? {}
+          // 幂等：同 request_id 已存在（断线重连重放）→ 保留原条目 ——
+          // 尤其不能重置 submitted（用户刚点过按钮，重放把禁用态弹回去等于引诱重复提交）
+          if (cur[rid]) return s
+          const entry: ApprovalInteraction = {
+            requestId: rid,
+            toolCallId: typeof p?.tool_call_id === 'string' ? p.tool_call_id : '',
+            toolName: typeof p?.tool_name === 'string' ? p.tool_name : '',
+            args: p?.args && typeof p.args === 'object' && !Array.isArray(p.args) ? p.args : {},
+            trigger: typeof p?.trigger === 'string' ? p.trigger : '',
+            reason: typeof p?.reason === 'string' ? p.reason : '',
+            sessionScopeHint: typeof p?.session_scope_hint === 'string' ? p.session_scope_hint : '',
+            mode: typeof p?.mode === 'string' ? p.mode : 'default',
+            timeoutSeconds: typeof p?.timeout_seconds === 'number' ? p.timeout_seconds : 0,
+            createdAt: typeof p?.created_at === 'number' ? p.created_at : 0,
+            submitted: false
+          }
+          return {
+            ...s,
+            approvalBySession: { ...s.approvalBySession, [sid]: { ...cur, [rid]: entry } }
+          }
+        })
+        break
+      }
+      case 'approval_resolved': {
+        // 审批已结算（作答 / 超时 / 停止）：清在途卡片 + 在对应工具条上落结算徽标。
+        // 与 ask_resolved 完全同构：多窗口一致 + fire-and-forget 提交的唯一出口。
+        const p = ev.payload as
+          | {
+              session_id?: string
+              request_id?: string
+              tool_call_id?: string
+              status?: ApprovalOutcome
+              at?: number
+            }
+          | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const cur = s.approvalBySession[sid] ?? {}
+          const rid = typeof p?.request_id === 'string' ? p.request_id : ''
+          const entry = rid ? cur[rid] : undefined
+          // 只清「同一条请求」；request_id 缺失（不该发生）时整表清空兜底
+          const next = rid ? { ...cur } : {}
+          if (rid) delete next[rid]
+          // 结算徽标：outcome + 在途条目的 trigger/mode 写进 tool_call_id 匹配的
+          // 工具行。允许结局（allowed_*）也写 —— 徽标只进内存 UI 态，回放是否
+          // 带它由后端落盘口径决定（只落 denied/timeout/stopped）。
+          const tcid = entry?.toolCallId || (typeof p?.tool_call_id === 'string' ? p.tool_call_id : '')
+          const buf = tcid
+            ? patchToolApproval(s.messagesBySession[sid] ?? [], tcid, {
+                decision: p?.status ?? 'denied',
+                trigger: entry?.trigger,
+                mode: entry?.mode
+              })
+            : (s.messagesBySession[sid] ?? [])
+          const messagesBySession = { ...s.messagesBySession, [sid]: buf }
+          return {
+            ...s,
+            approvalBySession: { ...s.approvalBySession, [sid]: next },
+            messagesBySession,
+            messages: s.activeSession === sid ? buf : s.messages
+          }
+        })
+        break
+      }
+      case 'permission_changed': {
+        // 会话权限档位已切换（session_permission 的回执广播）→ 同步盾牌 chip
+        // 选中态与 sessions 列表条目（chip 的 fallback 链读它，两处必须同时更新）。
+        const p = ev.payload as { session_id?: string; mode?: PermissionMode } | null
+        const sid = p?.session_id
+        const mode = p?.mode
+        if (typeof sid !== 'string' || !sid || (mode !== 'default' && mode !== 'full_access')) break
+        set((s) => ({
+          ...s,
+          permissionModeBySession: { ...s.permissionModeBySession, [sid]: mode },
+          sessions: s.sessions.map((x) => (x.id === sid ? { ...x, permission_mode: mode } : x))
+        }))
         break
       }
       case 'error': {

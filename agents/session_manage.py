@@ -374,11 +374,18 @@ class SessionManager:
                     norm["usage_session"] = msg_data["usage_session"]
                 normalized.append(norm)
             elif msg_role == "tool":
-                normalized.append({
+                norm = {
                     "role": "tool",
                     "content": content,
                     "tool_call_id": msg_data.get("tool_call_id", ""),
-                })
+                }
+                # 审批结算元数据（2026-09-22 权限管控，docs/frontend/17 §4.4）：
+                # 回放渲染「已拒绝/超时/停止」徽标的数据源。与 assistant 行的
+                # usage/model_info 同模式 —— **读取保留**，模型上下文由 Agent 侧
+                # 发送前的 MODEL_MSG_FIELDS 白名单投影剔除（approval 不在白名单）。
+                if msg_data.get("approval"):
+                    norm["approval"] = msg_data["approval"]
+                normalized.append(norm)
             elif msg_role == "subagent":
                 # 子智能体执行记录：原样保留（只服务回放展示，不进模型上下文；
                 # Agent 侧加载后统一过滤）。同时进缓存，供重写后回写。
@@ -634,11 +641,19 @@ class SessionManager:
                 row["usage_session"] = message["usage_session"]
             return row
         elif role == "tool":
-            return {
+            row = {
                 "role": "tool",
                 "content": message.get("content", ""),
                 "tool_call_id": message.get("tool_call_id", ""),
             }
+            # 审批结算元数据（2026-09-22 权限管控，docs/frontend/17 §4.4）：拒绝/
+            # 超时/停止的 tool 行旁挂 approval 字段，前端回放渲染「已拒绝」徽标。
+            # 纯 UI 元数据 —— 加载时由 load_session_history 保留，模型上下文由
+            # Agent 侧 MODEL_MSG_FIELDS 白名单投影剔除（与 usage/model_info 同模式）；
+            # 允许执行的工具行不写。
+            if message.get("approval"):
+                row["approval"] = message["approval"]
+            return row
         elif role == "subagent":
             # 子智能体执行记录：独立行，只服务回放展示，不进模型上下文
             row = {
@@ -1167,6 +1182,17 @@ class SessionManager:
             "model_id": None,
             "overrides": None,
             "unread": False,
+            # ── 权限管控（2026-09-22，docs/frontend/17 §2.2/§7.2）─────────
+            # 当前模式：default | full_access。None = 未记录（继承链兜底：
+            # 工作空间最后更改值 → permissions.json 默认值），不写死 "default"
+            # 是为了让继承链在会话创建后、模式首次显式更改前仍可生效。
+            "permission_mode": None,
+            # 模式最后变更时间（审计/展示用）
+            "permission_updated_at": None,
+            # 「会话内允许」记忆：[{type, value, at, source}]，type ∈
+            # bash_prefix/pattern/path/mcp_tool，source ∈ approval/user。
+            # 重启会话后保留生效（「会话内」以会话为界，不以进程为界）。
+            "session_allows": [],
         }
 
     def _meta_entry_for(self, session_file: Path) -> dict:
@@ -1409,6 +1435,37 @@ class SessionManager:
         # 选模型/调参数是 UI 操作，不是对话内容变化 → 不刷新 updated_at。
         return self._update_entry(session_id, mutate, touch=False)
 
+    def set_session_permission(self, session_id: str, mode: str) -> dict:
+        """记录会话当前权限模式（2026-09-22 权限管控，docs/frontend/17 §2.2）。
+
+        mode ∈ {"default", "full_access"}；非法值原样落盘不在此校验语义
+        （调用方 Agent.persist_permission_mode 负责校验）。写 permission_mode +
+        permission_updated_at 两个字段。模式切换是 UI 操作，不是对话内容变化
+        → touch=False（不把会话顶到列表最前）。
+        """
+        return self._update_entry(
+            session_id,
+            lambda e: e.update({
+                "permission_mode": mode,
+                "permission_updated_at": _now_iso(),
+            }),
+            touch=False,
+        )
+
+    def set_session_allows(self, session_id: str, allows: list) -> dict:
+        """整表覆写「会话内允许」记忆（审批 allow_session 时由 gate 回调写入）。
+
+        gate.record_session_allow 在内存去重后生成**全量快照**传进来 —— 这里
+        只做落盘，不做合并，避免内存与磁盘两份状态漂移。touch=False 同上。
+        """
+        clean = [
+            dict(a) for a in (allows if isinstance(allows, list) else [])
+            if isinstance(a, dict) and a.get("type") and a.get("value")
+        ]
+        return self._update_entry(
+            session_id, lambda e: e.update({"session_allows": clean}), touch=False,
+        )
+
     def add_usage_totals(self, session_id: str, delta: dict,
                          count_turn: bool = True) -> None:
         """把一轮 token 消耗增量累进会话元数据 usage_totals（O(1) 原子写）。
@@ -1493,7 +1550,8 @@ class SessionManager:
 
         Returns:
             [{id, title, title_source, status, created_at, updated_at,
-              trashed_at, file, model_id, project, usage_totals, unread}, ...]
+              trashed_at, file, model_id, project, usage_totals, unread,
+              permission_mode}, ...]
             按「最后修改时间」（元数据 updated_at，mtime 兜底）降序 —— 最近使用的在前
         """
         self.backfill_index()
@@ -1520,6 +1578,10 @@ class SessionManager:
                 "project": meta.get("project", self.project_id),
                 "usage_totals": meta.get("usage_totals"),
                 "unread": bool(meta.get("unread", False)),
+                # 当前权限模式（2026-09-22 权限管控）：前端盾牌 chip 的数据源。
+                # meta 无记录（存量会话）时前端按 "default" 兜底渲染；真实判定
+                # 以后端 gate 继承链为准，此字段只服务展示。
+                "permission_mode": meta.get("permission_mode") or "default",
             })
         sessions = [s for s in sessions if s.get("status") == status]
         # 排序键与会话列表展示解耦：list_sessions 内单独算 key（含 mtime 兜底），

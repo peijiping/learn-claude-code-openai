@@ -29,6 +29,12 @@ export interface AgentApi {
   /** 结构化提问作答 / 取消（ask_user）。fire-and-forget：回执走 `ask_resolved` 广播。 */
   answerAsk: (sessionId: string, requestId: string, answers: unknown[]) => Promise<void>
   cancelAsk: (sessionId: string, requestId: string) => Promise<void>
+  /** ── 权限管控（2026-09-22，docs/frontend/17）────────────────────────
+   * 审批作答（allow_once / allow_session / deny）与切换会话权限档位
+   * （default / full_access）。同 ask_answer 的 fire-and-forget 模式：
+   * 回执分别走 `approval_resolved` / `permission_changed` 广播。 */
+  approvalAnswer: (sessionId: string, requestId: string, decision: string) => Promise<void>
+  sessionPermission: (sessionId: string, mode: string) => Promise<void>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>

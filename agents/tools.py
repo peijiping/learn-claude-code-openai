@@ -125,6 +125,10 @@ class ToolRegistry:
         # 按会话注入（InteractionBroker 需要 session_id 与 deliver，属会话级状态）。
         # 未注入时 ask_user 返回明确的 Error 文本（绝不做阻塞式 input() 兜底）。
         self._interaction_broker = None
+        # 额外目录集（holder，2026-09-22 权限管控）：与 PermissionGate 共享同一
+        # set 对象（见 set_extra_dirs），safe_path 兜底层用它放行工作根之外的
+        # 预授权目录。gate 接线前为空集，行为与改造前一致。
+        self._extra_dirs: set = set()
 
         # ── 懒加载缓存 ──
         self._handlers_cache = None
@@ -211,6 +215,19 @@ class ToolRegistry:
         能力（需要 session_id 与事件投递出口），且要在 Agent 构造之后才拿得到。
         """
         self._interaction_broker = broker
+
+    def set_extra_dirs(self, dirs: set) -> None:
+        """注入额外目录集（PermissionGate 共享对象，2026-09-22 权限管控）。
+
+        ⚠️ **共享同一个 set 对象**（非拷贝）：gate 在会话恢复 / 审批「会话内允许」/
+        「允许一次」时动态增删，safe_path 的兜底判定即时同步，无二次同步代码。
+
+        内容 = WORKTREE_DIR（应用自管沙箱）∪ 全局 additional_dirs（permissions.json）
+        ∪ 会话批准目录（session_allows 的 path 类记忆，见 permission.py §3.3）。
+        gate 未接线时为空集 —— safe_path 行为与改造前一致（只认 workdir）。
+        """
+        if isinstance(dirs, set):
+            self._extra_dirs = dirs
 
     def get_interaction_broker(self):
         """获取 InteractionBroker；未注入返回 None（**不抛错**）。
@@ -306,6 +323,13 @@ class ToolRegistry:
             原为 `@staticmethod` + 模块级 `WORKDIR`。多工作空间下每个 Agent 的沙箱根
             不同（= 该空间选定的真实目录），故改为实例方法读 `self.workdir`。
             `base` 覆盖语义不变（worktree / 子智能体 scoped workdir 仍走它）。
+        兜底层扩展（2026-09-22 权限管控，见 docs/frontend/17 §3.3）：
+            判定层（PreToolUse 的 PermissionGate）先跑 —— 目标路径不在有效目录集内
+            会触发审批，批准后把父目录写入 `_extra_dirs`（与 gate 共享的 set）。
+            这里是**第二道兜底**：路径逃逸 base 后再查 `_extra_dirs`（全局
+            additional_dirs ∪ 会话批准目录 ∪ WORKTREE_DIR），命中则放行 ——
+            保证审批放行的单次执行不会在工具层被二次拦下；仍不在任何有效目录
+            才抛 ValueError（防绕过 hook 的调用路径）。
         """
         # 拼接工作根和输入路径，并解析为绝对路径
         # .resolve() 会解析符号链接并返回绝对路径
@@ -313,17 +337,31 @@ class ToolRegistry:
         path = (base / p).resolve()
 
         # is_relative_to() 检查 path 是否在 base 的子目录中
-        # 如果 path 是 "/etc/passwd" 或 "../other_dir" 等外部路径，则拒绝
         if not path.is_relative_to(base):
-            raise ValueError(f"Path escapes workspace: {p}")
+            # 逃逸 base → 查共享额外目录集（gate 维护；未接线时为空集 = 改造前行为）
+            if not self._in_extra_dirs(path):
+                raise ValueError(f"Path escapes workspace: {p}")
 
         return path
+
+    def _in_extra_dirs(self, path: Path) -> bool:
+        """路径是否落在额外目录集内（safe_path 兜底；逐目录 is_relative_to）。"""
+        for d in self._extra_dirs:
+            try:
+                if path.is_relative_to(d):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
 
     def run_bash(self, command: str, base: Path | None = None) -> str:
         """
         执行shell命令并返回结果
         安全特性：
-        - 危险命令黑名单检查：禁止 rm -rf /, sudo, shutdown, reboot 等高危操作
+        - 危险命令门控已上收到 PermissionGate（PreToolUse 先于本方法执行，
+          2026-09-22 权限管控，见 docs/frontend/17）：内置硬拒绝/危险清单、
+          自定义规则、会话内允许记忆、审批流均在判定层完成 —— 工具层不再
+          保留重复黑名单，避免两处清单漂移。
         - 超时保护：命令执行超过120秒会自动终止
         - 输出截断：结果最多返回50000字符，防止内存溢出
         参数：
@@ -334,11 +372,9 @@ class ToolRegistry:
             命令成功：返回标准输出+标准错误的合并内容（最多50000字符）
             命令失败：返回格式 "Error: command failed with return code X\\n错误信息"
             超时：返回 "Error: Timeout (120s)"
-            危险命令：返回 "Error: Dangerous command blocked"
+            危险命令：在判定层被拦截（回填 "Error: Permission denied ..."），
+            不会执行到这里
         """
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-        if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
         try:
             r = subprocess.run(
                 command,

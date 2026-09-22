@@ -26,6 +26,7 @@ import time
 from typing import Awaitable, Callable, Dict, Optional
 
 from agent_full_v2 import Agent
+from approval import ApprovalBroker
 from interaction import InteractionBroker
 from llm_config import (
     ENV_LLM_LOCK, apply_model_to_env, resolve_model_window, restore_llm_env,
@@ -101,6 +102,12 @@ class SessionRuntime:
         # 与 busy / stop_evt 正交 —— 但 request_stop 必须同步 cancel_all，
         # 否则停止后 ask 线程会一直阻塞到用户再点一次。
         self._interaction = InteractionBroker(sid, deliver)
+        # 权限审批 broker（2026-09-22 权限管控，docs/frontend/17 §4）：与
+        # interaction 同构的会话级阻塞通道（克隆其线程模型）。区别在语义：
+        # ask 是**范式 A**（答案进模型上下文），审批是**范式 C**（只有结局
+        # 文案回填，决定走 tool 行旁挂 approval 字段）。request_stop 同样
+        # 必须同步 cancel_all —— 否则停止后审批线程一直阻塞到超时。
+        self._approval = ApprovalBroker(sid, deliver)
         self._pending_overrides: tuple = (None, None)  # (reasoning_effort, max_context)
         self._bg_watch_task: Optional[asyncio.Task] = None  # 后台任务完成守望
         self._deliver = deliver
@@ -259,6 +266,11 @@ class SessionRuntime:
             # 放这里而不是 Agent.__init__：broker 需要 session_id 与 deliver 出口，
             # 都是 runtime 才知道的东西；Agent 侧因此零构造改动。
             self.agent.tools.set_interaction_broker(self._interaction)
+            # 权限审批 broker 注入给本会话 Agent 的权限门（同上：会话级对象，
+            # 需要 session_id 与 deliver 出口）。注入后 gate 的审批分支从
+            # 「无 broker 回落」切到「阻塞等前端作答」；switch_session 已在此
+            # 之前完成 → 继承链恢复（模式/会话内允许）已生效。
+            self.agent.permission_gate.attach_broker(self._approval)
             log.info("session_%s agent 构建完成 (model=%s)",
                      self.sid, model_id or "global-default")
             return self.agent
@@ -291,6 +303,10 @@ class SessionRuntime:
         # 在途提问立即结算为 stopped（返回"本轮已被用户停止"占位文本，
         # 保证那个 tool_call 仍有 tool_result 回填，不留孤儿）。
         self._interaction.cancel_all("stopped")
+        # 在途审批同样立即结算为 stopped（gate 回填"Permission denied
+        # (stopped by user)"，同样不留孤儿 tool_call）。放在 if 之外：
+        # agent 未构造也可能有在途审批（防御性对称，与 interaction 同）。
+        self._approval.cancel_all("stopped")
         if self.agent is not None:
             self.agent.request_stop()
             self.agent.background_manager.request_stop_all()
@@ -333,6 +349,18 @@ class SessionRuntime:
         """新连接重放 / status_query 用：所有在途提问的 ask_request 载荷。"""
         return self._interaction.pending_payloads()
 
+    # ── 权限审批（approval）的会话级转发（2026-09-22 权限管控）──────
+    def resolve_approval(self, request_id: str, decision: str) -> bool:
+        """前端三选一作答 → 唤醒阻塞中的审批。
+
+        幂等：迟到/重复/非法 decision（broker 内校验）返回 False，无副作用。
+        """
+        return self._approval.resolve(request_id, decision)
+
+    def pending_approvals(self) -> list[dict]:
+        """新连接重放 / status_query 用：所有在途审批的 approval_request 载荷。"""
+        return self._approval.pending_payloads()
+
     def close(self) -> None:
         """会话被移除时收尾：标记 broker 关闭并解锁所有阻塞中的 ask 线程。
 
@@ -340,6 +368,8 @@ class SessionRuntime:
         （守护线程，进程结束时才被强杀），白白占着资源且日志里看不出原因。
         """
         self._interaction.close()
+        # 审批 broker 同理收尾：在途审批结算为 stopped，阻塞线程解锁。
+        self._approval.close()
 
     def current_status(self) -> Optional[str]:
         """新连接状态重放用（ws_bridge.handle）：

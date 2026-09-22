@@ -7,6 +7,7 @@ import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
 import {
   attachmentUrl,
   useAgentStore,
+  type ApprovalInteraction,
   type AskUserMsg,
   type Message,
   type SubAgentMsg,
@@ -15,6 +16,7 @@ import {
 import MessageMenu from './MessageMenu'
 import AttachmentBar, { isDegraded } from './AttachmentBar'
 import AskUserBlock from './AskUserBlock'
+import ApprovalCard from './ApprovalCard'
 import RefBar from './RefBar'
 import RefText from './RefText'
 
@@ -52,7 +54,19 @@ function modelInfoText(mi: TurnModelInfo): string | null {
   return parts.length ? parts.join(' · ') : null
 }
 
+/** 审批结算徽标（2026-09-22 权限管控）：approval_resolved 后旁挂在工具行上。
+ *  allowed_* → 绿「已允许」、denied/timeout → 红「已拒绝」、stopped → 灰「已停止」。
+ *  回放路径只有拒绝系（后端不落盘允许结局，见 docs/frontend/17 §4.4）。 */
+const APPROVAL_BADGE: Record<string, { cls: string; text: string }> = {
+  allowed_once: { cls: 'ok', text: '已允许' },
+  allowed_session: { cls: 'ok', text: '已允许' },
+  denied: { cls: 'deny', text: '已拒绝' },
+  timeout: { cls: 'deny', text: '已拒绝' },
+  stopped: { cls: 'stop', text: '已停止' }
+}
+
 function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
+  const badge = tool.approval ? APPROVAL_BADGE[tool.approval.decision] : undefined
   return (
     <div className={`toolbar-call ${tool.status}`}>
       <span className="toolbar-icon">
@@ -60,6 +74,11 @@ function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
       </span>
       <span className="toolbar-name">{tool.name || '(工具)'}</span>
       <span className="toolbar-args">({tool.args.slice(0, 120)}{tool.args.length > 120 ? '…' : ''})</span>
+      {badge && (
+        <span className={`approval-badge ${badge.cls}`} title={tool.approval?.trigger || undefined}>
+          {badge.text}
+        </span>
+      )}
       {tool.status === 'running' ? (
         <span className="toolbar-status spinner" />
       ) : (
@@ -200,6 +219,26 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     const sid = s.activeSession
     if (!sid) return s.pendingProjectId ?? s.activeProject
     return s.sessions.find((x) => x.id === sid)?.project ?? s.activeProject
+  })
+
+  /** 本条消息上需要锚定的在途审批卡片（2026-09-22 权限管控）：按 toolCallId
+   *  匹配到本消息的工具行。主工具条匹配的渲染在工具条后；子智能体工具匹配的
+   *  渲染在子智能体块**外**（块默认折叠，审批是"必须现在做决定"的交互，
+   *  藏在折叠块里等于没问）。未被任何工具条配对的由 MessageList 末尾兜底。 */
+  const { mainApprovals, subApprovals } = useAgentStore((s) => {
+    const sid = s.activeSession
+    if (!sid || msg.role !== 'assistant') return { mainApprovals: [], subApprovals: [] }
+    const table = s.approvalBySession[sid] ?? {}
+    const mainIds = new Set(msg.toolCalls.map((t) => t.id))
+    const subIds = new Set(msg.subagents.flatMap((x) => x.toolCalls.map((t) => t.id)))
+    const main: ApprovalInteraction[] = []
+    const sub: ApprovalInteraction[] = []
+    for (const a of Object.values(table)) {
+      if (!a.toolCallId) continue
+      if (mainIds.has(a.toolCallId)) main.push(a)
+      else if (subIds.has(a.toolCallId)) sub.push(a)
+    }
+    return { mainApprovals: main, subApprovals: sub }
   })
 
   /** 正文里的 `@相对路径` token → 内联胶囊（与输入区同款视觉，见 lib/refTokens）。
@@ -356,8 +395,16 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
           {msg.toolCalls.map((t) => (
             <ToolCallBar key={t.id} tool={t} />
           ))}
+          {/* 在途审批卡片（主工具）：锚定到触发的工具条下方 */}
+          {mainApprovals.map((a) => (
+            <ApprovalCard key={a.requestId} approval={a} />
+          ))}
           {msg.subagents.map((s) => (
             <SubAgentBlock key={s.id} block={s} />
+          ))}
+          {/* 在途审批卡片（子智能体工具）：渲染在折叠块外，保证可见 */}
+          {subApprovals.map((a) => (
+            <ApprovalCard key={a.requestId} approval={a} />
           ))}
           {/* 正文与结构化提问小结块（ask_user）按**当时的先后**交错渲染：
               提问之前说的话在卡片上方，提问之后续写的正文（实时路径整轮合并进
