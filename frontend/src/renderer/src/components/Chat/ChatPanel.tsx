@@ -40,6 +40,12 @@ export default function ChatPanel(): JSX.Element {
     s.activeSession ? Object.keys(s.approvalBySession[s.activeSession] ?? {}).length > 0 : false
   )
 
+  // ── 右栏入口**不在本组件**（2026-09-23 二次调整）──────────────────
+  // 开关图标已上移到窗口标题栏（`components/TitleBar/TitleBar.tsx`，与窗口标题
+  // 「个人AI助手」同层），`⌘⇧E`/`⌘⇧G` 视图快捷键在 `RightPanel` 里（与 Esc 同属
+  // "右栏的键盘面"）。聊天区顶栏（`.chat-toolbar`）随之删除 —— 它当初就是为承载
+  // 这两枚按钮而存在的，按钮走了就只剩一条 40px 空栏（还会白占一条分隔线）。
+
   const doSend = (): void => {
     // 在途提问期间输入区已被隐藏（见 askOpen）—— 这里再兜一道：
     // 万一有残留焦点 / 快捷键把发送打进来，也绝不与作答面板抢答。

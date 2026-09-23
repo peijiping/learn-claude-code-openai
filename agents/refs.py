@@ -44,6 +44,15 @@ L0 冻结段不划算。
 `attach_ref_blocks(content, [])` 与 `expand_ref_blocks_for_model(message)`
 在「无引用」时**返回传入的同一个对象**（不是等值副本）。无附件的会话请求体因此
 与改造前**逐字节一致** —— 这条由结构保证，而不是靠"新增代码恰好没副作用"。
+
+════════════════════════════════════════════════════════════════════════
+附带的第二个用途：右栏「文件预览」（2026-09-23，docs/frontend/19）
+════════════════════════════════════════════════════════════════════════
+
+`read_workspace_file()` 让前端右栏读工作空间内单个文件的内容。它放在这里而不是
+新开模块，唯一理由是**沙箱判定只能有一份**：`resolve_within()` 已经是「前端线索
+→ 工作空间内路径」的既定口径（`safe_path` 的镜像），预览再写一套就一定会漂移。
+引用与预览的分工是「列路径 / 读内容」，共用同一条判定链。
 """
 from __future__ import annotations
 
@@ -112,6 +121,24 @@ def ignore_dirs() -> frozenset[str]:
     raw = os.environ.get("REF_LIST_IGNORE") or ""
     extra = {name.strip() for name in raw.split(",") if name.strip()}
     return DEFAULT_IGNORE_DIRS | extra
+
+
+def file_preview_max_bytes() -> int:
+    """单个文件预览的字节上限（默认 512KB），超过则**完全不读**。
+
+    不读而不是"读前 512KB"：预览区只有一屏，把 200MB 的日志读进内存再截断，
+    代价全在服务端而用户什么也没多看到。
+    """
+    return _int_env("FILE_PREVIEW_MAX_BYTES", 512 * 1024, minimum=1)
+
+
+def file_preview_max_lines() -> int:
+    """单个文件预览的行数上限（默认 5000），超过则截断并置 `truncated`。
+
+    与字节上限是**两个独立的降级档**：字节超限 = 整屏替换（什么都没读到），
+    行数超限 = 内容照常渲染 + 顶部横幅（读到了，尾部砍了）。
+    """
+    return _int_env("FILE_PREVIEW_MAX_LINES", 5000, minimum=1)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -256,6 +283,124 @@ def list_workspace(workdir, *, limit: int | None = None,
     result["total_seen"] = total_seen
     result["skipped"] = skipped
     return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  读单个文件（右栏「文件预览」，docs/frontend/19）
+# ══════════════════════════════════════════════════════════════════
+
+# 二进制嗅探的头部长度：足够覆盖所有已知容器格式的魔数区，又不值得再大
+_BINARY_SNIFF_BYTES = 8192
+
+
+def _preview_result(path: str, name: str = "", *, reason: str = "",
+                    size: int = 0, mtime: float = 0.0,
+                    binary: bool = False, too_large: bool = False,
+                    truncated: bool = False, lines: int = 0,
+                    text: str = "", encoding: str = "") -> dict:
+    """预览回执的统一形状（**所有**分支都从这一个构造函数出去）。
+
+    集中构造的理由是前端只需要认一套字段：它不区分"读失败"与"读成功但降级"，
+    只按 `reason` / `binary` / `too_large` / `truncated` 四个标志分派五态。
+    """
+    return {
+        "path": path,
+        "name": name,
+        "size": size,
+        "mtime": mtime,
+        "encoding": encoding,
+        "binary": bool(binary),
+        "too_large": bool(too_large),
+        "truncated": bool(truncated),
+        "lines": int(lines),
+        "text": text,
+        "reason": reason,
+    }
+
+
+def _decode_text(data: bytes) -> tuple[str, str]:
+    """字节 → 文本，返回 `(text, encoding)`。
+
+    顺序是**刻意**的：UTF-8 严格优先（正确编码的文件得到零损伤结果），失败再试
+    GB18030（中文环境最常见的另一种编码，且它是 UTF-8 的超集式兼容解码器，
+    对绝大多数中文文件能给出正确结果），最后才 utf-8 + `errors="replace"` 兜底。
+    直接用 replace 会把"编码判断错误"伪装成"文件里有乱码"，用户没法区分。
+    """
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("gb18030"), "gb18030"
+    except (UnicodeDecodeError, LookupError):
+        pass
+    return data.decode("utf-8", errors="replace"), "utf-8(replace)"
+
+
+def read_workspace_file(workdir, raw_path, *, max_bytes: int | None = None,
+                        max_lines: int | None = None) -> dict:
+    """读取工作空间内单个文件，供右栏预览（**绝不抛异常**）。
+
+    沙箱走 `resolve_within()`，与引用、`safe_path` 同一判定口径 —— 越界、软链
+    链出、路径非法一律在第一步被挡下，不存在第二条判定路径。
+
+    降级层次（前端据此渲染两个**不同**的状态，见 docs/frontend/19 §5.7）：
+    - `reason` 非空 → 读失败（越界 / 不存在 / 是目录 / 无权限），`text` 为空；
+    - `binary` → 二进制，`text` 为空（不是错误，是"这类文件本来就不该这样看"）；
+    - `too_large` → 超过字节上限，**一点内容都没读**，`text` 为空；
+    - `truncated` → 读到了但只保留了前 `max_lines` 行，`text` 非空。
+
+    本函数在 `asyncio.to_thread` 里跑，异常会让前端一直转圈 —— 所以内部逐层
+    吞异常并转成 `reason` 人话。
+    """
+    cap_bytes = file_preview_max_bytes() if max_bytes is None else int(max_bytes)
+    cap_lines = file_preview_max_lines() if max_lines is None else int(max_lines)
+
+    resolved = resolve_within(workdir, raw_path)
+    if resolved is None:
+        log.warning("文件预览路径越界或非法: %r", str(raw_path)[:200])
+        return _preview_result("", reason="路径不在当前工作空间内")
+
+    path_str = str(resolved)
+    name = resolved.name or path_str
+    try:
+        st = resolved.stat()
+    except FileNotFoundError:
+        return _preview_result(path_str, name, reason="文件不存在")
+    except OSError as exc:
+        log.warning("文件预览 stat 失败 %s: %s", path_str, exc)
+        return _preview_result(path_str, name, reason="无法访问该文件")
+
+    if os.path.isdir(path_str):
+        return _preview_result(path_str, name, reason="这是一个目录，无法预览")
+    if not os.path.isfile(path_str):
+        return _preview_result(path_str, name, reason="不是普通文件，无法预览")
+
+    base = dict(path=path_str, name=name, size=int(st.st_size), mtime=float(st.st_mtime))
+    if st.st_size > cap_bytes:
+        return _preview_result(**base, too_large=True)
+
+    try:
+        with open(path_str, "rb") as fh:
+            head = fh.read(_BINARY_SNIFF_BYTES)
+            if b"\x00" in head:
+                return _preview_result(**base, binary=True)
+            # 头部之外的部分在确认不是二进制之后再读，避免为二进制文件白白多读一遍
+            rest = fh.read() if st.st_size > len(head) else b""
+            data = head + rest
+    except OSError as exc:
+        log.warning("文件预览读取失败 %s: %s", path_str, exc)
+        return _preview_result(**base, reason="读取失败")
+
+    text, encoding = _decode_text(data)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    parts = text.split("\n")
+    truncated = len(parts) > cap_lines
+    if truncated:
+        parts = parts[:cap_lines]
+    text = "\n".join(parts)
+    return _preview_result(**base, text=text, encoding=encoding,
+                           truncated=truncated, lines=len(parts))
 
 
 # ══════════════════════════════════════════════════════════════════

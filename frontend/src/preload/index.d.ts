@@ -70,6 +70,29 @@ export interface AgentApi {
    *  与附件 **完全独立**：不复制、不存储，只给模型一份路径清单。
    *  拉取当前工作空间的可引用条目（扁平、一次全量）；超时返回 null。 */
   listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }) => Promise<unknown>
+  /** ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────────────
+   *  右栏状态记在**会话元数据**里（不是 localStorage），随 session_history 回传。
+   *  形状与 renderer 侧 `RPanelPersist` 一致（此处用 unknown，两套 tsconfig 不互访）。 */
+  /** 上报右栏状态（fire-and-forget：后端无点对点回包，同 ask_answer） */
+  sessionUi: (payload: { session_id: string; ui: unknown }) => Promise<void>
+  /** 读工作空间内单个文件 → `file_content` 信封 */
+  readFile: (payload: {
+    path: string
+    sessionId?: string | null
+    projectId?: string | null
+  }) => Promise<unknown>
+  /** 读取 git 状态 → `git_status` 信封 */
+  gitStatus: (payload?: {
+    sessionId?: string | null
+    projectId?: string | null
+  }) => Promise<unknown>
+  /** 读单个文件的 diff（`path` 为仓库相对路径）→ `git_diff` 信封 */
+  gitDiff: (payload: {
+    path: string
+    staged?: boolean
+    sessionId?: string | null
+    projectId?: string | null
+  }) => Promise<unknown>
   /** 工作空间列表（主要数据源是 `projects` 广播信封，这里是主动拉取的兜底） */
   listProjects: () => Promise<unknown>
   /** 把选定目录登记为工作空间（已登记则复用；后端同时置为活动空间） */
@@ -90,6 +113,9 @@ export interface AgentApi {
   /** 权限配置（~/.aigent/config/permissions.json）读 / 保存 */
   permissionConfigGet: () => Promise<unknown>
   permissionConfigSave: (config: unknown) => Promise<unknown>
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）读 / 保存（字段部分更新） */
+  sandboxConfigGet: () => Promise<unknown>
+  sandboxConfigSave: (payload: object) => Promise<unknown>
   /** 刷新某连接可用模型列表（GET {base_url}/models；api_key 留空回退已保存密钥） */
   llmModelsFetch: (payload: {
     base_url?: string

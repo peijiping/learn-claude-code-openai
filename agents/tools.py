@@ -38,6 +38,7 @@ from task_manager import TaskManager
 from message_bus import MessageBus, VALID_MSG_TYPES
 from memories import MemoryStore
 from logger import get_logger
+import sandbox as sandbox_mod
 # 工具读图与读文档（2026-09-21）：中性图片块的构造在 attachments 里定义（展开侧
 # 也在那），本模块只负责"读盘 + 判类型 + 造块"。**不引入循环依赖**：attachments
 # 只依赖标准库 + paths/config/doc_convert + logger，不 import tools。
@@ -364,6 +365,11 @@ class ToolRegistry:
           保留重复黑名单，避免两处清单漂移。
         - 超时保护：命令执行超过120秒会自动终止
         - 输出截断：结果最多返回50000字符，防止内存溢出
+        - 沙盒隔离（2026-09-22，见 sandbox.py / docs/frontend/19）：开关开启且
+          平台后端可用时，命令经 sandbox-exec（macOS）/ bwrap（Linux）执行 ——
+          写被限制在工作区∪额外目录∪临时目录内、网络默认断开、敏感目录不可读。
+          这是执行层的"绝对墙"，与判定层（PermissionGate）互补；full_access
+          模式下同样生效。后端不可用则裸跑 + 一次性 warning（诚实降级）。
         参数：
             command: 要执行的shell命令字符串
             base: 可选，命令的工作目录（worktree / 子智能体 scoped 场景传入）；
@@ -375,11 +381,14 @@ class ToolRegistry:
             危险命令：在判定层被拦截（回填 "Error: Permission denied ..."），
             不会执行到这里
         """
-        try:
-            r = subprocess.run(
+        cwd = base or self.bash_cwd or os.getcwd()
+        backend = sandbox_mod.get_backend()
+
+        def _bare_run():
+            return subprocess.run(
                 command,
                 shell=True,
-                cwd=base or self.bash_cwd or os.getcwd(),
+                cwd=cwd,
                 capture_output=True,
                 text=True,
                 # 显式 utf-8 + errors="replace"：**绝不能**用默认的严格解码。
@@ -391,11 +400,36 @@ class ToolRegistry:
                 errors="replace",
                 timeout=120
             )
+
+        try:
+            if backend is not None:
+                # 可写集 = workdir ∪ 有效 cwd（bash_cwd / worktree base 可能不在
+                # workdir 内，不加入会误拦工作目录内的写入）∪ 会话批准额外目录
+                try:
+                    r = backend.run(
+                        command,
+                        cwd=Path(cwd),
+                        workdir=self.workdir,
+                        extra_writable=[Path(cwd), *self._extra_dirs],
+                        timeout=120,
+                    )
+                except RuntimeError as e:
+                    # 模板被改坏（缺必需占位符）：降级裸跑 + error log，
+                    # 提示用户在设置页恢复默认模板。绝不因模板问题打死本轮。
+                    log.error("沙盒模板损坏，降级裸跑: %s", e)
+                    r = _bare_run()
+            else:
+                r = _bare_run()
             out = (r.stdout + r.stderr).strip()
             if self._is_binary_content(out):
                 return "Error: 输出包含大量二进制数据，请使用专用工具（如 pymupdf 读取 PDF）而非 strings/cat/hexdump 等原始命令。"
             if r.returncode != 0:
-                return f"Error: 命令执行失败，返回码 {r.returncode}\n{self._smart_truncate(out, 50000)}"
+                msg = self._smart_truncate(out, 50000)
+                # 沙盒拦截特征：给模型一条可行动的提示（走配置/模板调整，而非反复重试）
+                if sandbox_mod.looks_blocked_by_sandbox(r.stderr or ""):
+                    msg += ("\n（沙盒拦截：命令可能尝试写工作区外文件、访问网络或读取"
+                            "受保护目录；如确有需要，请让用户在设置→沙盒中调整沙盒配置）")
+                return f"Error: 命令执行失败，返回码 {r.returncode}\n{msg}"
             return self._smart_truncate(out, 50000) if out else "(command executed successfully, no output)"
         except subprocess.TimeoutExpired:
             # 命令执行超时（超过120秒）

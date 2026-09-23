@@ -327,6 +327,55 @@ class BrowserAgentBridge implements AgentApi {
       20000
     )
   }
+  // ── 右侧面板（2026-09-23，docs/frontend/19）────────────────────────
+  /** 右栏状态上报：**fire-and-forget**（后端 `session_ui` 无点对点回执，同 stop）。
+   *  状态本身以内存桶为准，这里只是把它写进会话元数据，丢了不影响当前体验。 */
+  sessionUi(payload: { session_id: string; ui: unknown }): Promise<void> {
+    if (!payload?.session_id) return Promise.resolve()
+    this.sendRaw(JSON.stringify({
+      kind: 'session_ui',
+      payload: { session_id: payload.session_id, ui: payload.ui ?? null }
+    }))
+    return Promise.resolve()
+  }
+  async readFile(payload: { path: string; sessionId?: string | null; projectId?: string | null }): Promise<unknown> {
+    return this.request('file_read', 'file_content', {
+      path: payload?.path ?? '',
+      ...(typeof payload?.projectId === 'string' && payload.projectId
+        ? { project_id: payload.projectId }
+        : {}),
+      ...(typeof payload?.sessionId === 'string' && payload.sessionId
+        ? { session_id: payload.sessionId }
+        : {})
+    }, 20000)
+  }
+  async gitStatus(payload?: { sessionId?: string | null; projectId?: string | null }): Promise<unknown> {
+    return this.request('git_status', 'git_status', {
+      ...(typeof payload?.projectId === 'string' && payload.projectId
+        ? { project_id: payload.projectId }
+        : {}),
+      ...(typeof payload?.sessionId === 'string' && payload.sessionId
+        ? { session_id: payload.sessionId }
+        : {})
+    }, 20000)
+  }
+  async gitDiff(payload: {
+    path: string
+    staged?: boolean
+    sessionId?: string | null
+    projectId?: string | null
+  }): Promise<unknown> {
+    return this.request('git_diff', 'git_diff', {
+      path: payload?.path ?? '',
+      ...(payload?.staged ? { staged: true } : {}),
+      ...(typeof payload?.projectId === 'string' && payload.projectId
+        ? { project_id: payload.projectId }
+        : {}),
+      ...(typeof payload?.sessionId === 'string' && payload.sessionId
+        ? { session_id: payload.sessionId }
+        : {})
+    }, 20000)
+  }
   async addProject(path: string): Promise<unknown> {
     return this.request('project_add', 'projects', { path })
   }
@@ -375,6 +424,13 @@ class BrowserAgentBridge implements AgentApi {
   }
   permissionConfigSave(config: unknown): Promise<unknown> {
     return this.request('permission_config_save', 'permission_config', { config })
+  }
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）：save 是字段部分更新载荷 */
+  async sandboxConfigGet(): Promise<unknown> {
+    return this.request('sandbox_config_get', 'sandbox_config')
+  }
+  sandboxConfigSave(payload: object): Promise<unknown> {
+    return this.request('sandbox_config_save', 'sandbox_config', payload as Record<string, unknown>)
   }
   /** 刷新远端模型列表：GET /models 可能较慢，超时放宽到 30s */
   llmModelsFetch(payload: {

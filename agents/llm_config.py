@@ -35,7 +35,7 @@ llmconfig.json v2 结构（连接 → 模型 两级）：
 api_key），使输入区模型下拉、会话绑定、resolveModelMeta 等既有链路零改动。
 
 启动语义（"没有配置时不加载"）与热切换语义保持不变，见旧版说明。
-依赖方向：本模块单向 import config（仅取 CONFIG_DIR / CREDENTIALS_FILE）。
+依赖方向：本模块单向 import config（仅取 config_path / CREDENTIALS_FILE）。
 """
 
 import json
@@ -45,16 +45,18 @@ import string
 import threading
 from pathlib import Path
 
-from config import CONFIG_DIR, CREDENTIALS_FILE
+from config import CREDENTIALS_FILE, config_path
 from logger import get_logger
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
 log = get_logger("llm_config")
 
 # ~/.aigent/config/llmconfig.json（含 api_key，权限收紧到 0600）
-LLM_CONFIG_FILE = CONFIG_DIR / "llmconfig.json"
+# 落点由 config.config_path() 统一给出 —— 禁止自拼 AIGENT_HOME / "xx.json"，
+# 否则某个模块漏改就会静默读写顶层（2026-09-22 踩过：顶层冒出过 providers.json）。
+LLM_CONFIG_FILE = config_path("llmconfig.json")
 # ~/.aigent/config/providers.json（预置厂商公共元数据，无密钥，可随官方更新覆盖）
-PROVIDER_CATALOG_FILE = CONFIG_DIR / "providers.json"
+PROVIDER_CATALOG_FILE = config_path("providers.json")
 
 CONFIG_VERSION = 2
 # 出厂预置目录版本。提升它 = 声明"内置目录改版"，既有 providers.json 会按内置

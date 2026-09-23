@@ -1,0 +1,742 @@
+/* ══════════════════════════════════════════════════════════════════════
+   右侧面板（2026-09-23，docs/frontend/19-右侧面板（文件与变更）.md）
+
+   层级与定位关系（改这一块之前先把这棵树看清楚）：
+
+   .app (flex column)
+     ├─ .titlebar       自绘窗口标题栏（layout.css）—— 右栏开关的落点 **在窗外层**
+     └─ .app-body (flex row, position: relative)
+          ├─ .sidebar        240px 固定（sidebar.css）
+          ├─ .chat           flex:1（chat.css）
+          └─ .rpanel         宽可变（inline style 下发 width）  ← 本文件
+               ├─ .rpanel-resizer   6px 拖拽热区（left:-3px 跨边界）
+               └─ .rpanel-inner
+                    ├─ .rpanel-tabs  单栏混放：视图标签 + 文件标签 + 栏尾「+」
+                    └─ .rpanel-body  各标签正文（min-height:0，内部各自滚动）
+
+   三条硬约定：
+   1. **只用 var(--*)，零硬编码色值** —— 深色主题是后置项，裸色值会让它无法推进；
+   2. **只有 .rpanel-body 的下钻层承担滚动**，本层不滚（否则 height 会失控）；
+   3. 右栏底色 `--color-bg-main`（白，贴内容），与侧边栏浅灰形成「灰/白」层次。
+
+   ⚠️ 2026-09-23 二次调整：右栏的开关落点由「聊天区顶栏（`.chat-toolbar`）」上移到
+   **窗口最外层标题栏**（`.titlebar`，样式在 layout.css）。聊天区顶栏随之删除 ——
+   否则会留一条 40px 的空栏。同时 `--toolbar-height` 更名 `--titlebar-height`。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── 容器与拖拽调宽 ──────────────────────────────────────────────── */
+
+.rpanel {
+  flex: none;
+  position: relative; /* .rpanel-resizer 的定位上下文 */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+}
+
+/* 拖拽热区：跨在左右边界上各 3px（面板窄，热区全在内侧会挤掉内容）。
+   视觉上常态无痕，hover 时给一条 2px 的强调线。 */
+.rpanel-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  z-index: 6;
+  cursor: col-resize;
+}
+.rpanel-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background-color 0.12s ease;
+}
+.rpanel-resizer:hover::after,
+.rpanel-resizer.dragging::after {
+  background: var(--color-accent);
+}
+/* 拖到最小宽度时的视觉反馈（贴着下限继续拖没有任何变化会让人以为卡住了） */
+.rpanel-resizer.at-min::after {
+  background: var(--color-warn);
+}
+
+.rpanel-inner {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 拖拽期间的全局态：禁选中 + 强制 col-resize 光标。
+   挂在 body 上（不是 .rpanel），否则鼠标滑出面板就丢光标。
+   `.chat` 一并禁用指针事件：拖拽经过聊天区时不会误触消息里的链接/按钮。 */
+body.is-resizing {
+  user-select: none;
+  cursor: col-resize !important;
+}
+body.is-resizing .chat {
+  pointer-events: none;
+}
+
+/* ── 标签栏（单栏混放）────────────────────────────────────────── */
+.rpanel-tabs {
+  flex: none;
+  height: var(--rpanel-tabs-height);
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+}
+/* 滚动层与「+」分离：`+` 必须**固定在栏尾**，不能随标签一起横向滚走 */
+.rpanel-tabs-scroll {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.rpanel-tabs-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.rpanel-tab {
+  flex: none;
+  display: flex;
+  align-items: center;
+  max-width: 168px;
+  padding-left: var(--sp-2);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+  position: relative;
+  user-select: none;
+}
+.rpanel-tab:hover {
+  background: var(--color-bg-hover);
+}
+/* 激活态：底色 + 2px 强调下划线（`::after` 而不是 border-bottom ——
+   后者会改变盒子高度，标签栏在切换时会抖 1px） */
+.rpanel-tab.active {
+  color: var(--color-text-primary);
+  background: var(--color-bg-active);
+}
+.rpanel-tab.active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--color-accent);
+}
+
+.rpanel-tab-main {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--sp-1) 0 0;
+  color: inherit;
+  font-size: inherit;
+}
+.rpanel-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 文件标签两种身份的唯一区分（列表见 19 篇 §5.3）：
+   - 预览位：**斜体** + 来源圆点（`title` 说明"来自会话链接"）
+   - 常驻位：正常字重、无圆点
+   刻意不用颜色区分 —— 颜色在这套设计里已经被"激活态"占用了。 */
+.rpanel-tab.--preview .rpanel-tab-label {
+  font-style: italic;
+}
+.rpanel-tab-origin {
+  flex: none;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+/* 关闭键：激活项常显（用户刚打开它，最可能想关它），非激活项 hover 才显。
+   预览位的关闭键**不在 hover 时**出现 —— 它是"被顶替即消失"的临时物，
+   给个 × 会让人以为关掉它和关掉常驻标签是同一件事。 */
+.rpanel-tab-close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: 2px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.rpanel-tab.active .rpanel-tab-close,
+.rpanel-tab.--pinned:hover .rpanel-tab-close,
+.rpanel-tab.--view:hover .rpanel-tab-close {
+  opacity: 1;
+}
+.rpanel-tab-close:hover {
+  background: var(--color-bg-active);
+  color: var(--color-danger);
+}
+
+.rpanel-tab-add {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 100%;
+  color: var(--color-text-secondary);
+  border-left: 1px solid var(--color-border);
+}
+.rpanel-tab-add:hover,
+.rpanel-tab-add.open {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+/* ── 右栏内的下拉菜单（复用 .session-menu 外壳，只补差异）──────── */
+.rpanel-menu {
+  min-width: 156px;
+}
+.rpanel-menu-item {
+  /* .session-menu-item 已有 flex + gap + padding，这里只补不可点态的语义色 */
+  color: var(--color-text-primary);
+}
+.rpanel-menu-item.disabled,
+.rpanel-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rpanel-menu-item.disabled:hover {
+  background: transparent;
+}
+.rpanel-menu-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 「第二期」微标：**禁用不用红/琥珀** —— 禁用不是错误，也不是降级 */
+.rpanel-menu-badge,
+.rpanel-welcome-badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.rpanel-menu-check {
+  flex: none;
+  display: flex;
+  color: var(--color-accent);
+}
+
+/* ── 正文容器 ─────────────────────────────────────────────────── */
+.rpanel-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ── 欢迎态（标签为空时）───────────────────────────────────────── */
+.rpanel-welcome {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  overflow-y: auto;
+}
+.rpanel-welcome-title {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+}
+.rpanel-welcome-list {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.rpanel-welcome-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.rpanel-welcome-item:hover:not(.disabled) {
+  border-color: rgba(var(--color-accent-rgb), 0.5);
+  background: var(--color-bg-active);
+}
+.rpanel-welcome-item.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rpanel-welcome-icon {
+  display: flex;
+  color: var(--color-text-secondary);
+}
+.rpanel-welcome-item:hover:not(.disabled) .rpanel-welcome-icon {
+  color: var(--color-accent);
+}
+.rpanel-welcome-label {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── 统一空/加载/错误态 ───────────────────────────────────────── */
+.rpanel-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  text-align: center;
+}
+.rpanel-state__icon {
+  display: flex;
+  color: var(--color-text-secondary);
+}
+/* 语义色只作用于图标与标题，正文一律中性灰 —— 整屏染色太吵 */
+.rpanel-state--error .rpanel-state__icon,
+.rpanel-state--error .rpanel-state__title {
+  color: var(--color-danger);
+}
+.rpanel-state--warn .rpanel-state__icon,
+.rpanel-state--warn .rpanel-state__title {
+  color: var(--color-warn);
+}
+.rpanel-state--empty .rpanel-state__icon {
+  color: var(--color-ok);
+}
+.rpanel-state__title {
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+}
+.rpanel-state__sub {
+  max-width: 100%;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.rpanel-state__action {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+.rpanel-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: rpanel-spin 0.8s linear infinite;
+}
+@keyframes rpanel-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* 带文字的紧凑按钮（**不要用 .mini-btn** —— 它是固定 24×24 的纯图标按钮，
+   中文会被压成竖排并溢出，任务面板曾踩过这个坑） */
+.rpanel-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+.rpanel-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+/* ── 内容头（预览头 / git 头 / 树头共用一条 32px 横条）────────── */
+.rpanel-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 32px;
+  padding: 0 var(--sp-2) 0 var(--sp-3);
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.rpanel-head-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  overflow: hidden;
+}
+.rpanel-head-name {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.rpanel-head-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.rpanel-head-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 降级横幅（琥珀）：**不是错误**，用 warn 不用 danger（tokens.css:25-27 既有语义） */
+.rpanel-notice {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-warn) 10%, transparent);
+  color: var(--color-warn);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+.rpanel-notice__text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── 文件树 ───────────────────────────────────────────────────── */
+.rpanel-tree {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.rpanel-tree-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: var(--sp-1) var(--sp-1) var(--sp-2);
+  /* 滚到边界时不带动外层（嵌套滚动最经典的坑） */
+  overscroll-behavior: contain;
+}
+.rpanel-tree-node {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  min-height: 24px;
+  padding: 0 var(--sp-1);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.rpanel-tree-node:hover {
+  background: var(--color-bg-hover);
+}
+/* 选中 = 底色 + 左侧 2px 强调条（与 `.rpanel-tab.active` 的下划线同源：
+   都是"当前这一项"的标记，只是方向不同） */
+.rpanel-tree-node.active {
+  background: var(--color-bg-active);
+  box-shadow: inset 2px 0 0 var(--color-accent);
+}
+/* 键盘漫游焦点（roving tabindex）：只描边、不染色 —— 它与"选中"是两件事 */
+.rpanel-tree-node.focused {
+  outline: 1px solid var(--color-accent);
+  outline-offset: -1px;
+}
+.rpanel-tree-chevron {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--color-text-secondary);
+}
+.rpanel-tree-chevron.rot {
+  transform: rotate(90deg);
+}
+.rpanel-tree-icon {
+  flex: none;
+  display: flex;
+  color: var(--color-text-secondary);
+}
+.rpanel-tree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rpanel-tree-foot {
+  flex: none;
+  padding: var(--sp-1) var(--sp-3);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* ── 文件预览 ─────────────────────────────────────────────────── */
+.rpanel-preview {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* 代码面：**深色**，沿用 `.markdown-body pre` 的既有认知。
+   行号槽固定宽度、右对齐、不可选中（选中代码时不会把行号一起复制进去）。 */
+.rpanel-code {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.55;
+  /* 横向滚动在**整块**上（行号槽与代码同步横移，不会错位） */
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.rpanel-code-gutter {
+  flex: none;
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  min-width: 3ch;
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-3);
+  background: var(--color-code-bg);
+  color: rgba(255, 255, 255, 0.32);
+  text-align: right;
+  white-space: pre;
+  user-select: none;
+}
+.rpanel-code-pre {
+  flex: none;
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  white-space: pre; /* **默认不折行**（与 global.css:136-144 既有约定一致） */
+  tab-size: 4;
+  /* ⚠️ body 全局 user-select: none（global.css:21）→ 代码必须显式放开，
+     否则右栏里一行代码都复制不了 */
+  user-select: text;
+  cursor: text;
+}
+
+/* ── 变更（git）面板 ─────────────────────────────────────────── */
+.rpanel-git {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.rpanel-git-scroll {
+  flex: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.git-group + .git-group {
+  border-top: 1px solid var(--color-border);
+}
+.git-group__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  min-height: 28px;
+  padding: 0 var(--sp-2);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  text-align: left;
+}
+.git-group__head:hover {
+  background: var(--color-bg-hover);
+}
+.git-group__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-group__count {
+  flex: none;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+/* 四个分组的语义色（冲突 danger / 已暂存 ok / 未暂存 warn / 未跟踪 secondary）——
+   只染名字，不染整行：一行一色会让人以为每行是不同类型的"错误" */
+.git-group--conflict .git-group__name {
+  color: var(--color-danger);
+}
+.git-group--staged .git-group__name {
+  color: var(--color-ok);
+}
+.git-group--unstaged .git-group__name {
+  color: var(--color-warn);
+}
+
+.git-file {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  min-height: 26px;
+  padding: 0 var(--sp-1) 0 var(--sp-2);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.git-file:hover {
+  background: var(--color-bg-hover);
+}
+.git-file.expanded {
+  background: var(--color-bg-active);
+}
+/* 状态徽标：等宽 2 字符（`M ` / `??` / `UU`），固定宽度保证路径左边界对齐 */
+.git-file__code {
+  flex: none;
+  width: 22px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.git-file__code.conflict {
+  color: var(--color-danger);
+}
+.git-file__code.staged {
+  color: var(--color-ok);
+}
+.git-file__code.unstaged {
+  color: var(--color-warn);
+}
+.git-file__code.untracked {
+  color: var(--color-text-secondary);
+}
+/* 路径渲染成「目录 + 文件名」两段：
+   - 目录段 `flex: 0 1 auto; min-width: 0` → 空间不够时**优先压缩目录**（从尾部省略），
+   - 文件名段 `flex: none` → 永远完整显示（文件名才是用户找的那一行）。
+   刻意不用 `direction: rtl` 那套"从左侧截断"的 hack —— 路径里的 `/` 是中性字符，
+   在 RTL 上下文里会按 bidi 规则重排，出现 `/a/b/c.ts` 显示成 `c.ts/b/a/` 的怪相。 */
+.git-file__path {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.git-file__dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+}
+.git-file__name {
+  flex: none;
+}
+.git-file__actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.git-file:hover .git-file__actions,
+.git-file.expanded .git-file__actions {
+  opacity: 1;
+}
+
+/* 内联 diff：**不替换右侧内容**（360px 太窄，长行要大量横向滚；
+   内联还能同时对比多个文件）。高度封顶，超出自身滚动。 */
+.git-diff {
+  max-height: 420px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+.git-diff-line {
+  display: block;
+  padding: 0 var(--sp-2);
+  white-space: pre;
+  user-select: text;
+}
+.git-diff-line.add {
+  background: var(--color-diff-add-bg);
+}
+.git-diff-line.del {
+  background: var(--color-diff-del-bg);
+}
+.git-diff-line.hunk {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-sidebar);
+}
+.git-diff-line.meta {
+  color: var(--color-text-secondary);
+}
+.git-diff-empty {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}

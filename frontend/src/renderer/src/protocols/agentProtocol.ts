@@ -279,18 +279,28 @@ export type UiEvent =
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { session_id: string; message_count: number; /** 新会话所属工作空间 id（前端据此对齐活动空间） */ project_id?: string } }
   | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
-  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; /** 该会话当前权限档位（2026-09-22）：切会话时恢复盾牌 chip 选中态 */ permission_mode?: PermissionMode } }
+  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; /** 该会话当前权限档位（2026-09-22）：切会话时恢复盾牌 chip 选中态 */ permission_mode?: PermissionMode; /** 右侧面板状态（2026-09-23）：切会话时恢复"开着的标签 + 当前激活" */ right_panel?: RPanelPersist | null } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
   | { kind: 'attachments_staged'; payload: AttachmentsStagedPayload }
   /** 引用候选列表（应答 `refs_list`）。**点对点信封，不进 isKnownAgentEvent 白名单** */
   | { kind: 'refs'; payload: RefsPayload }
+  /** 单个文件内容（应答 `file_read`，右栏「文件」预览）。**点对点信封** ——
+   *  同 refs：不进 isKnownAgentEvent 白名单（当流式事件处理会静默丢消息）。 */
+  | { kind: 'file_content'; payload: FileContentPayload }
+  /** git 状态（应答 `git_status`，右栏「变更」面板）。**点对点信封**。 */
+  | { kind: 'git_status'; payload: GitStatusPayload }
+  /** 单文件 diff（应答 `git_diff`）。**点对点信封**。 */
+  | { kind: 'git_diff'; payload: GitDiffPayload }
   | { kind: 'llm_config'; payload: LlmConfigResult }
   /** 权限配置（设置页「权限」页，docs/frontend/18）。**点对点信封**：只回执给发起
    *  窗口、不广播 —— 广播会把另一个窗口正在编辑的未保存 draft 冲掉（对比
    *  permission_changed 必须广播）。因此不进 isKnownAgentEvent 白名单。 */
   | { kind: 'permission_config'; payload: PermissionConfigResult }
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）。**点对点信封**（同上）：
+   *  get 与 save 回执同构，整份替换 store。 */
+  | { kind: 'sandbox_config'; payload: SandboxConfigResult }
   | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
   /** 任务面板快照（整份替换，不做增量）。
    *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
@@ -432,6 +442,147 @@ export interface MessageRef {
   path: string
   name: string
   is_dir: boolean
+}
+
+/** ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────────────────
+ *
+ *  右栏是**按会话隔离**的：一个会话一份实例（开着的标签 + 当前激活 + 开合），
+ *  状态记在会话元数据 `session_<sid>.meta.json` 的 `right_panel` 字段里，
+ *  随 `session_history` 回传恢复。**不是 localStorage** —— 它要与 unread /
+ *  permission_mode 同源（跨重启、多窗口一致，删会话即随之消失）。
+ */
+
+/** 四个**视图标签**（可用 `+` 菜单按需添加，每类至多一枚）。
+ *  「摘要/任务」刻意不在其中：任务面板留在聊天区下方，右栏不重复。 */
+export type RPanelView = 'files' | 'changes' | 'terminal' | 'browser'
+
+/** 视图标签的显示名（与后端 `RIGHTPANEL_VIEWS` 同序）。 */
+export const RPANEL_VIEW_LABELS: Record<RPanelView, string> = {
+  files: '文件',
+  changes: '变更',
+  terminal: '终端',
+  browser: '浏览器'
+}
+
+/** 本期可用 / 第二期置灰的视图（终端与浏览器只在菜单与欢迎态出现，置灰标注）。 */
+export const RPANEL_AVAILABLE_VIEWS: RPanelView[] = ['files', 'changes']
+
+/** 标签：视图标签 或 文件标签（两类**混在同一条标签栏里**）。
+ *
+ *  文件标签有两种身份：
+ *  - `pinned: false` = **预览位**（会话内点文件链接落这里，全场唯一，再点别的
+ *    文件就地顶替）；
+ *  - `pinned: true`  = **常驻位**（树里点开，永不被顶替）。
+ *  `name` 是显示用的文件名（basename），与输入区 `@` 胶囊同口径。 */
+export type RPanelTab =
+  | { kind: 'view'; view: RPanelView }
+  | { kind: 'file'; path: string; name: string; pinned: boolean }
+
+/** `session_history` 携带、以及 `session_ui` 上报的右栏状态。
+ *  `active` 是 tab key（`view:<view>` / `file:<绝对路径>`），不命中任何标签时
+ *  后端会归一化成 null（前端回落"激活末项"，标签全空则显示欢迎态）。 */
+export interface RPanelPersist {
+  open: boolean
+  tabs: RPanelTab[]
+  active: string | null
+}
+
+/** `session_ui` 上报载荷（fire-and-forget，无点对点回执）。 */
+export interface SessionUiPayload {
+  session_id: string
+  ui: RPanelPersist
+}
+
+/** `file_read` 的载荷：只传路径，读写都在后端（沙箱口径唯一）。 */
+export interface FileReadPayload {
+  session_id?: string
+  project_id?: string
+  path: string
+}
+
+/** `file_content` 回执（应答 `file_read`）。**点对点信封，不进
+ *  isKnownAgentEvent 白名单**（同 `refs`）。
+ *
+ *  降级层次刻意分成四个互斥的标志位，前端据此渲染**不同**的状态 ——
+ *  混用会把"文件太大"显示成"读取失败"，是误导：
+ *  - `reason` 非空 → 读失败（越界/不存在/是目录/无权限），`text` 为空；
+ *  - `binary`   → 二进制，`text` 为空（不是错误）；
+ *  - `too_large`→ 超过字节上限，**一点内容都没读**（整屏替换）；
+ *  - `truncated`→ 读到了但只保留前 N 行（正文照常渲染 + 顶部横幅）。 */
+export interface FileContentPayload {
+  project_id?: string
+  session_id?: string
+  path: string
+  name: string
+  size: number
+  mtime: number
+  encoding: string
+  binary: boolean
+  too_large: boolean
+  truncated: boolean
+  /** 实际返回的行数（`text.split('\n').length`，供行号槽用） */
+  lines: number
+  text: string
+  reason: string
+}
+
+/** 变更面板里的一行文件（`path` 是**仓库相对路径**）。 */
+export interface GitStatusFile {
+  path: string
+  /** porcelain 的 X（暂存区状态）单字符 */
+  index: string
+  /** porcelain 的 Y（工作区状态）单字符 */
+  working_dir: string
+  /** 两字状态码（`M ` / ` M` / `??` / `UU` …） */
+  code: string
+  untracked: boolean
+  conflicted: boolean
+  /** 出现在「已暂存」分组 */
+  staged: boolean
+  /** 出现在「未暂存」分组（一个文件可以两面都在：暂存后又改） */
+  has_working_changes: boolean
+  deleted: boolean
+  /** 重命名/复制的原路径 */
+  orig_path?: string
+}
+
+/** `git_status` 回执（应答 `git_status`）。非 git 仓库时 `available:false`
+ *  + `reason` 人话 —— 那是**平级空态**，不是错误。 */
+export interface GitStatusPayload {
+  project_id?: string
+  session_id?: string
+  available: boolean
+  reason: string
+  root: string
+  branch: string
+  ahead: number
+  behind: number
+  files: GitStatusFile[]
+  truncated: boolean
+}
+
+/** `git_diff` 的载荷（`path` 为仓库相对路径；`staged` 取暂存区版本）。 */
+export interface GitDiffPayloadIn {
+  session_id?: string
+  project_id?: string
+  path: string
+  staged?: boolean
+}
+
+/** `git_diff` 回执（应答 `git_diff`）。`too_large` 时 `diff` **为空** ——
+ *  半截 diff 会让用户以为"改动就这么点"，宁可不显示（见 19 篇 §5.8）。 */
+export interface GitDiffPayload {
+  project_id?: string
+  session_id?: string
+  path: string
+  staged: boolean
+  available: boolean
+  reason: string
+  diff: string
+  chars: number
+  too_large: boolean
+  binary: boolean
+  untracked: boolean
 }
 
 /** 会话历史回放消息（切换会话时后端下发，已过滤 system/tool/系统注入消息） */
@@ -714,6 +865,39 @@ export interface LlmModelsResult {
   error?: string
 }
 
+/** 沙盒设置回执（设置页「沙盒」页，docs/frontend/20）。
+ *  get 回执与 save 回执同构（save 多带 applied/errors），前端整份替换 store。 */
+export interface SandboxConfigResult {
+  /** 后端 sys.platform（darwin / linux / win32 …） */
+  platform: string
+  /** 探测到的后端名（seatbelt / bwrap）；null = 当前环境无可用后端 */
+  backend: string | null
+  /** 后端是否可用（false = 启用后也会裸跑，状态行提示） */
+  backend_available: boolean
+  /** 沙盒总开关（config.json 的 SANDBOX_ENABLED，保存后热生效） */
+  sandbox_enabled: boolean
+  /** macOS Seatbelt profile 模板内容（~/.aigent/sandbox/seatbelt.sb） */
+  seatbelt_profile: string
+  /** Linux bubblewrap 参数模板内容（~/.aigent/sandbox/bwrap_args.txt） */
+  bwrap_args: string
+  /** 模板文件绝对路径（编辑器上方「配置文件位置」展示用） */
+  seatbelt_path?: string
+  bwrap_path?: string
+  /** save 回执：false = 有字段保存失败（errors 里带原因，如模板缺占位符） */
+  applied?: boolean
+  /** save 校验错误（人话，页面内联展示） */
+  errors?: string[]
+}
+
+/** 沙盒设置保存载荷（**字段部分更新**：只带要改的字段） */
+export interface SandboxConfigSavePayload {
+  sandbox_enabled?: boolean
+  seatbelt_profile?: string
+  bwrap_args?: string
+  /** 恢复默认模板（不与 *_profile/*_args 同发） */
+  reset?: 'seatbelt' | 'bwrap'
+}
+
 /** 会话元数据（来自后端会话元数据 + 会话文件统计） */
 export interface SessionMeta {
   /** 会话 id：短随机串（新会话）/ 存量编号字符串（旧会话）；全链路唯一标识 */
@@ -817,6 +1001,10 @@ export type ControlKind =
   /** 权限配置读 / 保存（设置页「权限」页；回执为 permission_config 点对点信封） */
   | 'permission_config_get'
   | 'permission_config_save'
+  /** 沙盒设置读 / 保存（设置页「沙盒」页，docs/frontend/20；回执为 sandbox_config
+   *  点对点信封。save 是**字段部分更新**载荷，见 SandboxConfigSavePayload） */
+  | 'sandbox_config_get'
+  | 'sandbox_config_save'
   | 'llm_models_fetch'
   /** 结构化提问的作答（ask_user）。**fire-and-forget，无点对点回包** ——
    *  回执走 `ask_resolved` 广播。刻意不走 request()：主进程 pending 表按 kind
@@ -835,6 +1023,17 @@ export type ControlKind =
    *  fire-and-forget：成功后后端广播 `projects` 刷新（无会话号，不带
    *  permission_changed）—— chip 选中态由 projects 广播驱动。 */
   | 'project_permission'
+  /** 右侧面板状态上报（2026-09-23，docs/frontend/19）。**fire-and-forget，
+   *  无点对点回包** —— 与 ask_answer 同款：主进程 pending 表按 kind FIFO 配对
+   *  且无 id，同 kind 并发会串台。前端做 400ms 防抖合并上报，丢一两条只影响
+   *  下一次恢复的精确度（状态本身以内存桶为准）。 */
+  | 'session_ui'
+  /** 右栏「文件」预览：读工作空间内单个文件 → 回执 `file_content` */
+  | 'file_read'
+  /** 右栏「变更」：git 状态 → 回执 `git_status` */
+  | 'git_status'
+  /** 右栏「变更」：单文件 diff → 回执 `git_diff` */
+  | 'git_diff'
 
 export interface WsOutbound {
   kind: ControlKind | 'ping'

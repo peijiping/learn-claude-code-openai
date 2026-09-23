@@ -32,6 +32,8 @@ from attachments import (
     stage as stage_attachments,
 )
 from config import load as load_config
+from config import CONFIG_FILE
+import sandbox as sandbox_mod
 from interaction import status_of_result
 from llm_config import (
     caps_allow_image, fetch_remote_models, get_config, get_model_by_id,
@@ -52,8 +54,13 @@ from refs import (
     harvest_refs,
     list_workspace as list_ref_workspace,
     normalize_refs,
+    read_workspace_file,
     ref_title_hint,
 )
+# 右栏「变更」面板（2026-09-23）：git 取数放在 Python 侧，唯一理由是**口径唯一** ——
+# "当前工作空间根"只由 paths.WorkspacePaths 定义，让 Electron 再推一遍必然分叉。
+from git_changes import diff_file as git_changes_diff
+from git_changes import status as git_changes_status
 from permission import PermissionStore, VALID_MODES, builtin_snapshot
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
@@ -652,6 +659,28 @@ def _permission_store() -> PermissionStore:
     return PermissionStore()
 
 
+def _save_sandbox_enabled(enabled: bool) -> None:
+    """沙盒开关落盘 config.json 并**直接覆写 os.environ**（热生效，无需重启）。
+
+    config.load() 走 setdefault（不覆盖已有值），重跑也不会生效 —— 必须就地
+    覆写 env（同 llm_config.py 的热切换先例）。sandbox.py 每次使用时读 env，
+    所以覆写后下一条 bash 命令立即按新开关执行。
+    """
+    data = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    data["SANDBOX_ENABLED"] = "1" if enabled else "0"
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.environ["SANDBOX_ENABLED"] = "1" if enabled else "0"
+    log.info("沙盒开关已保存并生效: %s", enabled)
+
+
 def _refresh_permission_dirs() -> int:
     """设置页保存后：把新的全局额外目录推给所有**已构造**的在途会话 Agent。
 
@@ -676,6 +705,113 @@ def _refresh_permission_dirs() -> int:
         except Exception as exc:  # noqa: BLE001
             log.warning("额外目录刷新失败 session_%s: %s", rt.sid, exc)
     return n
+
+
+# ── 右侧面板（docs/frontend/19，2026-09-23）──────────────────────────────
+# 三个数据命令（file_read / git_status / git_diff）共用同一套归属解析与降级信封。
+# ⚠️ 本节必须留在 `_text_of` **之前** —— 下方到 handle 之间的切片区域只允许 def
+# （守卫见本节末尾说明与 tests/test_*_slice_guard）。
+
+DEFAULT_RPANEL_DISABLED_REASON = (
+    "默认工作空间是临时草稿目录，没有可浏览的项目文件；请先切换到自定义工作空间"
+)
+
+
+async def _resolve_rpanel_target(payload: dict) -> tuple[str, object | None, str, str]:
+    """右栏命令的统一归属解析 → `(project_id, ws_paths|None, reason, session_id)`。
+
+    与 `_refs_payload` 同口径（**这是刻意的**）：有会话时按会话 `work_root` 快照
+    解析沙箱根，否则按空间现值。文件树、文件预览、git status 三者必须看到**同一个
+    根** —— 否则会出现"树里列出来的文件点开说不在工作空间内"这种自相矛盾。
+
+    `ws_paths is None` 时 `reason` 是给人看的原因，调用方据此回降级信封而不是报错：
+    "空间目录被移动/这是草稿区"都不是协议错误。
+    """
+    sid = str(payload.get("session_id") or "")
+    if sid:
+        pid = _SID_PROJECT.get(sid) or _project_of_session(sid)
+    else:
+        pid = str(payload.get("project_id") or "") or _active_project()
+
+    meta = None
+    if sid:
+        try:
+            meta = await asyncio.to_thread(_manager_for_session(sid).load_meta, sid)
+        except Exception as exc:  # noqa: BLE001 - 读不到 meta 就按空间现值兜底
+            log.warning("右栏命令读取会话元数据失败 session=%s: %s: %s",
+                        sid, type(exc).__name__, exc)
+
+    try:
+        ws_paths = _workspace_for_session(pid, meta) if sid else _workspace_of(pid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("右栏命令解析工作空间失败 project=%s: %s: %s",
+                    pid, type(exc).__name__, exc)
+        return pid, None, "该工作空间的目录当前不可用（已被移动或删除）", sid
+
+    if ws_paths.id == DEFAULT_PROJECT_ID:
+        return pid, None, DEFAULT_RPANEL_DISABLED_REASON, sid
+    if not _project_ready(pid):
+        return pid, None, "该工作空间的目录当前不可用（已被移动或删除）", sid
+    return pid, ws_paths, "", sid
+
+
+def file_content_disabled(raw_path, *, project_id: str = "",
+                          session_id: str = "", reason: str) -> dict:
+    """`file_content` 的「读不到」形态。
+
+    与成功形态**同一套字段**（照 `_refs_disabled` 的取舍）：前端不必为失败分支
+    单独写一套解析，只要看 `reason` 非空即可切到错误态。
+    """
+    return {
+        "project_id": project_id,
+        "session_id": session_id,
+        "path": str(raw_path or ""),
+        "name": "",
+        "size": 0,
+        "mtime": 0.0,
+        "encoding": "",
+        "binary": False,
+        "too_large": False,
+        "truncated": False,
+        "lines": 0,
+        "text": "",
+        "reason": reason,
+    }
+
+
+def git_status_disabled(*, project_id: str = "", session_id: str = "",
+                        reason: str) -> dict:
+    """`git_status` 的「不可用」形态（非仓库 / 空间不可用）。"""
+    return {
+        "project_id": project_id,
+        "session_id": session_id,
+        "available": False,
+        "reason": reason,
+        "root": "",
+        "branch": "",
+        "ahead": 0,
+        "behind": 0,
+        "files": [],
+        "truncated": False,
+    }
+
+
+def git_diff_disabled(raw_path, *, project_id: str = "", session_id: str = "",
+                      staged: bool = False, reason: str) -> dict:
+    """`git_diff` 的「不可用」形态。"""
+    return {
+        "project_id": project_id,
+        "session_id": session_id,
+        "path": str(raw_path or ""),
+        "staged": bool(staged),
+        "available": False,
+        "reason": reason,
+        "diff": "",
+        "chars": 0,
+        "too_large": False,
+        "binary": False,
+        "untracked": False,
+    }
 
 
 def _text_of(content) -> str:
@@ -1317,6 +1453,75 @@ async def handle(ws):
                     continue
                 await safe_send(ws, _envelope("refs", refs_payload))
 
+            elif kind == "file_read":
+                # 右栏「文件」预览（2026-09-23，docs/frontend/19）：读工作空间内
+                # 单个文件。点对点回执 `file_content`。
+                # 越界 / 不存在 / 二进制 / 过大 / 超长 都从 `read_workspace_file`
+                # 以**正常结果**返回（reason 或标志位），只有真异常才回 error 信封。
+                raw_path = str(payload.get("path") or "")
+                pid, ws_paths, reason, sid = await _resolve_rpanel_target(payload)
+                if ws_paths is None:
+                    await safe_send(ws, _envelope("file_content", file_content_disabled(
+                        raw_path, project_id=pid, session_id=sid, reason=reason)))
+                    continue
+                try:
+                    content = await asyncio.to_thread(
+                        read_workspace_file, ws_paths.workdir, raw_path)
+                except Exception as exc:  # noqa: BLE001 - 桥层兜底，绝不打死连接
+                    log.error("file_read 失败: %s: %s", type(exc).__name__, exc,
+                              exc_info=True)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"读取文件失败：{exc}"}))
+                    continue
+                content["project_id"] = pid
+                content["session_id"] = sid
+                await safe_send(ws, _envelope("file_content", content))
+
+            elif kind == "git_status":
+                # 右栏「变更」面板的文件清单（2026-09-23）。非 git 仓库是常态而
+                # 不是错误 → `available:false` + 人话 reason，前端渲染平级空态。
+                pid, ws_paths, reason, sid = await _resolve_rpanel_target(payload)
+                if ws_paths is None:
+                    await safe_send(ws, _envelope("git_status", git_status_disabled(
+                        project_id=pid, session_id=sid, reason=reason)))
+                    continue
+                try:
+                    info = await asyncio.to_thread(
+                        git_changes_status, ws_paths.workdir)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("git_status 失败: %s: %s", type(exc).__name__, exc,
+                              exc_info=True)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"读取 git 状态失败：{exc}"}))
+                    continue
+                info["project_id"] = pid
+                info["session_id"] = sid
+                await safe_send(ws, _envelope("git_status", info))
+
+            elif kind == "git_diff":
+                # 单个文件的 diff（**只做单文件**：整仓 diff 会卡住十几秒）。
+                # `path` 是**仓库相对路径**（`git_status` 回执的产出口径）。
+                raw_path = str(payload.get("path") or "")
+                staged = bool(payload.get("staged"))
+                pid, ws_paths, reason, sid = await _resolve_rpanel_target(payload)
+                if ws_paths is None:
+                    await safe_send(ws, _envelope("git_diff", git_diff_disabled(
+                        raw_path, project_id=pid, session_id=sid, staged=staged,
+                        reason=reason)))
+                    continue
+                try:
+                    info = await asyncio.to_thread(
+                        git_changes_diff, ws_paths.workdir, raw_path, staged=staged)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("git_diff 失败: %s: %s", type(exc).__name__, exc,
+                              exc_info=True)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"读取 diff 失败：{exc}"}))
+                    continue
+                info["project_id"] = pid
+                info["session_id"] = sid
+                await safe_send(ws, _envelope("git_diff", info))
+
             elif kind == "stop":
                 # 仅停止当前显示会话正在执行的那一轮，其它会话不受影响
                 sid = str(payload.get("session_id") or "")
@@ -1477,6 +1682,8 @@ async def handle(ws):
                         "usage_totals": meta.get("usage_totals"),
                         # 权限档位（2026-09-22）：前端据此恢复盾牌 chip 的选中态
                         "permission_mode": meta.get("permission_mode") or "default",
+                        # 右侧面板状态（2026-09-23，docs/frontend/19）
+                        "right_panel": meta.get("right_panel"),
                     }))
                     # 任务板照常补发：只读 .tasks/，不触碰会话文件，无重写风险
                     await _reply_task_board(ws, sm, sid)
@@ -1503,6 +1710,8 @@ async def handle(ws):
                         "usage_totals": meta.get("usage_totals"),
                         # 权限档位（2026-09-22）：前端据此恢复盾牌 chip 的选中态
                         "permission_mode": meta.get("permission_mode") or "default",
+                        # 右侧面板状态（2026-09-23，docs/frontend/19）
+                        "right_panel": meta.get("right_panel"),
                     }))
                     # 任务板补发：只发未完成组 → 已结束的组切回来不显示
                     await _reply_task_board(ws, sm, sid)
@@ -1531,6 +1740,30 @@ async def handle(ws):
                 unread = bool(payload.get("unread", False))
                 await asyncio.to_thread(sm.set_unread, sid, unread)
                 await reply_sessions()
+
+            elif kind == "session_ui":
+                # 右侧面板状态落盘（2026-09-23，docs/frontend/19）。沿用 unread /
+                # permission_mode 的载体（会话元数据）→ 切会话时随 session_history
+                # 回传恢复，删会话时随 meta 一起消失，零新增清理逻辑。
+                # **fire-and-forget，无回包**（同 ask_answer）：主进程的 pending 表
+                # 按 kind FIFO 配对且无 id，同 kind 并发会串台；前端做 400ms 防抖
+                # 合并上报，丢一两条只影响下一次恢复的精确度。
+                # **不 reply_sessions()**：`list_sessions()` 的白名单刻意不含该字段，
+                # 重播列表既无意义又会让每次点标签都多推一遍全部会话。
+                sid = str(payload.get("session_id") or "")
+                if not sid:
+                    continue
+                sm = _manager_for_session(sid)
+                if not sm.get_session_file(sid).exists():
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        sm.set_session_ui, sid, payload.get("ui"))
+                except FileNotFoundError:
+                    continue
+                except Exception as exc:  # noqa: BLE001 - 落盘失败不影响会话可用性
+                    log.error("session_ui 写入失败 session_%s: %s: %s",
+                              sid, type(exc).__name__, exc, exc_info=True)
 
             elif kind == "session_model":
                 # 记录会话最后选择的模型 + 参数到会话元数据（会话级独立绑定）；
@@ -1832,6 +2065,64 @@ async def handle(ws):
                             "warnings": warnings,
                             "msg": "权限配置已保存并生效",
                         }))
+
+            elif kind == "sandbox_config_get":
+                # 沙盒设置页读：平台/后端状态 + 开关 + 两个模板文件内容。
+                # 模板不存在（首次）先补默认，保证编辑器永远有内容可展示。
+                status = await asyncio.to_thread(sandbox_mod.backend_status)
+                seatbelt = await asyncio.to_thread(sandbox_mod.read_template, "seatbelt")
+                bwrap = await asyncio.to_thread(sandbox_mod.read_template, "bwrap")
+                await safe_send(ws, _envelope("sandbox_config", {
+                    "platform": status["platform"],
+                    "backend": status["backend"],
+                    "backend_available": status["backend_available"],
+                    "sandbox_enabled": sandbox_mod.sandbox_enabled(),
+                    "seatbelt_profile": seatbelt,
+                    "bwrap_args": bwrap,
+                    "seatbelt_path": str(sandbox_mod.SEATBELT_FILE),
+                    "bwrap_path": str(sandbox_mod.BWRAP_FILE),
+                }))
+
+            elif kind == "sandbox_config_save":
+                # 字段部分更新：sandbox_enabled（开关热生效）/
+                # seatbelt_profile、bwrap_args（模板覆写，缺占位符拒存）/
+                # reset（恢复默认模板）。回执为权威源，前端以回执重绘。
+                errors: list[str] = []
+                enabled = payload.get("sandbox_enabled")
+                if isinstance(enabled, bool):
+                    await asyncio.to_thread(_save_sandbox_enabled, enabled)
+                for field, tpl_kind in (("seatbelt_profile", "seatbelt"),
+                                        ("bwrap_args", "bwrap")):
+                    if field in payload:
+                        content = payload.get(field)
+                        if not isinstance(content, str):
+                            errors.append(f"{field} 必须是字符串")
+                            continue
+                        try:
+                            await asyncio.to_thread(
+                                sandbox_mod.save_template, tpl_kind, content)
+                        except ValueError as exc:
+                            errors.append(str(exc))
+                reset = payload.get("reset")
+                if reset in ("seatbelt", "bwrap"):
+                    await asyncio.to_thread(sandbox_mod.reset_template, reset)
+                if errors:
+                    await safe_send(ws, _envelope("error", {"msg": "；".join(errors)}))
+                status = await asyncio.to_thread(sandbox_mod.backend_status)
+                seatbelt = await asyncio.to_thread(sandbox_mod.read_template, "seatbelt")
+                bwrap = await asyncio.to_thread(sandbox_mod.read_template, "bwrap")
+                await safe_send(ws, _envelope("sandbox_config", {
+                    "platform": status["platform"],
+                    "backend": status["backend"],
+                    "backend_available": status["backend_available"],
+                    "sandbox_enabled": sandbox_mod.sandbox_enabled(),
+                    "seatbelt_profile": seatbelt,
+                    "bwrap_args": bwrap,
+                    "seatbelt_path": str(sandbox_mod.SEATBELT_FILE),
+                    "bwrap_path": str(sandbox_mod.BWRAP_FILE),
+                    "applied": not errors,
+                    "errors": errors,
+                }))
 
             elif kind == "llm_models_fetch":
                 # 「刷新」按钮：调 GET {base_url}/models 拉取该连接可用的模型 id 列表。

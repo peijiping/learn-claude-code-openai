@@ -1477,3 +1477,116 @@
 .perm-foot-status.dirty {
   color: var(--color-accent);
 }
+
+/* ── 沙盒设置页（设置弹窗「沙盒」，docs/frontend/20）──────────────────── */
+.sbx {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* 总开关行：左文案右开关 */
+.sbx-switch-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+}
+.sbx-switch-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.sbx-switch-row .perm-sec-desc {
+  margin: 0;
+}
+
+/* 平台状态行：ok = 后端可用（绿点前缀）/ warn = 不可用（黄） */
+.sbx-status {
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+.sbx-status.ok {
+  color: var(--color-text-secondary);
+}
+.sbx-status.ok::before {
+  content: '● ';
+  color: var(--color-success, #34c759);
+}
+.sbx-status.warn {
+  color: var(--color-warning, #d97706);
+}
+.sbx-status.warn::before {
+  content: '▲ ';
+}
+
+/* 保存校验错误（后端回执 errors，内联展示不 toast） */
+.sbx-error {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  color: #dc2626;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+/* 当前平台分区高亮 + 标签 */
+.sbx-section {
+  border-radius: var(--radius-md);
+}
+.sbx-section.current {
+  padding: var(--sp-3);
+  margin: 0 calc(var(--sp-3) * -1);
+  border: 1px solid rgba(var(--color-accent-rgb), 0.35);
+  background: var(--color-bg-sidebar);
+}
+.sbx-current-tag {
+  padding: 1px var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: rgba(var(--color-accent-rgb), 0.15);
+  color: var(--color-accent);
+  font-size: var(--fs-xs);
+  font-weight: normal;
+}
+
+/* 占位符说明行 */
+.sbx-placeholders {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.8;
+}
+.sbx-placeholders code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--color-bg-sidebar);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+
+/* 模板编辑器 */
+.sbx-editor {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  resize: vertical;
+}
+.sbx-editor:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+/* 编辑器操作行 */
+.sbx-actions {
+  display: flex;
+  gap: var(--sp-2);
+}

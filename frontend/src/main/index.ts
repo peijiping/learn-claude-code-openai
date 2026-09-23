@@ -156,8 +156,15 @@ protocol.registerSchemesAsPrivileged([
   }
 ])
 
-// 应用名称：macOS Dock / 菜单栏 / Cmd+Tab 等所有系统展示处统一命名为「个人AI助手」
+// 应用名称：macOS Dock / 菜单栏 / Cmd+Tab 等所有系统展示处统一命名为「个人AI助手」。
+// ⚠️ 与渲染层的 `.titlebar`（`components/TitleBar/TitleBar.tsx` 的 APP_NAME）和
+// `src/renderer/index.html` 的 `<title>` 是同一个字符串的三处落点（原生标题栏隐去后，
+// 窗口里可见的那份由渲染层画，这里这处是系统展示位）。改名要三处一起改。
 app.setName('个人AI助手')
+
+// 自绘标题栏高度（px）。**跨进程常量**：渲染层同值见 `styles/tokens.css` 的
+// `--titlebar-height` —— 交通灯位置与 `titleBarOverlay` 高度都按它算，改一处必须改两处。
+const TITLEBAR_HEIGHT = 40
 
 // 应用图标：透明背景的浅蓝机器人头像（dev 下位于工程根 build/icon.png；打包后位于安装资源目录）
 const APP_ICON = join(app.getAppPath(), 'build/icon.png')
@@ -241,6 +248,17 @@ function createWindow(): void {
     minHeight: 600,
     show: false,
     icon: APP_ICON, // Windows/Linux 窗口与任务栏图标
+    // ── 自绘标题栏（2026-09-23）─────────────────────────────────────
+    // 右栏开关要落在"最外层窗体的右上角"（与窗口标题同层），而原生标题栏画不了
+    // 自绘控件 → 隐去原生标题栏，标题文字与拖拽区交给渲染层的 `.titlebar`
+    // （`-webkit-app-region: drag`，见 styles/layout.css）。
+    // · macOS：保留交通灯，位置显式对齐 TITLEBAR_HEIGHT 的中线（左 16 / 上 14）；
+    // · Windows / Linux：走 `titleBarOverlay`，系统的最小化/最大化/关闭按钮仍由
+    //   系统绘制在窗口右上角（渲染层按 UA 给它们留出 138px，见 lib/platform.ts）。
+    titleBarStyle: 'hidden',
+    ...(process.platform === 'darwin'
+      ? { trafficLightPosition: { x: 16, y: 14 } }
+      : { titleBarOverlay: { color: '#ffffff', symbolColor: '#1f1f1f', height: TITLEBAR_HEIGHT } }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -422,6 +440,72 @@ function createWindow(): void {
     )
   })
 
+  // ── 右侧面板（2026-09-23，docs/frontend/19）──────────────────────────
+  // 四个命令，全部按 `sessionId ?? projectId` 定位归属（与 listRefs 同口径）。
+  ipcMain.handle('agent:sessionUi', (e, payload: { session_id?: string; ui?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    // **fire-and-forget**：后端无点对点回包（同 agent:stop / agent:answerAsk）。
+    // ⚠️ 刻意**不走 request()** —— 主进程 pending 表按 kind 先进先出配对且没有
+    // request id，同 kind 并发会串台；而这个命令本来就允许丢（前端防抖上报，
+    // 状态以内存桶为准，落盘只是为了让"下次切回来"更准）。
+    ws.send(JSON.stringify({
+      kind: 'session_ui',
+      payload: { session_id: payload.session_id, ui: payload.ui ?? null }
+    }))
+  })
+
+  ipcMain.handle('agent:readFile', (e, payload: {
+    path?: string
+    sessionId?: string | null
+    projectId?: string | null
+  }) => {
+    if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) return null
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    // 超时给宽一点：大文件解码 + 二进制嗅探都在后端线程里做
+    return request('file_read', 'file_content', {
+      path: payload.path,
+      ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {})
+    }, 20000)
+  })
+
+  ipcMain.handle('agent:gitStatus', (e, payload?: {
+    sessionId?: string | null
+    projectId?: string | null
+  }) => {
+    if (!isTrustedSender(e)) return null
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    return request('git_status', 'git_status', {
+      ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {})
+    }, 20000)
+  })
+
+  ipcMain.handle('agent:gitDiff', (e, payload: {
+    path?: string
+    staged?: boolean
+    sessionId?: string | null
+    projectId?: string | null
+  }) => {
+    if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) return null
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    return request('git_diff', 'git_diff', {
+      path: payload.path,
+      ...(payload.staged ? { staged: true } : {}),
+      ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {})
+    }, 20000)
+  })
+
   ipcMain.handle('agent:openInFinder', async (e, payload: { path?: string }) => {
     if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) {
       return { ok: false, error: '空路径' }
@@ -553,6 +637,15 @@ function createWindow(): void {
       return null
     }
     return request('permission_config_save', 'permission_config', { config: payload.config })
+  })
+  // 沙盒设置（设置弹窗「沙盒」页，docs/frontend/20）：读 / 保存（字段部分更新）。
+  // 字段级校验（占位符、reset 枚举）是后端 sandbox.py 的职责，桥层只透传。
+  ipcMain.handle('agent:sandboxConfigGet', (e) =>
+    isTrustedSender(e) ? request('sandbox_config_get', 'sandbox_config') : null
+  )
+  ipcMain.handle('agent:sandboxConfigSave', (e, payload: Record<string, unknown> | undefined) => {
+    if (!isTrustedSender(e) || typeof payload !== 'object' || payload === null) return null
+    return request('sandbox_config_save', 'sandbox_config', payload)
   })
   // 「刷新模型列表」：远端 GET /models 可能较慢，超时放宽到 30s
   ipcMain.handle(

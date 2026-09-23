@@ -45,10 +45,32 @@
   --fs-lg: 16px;
   --fs-xl: 24px;
 
+  /* ── 代码 / diff 底色 ──────────────────────────────────────────────
+     产品里有两个**不同的**代码面，刻意不统一：
+     - `.rpanel-code`（文件预览）：沿用 `.markdown-body pre` 那套深色代码块
+       （--color-code-bg / --color-code-fg），用户对"代码长什么样"已有认知；
+     - `.git-diff`（改动行）：**浅色**面 + 浅绿/浅红行底。360px 的窄栏里
+       整屏深底太压抑，而 diff 的行底色（add/del 淡色）本来也只在浅底上才好看。
+     详见 docs/frontend/19-右侧面板（文件与变更）.md §5.7/§5.8。 */
+  --color-diff-add-bg: #e6ffed;      /* 新增行 */
+  --color-diff-del-bg: #ffeef0;      /* 删除行 */
+  --color-code-bg: #1e1e1e;
+  --color-code-fg: #d4d4d4;
+
   /* 布局 */
   --sidebar-width: 240px;
   --statusbar-height: 26px;
   --radii-btn: 12px;
+  /* 右侧面板（2026-09-23）。宽度是**全局单值 + 运行时可变**（拖拽调宽），
+     这里只声明默认值与边界，实际宽度由 store 以 inline style 下发。 */
+  --rpanel-width: 360px;
+  --rpanel-min-width: 280px;
+  --rpanel-max-width: 720px;
+  /* 窗口标题栏（自绘，右栏开关的落点）与右栏标签栏高度。
+     ⚠️ 前者是**跨进程常量**：主进程 `src/main/index.ts` 的 `TITLEBAR_HEIGHT`
+     必须与本值一致（交通灯位置与 `titleBarOverlay` 高度都按它算）。 */
+  --titlebar-height: 40px;
+  --rpanel-tabs-height: 34px;
 
   /* 阴影 */
   --shadow-md: 0 2px 12px rgba(0, 0, 0, 0.08);

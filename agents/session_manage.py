@@ -42,6 +42,136 @@ SESSION_ID_LEN = 10
 # token 消耗统计的四字段（与 LLM usage 投影结构一致，会话级累计/轮级明细共用）
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "cached_tokens", "total_tokens")
 
+# ── 右侧面板（2026-09-23，docs/frontend/19）────────────────────────────
+# 会话级 UI 状态，与 unread / permission_mode / usage_totals 同源，随
+# session_history 回传恢复。**只有这四项视图**：摘要是刻意不做的一项（任务面板
+# 留在聊天区下方），加回来必须先改这张白名单，否则读写两侧口径会打架。
+RIGHTPANEL_VIEWS = ("files", "changes", "terminal", "browser")
+# 视图标签每类至多一枚；常驻文件标签上限 12（超出丢最旧的非激活项）。
+RIGHTPANEL_MAX_FILE_TABS = 12
+# 标签总数上限 = 视图上限 + 常驻上限 + 1 个预览位。视图标签**永不**因超限被丢。
+RIGHTPANEL_MAX_TABS = len(RIGHTPANEL_VIEWS) + RIGHTPANEL_MAX_FILE_TABS + 1
+
+
+def right_panel_tab_key(tab: dict) -> str:
+    """标签的稳定键：视图标签 `view:<view>`，文件标签 `file:<绝对路径>`。
+
+    前端 `lib/rpanelTabs.ts::tabKey` 必须与此**逐字一致** —— `active` 字段存的
+    就是它，两边算法一旦漂移，切会话恢复时激活项会对不上（表现为"标签都在但
+    一个都没选中"）。
+    """
+    if not isinstance(tab, dict):
+        return ""
+    if tab.get("kind") == "view":
+        return f"view:{tab.get('view')}"
+    if tab.get("kind") == "file":
+        return f"file:{tab.get('path')}"
+    return ""
+
+
+def normalize_right_panel(ui) -> Optional[dict]:
+    """归一化右栏状态；整份不可用返回 None（= 当作没设置）。
+
+    存在的理由是**防线而不是清洗**：这份数据来自前端、落在磁盘上、会被手改、
+    会跨版本漂移。任何一处畸形都不许把前端打崩，所以规则是**逐项丢弃**而不是
+    整份拒绝 —— 丢掉一枚坏标签，比让整条会话恢复失败划算得多。
+
+    规则（与前端 `normalizeTabs` 逐条对齐）：
+    - 入参非 dict → None；`tabs` 非 list → 空列表
+    - `kind` 非 view/file、`view` 不在白名单、`path` 非非空 str → 丢弃该项
+    - 同 view / 同 path 重复 → 只留首个
+    - `name` 缺失/非 str/空 → 用 basename 兜底
+    - `pinned` 非 bool → 视为 True（**默认常驻**：手改 meta 不该凭空造出
+      "无人打开的预览位"，那种标签会被下一次会话点击无声顶掉，很难理解）
+    - 预览位（pinned=False）多于一枚 → 只留最后一枚
+    - 常驻文件标签 > 12 → 丢最旧的非激活项；总标签 > 16 → 再丢文件标签
+    - `active` 不命中任何 tab key → None
+    """
+    if not isinstance(ui, dict):
+        return None
+
+    raw_tabs = ui.get("tabs")
+    if not isinstance(raw_tabs, list):
+        raw_tabs = []
+
+    tabs: list[dict] = []
+    seen_views: set[str] = set()
+    seen_paths: set[str] = set()
+    for raw in raw_tabs:
+        if not isinstance(raw, dict):
+            continue
+        kind = raw.get("kind")
+        if kind == "view":
+            view = raw.get("view")
+            if view not in RIGHTPANEL_VIEWS or view in seen_views:
+                continue
+            seen_views.add(view)
+            tabs.append({"kind": "view", "view": view})
+        elif kind == "file":
+            path = raw.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            path = path.strip()
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            name = raw.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = os.path.basename(path.rstrip("/")) or path
+            pinned = raw.get("pinned")
+            if not isinstance(pinned, bool):
+                pinned = True
+            tabs.append({
+                "kind": "file",
+                "path": path,
+                "name": name.strip(),
+                "pinned": pinned,
+            })
+
+    # 预览位全场唯一：只留最后一枚（"最近一次会话点击"才是用户心智里的预览位）
+    preview_idx = [i for i, t in enumerate(tabs)
+                   if t["kind"] == "file" and not t["pinned"]]
+    if len(preview_idx) > 1:
+        drop = set(preview_idx[:-1])
+        tabs = [t for i, t in enumerate(tabs) if i not in drop]
+
+    active = ui.get("active")
+    if not isinstance(active, str) or not active:
+        active = None
+
+    # 超限淘汰：先常驻文件标签（丢最旧的非激活），再文件标签总数。
+    # 视图标签与预览位（最近一次交互的结果）永远保留 —— 淘汰它们是"点了没反应"。
+    # 计数含激活项（上限就是"常驻标签有几枚"），但**只丢非激活的**。
+    def pinned_count(items: list[dict]) -> int:
+        return sum(1 for t in items if t["kind"] == "file" and t["pinned"])
+
+    def droppable_indexes(items: list[dict]) -> list[int]:
+        return [i for i, t in enumerate(items)
+                if t["kind"] == "file" and t["pinned"]
+                and right_panel_tab_key(t) != active]
+
+    while pinned_count(tabs) > RIGHTPANEL_MAX_FILE_TABS:
+        candidates = droppable_indexes(tabs)
+        if not candidates:
+            break
+        tabs.pop(candidates[0])
+    while len(tabs) > RIGHTPANEL_MAX_TABS:
+        candidates = droppable_indexes(tabs)
+        if not candidates:
+            # 只剩视图标签与预览位时无从淘汰：宁可略微超限，也不静默丢视图标签
+            break
+        tabs.pop(candidates[0])
+
+    keys = {right_panel_tab_key(t) for t in tabs}
+    if active is not None and active not in keys:
+        active = None
+
+    return {
+        "open": bool(ui.get("open")),
+        "tabs": tabs,
+        "active": active,
+    }
+
 
 def new_session_id() -> str:
     """生成 10 字符 base62 随机短 id；恰好全为数字则重掷。
@@ -1193,6 +1323,12 @@ class SessionManager:
             # bash_prefix/pattern/path/mcp_tool，source ∈ approval/user。
             # 重启会话后保留生效（「会话内」以会话为界，不以进程为界）。
             "session_allows": [],
+            # ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────
+            # 会话级 UI 状态：开着的标签 + 当前激活 + 右栏开合。
+            # None = 从未用过右栏（前端回落"关闭"）。形状见 normalize_right_panel()。
+            # 写在这里只为**可发现性**（一份 meta 摆在眼前能看出有哪些字段）；
+            # 读路径一律 `.get()`，存量 meta 缺该字段与 None 同义。
+            "right_panel": None,
         }
 
     def _meta_entry_for(self, session_file: Path) -> dict:
@@ -1450,6 +1586,24 @@ class SessionManager:
                 "permission_updated_at": _now_iso(),
             }),
             touch=False,
+        )
+
+    def set_session_ui(self, session_id: str, ui: dict | None) -> dict:
+        """记录会话的右侧面板状态（2026-09-23，docs/frontend/19）。
+
+        形状 `{open, tabs[], active}`，见 `normalize_right_panel()`。落盘前
+        **一律归一化**：这份数据来自前端、会被手改、会跨版本漂移，坏值必须在
+        写入口就被挡掉，否则前端每次恢复都要自己防一遍。
+
+        切标签/开关面板是 UI 操作，不是对话内容变化 → touch=False（不把会话
+        顶到列表最前）。
+
+        Raises:
+            FileNotFoundError: 会话 jsonl 不存在
+        """
+        payload = normalize_right_panel(ui)
+        return self._update_entry(
+            session_id, lambda e: e.update({"right_panel": payload}), touch=False,
         )
 
     def set_session_allows(self, session_id: str, allows: list) -> dict:

@@ -1,5 +1,10 @@
 import { create } from 'zustand'
-import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+// 右栏（2026-09-23）：本文件是**单向**依赖右栏 store 的调用方 ——
+// `rightPanelStore` 绝不反向 import 本文件（那会形成循环依赖，见其文件头警告）。
+// 这里只用到三件事：接收 `session_history` 里的 right_panel、切会话时收尾、
+// 删会话/断线重连时清缓存。
+import { flushRightPanelPending, useRightPanelStore } from './rightPanelStore'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -14,7 +19,7 @@ export type SessionOverridesMap = Record<string, SessionOverrides>
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
-export type SettingsTab = 'general' | 'model' | 'permission' | 'trash' | 'about'
+export type SettingsTab = 'general' | 'model' | 'permission' | 'sandbox' | 'trash' | 'about'
 
 /** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
@@ -432,6 +437,10 @@ interface AgentState {
    *  只由设置页消费 —— 它是点对点回执，不参与全局广播状态。 */
   permissionConfig: PermissionConfigResult | null
   permissionSaving: boolean
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）：get/save 回执整份结果
+   *  （平台状态 + 开关 + 两个模板文件内容）。只由设置页消费 —— 点对点回执。 */
+  sandboxConfig: SandboxConfigResult | null
+  sandboxSaving: boolean
   /** 当前激活会话的上下文统计（每轮 turn_end / 切会话时后端下发） */
   currentContextStats: ContextStats | null
   /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
@@ -543,6 +552,11 @@ interface AgentState {
   /** 保存权限配置，返回 applied（false = 写盘失败）。
    *  归一化 warnings / 权威值由 `permissionConfig` 回写，页面自行读取展示。 */
   savePermissionConfig: (config: PermissionConfig) => Promise<boolean>
+  /** 拉取沙盒设置（进「沙盒」页时懒加载；后端未就绪静默忽略） */
+  loadSandboxConfig: () => Promise<void>
+  /** 保存沙盒设置（**字段部分更新**：开关 / 模板内容 / 恢复默认）。
+   *  权威值由 `sandboxConfig` 回执回写；返回 applied（false = 有字段校验失败）。 */
+  saveSandboxConfig: (payload: SandboxConfigSavePayload) => Promise<boolean>
   /** 刷新某连接可用模型列表（GET {base_url}{models_path}），返回模型 id 列表（失败返回空） */
   fetchModels: (payload: {
     base_url?: string
@@ -1265,6 +1279,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   llmSaving: false,
   permissionConfig: null,
   permissionSaving: false,
+  sandboxConfig: null,
+  sandboxSaving: false,
   currentContextStats: null,
   sessionUsageBySession: {},
   taskBoardBySession: {},
@@ -1289,6 +1305,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 与 approval_request 快照（`_ask_snapshot_lines()` / `_approval_snapshot_lines()`）
       // —— 不断连期间若已被结算，前端拿不到 resolved 广播，留下的面板/卡片会永远消不掉。
       if (c === 'connected' && s.connection !== 'connected') {
+        // 断线重连：右栏只清**在途标志**（loading / pendingReveal），
+        // **不清 layoutBySession** —— 标签栏是用户的意图，不是可恢复的瞬时态。
+        useRightPanelStore.getState().resetTransient()
         return {
           ...s,
           connection: c,
@@ -1685,11 +1704,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode } | null
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
+        // 右栏状态：**在 `set(...)` 之外**调用。两个理由：
+        // ① 它是另一个 store 的 action，放进更新函数会破坏"更新函数必须纯"的前提
+        //    （StrictMode / 并发渲染下可能被调用两次）；
+        // ② `applySessionUi` 自带"内存桶已存在则整条忽略"的守卫（19 篇 §2.5 纪律 1）——
+        //    落盘是防抖异步的，回读可能滞后于用户刚做的操作，整份替换会把刚开的标签吃掉。
+        useRightPanelStore.getState().applySessionUi(payload.session_id, payload.right_panel)
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null }
           // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
           // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
           // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
@@ -1757,6 +1782,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (payload?.config) {
           set({ permissionConfig: mergePermissionResult(get().permissionConfig, payload) })
         }
+        break
+      }
+      case 'sandbox_config': {
+        // 点对点回执（同 permission_config）：get/save 回执同构，整份替换。
+        // 校验错误由沙盒页内联展示，不 toast（同上理由）。
+        const payload = ev.payload as SandboxConfigResult
+        if (payload?.platform) set({ sandboxConfig: payload })
         break
       }
       case 'context_stats': {
@@ -2095,7 +2127,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       if (!payload?.projects) return  // 被拒（空间有会话在跑 / 删 default）时后端回 error 信封
       set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
       // 该空间的会话已随目录消失：本地列表里清掉，避免点进去报"会话不存在"
+      const gone = get()
+        .sessions.filter((x) => sessionProjectId(x) === projectId)
+        .map((x) => x.id)
       set((s) => ({ sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId) }))
+      // 右栏：被删会话的内存桶一起清掉。**这是既有分桶的缺口**
+      // （`sessions` 过滤了但 messagesBySession 等没有人清），本 store 不照抄这个缺陷。
+      useRightPanelStore.getState().dropSessions(gone)
       if (get().pendingProjectId === projectId) await get().newSession(DEFAULT_PROJECT_ID)
       showToast('已删除工作空间（仅元数据，真实目录已保留）', 'info', 4000)
     } catch {
@@ -2113,6 +2151,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     if (r && !r.ok) showToast(`无法打开目录：${r.error ?? ''}`, 'error', 4000)
   },
   switchSession: async (sid) => {
+    // ── 右栏：**先落盘，再切**（19 篇 §2.5 纪律 3）──────────────────
+    // 把上一个会话还压在防抖窗口里的写盘立刻发出去。放在最前面是刻意的：
+    // 只要"切会话"这件事一旦发生，任何"还欠着没发"的状态都有写错会话的风险，
+    // 所以不依赖任何后续顺序。payload 里带的是**当时的 sid**，与当前会话无关。
+    flushRightPanelPending()
     // 进入会话 = 已读。先本地即时置已读（即时反馈），再持久化到后端元数据。
     void get().setSessionUnread(sid, false)
     // 立即高亮 + 切换到该会话缓冲（后台会话继续执行不受影响，仅换投影）。
@@ -2131,6 +2174,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       //（文本草稿沿用既有行为不清，差异见 docs/frontend/12 的取舍一节）
       draftAttachments: []
     }))
+    // ── 右栏：丢掉别的会话的大块数据缓存（树 / 预览 / diff）────────
+    // 只留新会话那一份（与 `currentContextStats` 同范式：树可能 3000 条、
+    // diff 可能几百 KB，N 个会话累积明显吃内存，且天然易过期）。
+    // `layoutBySession` **不丢**：它要长期留着，切回来时标签栏才能同步恢复、不闪动。
+    useRightPanelStore.getState().keepOnly(sid)
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
     // 切到别的空间时同步后端"活动空间"：否则下一次 projects 广播会把 chip 拉回去
     if (pid && pid !== prevPid) void window.agent.openProject(pid)
@@ -2214,6 +2262,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         sessions: s.sessions.filter((x) => !remove.has(x.id)),
         trashSessions: s.trashSessions.filter((x) => !remove.has(x.id)),
       }))
+      // 右栏：同步丢内存桶（含把该 sid 还压着的待写盘条目一并撤掉，
+      // 否则防抖定时器到点会往一个已删除的会话写 meta）
+      useRightPanelStore.getState().dropSessions(deleted)
     }
   },
 
@@ -2221,10 +2272,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     set({ settingsOpen: true, settingsTab: tab })
     if (tab === 'model' && !get().llmConfig) void get().loadLlConfig()
     if (tab === 'permission' && !get().permissionConfig) void get().loadPermissionConfig()
+    if (tab === 'sandbox' && !get().sandboxConfig) void get().loadSandboxConfig()
   },
-  // 关闭时清掉权限配置缓存：配置可能被另一个窗口改过，重进必须重新拉取
+  // 关闭时清掉权限/沙盒配置缓存：配置可能被另一个窗口改过，重进必须重新拉取
   // （未保存的 draft 在组件内 state，随组件卸载自然丢弃）
-  closeSettings: () => set({ settingsOpen: false, permissionConfig: null }),
+  closeSettings: () => set({ settingsOpen: false, permissionConfig: null, sandboxConfig: null }),
   loadLlConfig: async () => {
     try {
       const res = (await window.agent.llmConfigGet()) as { config?: LlmConfig } | null
@@ -2279,6 +2331,31 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       return false
     } finally {
       set({ permissionSaving: false })
+    }
+  },
+  loadSandboxConfig: async () => {
+    try {
+      const res = (await window.agent.sandboxConfigGet()) as SandboxConfigResult | null
+      if (res?.platform) set({ sandboxConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  saveSandboxConfig: async (payload) => {
+    set({ sandboxSaving: true })
+    try {
+      const res = (await window.agent.sandboxConfigSave(payload)) as
+        | SandboxConfigResult
+        | null
+      // 以后端回执为准回填（权威值）：开关状态 / 模板内容以磁盘实际为准，
+      // 校验错误由沙盒页读 res.errors 内联展示。
+      if (res?.platform) set({ sandboxConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存沙盒设置失败', 'error', 4000)
+      return false
+    } finally {
+      set({ sandboxSaving: false })
     }
   },
   fetchModels: async (payload) => {

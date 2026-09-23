@@ -2,19 +2,22 @@ import { useAgentStore, type SettingsTab } from '@store/agentStore'
 import { Icon } from '@components/common/Icon'
 import ModelSettings from './Settings/ModelSettings'
 import PermissionSettings from './Settings/PermissionSettings'
+import SandboxSettings from './Settings/SandboxSettings'
 import TrashSettings from './Settings/TrashSettings'
 
 const NAV: { key: SettingsTab; label: string }[] = [
   { key: 'general', label: '通用' },
   { key: 'model', label: '模型' },
   { key: 'permission', label: '权限' },
+  { key: 'sandbox', label: '沙盒' },
   { key: 'trash', label: '归档' },
   { key: 'about', label: '关于' }
 ]
 
-/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/权限/归档/关于）。
+/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/权限/沙盒/归档/关于）。
  *  「归档」（key 仍为 trash）= 原回收站：软删除会话在此还原 / 彻底删除。
- *  「权限」= 权限管控全局配置（~/.aigent/config/permissions.json，docs/frontend/18）。 */
+ *  「权限」= 权限管控全局配置（~/.aigent/config/permissions.json，docs/frontend/18）。
+ *  「沙盒」= 执行隔离开关与双平台模板编辑（docs/frontend/20）。 */
 export default function SettingsModal(): JSX.Element {
   const tab = useAgentStore((s) => s.settingsTab)
   const openSettings = useAgentStore((s) => s.openSettings)
@@ -53,6 +56,7 @@ export default function SettingsModal(): JSX.Element {
           <div className={`settings-body ${tab === 'model' ? 'flush' : ''}`}>
             {tab === 'model' && <ModelSettings />}
             {tab === 'permission' && <PermissionSettings />}
+            {tab === 'sandbox' && <SandboxSettings />}
             {tab === 'trash' && <TrashSettings />}
             {tab === 'general' && <GeneralSettings />}
             {tab === 'about' && <AboutSettings />}

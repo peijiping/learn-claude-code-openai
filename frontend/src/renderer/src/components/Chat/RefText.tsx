@@ -16,8 +16,9 @@ import type { RefSegment } from '@lib/refTokens'
 interface RefTextProps {
   /** 已切好的片段序列（由 `renderRefText` 产出，本组件不做匹配） */
   segments: RefSegment[]
-  /** 点击胶囊：在系统文件管理器中定位（可缺省） */
-  onOpen?: (path: string) => void
+  /** 点击胶囊。`isDir` 一并给出：目录与文件在右栏走**不同**的落点
+   *  （目录去系统文件管理器，文件去右栏预览位，见 docs/frontend/19 §6 第 20 条）。 */
+  onOpen?: (path: string, isDir: boolean) => void
 }
 
 export default function RefText({ segments, onOpen }: RefTextProps): JSX.Element {
@@ -34,7 +35,7 @@ export default function RefText({ segments, onOpen }: RefTextProps): JSX.Element
             className="ref-chip inline"
             title={seg.ref.path}
             data-ref-path={seg.ref.path}
-            onClick={onOpen ? () => onOpen(seg.ref.path) : undefined}
+            onClick={onOpen ? () => onOpen(seg.ref.path, seg.ref.is_dir) : undefined}
           >
             <Icon name={seg.ref.is_dir ? 'folder' : 'fileText'} size={12} />
             <span className="ref-chip-name">

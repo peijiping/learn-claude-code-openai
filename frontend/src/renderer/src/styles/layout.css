@@ -12,6 +12,130 @@
   min-height: 0;
 }
 
+/* ── 窗口标题栏（自绘，2026-09-23）──────────────────────────────────
+   右栏开关从「聊天区顶栏」挪到**窗口最外层**——与窗口标题「个人AI助手」同一层。
+   原生标题栏画不了自绘控件，所以主进程改成 `titleBarStyle: 'hidden'`
+   （`src/main/index.ts` 的 TITLEBAR_HEIGHT 与本层同高），标题与拖拽区由本层承担。
+
+   五条约定（改这一块先读注释，每一条都踩过坑）：
+   1. **拖拽区是 `.titlebar-drag` 填充块，不是整条栏**（2026-09-23 二次修正）。
+      禁止"整层 drag + 按钮 `no-drag`"那套写法：它要求浏览器把父级 drag 矩形
+      **减去**子级 no-drag 矩形，而 Chromium 的拖拽区是**异步算好、缓存给系统**的
+      （`DraggableRegionsChanged` → AppKit `mouseDownCanMoveWindow`）。一旦缓存与
+      DOM 不同步（按钮是"有会话才渲染"的迟到节点），那 26×26 就会被算成 drag →
+      mousedown 被系统拿去拖窗 → **`click` 根本不派发**，症状是"点得开、点不关"
+      （或干脆点不动）。且这种失败**测不出来**：headless Chromium 不实现拖拽区
+      命中改写，CDP 注入的鼠标事件也绕过系统判定（19 篇 §7.3.1）。
+      现在的形状保证一条**可几何验证**的不变式：
+        **没有任何 `-webkit-app-region: drag` 的矩形与开关按钮相交。**
+   2. 底色**分两段**：左 `--sidebar-width` 灰（与侧边栏对齐，macOS 交通灯正好落在
+      灰底上）+ 其余白（与聊天区对齐）。两段由 ::before/::after 铺，本层自身
+      **不设 background** —— 否则要跟伪元素抢层级；
+   3. 标题**居中**：grid `1fr auto 1fr` 两翼等宽，位置与原生标题栏一致；
+   4. **内容要压在两段底色之上**（`z-index`）：`::after` 在文档序里排在真实子元素
+      **之后**，不给内容层提层级会被它盖住；
+   5. 交通灯（macOS）/ 系统按钮（Windows）都是**原生绘制、压在本层之上**的，
+      渲染层看不见它们，只能靠留白避让（右侧留白见 `.titlebar--overlay`）。 */
+.titlebar {
+  position: relative;
+  flex: none;
+  height: var(--titlebar-height);
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+  user-select: none;
+  /* ⚠️ 本层**刻意不设** `-webkit-app-region` —— 见上面第 1 条。 */
+}
+.titlebar::before,
+.titlebar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.titlebar::before {
+  left: 0;
+  width: var(--sidebar-width);
+  background: var(--color-bg-sidebar);
+}
+.titlebar::after {
+  left: var(--sidebar-width);
+  right: 0;
+  background: var(--color-bg-main);
+}
+/* 内容浮在两段底色之上。**必须有 z-index**：`::after` 在文档序里排在真实子元素
+   **之后**，同为 `position: relative/absolute` + auto z-index 时它绘制在上层 →
+   会盖住右上角的开关按钮（点击落在底色上，按钮永远收不到 click）。
+   踩过：harness 里"点图标右栏没反应"就是这个。 */
+.titlebar > * {
+  position: relative;
+  z-index: 1;
+}
+/* 拖拽区（可点元素一律**不要**放进这里）。空 div 默认高度 0 = 没有可拖区域，
+   所以必须 `align-self: stretch` 撑满栏高。 */
+.titlebar-drag {
+  -webkit-app-region: drag;
+  align-self: stretch;
+  min-width: 0;
+}
+/* 开关左侧那段空白：`flex: 1` 吃掉剩余宽度，右边界正好贴到按钮左边界 */
+.titlebar-drag--flex {
+  flex: 1;
+}
+.titlebar-title {
+  grid-column: 2;
+  /* 标题自带拖拽区（原生的"拖动标题栏"手感就落在这儿） */
+  -webkit-app-region: drag;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.titlebar-right {
+  grid-column: 3;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  /* 必须撑满栏高：否则里面的拖拽填充块只有按钮那么高（26px），
+     按钮上下各 7px 的横带就拖不动了（harness S0p 抓的就是这个）。 */
+  align-self: stretch;
+}
+/* Windows / Linux：`titleBarOverlay` 的系统按钮（最小化/最大化/关闭，各 46px）
+   由系统绘制在**窗口**右上角、压在本层之上 —— 不留位就会盖住开关图标。
+   macOS 交通灯在左边，故只在 win/linux 生效（判定见 `lib/platform.ts`）。 */
+.titlebar--overlay .titlebar-right {
+  padding-right: 138px;
+}
+
+/* 标题栏图标按钮（右栏开关）。几何与栏内同类小按钮一致：26×26 正方形热区；
+   hover 浅灰、`aria-pressed=true` 主题色（= 该会话的右栏正开着）。
+   `no-drag` 保留为**显式声明意图**：这里本来就没有 drag 矩形盖着它（第 1 条），
+   写上是为了将来有人给 `.titlebar-right` 加 drag 时能立刻看见冲突。 */
+.titlebar-toggle {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+}
+.titlebar-toggle:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.titlebar-toggle[aria-pressed='true'] {
+  background: var(--color-bg-active);
+  color: var(--color-accent);
+}
+
 /* 状态条 */
 .statusbar {
   height: var(--statusbar-height);
@@ -52,10 +176,11 @@
   background: var(--color-text-secondary);
 }
 
-/* Toast（顶部居中） */
+/* Toast（顶部居中）。**必须让开自绘标题栏**（`top` 是相对窗口算的，
+   不留位就会压在窗口标题上 —— 原生标题栏时代它天然落在标题栏下方）。 */
 .toast {
   position: fixed;
-  top: var(--sp-4);
+  top: calc(var(--titlebar-height) + var(--sp-4));
   left: 50%;
   transform: translateX(-50%);
   background: #1f1f1f;

@@ -19,6 +19,7 @@ import AskUserBlock from './AskUserBlock'
 import ApprovalCard from './ApprovalCard'
 import RefBar from './RefBar'
 import RefText from './RefText'
+import { useRightPanelStore } from '@store/rightPanelStore'
 
 /** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
 function fmtTokens(n: number): string {
@@ -221,6 +222,26 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     return s.sessions.find((x) => x.id === sid)?.project ?? s.activeProject
   })
 
+  /** 会话内点引用（正文里的 `@文件` 胶囊 / RefBar 兜底行）该落到哪里
+   *  （2026-09-23，docs/frontend/19 §6 第 20 条）：
+   *  - **文件** → 右栏的**预览位**（全场唯一、再点别的文件就地顶替）；
+   *  - **目录** → 仍然去系统文件管理器。右栏没有"目录预览"这回事，
+   *    开一枚只会显示"这是一个目录，无法预览"的标签是纯噪音。
+   *  - **附件**不在此列：附件是会话副本、不在工作区树里，保持 `openInFinder` 不变。
+   *
+   *  这里读 `activeSession` 而不是走 props：MessageItem 只会渲染**当前会话**的消息
+   *  （`messages` 就是按 activeSession 做的投影），不存"渲染着 A 的消息、
+   *  当前会话却是 B"的中间态。 */
+  const activeSession = useAgentStore((s) => s.activeSession)
+  const revealFile = useRightPanelStore((s) => s.revealFile)
+  const openRef = (path: string, isDir: boolean): void => {
+    if (isDir || !activeSession) {
+      void window.agent.openInFinder(path)
+      return
+    }
+    revealFile(activeSession, path)
+  }
+
   /** 本条消息上需要锚定的在途审批卡片（2026-09-22 权限管控）：按 toolCallId
    *  匹配到本消息的工具行。主工具条匹配的渲染在工具条后；子智能体工具匹配的
    *  渲染在子智能体块**外**（块默认折叠，审批是"必须现在做决定"的交互，
@@ -338,17 +359,11 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
               />
             )}
             {/* 正文：`@相对路径` token 就地渲染成胶囊（只显示文件名，与输入区一致） */}
-            <RefText
-              segments={refRender.segments}
-              onOpen={(p) => void window.agent.openInFinder(p)}
-            />
+            <RefText segments={refRender.segments} onOpen={openRef} />
             {/* 引用（@-mention）兜底行：只列"正文里没能内联渲染"的引用（正常为空）。
                 引用与附件是**两条独立通道**（形状与语义都不同）—— 引用零复制、
                 只指向工作空间里的路径，故用独立组件与独立样式渲染 */}
-            <RefBar
-              refs={refRender.leftover}
-              onOpen={(p) => void window.agent.openInFinder(p)}
-            />
+            <RefBar refs={refRender.leftover} onOpen={openRef} />
             <div className="msg-meta">
               {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}
               <button

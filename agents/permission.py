@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from config import AIGENT_HOME, CONFIG_DIR
+from config import AIGENT_HOME, config_path
 from logger import get_logger
 from paths import WORKTREE_DIR
 
@@ -138,9 +138,9 @@ def _deny_path_roots() -> list[Path]:
         # 配置文件目录（2026-09-22 起配置文件统一收在 ~/.aigent/config/）：
         # 只拦其中含凭证/规则的三份 —— config.json（纯参数）与 providers.json
         # （公共厂商元数据）不含密钥，维持既有「不拦」语义。
-        CONFIG_DIR / "credentials.json",
-        CONFIG_DIR / "llmconfig.json",
-        CONFIG_DIR / "permissions.json",
+        config_path("credentials.json"),
+        config_path("llmconfig.json"),
+        config_path("permissions.json"),
         # 迁移前的顶层旧路径：一并拦截。迁移是 rename，正常情况下旧文件已不存在；
         # 但若搬迁失败（跨设备/权限）或用户手工同步回一份副本，这里的兜底能避免
         # 「新路径已生效、旧文件却成了可读取后门」的安全退化。
@@ -190,7 +190,7 @@ def builtin_snapshot() -> dict:
     必然漏改前端，正是 17 篇 §1.1 记录的「hooks.py 与 tools.py 两份黑名单不同步」
     缺陷模式重演。
 
-    `deny_paths` 由 `CONFIG_DIR` / `Path.home()` 派生（不手写字面量），与前缀拦截的
+    `deny_paths` 由 `config_path()` / `Path.home()` 派生（不手写字面量），与前缀拦截的
     真实来源同源。迁移前的顶层旧路径（`~/.aigent/credentials.json` 等三份）仍在拦，
     但**不下发** —— 那是过渡期兜底，不是用户需要理解的配置面。
     """
@@ -202,9 +202,9 @@ def builtin_snapshot() -> dict:
             "*.pem / *.key（任意目录）",
             ".env（任意目录）",
             f"{_tilde(Path.home() / '.ssh')}/（整个目录）",
-            _tilde(CONFIG_DIR / "credentials.json"),
-            _tilde(CONFIG_DIR / "llmconfig.json"),
-            _tilde(CONFIG_DIR / "permissions.json"),
+            _tilde(config_path("credentials.json")),
+            _tilde(config_path("llmconfig.json")),
+            _tilde(config_path("permissions.json")),
         ],
         "timeout": {
             "default": DEFAULT_TIMEOUT_SECONDS,
@@ -610,7 +610,7 @@ class PermissionStore:
     """
 
     def __init__(self, path: Path | str | None = None):
-        self.path = Path(path) if path else CONFIG_DIR / "permissions.json"
+        self.path = Path(path) if path else config_path("permissions.json")
         self._lock = threading.Lock()
         self._cache: dict | None = None
         self._mtime: float | None = None

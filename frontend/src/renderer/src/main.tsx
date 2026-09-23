@@ -7,6 +7,7 @@ import './styles/global.css'
 import './styles/layout.css'
 import './styles/sidebar.css'
 import './styles/chat.css'
+import './styles/rightpanel.css'
 import './styles/settings.css'
 
 // 纯浏览器预览（无 Electron preload）时安装直连 WS 的回退桥；Electron 内自动跳过

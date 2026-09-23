@@ -125,6 +125,24 @@ const agent = {
    *  之后按键在前端本地过滤）。返回 `RefsPayload`；主进程等待超时返回 null。 */
   listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }): Promise<unknown> =>
     ipcRenderer.invoke('agent:listRefs', payload ?? {}),
+
+  /** ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────────────
+   * 右栏状态记在**会话元数据**里（不是 localStorage），随 session_history 回传。
+   * 设计见 docs/frontend/19-右侧面板（文件与变更）.md。 */
+  /** 上报右栏状态（开着的标签 + 当前激活 + 开合）。**fire-and-forget** ——
+   *  同 ask_answer：主进程 pending 表按 kind FIFO 配对且无 id，同 kind 并发会
+   *  串台。调用方做 400ms 防抖合并上报，故这里直发不回执。 */
+  sessionUi: (payload: { session_id: string; ui: unknown }): Promise<void> =>
+    ipcRenderer.invoke('agent:sessionUi', payload),
+  /** 读工作空间内单个文件（右栏「文件」预览）→ `file_content` 信封 */
+  readFile: (payload: { path: string; sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:readFile', payload),
+  /** 读取 git 状态（右栏「变更」）→ `git_status` 信封 */
+  gitStatus: (payload?: { sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:gitStatus', payload ?? {}),
+  /** 读单个文件的 diff（仓库相对路径）→ `git_diff` 信封 */
+  gitDiff: (payload: { path: string; staged?: boolean; sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:gitDiff', payload),
   /** 工作空间列表（`projects` 信封为主要数据源，这里是主动拉取的兜底） */
   listProjects: (): Promise<unknown> => ipcRenderer.invoke('agent:listProjects'),
   /** 把选定目录登记为工作空间（已登记过则复用；后端同时把它设为活动空间） */
@@ -156,6 +174,11 @@ const agent = {
   permissionConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:permissionConfigGet'),
   permissionConfigSave: (config: unknown): Promise<unknown> =>
     ipcRenderer.invoke('agent:permissionConfigSave', { config }),
+
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）：读 / 保存（字段部分更新） */
+  sandboxConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:sandboxConfigGet'),
+  sandboxConfigSave: (payload: object): Promise<unknown> =>
+    ipcRenderer.invoke('agent:sandboxConfigSave', payload),
 
   /** 刷新某连接的可用模型列表（GET {base_url}/models）；api_key 留空时后端回退已保存密钥 */
   llmModelsFetch: (payload: {
