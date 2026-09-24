@@ -81,6 +81,9 @@ export interface AgentApi {
     sessionId?: string | null
     projectId?: string | null
   }) => Promise<unknown>
+  /** 把要经 `aigent-file://` 展示的路径报备进主进程白名单（多格式预览，
+   *  docs/frontend/21）。fire-and-forget：主进程无回包。 */
+  allowFileStream: (paths: string[]) => Promise<void>
   /** 读取 git 状态 → `git_status` 信封 */
   gitStatus: (payload?: {
     sessionId?: string | null

@@ -137,6 +137,11 @@ const agent = {
   /** 读工作空间内单个文件（右栏「文件」预览）→ `file_content` 信封 */
   readFile: (payload: { path: string; sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
     ipcRenderer.invoke('agent:readFile', payload),
+  /** 把要经 `aigent-file://` 展示的路径报备进主进程白名单（多格式预览，
+   *  docs/frontend/21）。收到 file_content 且 kind 为 image/pdf（或 office 转换
+   *  成功）后调用。**fire-and-forget**：主进程无回包。 */
+  allowFileStream: (paths: string[]): Promise<void> =>
+    ipcRenderer.invoke('agent:allowFileStream', { paths }),
   /** 读取 git 状态（右栏「变更」）→ `git_status` 信封 */
   gitStatus: (payload?: { sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
     ipcRenderer.invoke('agent:gitStatus', payload ?? {}),

@@ -1,5 +1,5 @@
 import { app, shell, BrowserWindow, dialog, ipcMain, nativeImage, net, protocol } from 'electron'
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, sep } from 'path'
 import { pathToFileURL } from 'url'
@@ -18,6 +18,11 @@ const WS_PORT = Number(process.env.AGENT_WS_PORT || '8765')
 
 /** 附件缩略图自定义协议名（CSP 里 img-src 需放行同名 scheme） */
 const ATT_SCHEME = 'aigent-att'
+/** 工作空间文件流自定义协议（多格式预览，docs/frontend/21）。
+ *  图片 / PDF / Office 转出的 PDF 由渲染层 <img> / <embed> 直读磁盘，
+ *  **不经 WS 传字节**（websockets 帧上限 1 MiB，base64 必超）——与附件缩略图
+ *  同一条"主进程喂文件"的路线。CSP 的 img-src / object-src 需放行同名 scheme。 */
+const FILE_SCHEME = 'aigent-file'
 /** 后端附件目录名（与 agents/paths.ATTACHMENTS_DIRNAME 一致） */
 const ATTACHMENTS_DIRNAME = '.attachments'
 /** 未发送附件的草稿区（与 agents/paths.DRAFT_ATTACHMENTS_DIRNAME 一致） */
@@ -149,12 +154,114 @@ function sweepClipboardTemp(): void {
 
 // scheme 必须在 app ready **之前**声明为 privileged：否则渲染层的 <img src="aigent-att://…">
 // 会被当作不认识的 scheme 直接拦掉（standard=true 才能被 new URL 正常解析）。
+// aigent-file 同理，且 <embed type="application/pdf"> 需要 stream=true。
 protocol.registerSchemesAsPrivileged([
   {
     scheme: ATT_SCHEME,
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+  },
+  {
+    scheme: FILE_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
   }
 ])
+
+// ── aigent-file 协议（多格式预览，docs/frontend/21）────────────────────────
+// 扩展名 → Content-Type。**刻意只有一张白名单表**：不在表里的扩展名一律 403，
+// 绝不按"认不认识"猜测 —— 协议能读的文件种类必须与后端 `refs.classify_preview_kind`
+// 放行的 kind（image/pdf/office 产物）同域，多出来的种类就是多余的安全面。
+// ⚠️ 没有 .html/.htm/.js：工作空间里的 HTML/JS 只走文本预览，**绝不**作为文档喂给
+// 渲染引擎（同 refs.py 的取舍：把工作区 HTML 当网页渲染 = 点开就执行同源脚本）。
+const FILE_MIME_BY_EXT: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+  '.avif': 'image/avif',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff'
+}
+
+/** 流式文件字节上限 —— 与后端 `refs.stream_max_bytes()`（FILE_STREAM_MAX_BYTES）
+ *  同值同义：协议侧再卡一道，防一个 2GB 的 PDF 把主进程读爆内存。 */
+const FILE_STREAM_MAX_BYTES = 64 * 1024 * 1024
+
+/** 渲染层经 `agent:allowFileStream` 报备过的可读路径（realpath 归一后的绝对路径）。
+ *
+ *  为什么是"回执报备制"而不是协议侧自己校验工作空间：主进程**不知道**各项目的
+ *  workdir（那在后端的 projects.json 里），再开一条查询通道只为让协议能自己判定
+ *  得不偿失。报备制还有个额外好处：只有后端 `file_read` 回执**真正给出去过**的
+ *  路径（沙箱判定已经过了）才可能被读，白名单的边界与后端完全一致。
+ *  FIFO 上限防长会话无限累积。 */
+const streamAllowed: string[] = []
+const STREAM_ALLOWED_MAX = 200
+
+function allowFileStreamPath(raw: string): void {
+  const p = String(raw || '').trim()
+  if (!p) return
+  let real = p
+  try {
+    real = realpathSync(p) // 消掉 symlink 与 `..`；文件不存在时抛 → 下面拦
+  } catch {
+    return
+  }
+  try {
+    if (!statSync(real).isFile()) return
+  } catch {
+    return
+  }
+  const i = streamAllowed.indexOf(real)
+  if (i >= 0) streamAllowed.splice(i, 1)
+  streamAllowed.push(real)
+  if (streamAllowed.length > STREAM_ALLOWED_MAX) streamAllowed.shift()
+}
+
+/** 处理 `aigent-file://local/?path=<abs>`：白名单命中 → 按扩展名给 Content-Type。 */
+function handleFileStream(req: Request): Response {
+  let raw = ''
+  try {
+    raw = new URL(req.url).searchParams.get('path') ?? ''
+  } catch {
+    return new Response('bad request', { status: 400 })
+  }
+  if (!raw) return new Response('not found', { status: 404 })
+  let real: string
+  try {
+    real = realpathSync(raw)
+  } catch {
+    return new Response('not found', { status: 404 })
+  }
+  // 双重校验：报备的原样串与 realpath 各查一遍（报备前文件被改名/替换时仍能命中）
+  if (!streamAllowed.includes(real) && !streamAllowed.includes(raw)) {
+    return new Response('forbidden', { status: 403 })
+  }
+  let buf: Buffer
+  try {
+    const st = statSync(real)
+    if (!st.isFile() || st.size > FILE_STREAM_MAX_BYTES) {
+      return new Response('too large', { status: 413 })
+    }
+    buf = readFileSync(real)
+  } catch {
+    return new Response('not found', { status: 404 })
+  }
+  const ext = real.slice(real.lastIndexOf('.')).toLowerCase()
+  const mime = FILE_MIME_BY_EXT[ext]
+  if (!mime) return new Response('unsupported type', { status: 403 })
+  // SVG 走 <img> 不执行脚本，但若被误用 <embed>/<iframe> 加载就会 —— 响应头 CSP
+  // 直接禁掉该文档内的脚本，把这条路焊死（对 PDF viewer 无影响，它不是脚本）。
+  const headers: Record<string, string> = { 'Content-Type': mime }
+  if (mime === 'image/svg+xml') headers['Content-Security-Policy'] = "script-src 'none'"
+  // Electron 全局 Response（undici 类型）对 Buffer/Uint8Array 泛型较挑剔，
+  // 复制成独立 ArrayBuffer 再交（一次字节拷贝，64MB 上限内可接受）
+  const body = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+  return new Response(body, { headers })
+}
 
 // 应用名称：macOS Dock / 菜单栏 / Cmd+Tab 等所有系统展示处统一命名为「个人AI助手」。
 // ⚠️ 与渲染层的 `.titlebar`（`components/TitleBar/TitleBar.tsx` 的 APP_NAME）和
@@ -263,7 +370,11 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      // Electron 内置 Chromium PDF viewer 的开关：<embed type="application/pdf">
+      // 能否被插件接管全看它（真机探针验证过，2026-09-23，docs/frontend/21）。
+      // 附件/预览之外不引入任何第三方插件，开启没有额外攻击面。
+      plugins: true
     }
   })
 
@@ -515,6 +626,14 @@ function createWindow(): void {
     return err ? { ok: false, error: err } : { ok: true }
   })
 
+  // ── aigent-file 白名单报备（多格式预览，docs/frontend/21）────────────────
+  // 渲染层收到 file_content 回执且 kind 为 image/pdf（或 office 且转换成功）后，
+  // 把要展示的路径报备进来；协议 handler 只认报备过的路径。fire-and-forget。
+  ipcMain.handle('agent:allowFileStream', (e, payload: { paths?: string[] }) => {
+    if (!isTrustedSender(e) || !Array.isArray(payload?.paths)) return
+    for (const p of payload.paths) allowFileStreamPath(p)
+  })
+
   // ── 会话附件（「添加文件或图片」）──────────────────────────────────
   // 三类入口都收敛成"本地绝对路径列表"，由后端（同机进程）自己读盘：
   // **不经 IPC/WS 传文件字节**（websockets 默认帧上限 1 MiB，base64 图片必然超限）。
@@ -715,6 +834,9 @@ app.whenReady().then(() => {
     if (!real) return new Response('not found', { status: 404 })
     return net.fetch(pathToFileURL(real).toString())
   })
+  // 工作空间文件流协议：图片 / PDF / Office 转出的 PDF 由此兑现。
+  // 只读白名单内（后端 file_read 回执给过、渲染层报备过）的文件，按扩展名定 MIME。
+  protocol.handle(FILE_SCHEME, (req) => handleFileStream(req as unknown as Request))
   sweepClipboardTemp()
   ensureAppIcon() // macOS Dock 图标
   createWindow()

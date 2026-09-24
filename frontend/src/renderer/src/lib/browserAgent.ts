@@ -273,6 +273,11 @@ class BrowserAgentBridge implements AgentApi {
     console.warn('[browserAgent] openInFinder 仅在 Electron 宿主中可用')
     return Promise.resolve({ ok: false, error: 'not supported in browser' })
   }
+  /** 浏览器没有 aigent-file:// 协议（也没有主进程白名单）：no-op。
+   *  多格式预览分支在此环境下本来就不渲染真实媒体。 */
+  allowFileStream(_paths: string[]): Promise<void> {
+    return Promise.resolve()
+  }
 
   // ── 会话附件（浏览器无宿主能力，降级为可用的最小实现）──────────────
   /** 浏览器拿不到本地文件路径（File 对象没有 path，也不允许 JS 读取磁盘）：

@@ -25,7 +25,12 @@ export const DEFAULT_RPANEL: RPanelPersist = { open: false, tabs: [], active: nu
 /** 视图枚举顺序（与后端 `RIGHTPANEL_VIEWS` 同序；`normalizeTabs` 的校验源） */
 export const RPANEL_VIEW_ORDER: RPanelView[] = ['files', 'changes', 'terminal', 'browser']
 
-/** 文件标签的来源：`chat` = 会话内点文件链接（走预览位）；`tree` = 树里点开（走常驻位） */
+/**
+ * 文件标签的来源（落点选择器）。
+ * `tree` = 树里点开 / 会话内点文件链接（均走**常驻位**；2026-09-23 用户拍板
+ * 「会话内点文件 = 独立 tab 页」后，`chat` 来源并入 `tree`，预览位只随手动
+ * 固定语义保留）。
+ */
 export type FileTabOrigin = 'chat' | 'tree'
 
 /** 标签集合 + 当前激活（store 里所有标签操作都按这个形状传进传出） */

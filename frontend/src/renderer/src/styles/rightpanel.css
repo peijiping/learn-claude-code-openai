@@ -571,6 +571,48 @@ body.is-resizing .chat {
   cursor: text;
 }
 
+/* ── 媒体面：图片 / PDF（多格式预览，2026-09-23，docs/frontend/21）─────
+   ⚠️ 这三条是**高度链的最后一环**，缺一条都会塌：
+   `.rpanel-body(flex:1,min-height:0)` → `.rpanel-preview(flex:1,min-height:0)`
+   → 这里（媒体面 flex:1）。中间任何一层不给 `min-height:0`，flex 项就会被内容
+   撑成内容高度、`flex:1` 失效。
+   事故（2026-09-23 二修）：本轮之前这三条被写进了仓库**根目录**下的游离
+   `rightpanel.css`，而 `main.tsx` 引的是 `styles/rightpanel.css` → 规则从未生效：
+   `<embed>` 回落 Chromium 默认盒 150px（用户报"pdf 默认高度太低"），
+   `11250×7508` 的截图按原始像素渲染把面板撑到 7511px 高并溢出滚动
+   （用户报"图片无法正常预览"）。**新增样式后必须确认它在 `main.tsx` 引入的
+   那 7 个文件里** —— 游离的 .css 不会报错，只会静默不生效。 */
+
+/* 图片：深色衬底（与代码面同一 `--color-code-bg`，透明底 PNG 也看得清边界）+
+   **等比缩放到容器内**。居中用子元素 `margin:auto`（不是父级 align/justify-center）
+   —— 父级居中在"内容比容器大"时会把溢出部分推到滚动不可达的负方向，`auto` 边距
+   在溢出时会归零，滚动条两端都够得着。 */
+.rpanel-media-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--color-code-bg);
+}
+.rpanel-media {
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* PDF：交给 Electron 内置 viewer（`webPreferences.plugins` + CSP `object-src` 放行
+   `aigent-file:`，二者缺一即白板 —— 真机探针验证过）。**必须显式撑满**：`<embed>`
+   无尺寸时是 300×150 的替换元素，不是"自动铺满"。 */
+.rpanel-pdf {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: var(--color-code-bg);
+}
+
 /* ── 变更（git）面板 ─────────────────────────────────────────── */
 .rpanel-git {
   flex: 1;

@@ -46,7 +46,7 @@ L0 冻结段不划算。
 与改造前**逐字节一致** —— 这条由结构保证，而不是靠"新增代码恰好没副作用"。
 
 ════════════════════════════════════════════════════════════════════════
-附带的第二个用途：右栏「文件预览」（2026-09-23，docs/frontend/19）
+附带的第二个用途：右栏「文件预览」（2026-09-23，docs/frontend/19 / 21）
 ════════════════════════════════════════════════════════════════════════
 
 `read_workspace_file()` 让前端右栏读工作空间内单个文件的内容。它放在这里而不是
@@ -56,7 +56,10 @@ L0 冻结段不划算。
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
+import subprocess
 from collections import deque
 from pathlib import Path
 
@@ -292,16 +295,108 @@ def list_workspace(workdir, *, limit: int | None = None,
 # 二进制嗅探的头部长度：足够覆盖所有已知容器格式的魔数区，又不值得再大
 _BINARY_SNIFF_BYTES = 8192
 
+# ── 预览类型（前端据此选渲染分支，2026-09-23，docs/frontend/21）─────────────
+# 为什么由**后端**分类、而不是前端看扩展名：沙箱判定与文件读取都已经在这里，
+# 再来一份扩展名表就是第二处真相（与「`resolve_within` 只留一份」同理）；而且
+# 魔数兜底只有后端做得到 —— 它本来就要读头部字节。
+PREVIEW_KIND_TEXT = "text"
+PREVIEW_KIND_IMAGE = "image"
+PREVIEW_KIND_PDF = "pdf"
+PREVIEW_KIND_OFFICE = "office"
+PREVIEW_KIND_BINARY = "binary"
+
+# `.svg` 归图片：`<img>` 加载 SVG **不执行脚本**（`<object>` / `<iframe>` 才会），
+# 所以这条路是安全的，且渲染出来比让用户看源码有价值。
+#
+# ⚠️ `.html` / `.htm` **刻意不在任何清单里**，必须继续走文本预览。把工作空间里的
+# HTML 当网页渲染 = 用户点开一个文件就执行任意同源脚本，CSP 也拦不住（`default-src
+# 'self'` 恰恰放行同源脚本）。这是本模块唯一一处"少支持一种格式换来安全"的取舍。
+IMAGE_PREVIEW_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg", ".avif",
+    ".tif", ".tiff",
+})
+# 能交给 LibreOffice 转 PDF 的格式。`.doc/.xls/.ppt`（老二进制格式）与
+# `.odt/.ods/.odp` 只有在 LibreOffice 在场时才能预览 —— 文本降级路径
+# （`doc_convert.convert_office`）只认 docx/xlsx/pptx 三种。
+OFFICE_PREVIEW_EXTS = frozenset({
+    ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".odt", ".ods", ".odp",
+})
+
+
+def _stream_max_bytes_default() -> int:
+    """图片 / PDF / 转换产物交给前端协议直读时的字节上限（默认 64MB）。
+
+    比文本的 512KB 宽得多，因为**代价根本不同**：文本要进 JSON、进而要进
+    WebSocket 帧（1 MiB 上限，故必须卡死在 512KB）；这三类走 `aigent-file://`
+    直读磁盘、**根本不进帧**，卡上限只为防一个 2GB 的 PDF 把主进程读爆内存。
+    """
+    return 64 * 1024 * 1024
+
+
+def stream_max_bytes() -> int:
+    return _int_env("FILE_STREAM_MAX_BYTES", _stream_max_bytes_default(),
+                    minimum=1024)
+
+
+def office_convert_timeout() -> int:
+    """LibreOffice 单次转换的超时秒数（默认 90）。
+
+    冷启动要 3~8s，大文档更久；但它是**同步阻塞**在 `to_thread` 里的，不设上限
+    会让前端一直转圈，所以宁可超时失败降级为文本。
+    """
+    return _int_env("OFFICE_CONVERT_TIMEOUT", 90, minimum=5)
+
+
+def _sniff_kind(head: bytes) -> str:
+    """魔数兜底 —— 只在**扩展名不认识**时才会被问到。
+
+    为什么不反过来让魔数优先：扩展名撒谎（`.txt` 里装 PDF）远比"扩展名正确却
+    识别不出"罕见；而先信魔数会让一个正常的 `.svg`（XML 开头，不带任何图片魔数）
+    落到文本分支。所以顺序是扩展名优先、魔数兜底，不是二选一。
+    """
+    if head.startswith(b"%PDF-"):
+        return PREVIEW_KIND_PDF
+    if head.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")):
+        return PREVIEW_KIND_IMAGE
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return PREVIEW_KIND_IMAGE
+    return ""
+
+
+def classify_preview_kind(path, head: bytes = b"") -> str:
+    """路径（可带头部字节）→ 预览类型；返回 `""` 表示"按文本/二进制处理"。
+
+    扩展名清单里没有的格式一律回落 `""`，**刻意不猜**：一个 `.xyz` 文件既可能是
+    文本也可能是二进制，交给下面原有的 `\\x00` 嗅探判定比在这里硬编一张更长的
+    表更可靠。
+    """
+    ext = Path(str(path or "")).suffix.lower()
+    if ext in IMAGE_PREVIEW_EXTS:
+        return PREVIEW_KIND_IMAGE
+    if ext == ".pdf":
+        return PREVIEW_KIND_PDF
+    if ext in OFFICE_PREVIEW_EXTS:
+        return PREVIEW_KIND_OFFICE
+    return _sniff_kind(head)
+
 
 def _preview_result(path: str, name: str = "", *, reason: str = "",
                     size: int = 0, mtime: float = 0.0,
                     binary: bool = False, too_large: bool = False,
                     truncated: bool = False, lines: int = 0,
-                    text: str = "", encoding: str = "") -> dict:
+                    text: str = "", encoding: str = "",
+                    kind: str = PREVIEW_KIND_TEXT, pdf_path: str = "",
+                    office_hint: str = "") -> dict:
     """预览回执的统一形状（**所有**分支都从这一个构造函数出去）。
 
     集中构造的理由是前端只需要认一套字段：它不区分"读失败"与"读成功但降级"，
     只按 `reason` / `binary` / `too_large` / `truncated` 四个标志分派五态。
+
+    `kind` 是 2026-09-23 新增的**渲染分支选择器**（docs/frontend/21）：前端不再
+    靠扩展名猜自己该用哪条渲染路径，后端说是什么就是什么。`pdf_path` 只在
+    `kind="office"` 且转换成功时非空（指向 `.aigent/office-preview/` 下的产物，
+    它同样在工作空间内 → 协议读得到）；`office_hint` 是 Office 降级时给用户看的
+    原因（"没装 LibreOffice"这类），成功时为空。
     """
     return {
         "path": path,
@@ -315,6 +410,9 @@ def _preview_result(path: str, name: str = "", *, reason: str = "",
         "lines": int(lines),
         "text": text,
         "reason": reason,
+        "kind": kind or PREVIEW_KIND_TEXT,
+        "pdf_path": pdf_path,
+        "office_hint": office_hint,
     }
 
 
@@ -337,6 +435,223 @@ def _decode_text(data: bytes) -> tuple[str, str]:
     return data.decode("utf-8", errors="replace"), "utf-8(replace)"
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Office 预览：LibreOffice 转 PDF（**只运行时探测，绝不打包**）
+# ══════════════════════════════════════════════════════════════════
+#
+# 为什么是 LibreOffice，而不是前端引一个 JS 渲染库（2026-09-23 决策）：
+# - **程序体积 0 增量**。LibreOffice.app 本机实测 794MB，随包分发会把安装包从
+#   约 100MB 推到约 900MB（9 倍，不可接受）；而纯 JS 三件套（docx / excel / pptx
+#   预览库）gzip 后也要 +0.7~1MB，且保真度明显不如真渲染 —— 公式、图表、分页、
+#   字体都会打折。既然装了 LO 的机器能拿到高保真，就没必要为"没装的机器"再引
+#   一份降级实现。
+# - 所以策略是：**探测到就用，探测不到就降级为文本抽取**（`convert_office`，与
+#   附件通道、工具读文档共用同一段代码，口径一致）。
+#
+# 这与 `doc_convert.py` 里那句"LibreOffice 渲染（~800MB）已被否决"不矛盾：那句
+# 说的是**给模型读内容**（模型要的是文本，渲染无收益还多几百 MB 依赖）；这里是
+# **给人看预览**（要的正是版式与图表）。同一份二进制，两个场景结论相反。
+
+OFFICE_PREVIEW_DIRNAME = ".aigent/office-preview"
+
+# `.gitignore` 内容与 `doc_convert` 里那份同款：本模块是叶子模块（见文件头），
+# 不为一行常量去 import 它。
+_CACHE_GITIGNORE = "*\n"
+
+_OFFICE_DEGRADED_HINT = "未检测到 LibreOffice，已降级为文本抽取：版式、图片与图表未包含"
+
+# 进程内缓存。LibreOffice 探测是若干次 stat，单次很便宜，但用户会连着点十几个
+# 文件；而且"未安装"同样是稳定结论（不会装着装着就装上了）。
+_LIBREOFFICE_CACHE: dict[str, str] = {}
+
+
+def _libreoffice_candidates() -> list[str]:
+    """候选路径，按优先级：平台默认安装位置 > PATH。"""
+    listed = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",              # macOS
+        "/usr/bin/soffice", "/usr/local/bin/soffice",
+        "/opt/libreoffice/program/soffice",                                   # Linux
+        r"C:\Program Files\LibreOffice\program\soffice.exe",                  # Windows
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+    for name in ("soffice", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            listed.append(found)
+    return listed
+
+
+def libreoffice_binary() -> str:
+    """可用的 LibreOffice 可执行文件路径；没装返回 `""`。
+
+    非标准安装位置的唯一出口是环境变量 `LIBREOFFICE_PATH`（显式指定优先于一切
+    探测）—— 没有它，绿色版 / Homebrew 装的 LO 就只能靠运气被 PATH 找到。
+    """
+    if "bin" in _LIBREOFFICE_CACHE:
+        return _LIBREOFFICE_CACHE["bin"]
+    result = ""
+    explicit = str(os.environ.get("LIBREOFFICE_PATH") or "").strip()
+    if explicit:
+        try:
+            if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+                result = explicit
+        except OSError:
+            result = ""
+    if not result:
+        for candidate in _libreoffice_candidates():
+            try:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    result = candidate
+                    break
+            except OSError:
+                continue
+    _LIBREOFFICE_CACHE["bin"] = result
+    if result:
+        log.info("Office 预览：检测到 LibreOffice %s", result)
+    else:
+        log.info("Office 预览：未检测到 LibreOffice，Office 文件将降级为文本抽取")
+    return result
+
+
+def office_pdf_cache(workdir, src) -> Path | None:
+    """转换产物的落盘目录：`<workdir>/.aigent/office-preview/<key>/`。
+
+    缓存键含 `mtime_ns` 与 `size`（与 `doc_convert._cache_key` 同一取舍）：源文件
+    一改键就变，旧目录再无人引用 → **不需要精确 GC**，靠 TTL 清剪顺手做即可。
+
+    放在工作空间**之内**不是图方便：`aigent-file://` 协议只放行后端给过的路径，
+    而产物必须被那个协议读到；落到 OS 临时目录就得再开一条协议白名单。代价是
+    污染工作空间，靠「`.aigent` 已在 `DEFAULT_IGNORE_DIRS` 里 + 目录内 .gitignore
+    + TTL 清剪」收窄 —— 与 `doc_convert.tool_cache_dir` 完全同款，不是新例外。
+    """
+    try:
+        resolved = Path(src).resolve()
+        st = resolved.stat()
+        base = Path(workdir).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    raw = "|".join((str(resolved), str(st.st_mtime_ns), str(st.st_size)))
+    key = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+    return base / OFFICE_PREVIEW_DIRNAME / key
+
+
+def _ensure_cache_gitignore(cache_root: Path) -> None:
+    """保证 `<workdir>/.aigent/.gitignore` 存在（内容 `*`）。
+
+    不写的话，用户的工作空间若是 git 仓库，点开一个 Word 就会在 `git status` 里
+    冒出一串未跟踪文件；去改用户自己的 `.gitignore` 更越界。写失败一律吞掉 ——
+    预览能不能用远重于这份卫生。
+    """
+    try:
+        agent_dir = cache_root.parent
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        target = agent_dir / ".gitignore"
+        if not target.exists():
+            target.write_text(_CACHE_GITIGNORE, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 - 写不了就算了
+        log.debug("写 .aigent/.gitignore 失败: %s", exc)
+
+
+def _stderr_tail(raw, limit: int = 160) -> str:
+    """把转换进程的 stderr 压成一行人话。
+
+    取**最后一行非空**而不是第一行：LibreOffice 的 stderr 开头全是
+    `javaldx: Could not find a Java runtime` 这类与本次失败无关的噪音，真正原因
+    （"source file could not be loaded"）总在末尾。
+    """
+    try:
+        text = (raw or b"").decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - 解码失败不值得影响预览
+        return ""
+    for line in reversed([ln.strip() for ln in text.splitlines()]):
+        if line:
+            return line[:limit]
+    return ""
+
+
+def convert_office_to_pdf(workdir, src) -> tuple[str, str]:
+    """Office → PDF，返回 `(pdf 绝对路径, 失败原因)`；成功时原因为空串。
+
+    **绝不抛异常** —— 与 `read_workspace_file` 同契约：它在 `asyncio.to_thread`
+    里跑，异常会让前端一直转圈；而且"没装 LibreOffice"是**常规降级**、不是错误。
+
+    独立 profile（`-env:UserInstallation=`）是必须的，不是洁癖：LibreOffice 默认
+    profile 带锁文件，用户自己正开着 Writer 时再被我们拉起第二个实例，会失败或
+    静默卡住 —— 表现为"点开 Word 一直转圈"。
+    """
+    binary = libreoffice_binary()
+    if not binary:
+        return "", _OFFICE_DEGRADED_HINT
+
+    source = Path(src)
+    cache = office_pdf_cache(workdir, source)
+    if cache is None:
+        return "", "无法定位转换产物的缓存目录"
+
+    target = cache / f"{source.stem}.pdf"
+    try:
+        if target.is_file() and target.stat().st_size > 0:
+            return str(target), ""      # 命中缓存：秒开
+    except OSError:
+        pass
+
+    _ensure_cache_gitignore(cache)
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return "", f"无法创建转换缓存目录：{exc}"
+
+    profile = cache / "lo-profile"
+    cmd = [
+        binary, "--headless", "--norestore", "--nolockcheck", "--nodefault",
+        f"-env:UserInstallation={profile.as_uri()}",
+        "--convert-to", "pdf", "--outdir", str(cache), str(source),
+    ]
+    timeout = office_convert_timeout()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.warning("LibreOffice 转换超时(%ss): %s", timeout, source)
+        return "", f"转换超时（超过 {timeout}s），文件可能过大"
+    except OSError as exc:
+        log.warning("LibreOffice 启动失败: %s: %s", type(exc).__name__, exc)
+        return "", f"无法启动转换进程：{exc}"
+
+    try:
+        produced = target.is_file() and target.stat().st_size > 0
+    except OSError:
+        produced = False
+    if not produced:
+        detail = _stderr_tail(proc.stderr)
+        log.warning("LibreOffice 转换未产出文件 (rc=%s): %s %s",
+                    proc.returncode, source, detail)
+        return "", f"转换失败{('：' + detail) if detail else ''}"
+    log.info("Office 预览转 PDF 成功: %s → %s", source.name, target.name)
+    return str(target), ""
+
+
+def _office_text_fallback(path: str, cap_chars: int) -> str:
+    """LibreOffice 缺位时的降级：抽正文与表格结构（无版式）。抽不出来返回 `""`。
+
+    **局部 import `doc_convert`**，不放文件头：本模块是叶子模块，顶层 import 会
+    给每次 `import refs` 都挂上 doc_convert 的导入代价，而这条路径只在真的预览
+    一个没装 LO 的 Office 文件时才走到。`doc_convert` 不在文件头禁止的清单
+    （attachments / agent_full_v2 / session_manage）里，也不构成循环依赖。
+    """
+    ext = Path(path).suffix.lower()
+    try:
+        from doc_convert import convert_office
+    except Exception as exc:  # noqa: BLE001 - 缺库同样只是降级，不该打死预览
+        log.warning("加载 doc_convert 失败: %s: %s", type(exc).__name__, exc)
+        return ""
+    try:
+        out = convert_office(path, ext, limit=max(1000, int(cap_chars)))
+    except Exception as exc:  # noqa: BLE001 - 抽取失败同样只是降级
+        log.warning("Office 文本抽取失败 %s: %s: %s", path, type(exc).__name__, exc)
+        return ""
+    return str(out.get("markdown") or "")
+
+
 def read_workspace_file(workdir, raw_path, *, max_bytes: int | None = None,
                         max_lines: int | None = None) -> dict:
     """读取工作空间内单个文件，供右栏预览（**绝不抛异常**）。
@@ -344,10 +659,20 @@ def read_workspace_file(workdir, raw_path, *, max_bytes: int | None = None,
     沙箱走 `resolve_within()`，与引用、`safe_path` 同一判定口径 —— 越界、软链
     链出、路径非法一律在第一步被挡下，不存在第二条判定路径。
 
-    降级层次（前端据此渲染两个**不同**的状态，见 docs/frontend/19 §5.7）：
+    返回的 `kind` 决定前端用哪条渲染分支（2026-09-23 多格式预览，docs/frontend/21）：
+
+    | `kind` | 谁来渲染 | `text` |
+    |---|---|---|
+    | `image` / `pdf` | 主进程 `aigent-file://` 直读磁盘，前端 `<img>` / `<embed>` | 恒空 |
+    | `office` | 转出的 PDF 走同一条（`pdf_path`）；转不动则文本抽取 + `office_hint` | 降级时有 |
+    | `text` | 前端代码视图（行号 + 等宽） | 有 |
+    | `binary` | 平级空态，不是错误 | 恒空 |
+
+    降级层次（前端据此渲染**不同**的状态，见 docs/frontend/19 §5.7）：
     - `reason` 非空 → 读失败（越界 / 不存在 / 是目录 / 无权限），`text` 为空；
     - `binary` → 二进制，`text` 为空（不是错误，是"这类文件本来就不该这样看"）；
-    - `too_large` → 超过字节上限，**一点内容都没读**，`text` 为空；
+    - `too_large` → 超过对应上限（文本 512KB / 图片与 PDF 与产物 64MB），
+      **一点内容都没读**，`text` 为空；
     - `truncated` → 读到了但只保留了前 `max_lines` 行，`text` 非空。
 
     本函数在 `asyncio.to_thread` 里跑，异常会让前端一直转圈 —— 所以内部逐层
@@ -377,14 +702,47 @@ def read_workspace_file(workdir, raw_path, *, max_bytes: int | None = None,
         return _preview_result(path_str, name, reason="不是普通文件，无法预览")
 
     base = dict(path=path_str, name=name, size=int(st.st_size), mtime=float(st.st_mtime))
+
+    # ── 类型分派（扩展名优先，魔数兜底）─────────────────────────────────
+    # 先只看扩展名；分不出来才读头部 —— 文本/二进制嗅探要的也是同一份头部字节，
+    # 所以**最多只读一次**。一个 `.xyz` 文件里装着 PNG 也会在这里被纠正过来。
+    kind = classify_preview_kind(path_str)
+    head = b""
+    if not kind:
+        try:
+            with open(path_str, "rb") as fh:
+                head = fh.read(_BINARY_SNIFF_BYTES)
+        except OSError as exc:
+            log.warning("文件预览读取失败 %s: %s", path_str, exc)
+            return _preview_result(**base, reason="读取失败")
+        kind = _sniff_kind(head)
+
+    # ── 图片 / PDF：**一个字节的正文都不读** ─────────────────────────────
+    # 内容由主进程的 `aigent-file://` 协议直读磁盘（路径在上面已经过完沙箱判定）。
+    # 不走这里的原因与附件缩略图同款：图片/PDF 动辄几 MB，base64 进 JSON 会撑爆
+    # WebSocket 的 1 MiB 帧上限 —— 那条路从设计上就走不通，不是性能取舍。
+    if kind in (PREVIEW_KIND_IMAGE, PREVIEW_KIND_PDF):
+        if st.st_size > stream_max_bytes():
+            return _preview_result(**base, kind=kind, too_large=True)
+        return _preview_result(**base, kind=kind)
+
+    # ── Office：先转 PDF（LibreOffice 在就用），转不动才降级为文本 ────────
+    if kind == PREVIEW_KIND_OFFICE:
+        pdf_path, why = convert_office_to_pdf(workdir, resolved)
+        if pdf_path:
+            return _preview_result(**base, kind=PREVIEW_KIND_OFFICE, pdf_path=pdf_path)
+        text = _office_text_fallback(path_str, cap_bytes)
+        return _preview_result(**base, kind=PREVIEW_KIND_OFFICE, text=text,
+                               encoding="utf-8" if text else "", office_hint=why)
+
+    # ── 文本 / 二进制（原有逻辑，只是补上 kind）──────────────────────────
     if st.st_size > cap_bytes:
         return _preview_result(**base, too_large=True)
+    if b"\x00" in head:
+        return _preview_result(**base, kind=PREVIEW_KIND_BINARY, binary=True)
 
     try:
         with open(path_str, "rb") as fh:
-            head = fh.read(_BINARY_SNIFF_BYTES)
-            if b"\x00" in head:
-                return _preview_result(**base, binary=True)
             # 头部之外的部分在确认不是二进制之后再读，避免为二进制文件白白多读一遍
             rest = fh.read() if st.st_size > len(head) else b""
             data = head + rest

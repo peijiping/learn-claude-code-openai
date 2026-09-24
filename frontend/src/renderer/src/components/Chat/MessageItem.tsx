@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
 import { renderRefText } from '@lib/refTokens'
+import { buildPathIndex, localTargetOf, parseRefUrl, remarkPathLinks, safeUrlTransform, type PathIndex } from '@lib/pathLinks'
 import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
 import {
   attachmentUrl,
@@ -180,21 +181,96 @@ function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
 
 /** 正文段（Markdown 渲染）。提问块把正文切成前后两段时各渲染一段，
  *  样式与改造前的单块完全一致（同一个 `.markdown-body` 容器 + 同一条表格包裹规则）。
- *  `cursor` = 流式光标，只在**最后一段**上出现，位置与改造前相同（正文末尾）。 */
-function MarkdownBody({ text, cursor }: { text: string; cursor?: boolean }): JSX.Element {
+ *  `cursor` = 流式光标，只在**最后一段**上出现，位置与改造前相同（正文末尾）。
+ *
+ *  `pathIndex`（可选）= 工作空间路径白名单（`lib/pathLinks.ts`）：助手正文里的
+ *  裸路径文本 / `file://` 链接命中即渲染成可点链接（多格式预览，2026-09-23，
+ *  docs/frontend/21）。用户消息不传（正文走 RefText 胶囊，不走 markdown）。
+ *  `onOpenPath` = 点击后的动作（复用 openRef：文件 → 右栏常驻 tab，目录 → 定位）。 */
+function MarkdownBody({
+  text,
+  cursor,
+  pathIndex,
+  onOpenPath
+}: {
+  text: string
+  cursor?: boolean
+  pathIndex?: PathIndex
+  onOpenPath?: (abs: string, isDir: boolean) => void
+}): JSX.Element {
+  // 插件数组按 index 是否为空构建：空树（未加载/不可引用）零开销直通
+  const remarkPlugins = useMemo(() => {
+    if (!pathIndex || pathIndex.size === 0) return [remarkGfm]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- remark 的 [plugin, ...args] 元组形态
+    return [remarkGfm, [remarkPathLinks, pathIndex] as any]
+  }, [pathIndex])
   return (
     <div className="markdown-body">
       {text ? (
         // 表格外包一层横向滚动框（.table-scroll）：列多时表格自身横向滚动，
         // 不把整块对话区撑宽（外层 .msgscroll 为 overflow-x: hidden）。
+        // urlTransform 必须自定义：默认清洗会把内部链接 aigent-ref: 清成空串；
+        // safeUrlTransform 镜像默认白名单、只多放行内部协议（javascript:/data: 仍拦）。
         <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
+          remarkPlugins={remarkPlugins}
+          urlTransform={safeUrlTransform}
           components={{
             table: ({ children }) => (
               <div className="table-scroll">
                 <table>{children}</table>
               </div>
-            )
+            ),
+            a: ({ href, children }) => {
+              const url = String(href ?? '')
+              const ref = url ? parseRefUrl(url) : null
+              if (ref) {
+                return (
+                  <button
+                    type="button"
+                    className="md-path-link"
+                    title={ref.abs}
+                    onClick={() => onOpenPath?.(ref.abs, ref.isDir)}
+                    disabled={!onOpenPath}
+                  >
+                    {children}
+                  </button>
+                )
+              }
+              // ── 本地路径兜底（2026-09-23 事故修复）─────────────────────
+              // `file://` 链接只在"逐字命中已加载的文件列表"时被 remark 插件改写成
+              // 内部链接；**文件列表没加载**（用户从没开过右栏「文件」视图 —— 最常见的
+              // 情形）时它是裸 `file:`，会被 urlTransform 清成空串 → `<a href="">`
+              // 点一下就"导航到当前页"= 整页重载 = 会话态全丢、回到新建任务态。
+              // 所以这里把本地路径一律转成按钮送右栏；路径不在工作空间内时由后端
+              // 沙箱拒绝并在预览区说明原因 —— 看得懂的失败 ≫ 整页重载。
+              const local = localTargetOf(url)
+              if (local) {
+                return (
+                  <button
+                    type="button"
+                    className="md-path-link md-path-link-unknown"
+                    title={local.path}
+                    onClick={() => onOpenPath?.(local.path, local.isDir)}
+                    disabled={!onOpenPath}
+                  >
+                    {children}
+                  </button>
+                )
+              }
+              // 外链：`target=_blank` 交给主进程 `setWindowOpenHandler` → shell.openExternal。
+              // **绝不能在本窗口导航** —— 渲染层一导航，整个应用就没了。
+              if (/^(https?:)?\/\//i.test(url) || /^mailto:/i.test(url)) {
+                return (
+                  <a href={url} target="_blank" rel="noreferrer noopener">
+                    {children}
+                  </a>
+                )
+              }
+              // 其余（`javascript:` / `data:` 已被 urlTransform 清成空串、纯锚点）：
+              // 锚点保留（只改 hash，不离开应用），其它不渲染成可导航元素。
+              if (url.startsWith('#')) return <a href={url}>{children}</a>
+              return <span>{children}</span>
+            }
           }}
         >
           {text}
@@ -223,10 +299,10 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
   })
 
   /** 会话内点引用（正文里的 `@文件` 胶囊 / RefBar 兜底行）该落到哪里
-   *  （2026-09-23，docs/frontend/19 §6 第 20 条）：
-   *  - **文件** → 右栏的**预览位**（全场唯一、再点别的文件就地顶替）；
-   *  - **目录** → 仍然去系统文件管理器。右栏没有"目录预览"这回事，
-   *    开一枚只会显示"这是一个目录，无法预览"的标签是纯噪音。
+   *  （2026-09-23 改版，docs/frontend/19 §6 / 21 篇）：
+   *  - **文件** → 右栏**常驻位**（独立 tab 页，互不顶替，用户拍板的新语义）；
+   *  - **目录** → 定位右栏「文件」视图（标签没开就自动添加并激活），
+   *    并在树里展开到该目录 —— 不再弹系统文件管理器；
    *  - **附件**不在此列：附件是会话副本、不在工作区树里，保持 `openInFinder` 不变。
    *
    *  这里读 `activeSession` 而不是走 props：MessageItem 只会渲染**当前会话**的消息
@@ -234,13 +310,22 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
    *  当前会话却是 B"的中间态。 */
   const activeSession = useAgentStore((s) => s.activeSession)
   const revealFile = useRightPanelStore((s) => s.revealFile)
+  const revealDir = useRightPanelStore((s) => s.revealDir)
   const openRef = (path: string, isDir: boolean): void => {
-    if (isDir || !activeSession) {
+    if (!activeSession) {
       void window.agent.openInFinder(path)
       return
     }
-    revealFile(activeSession, path)
+    if (isDir) revealDir(activeSession, path)
+    else revealFile(activeSession, path)
   }
+
+  /** 工作空间路径白名单（裸路径识别的数据源）：与右栏树同源（refs_list 回执）。
+   *  selector 只取 tree 引用（稳定），索引构建在 useMemo 里，每条消息仅建一次。 */
+  const rpTree = useRightPanelStore((s) =>
+    activeSession ? s.liveBySession[activeSession]?.tree : undefined
+  )
+  const pathIndex = useMemo(() => buildPathIndex(rpTree), [rpTree])
 
   /** 本条消息上需要锚定的在途审批卡片（2026-09-22 权限管控）：按 toolCallId
    *  匹配到本消息的工具行。主工具条匹配的渲染在工具条后；子智能体工具匹配的
@@ -442,6 +527,8 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
                 key={`md-${i}`}
                 text={p.text}
                 cursor={msg.streaming && i === parts.length - 1}
+                pathIndex={pathIndex}
+                onOpenPath={openRef}
               />
             )
           )}

@@ -2053,3 +2053,31 @@
   flex: none;
 }
 
+
+/* ── 正文裸路径 / file:// 链接命中后的内部跳转（2026-09-23，docs/frontend/21）──
+   视觉 = 与 .markdown-body a 同色（--color-accent），但它是 button：
+   下划虚线区分"普通外链"，悬停出下划线提示可点 */
+.markdown-body .md-path-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-accent);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.markdown-body .md-path-link:hover {
+  text-decoration: underline;
+}
+/* 兜底形态：路径**没命中**已加载的文件列表（工作空间文件列表没加载过、或路径在
+   工作空间之外）。仍然可点（右栏真的去读，读不到由后端给原因），但下划线改用
+   **虚线**，与"已确认在工作空间内"的点线区分开 —— 别让人以为必然能打开。
+   （2026-09-23：此前这种链接会退化成 `<a href="">`，点一下整页重载回到新建任务态。） */
+.markdown-body .md-path-link-unknown {
+  text-decoration-style: dashed;
+}
+.markdown-body .md-path-link:disabled {
+  color: var(--color-text-secondary);
+  cursor: default;
+}

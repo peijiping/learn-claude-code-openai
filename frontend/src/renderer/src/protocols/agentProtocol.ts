@@ -470,9 +470,10 @@ export const RPANEL_AVAILABLE_VIEWS: RPanelView[] = ['files', 'changes']
 /** 标签：视图标签 或 文件标签（两类**混在同一条标签栏里**）。
  *
  *  文件标签有两种身份：
- *  - `pinned: false` = **预览位**（会话内点文件链接落这里，全场唯一，再点别的
- *    文件就地顶替）；
- *  - `pinned: true`  = **常驻位**（树里点开，永不被顶替）。
+ *  - `pinned: false` = **预览位**（全场唯一；2026-09-23 起会话内点文件链接改落
+ *    常驻位，预览位仅随「双击固定」的逆操作语义保留，新数据不该再产生）；
+ *  - `pinned: true`  = **常驻位**（树里点开 / 会话内点文件链接，独立 tab、互不
+ *    顶替，上限 12 枚）。
  *  `name` 是显示用的文件名（basename），与输入区 `@` 胶囊同口径。 */
 export type RPanelTab =
   | { kind: 'view'; view: RPanelView }
@@ -524,6 +525,18 @@ export interface FileContentPayload {
   lines: number
   text: string
   reason: string
+  /** ── 多格式预览（2026-09-23，docs/frontend/21）────────────────────────
+   *  `kind` 是**渲染分支选择器**，由后端按扩展名+魔数分派（前端不再猜）：
+   *  - `image` / `pdf` → `aigent-file://` 直读磁盘渲染（`text` 恒空）；
+   *  - `office` → 有 `pdf_path` 就渲染转出的 PDF，否则 `text` 是文本抽取降级；
+   *  - `text` / `binary` → 代码视图 / 平级空态（原有行为）。
+   *  旧后端（无此字段）的回执按 `text` 处理，故给缺省值而不是可选字段。 */
+  kind: 'text' | 'image' | 'pdf' | 'office' | 'binary'
+  /** 仅 `kind === 'office'` 且 LibreOffice 转换成功时非空：转出 PDF 的绝对路径
+   *  （在工作空间 `.aigent/office-preview/` 下，aigent-file 协议读得到）。 */
+  pdf_path: string
+  /** Office 降级给用户看的原因（"未检测到 LibreOffice…"）；成功时为空串。 */
+  office_hint: string
 }
 
 /** 变更面板里的一行文件（`path` 是**仓库相对路径**）。 */

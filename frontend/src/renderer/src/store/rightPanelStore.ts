@@ -21,6 +21,7 @@ import {
   type FileTabOrigin
 } from '@lib/rpanelTabs'
 import { ancestorDirs } from '@lib/fileTree'
+import { reportFileStream } from '@lib/fileStream'
 
 /**
  * 右侧面板状态（2026-09-23，docs/frontend/19）。
@@ -239,8 +240,11 @@ export interface RightPanelState {
   // ── 文件标签 ───────────────────────────────────────────────────
   /** 打开/激活一个文件标签（origin 决定落预览位还是常驻位） */
   openFileTab: (sid: string, file: { path: string; name?: string }, origin: FileTabOrigin) => void
-  /** 会话内点文件链接的完整链路：开右栏 + 落预览位 + 展开祖先链 + 读内容 */
+  /** 会话内点文件链接的完整链路：开右栏 + 落**常驻位**（独立 tab，互不顶替）
+   *  + 展开祖先链 + 读内容（origin 语义变更见实现内注释，2026-09-23） */
   revealFile: (sid: string, path: string, name?: string) => void
+  /** 会话内点目录链接：定位右栏「文件」视图（没开就自动添加）+ 树中展开到该目录 */
+  revealDir: (sid: string, path: string) => void
 
   // ── 数据取数 ───────────────────────────────────────────────────
   ensureTree: (sid: string, force?: boolean) => void
@@ -438,7 +442,21 @@ export const useRightPanelStore = create<RightPanelState>((set, get) => {
 
     revealFile: (sid, path, name) => {
       if (!sid || !path) return
-      get().openFileTab(sid, { path, name }, 'chat')
+      // 会话内点文件链接（正文胶囊 / 裸路径链接）→ **落常驻位**（origin='tree'）。
+      // 2026-09-23 用户拍板改为"独立 tab 页"：每点开一个文件就在右栏新增一枚
+      // 互不顶替的常驻标签（上限 12 枚，超出淘汰最旧），可多个文件对照看。
+      // 旧语义（落全场唯一的预览位、再点就地顶替）已被推翻，勿回退。
+      get().openFileTab(sid, { path, name }, 'tree')
+      get().expandTo(sid, path)
+    },
+
+    /** 会话内点**目录**链接 → 定位右栏「文件」视图：标签没开就自动添加并激活，
+     *  再在树里展开到该目录（祖先链全展开）。替代原来的"丢给系统文件管理器"。
+     *  树未加载时 `expandTo` 自会挂 pendingReveal，回执到达后补展开。 */
+    revealDir: (sid, path) => {
+      if (!sid || !path) return
+      get().openViewTab(sid, 'files')
+      get().ensureTree(sid)
       get().expandTo(sid, path)
     },
 
@@ -559,6 +577,13 @@ export const useRightPanelStore = create<RightPanelState>((set, get) => {
     applyFileContent: (sid, p, error) => {
       const live = get().liveBySession[sid]
       if (!live) return
+      // 多格式预览（docs/frontend/21）：图片 / PDF（或 Office 转出的 PDF）要先
+      // 向主进程报备，aigent-file:// 协议才放行。收口在这一个回执入口 ——
+      // ensurePreview 的所有触发方（树、标签激活、会话内链接）都会经过这里。
+      if (p && !p.reason) {
+        if (p.kind === 'image' || p.kind === 'pdf') reportFileStream([p.path])
+        else if (p.kind === 'office' && p.pdf_path) reportFileStream([p.pdf_path])
+      }
       mutateLive(sid, (l) => {
         // 自校验：晚到的回执不得覆盖新选中（主进程 pending 表按 kind 配对、无 id）
         if (p && l.previewPath && p.path !== l.previewPath) return l

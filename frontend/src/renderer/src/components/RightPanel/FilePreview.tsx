@@ -1,7 +1,8 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Icon } from '@components/common/Icon'
 import { showToast } from '@store/agentStore'
 import { EMPTY_LIVE, useRightPanelStore } from '@store/rightPanelStore'
+import { fileStreamUrl, reportFileStream } from '@lib/fileStream'
 import RPanelState from './RPanelState'
 
 interface FilePreviewProps {
@@ -27,16 +28,31 @@ function relativize(workdir: string, path: string): string {
   return path
 }
 
+/** PDF / Office 转出 PDF 的 `<embed>`。插件渲染交给 Electron 内置
+ *  Chromium PDF viewer（webPreferences.plugins: true + CSP object-src
+ *  放行 aigent-file:，二者缺一即白板 —— 真机探针验证过，docs/frontend/21）。 */
+function PdfEmbed({ src, nonce }: { src: string; nonce: number }): JSX.Element {
+  // nonce 只为了在重试时强制重建元素（同 src 的 embed 不会因为重渲染重载）
+  return <embed key={nonce} className="rpanel-pdf" src={src} type="application/pdf" />
+}
+
 /**
- * 文件标签的正文：单个文件预览（19 篇 §5.7）。
+ * 文件标签的正文：单个文件预览（19 篇 §5.7 / 21 篇）。
  *
  * **只显示文件、全宽** —— 这是"单栏混放"标签模型的既定取舍：激活文件标签时
  * 树不在旁边。缓解手段是预览头常驻一枚「浏览」按钮（一键回树），
  * 而不是把树塞回来（那会让标签模型失去意义）。
  *
- * 五种状态 + 一个补充，判定优先级固定
- * `不可用 > error > loading > empty > content`（与 `RefPicker` 同口径）：
- * 加载中 / 读失败 / 文件已不存在 / 二进制 / 超限（整屏替换） / 被截断（横幅 + 正文）。
+ * 状态判定优先级固定（与 `RefPicker` 同口径）：
+ * `传输错误 > loading > reason(读失败) > too_large(整屏替换) > binary(空态)
+ * > 按后端 kind 分派渲染分支 > 文本（可能带截断横幅）`。
+ *
+ * `kind` 由**后端**分派（扩展名 + 魔数，`refs.classify_preview_kind`）：
+ * - `image` → `<img>` 走 `aigent-file://`（CSP img-src 已放行）；
+ * - `pdf`   → `<embed type="application/pdf">` 交给内置 PDF viewer；
+ * - `office`→ 有 `pdf_path` 渲染转出的 PDF（LibreOffice 在场），否则 `text`
+ *   是文本抽取降级（顶部琥珀横幅给 `office_hint`，版式丢失如实说明）；
+ * - `text` / `binary` → 代码视图 / 平级空态（原有行为）。
  *
  * ⚠️ **超限**与**截断**必须分开表达：超限是"一点内容都没读"（整屏替换成说明），
  * 截断是"读到了但尾部砍了"（正文照常渲染 + 顶部琥珀条）。混起来会让用户
@@ -50,6 +66,14 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
   const { preview, previewLoading, previewError } = live
 
   const workdir = live.tree?.workdir ?? ''
+
+  // 媒体分支的加载失败与重试：aigent-file 协议 403/404 时 <img> 有 error 事件、
+  // <embed> 没有 —— 统一靠"重试"按钮重新报备 + nonce 重建元素兜底。
+  const [mediaFailed, setMediaFailed] = useState(false)
+  const [mediaNonce, setMediaNonce] = useState(0)
+  useEffect(() => {
+    setMediaFailed(false)
+  }, [path])
 
   // 自校验：主进程的请求配对**按 kind FIFO、没有 request id**（19 篇 §4.4），
   // 慢回执可能属于上一个被点开的文件 —— 路径对不上就当它没到（进而在下面显示"读取中"）。
@@ -156,22 +180,8 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
     return errorState(missing ? '文件已不存在' : '无法读取该文件', data.reason, missing)
   }
 
-  // 4) 二进制：**平级空态**，不是错误（图片 / 压缩包打不开是预期行为）
-  if (data.binary) {
-    return (
-      <div className="rpanel-preview">
-        {head}
-        <RPanelState
-          kind="empty"
-          icon="fileText"
-          title="此文件为二进制，无法预览"
-          sub={data.size ? `大小 ${formatBytes(data.size)}` : undefined}
-        />
-      </div>
-    )
-  }
-
-  // 5) 超限：**一点内容都没读** → 整屏替换（琥珀，降级不是错误）
+  // 4) 超限：**一点内容都没读** → 整屏替换（琥珀，降级不是错误）。
+  //    图片 / PDF 的上限是流式 64MB（与后端同值），文本仍是 512KB。
   if (data.too_large) {
     return (
       <div className="rpanel-preview">
@@ -192,7 +202,105 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
     )
   }
 
-  // 6) 正常内容（可能带"被截断"横幅）
+  // 5) 二进制：**平级空态**，不是错误（压缩包等打不开是预期行为）
+  if (data.binary || data.kind === 'binary') {
+    return (
+      <div className="rpanel-preview">
+        {head}
+        <RPanelState
+          kind="empty"
+          icon="fileText"
+          title="此文件为二进制，无法预览"
+          sub={data.size ? `大小 ${formatBytes(data.size)}` : undefined}
+        />
+      </div>
+    )
+  }
+
+  // 6) 图片：`<img>` 直读磁盘。加载失败（白名单未报备上 / 文件刚被删）→ 可重试。
+  if (data.kind === 'image' && !mediaFailed) {
+    return (
+      <div className="rpanel-preview">
+        {head}
+        <div className="rpanel-media-wrap">
+          <img
+            key={mediaNonce}
+            className="rpanel-media"
+            src={fileStreamUrl(data.path)}
+            alt={data.name || name}
+            onError={() => setMediaFailed(true)}
+          />
+        </div>
+      </div>
+    )
+  }
+
+  // 7) PDF（含 Office 转出成功的）：交给内置 PDF viewer
+  const pdfSrc = data.kind === 'pdf' ? data.path : data.kind === 'office' ? data.pdf_path : ''
+  if (pdfSrc && !mediaFailed) {
+    return (
+      <div className="rpanel-preview">
+        {head}
+        <PdfEmbed src={fileStreamUrl(pdfSrc)} nonce={mediaNonce} />
+      </div>
+    )
+  }
+
+  // 8) Office 文本降级（没装 LibreOffice / 转换失败）：顶部横幅如实说明，
+  //    正文照旧走代码视图。抽不出来（text 为空）→ 平级空态。
+  if (data.kind === 'office' || mediaFailed) {
+    const hint = data.kind === 'office' ? data.office_hint : ''
+    if (data.text) {
+      return (
+        <div className="rpanel-preview">
+          {head}
+          {hint ? (
+            <div className="rpanel-notice">
+              <Icon name="clock" size={13} />
+              <span className="rpanel-notice__text">{hint}</span>
+            </div>
+          ) : null}
+          <div className="rpanel-code">
+            <div className="rpanel-code-gutter" aria-hidden="true">
+              {lines.map((_, i) => `${i + 1}`).join('\n')}
+            </div>
+            <pre className="rpanel-code-pre">{data.text}</pre>
+          </div>
+        </div>
+      )
+    }
+    return (
+      <div className="rpanel-preview">
+        {head}
+        <RPanelState
+          kind={mediaFailed ? 'error' : 'empty'}
+          icon="fileText"
+          title={mediaFailed ? '文件内容加载失败' : '无法预览此文件'}
+          sub={
+            mediaFailed
+              ? '文件可能已被移动或删除'
+              : hint || (data.size ? `大小 ${formatBytes(data.size)}` : undefined)
+          }
+          action={
+            <button
+              className="rpanel-btn"
+              onClick={() => {
+                // 重新报备（白名单可能因 200 上限被挤出）再重载
+                reportFileStream([data.path, data.pdf_path || undefined])
+                setMediaFailed(false)
+                setMediaNonce((n) => n + 1)
+                ensurePreview(sid, path)
+              }}
+            >
+              重试
+            </button>
+          }
+        />
+      </div>
+    )
+  }
+
+  // 9) 正常文本（可能带"被截断"横幅）
   return (
     <div className="rpanel-preview">
       {head}
