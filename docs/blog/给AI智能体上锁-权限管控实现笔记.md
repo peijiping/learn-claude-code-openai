@@ -256,7 +256,7 @@ if (pattern_matches(pattern, seg)
 | 阻塞点 | PreToolUse 钩子内（turn 工作线程），用 `asyncio.to_thread` 派发，阻塞工作线程不卡事件循环 |
 | 等待循环 | `done.wait(0.2s)` 切片轮询 `stop_event` + 超时检查；**等待期绝不持锁** |
 | 唤醒 | `resolve()` 锁内改状态、**锁外** `done.set()` + 广播 |
-| 独占性 | 同会话至多一个在途审批（agent_loop 顺序执行工具，天然排队）；撞车则 fail-closed 立即拒绝 |
+| 并发性 | 同会话**允许多个在途审批**（2026-09-25 修正，原为"至多一个 + 撞车 fail-closed"）：后台子智能体在各自 daemon 线程里进 PreToolUse，并发是正常情形。各请求按 `request_id` 独立阻塞/结算，前端按 `tool_call_id` 各自锚定卡片 |
 | 超时 | 默认 300s（可配 60–3600），到期自结算 `timeout` → 自动拒绝 |
 | 幂等 | 迟到 / 重复 / 非法 decision 一律丢弃，前端重复点击无副作用 |
 
@@ -397,7 +397,7 @@ else:
 - `APPROVE_*`：gate ↔ broker 的接口词（`allow_once` / `allow_session` / `deny`）
 - `OUTCOME_*`：事件与落盘的结局词（`allowed_once` / `allowed_session` / `denied` / `timeout` / `stopped`）
 
-测试首跑就揪出两处混用（撞车路径返回了裸结局词 `"denied"` 而不是接口词 `"deny"`）。修完之后我把**两族的唯一交汇点收敛到一行**，并写进注释：
+测试首跑就揪出两处混用（撞车路径返回了裸结局词 `"denied"` 而不是接口词 `"deny"`；该路径本身已于 2026-09-25 移除，见 17 篇 §9 —— 但"接口词 vs 结局词"的结论对现存的超时 / 停止 / 用户拒绝三条路径同样成立）。修完之后我把**两族的唯一交汇点收敛到一行**，并写进注释：
 
 ```python
 self.note_approval_record(tool_call_id, {
@@ -503,8 +503,10 @@ OK
 | 文件 | 例数 | 覆盖 |
 | --- | --- | --- |
 | `test_permission_gate.py` | 69 | 八步链顺序、硬拒绝压倒完全访问、分段归一化绕过用例、继承链折叠、存量规则迁移、⑦ 步次序 |
-| `test_approval_broker.py` | 19 | 事件流、三选一映射、超时自结算、stop 兜底、幂等、等待期不持锁、撞车 fail-closed、回放往返 |
+| `test_approval_broker.py` | 20 | 事件流、三选一映射、超时自结算、stop 兜底、幂等、等待期不持锁、**并发在途各自结算**（2026-09-25 修正，原行为"撞车 fail-closed 拒绝第二个"）、announced 闸门、载荷截断、回放往返 |
 | `test_config_dir_migration.py` | 17 | 迁移 / 回收语义、路径口径、源码静态扫描 |
+
+> 上方 `Ran 105 tests` 是当时（三个测试文件）的快照；当前全量 **176 例**（`skipped=4`），因为之后又加了两个测试文件。本表只更新了 2026-09-25 受影响的 `test_approval_broker.py` 一行。
 
 其中我自己最喜欢的一组是 `TestStep7Ordering`（3 例）：**特例优先**、**重定向掩护回归**、**逐段生效**。因为这三条正是我改错过的三个点，把它们钉成测试，以后谁改判定链顺序都会立刻红。
 

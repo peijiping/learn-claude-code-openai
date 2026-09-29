@@ -130,6 +130,12 @@ class ToolRegistry:
         # set 对象（见 set_extra_dirs），safe_path 兜底层用它放行工作根之外的
         # 预授权目录。gate 接线前为空集，行为与改造前一致。
         self._extra_dirs: set = set()
+        # 计划文书写入回调（holder，2026-09-25 任务执行模式）：由 `Agent` 在构造时
+        # 经 `set_plan_sink` 注入一个**已经算好落点**的闭包（见
+        # agent_full_v2.Agent._bind_plan_sink）。为什么是闭包而不是路径：
+        # `ToolRegistry` 只有 workdir / bash_cwd，**拿不到 workspace、session_id、
+        # data_root** —— 计划文书落在元数据目录，registry 侧推断必然推错。
+        self._plan_sink = None
 
         # ── 懒加载缓存 ──
         self._handlers_cache = None
@@ -229,6 +235,21 @@ class ToolRegistry:
         """
         if isinstance(dirs, set):
             self._extra_dirs = dirs
+
+    def set_plan_sink(self, cb) -> None:
+        """注入「计划文书写入」回调（holder，2026-09-25 任务执行模式）。
+
+        `cb(content: str) -> str`：**已经绑定本会话落点**的闭包，内部完成
+        "算路径 → 原子写 → 标 ready → 落 meta → 推 execution_mode_changed /
+        plan_ready"，返回给模型的 tool_result 文本。
+
+        ⚠️ 只能传"已经算好路径"的回调：`ToolRegistry.__init__` 没有 workspace /
+        session_id / data_root（见 `_plan_sink` 的定义处注释），registry 侧
+        **不做任何路径推断**。未注入时 `plan_write` 返回可读的 Error 文本
+        （工具层铁律：永远返回字符串、绝不向上抛），与 cron / teammate 的
+        holder 缺省语义一致。
+        """
+        self._plan_sink = cb
 
     def get_interaction_broker(self):
         """获取 InteractionBroker；未注入返回 None（**不抛错**）。
@@ -365,7 +386,7 @@ class ToolRegistry:
           保留重复黑名单，避免两处清单漂移。
         - 超时保护：命令执行超过120秒会自动终止
         - 输出截断：结果最多返回50000字符，防止内存溢出
-        - 沙盒隔离（2026-09-22，见 sandbox.py / docs/frontend/19）：开关开启且
+        - 沙盒隔离（2026-09-22，见 sandbox.py / docs/frontend/20）：开关开启且
           平台后端可用时，命令经 sandbox-exec（macOS）/ bwrap（Linux）执行 ——
           写被限制在工作区∪额外目录∪临时目录内、网络默认断开、敏感目录不可读。
           这是执行层的"绝对墙"，与判定层（PermissionGate）互补；full_access
@@ -382,7 +403,6 @@ class ToolRegistry:
             不会执行到这里
         """
         cwd = base or self.bash_cwd or os.getcwd()
-        backend = sandbox_mod.get_backend()
 
         def _bare_run():
             return subprocess.run(
@@ -402,6 +422,9 @@ class ToolRegistry:
             )
 
         try:
+            # 后端探测也放进 try：工具层的契约是"返回字符串、绝不向上抛"，
+            # 探测里的 which/subprocess 一旦抛异常也不能穿透（2026-09-24 修）。
+            backend = sandbox_mod.get_backend()
             if backend is not None:
                 # 可写集 = workdir ∪ 有效 cwd（bash_cwd / worktree base 可能不在
                 # workdir 内，不加入会误拦工作目录内的写入）∪ 会话批准额外目录
@@ -758,6 +781,9 @@ class ToolRegistry:
             # 回滚方式：取消下一行注释，并恢复 _tools_cache 里的 "todo" 定义。
             # "todo":      lambda **kw: self.get_todo_manager().update(kw["items"], kw.get("fresh_start", False)),
             "load_skill":  lambda **kw: self.skills.load_skill(kw["name"]),
+            # 计划文书（2026-09-25 任务执行模式）：真正的落盘在 Agent 注入的
+            # _plan_sink 闭包里（registry 拿不到 session_id / data_root）。
+            "plan_write":  lambda **kw: self._run_plan_write(kw),
             "list_skills": lambda **kw: self.skills.list_skills(),
             "write_memory":   lambda **kw: self.memory.write(kw["name"], kw["type"], kw["description"], kw["body"]),
             "forget_memory":  lambda **kw: self.memory.forget(kw["name"]),
@@ -861,6 +887,28 @@ class ToolRegistry:
             # 可被停止唤醒）。模型侧 schema 里**没有**这两个字段。
             "ask_user": lambda **kw: self._run_ask_user(kw),
         }
+
+    def _run_plan_write(self, kw: dict) -> str:
+        """plan_write 处理器：把正文交给 Agent 注入的闭包落盘。
+
+        工具层铁律：**永远返回字符串、绝不向上抛异常**（见模块头与
+        `execute` 的注释）。未注入 sink（子智能体 / CLI 之外的独立构造 /
+        单测直连）时返回明确 Error 文本，而不是抛异常打死整轮。
+        """
+        content = kw.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return "Error: plan_write 需要非空的 content（计划正文 Markdown）。"
+        sink = self._plan_sink
+        if sink is None:
+            return (
+                "Error: plan_write 当前不可用（本会话未接入任务执行模式）。"
+                "请改用普通回复说明你的计划。"
+            )
+        try:
+            return sink(content)
+        except Exception as e:  # noqa: BLE001 - 工具层绝不向上抛
+            log.error("plan_write 处理器异常: %s: %s", type(e).__name__, e, exc_info=True)
+            return f"Error: plan_write 执行失败: {type(e).__name__}: {e}"
 
     # ── ask_user：向用户提出结构化选择题并阻塞等待作答 ──────────────
     def _run_ask_user(self, kw: dict) -> str:
@@ -1021,11 +1069,30 @@ class ToolRegistry:
                 #         "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
                 #     }, "required": ["items"]}
                 # }},
+                # ── 计划文书（2026-09-25 任务执行模式，docs/frontend/22）──────
+                # schema 只有 `content` 一个参数（**不设 path**）：落点由后端**强制**
+                # 为 `<元数据目录>/plans/<prefix><sid>.md`，模型无从指定 —— 比
+                # "有 path 但被忽略"更干净，也不会给模型"我能换地方写"的错觉。
+                # 工具**常驻**工具列表（不做按模式动态裁剪：那会牵动
+                # tools / base_tools / main_agent_tools / default_agent_tools 多处
+                # 传参点）；非 plan 模式下调用会被 plan 守卫拦下。
+                {"type": "function", "function": {
+                    "name": "plan_write",
+                    "description": (
+                        "写入/覆盖本会话的计划文书（仅在计划模式下可用）。"
+                        "在计划模式下完成只读探索后，用本工具提交实施计划：目标、"
+                        "步骤分解、涉及文件、风险与验证方式。用户批准后才会开始执行。"
+                        "不要用它保存代码、笔记或任何交付文档。"
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "content": {"type": "string",
+                                    "description": "计划正文（Markdown 格式）"},
+                    }, "required": ["content"]}
+                }},
                 {"type": "function", "function": {
                     "name": "load_skill", "description": "加载指定名称的专业技能（skill）知识。",
                     "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "要加载的专业技能（skill）名称"}}, "required": ["name"]}
-                }},
-                {"type": "function", "function": {
+                }},                {"type": "function", "function": {
                     "name": "list_skills", "description": "获取当前所有可用技能（skill）的名称和简短描述列表，用于了解当前会话支持哪些技能。",
                     "parameters": {"type": "object", "properties": {
                         "parallel": {"type": "boolean", "default": False,

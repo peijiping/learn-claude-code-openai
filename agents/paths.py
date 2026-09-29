@@ -91,6 +91,18 @@ DEFAULT_SCRATCH_DIR = DATA_ROOT / "scratch"
 ATTACHMENTS_DIRNAME = ".attachments"
 DRAFT_ATTACHMENTS_DIRNAME = "_draft"
 
+# ── 计划文书目录（2026-09-25，任务执行模式，docs/frontend/22）─────────────────
+# 布局：
+#
+#   ~/.aigent/projects/<id>/plans/session_<sid>.md
+#
+# 落**元数据目录**而不是工作区，理由有两条（都很硬）：
+#   1. 计划文书是会话级产物，与会话 jsonl / .tasks 同源，删会话即随 meta 级联清理；
+#   2. 写进用户的项目目录会污染仓库（而且是"每会话一个文件"的持续污染）。
+# 与 `.attachments` 同策略：由运行期按需创建（`plan_write` 落盘时 mkdir parents），
+# 不进 WORKSPACE_SUBDIRS —— 没用过计划模式的用户永远不会看到这个目录。
+PLANS_DIRNAME = "plans"
+
 
 @dataclass(frozen=True)
 class WorkspacePaths:
@@ -173,6 +185,16 @@ class WorkspacePaths:
         （模块级常量只代表 default 空间）。
         """
         return self.data_root / ATTACHMENTS_DIRNAME
+
+    @property
+    def plans_dir(self) -> Path:
+        """计划文书根（`plans/`，任务执行模式）。
+
+        任何"计划文书在哪个空间"的解析都必须经本属性 —— 与其它运行期目录同一
+        口径（模块级常量只代表 default 空间）。文件名口径见
+        `execution_mode.plan_relpath`（`<prefix><sid>.md`，与会话 jsonl 同源）。
+        """
+        return self.data_root / PLANS_DIRNAME
 
 
 def workspace_paths(project_id: str, root: Path | str | None = None) -> WorkspacePaths:
@@ -277,6 +299,9 @@ def ensure_dirs() -> None:
         (DATA_ROOT / name).mkdir(parents=True, exist_ok=True)
     # default 草稿目录：桌面端新建 default 会话的沙箱根（2026-09-20）
     DEFAULT_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    # 计划文书目录（2026-09-25，任务执行模式）：default 空间预先建；自定义空间
+    # 由 plan_write 运行期按需 mkdir（与 .attachments 同策略）。
+    (DATA_ROOT / PLANS_DIRNAME).mkdir(parents=True, exist_ok=True)
     # 配置文件目录（2026-09-22）：config.json / credentials.json / llmconfig.json /
     # providers.json / permissions.json 的落点（migrate_legacy 已尝试搬迁旧顶层文件）
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -367,6 +392,21 @@ def task_file_for_session(session_id: str, session_prefix: str = "session_",
     `tasks_dir` 为该会话所属工作空间的任务目录（缺省 = default 空间）。
     """
     return task_scope_file(f"{session_prefix}{session_id}", tasks_dir)
+
+
+def plan_file_for_session(session_id: str, session_prefix: str = "session_",
+                          plans_dir: Path | None = None) -> Path:
+    """指定会话的计划文书路径（任务执行模式，docs/frontend/22）。
+
+    ⚠️ **这是 会话 ↔ 计划文书文件名口径的唯一出处**（与 `task_scope_file` 同款
+    约束）：`agent_full_v2` 的 `plan_write` 闭包、`ws_bridge` 的 `plan_read`、
+    以及 `SessionManager` 的三处级联清理必须同源 —— 任何一边漂移都会导致
+    "写得到、读不到"或"清理静默失效"。
+
+    `plans_dir` 为该会话**所属工作空间**的 `plans/` 目录（缺省 = default 空间）。
+    """
+    base = plans_dir if plans_dir is not None else (DATA_ROOT / PLANS_DIRNAME)
+    return base / f"{session_prefix}{session_id}.md"
 
 
 def task_files_for_session(session_id: str, session_prefix: str = "session_",

@@ -2081,3 +2081,253 @@
   color: var(--color-text-secondary);
   cursor: default;
 }
+
+
+/* ══════════════════════════════════════════════════════════════════════
+   任务执行模式（2026-09-25，docs/frontend/22）
+   - .exec-chip*  ：输入区工具栏的胶囊 tag（计划 / 目标）
+   - .goal-dialog*：目标条件输入弹层（Portal 到 body）
+   - .plan-card*  ：消息流**末尾**的计划卡片
+   ⚠ 必须落在 main.tsx 已引的 7 个 css 之一（本文件 ✓）—— 写进游离 css 会
+   规则从未生效、且构建全绿查不出来（21 篇 §6.2 事故）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── 执行模式胶囊 ───────────────────────────────────────────────────
+   位置 = 工作空间 chip 右侧。normal 时组件 return null（**零占位**），
+   故此处不需要任何"空槽"补偿。两态配色沿用 .ref-capsule 的做法：
+   计划 = 浅蓝信息态；目标 = 主色淡底推进态。 */
+.exec-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  max-width: 220px;
+  padding: 0 4px 0 8px;
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-sm);
+  line-height: 20px;
+  white-space: nowrap;
+  user-select: none;
+}
+.exec-chip.plan {
+  background: var(--color-ref-bg);
+  color: var(--color-ref-fg);
+}
+.exec-chip.goal {
+  background: rgba(var(--color-accent-rgb), 0.12);
+  color: var(--color-accent);
+}
+.exec-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* × 悬浮才浮出（照 .ref-capsule，**不是** .att-chip 的常显 ×）：常显会让胶囊
+   一直"带着一个删除按钮"，视觉噪音大。 */
+.exec-chip-close {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+.exec-chip:hover .exec-chip-close {
+  display: inline-flex;
+}
+.exec-chip-close:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+/* ── 目标条件输入弹层 ────────────────────────────────────────────────
+   Portal 到 body → 固定居中，不受 composer 的 overflow / 层叠上下文影响。
+   z-index 取 1000/1001：高于输入区工具栏菜单（900/901），低于设置弹窗。 */
+.goal-dialog-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.28);
+  z-index: 1000;
+}
+.goal-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(520px, calc(100vw - 48px));
+  padding: var(--sp-4);
+  background: var(--color-bg-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.2));
+  z-index: 1001;
+}
+.goal-dialog-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--color-text-primary);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+.goal-dialog-desc {
+  margin-top: var(--sp-1);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+.goal-dialog-input {
+  display: block;
+  width: 100%;
+  margin-top: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+}
+.goal-dialog-input:focus {
+  border-color: var(--color-accent);
+}
+.goal-dialog-hint {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+}
+.goal-dialog-hint.error {
+  color: var(--color-danger);
+}
+.goal-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.goal-dialog-btn {
+  padding: 6px var(--sp-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.goal-dialog-btn:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+.goal-dialog-btn.primary {
+  border-color: transparent;
+  background: var(--color-accent);
+  color: #fff;
+}
+.goal-dialog-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.goal-dialog-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── 计划卡片（消息流末尾固定块）────────────────────────────────────
+   用左侧色条表达"这是一份待批准的文书"，刻意不复用消息气泡样式
+   （它不是一条消息）。 */
+.plan-card {
+  margin: var(--sp-3) 0;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-ref-fg);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  overflow: hidden;
+}
+.plan-card.approved {
+  border-left-color: var(--color-ok);
+}
+.plan-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--color-bg-sidebar);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.plan-card-title {
+  flex: 1;
+}
+.plan-card-badge {
+  padding: 0 var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-ref-bg);
+  color: var(--color-ref-fg);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 18px;
+}
+.plan-card-badge.approved {
+  background: rgba(52, 168, 83, 0.14);
+  color: var(--color-ok);
+}
+/* 正文可滚动：计划文书可能很长，卡片不能把整条消息流顶到天上去 */
+.plan-card-body {
+  max-height: 420px;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-3);
+}
+.plan-card-loading,
+.plan-card-lost {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+}
+/* 读不到是降级不是错误 —— 但要让用户知道"为什么没有正文"，用琥珀而不是红 */
+.plan-card-lost {
+  color: var(--color-warn);
+}
+.plan-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--color-border);
+}
+.plan-card-note {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+}
+.plan-card-btn {
+  padding: 5px var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.plan-card-btn:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+.plan-card-btn.primary {
+  border-color: transparent;
+  background: var(--color-accent);
+  color: #fff;
+}
+.plan-card-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.plan-card-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

@@ -92,6 +92,11 @@ class HookSystem:
         # set_permission_gate() 注入。主智能体与子智能体共用同一实例 ——
         # 子智能体的审批卡片因此能落在同一会话的 broker 上（文档 §6）。
         self.permission_gate = None
+        # 执行模式门（2026-09-25，docs/frontend/22 任务执行模式）：同款注入点，
+        # 策略本体在 execution_mode.py 的 ExecutionGate。与权限门**各自独立** ——
+        # 两条轴不合并判定链，只是同一事件上按固定顺序各判一次（见
+        # register_default_hooks 的顺序说明）。
+        self.execution_gate = None
         self._no_gate_warned = False   # 无门告警只打一次，避免子智能体循环刷屏
         # MCP 破坏性工具查询回调（由外部注入 MCPManager.is_destructive，s19 真实 MCP）
         self.mcp_destructive_lookup = None
@@ -103,6 +108,15 @@ class HookSystem:
     def set_permission_gate(self, gate) -> None:
         """注入权限门（PermissionGate 实例）。注入后 permission_hook 纯委托判定。"""
         self.permission_gate = gate
+
+    def set_execution_gate(self, gate) -> None:
+        """注入执行模式门（`execution_mode.ExecutionGate` 实例）。
+
+        与 `set_permission_gate` **并列**（不是二选一）：两条轴各持一份状态、
+        各判一次。未注入时 `plan_guard_hook` 直接放行 —— 独立 HookSystem
+        （子智能体兜底构造、单测直连）因此行为与改造前一致。
+        """
+        self.execution_gate = gate
 
     # ── 注册与触发 ────────────────────────────────────────────────────────
     def register(self, event: str, callback):
@@ -150,7 +164,8 @@ class HookSystem:
         """
         PreToolUse 钩子 —— 权限校验器（纯委托，2026-09-22 起）。
 
-        本函数是 s03 `check_permission()` 的迁移，经历 s04（钩子化）与本次权限管控
+        本函数是 s03 `check_permission()` 的迁移（该文件已于 2026-09-25 删除，原文存
+        `history/anthropic_v2/s03_permission/`），经历 s04（钩子化）与本次权限管控
         改造（策略迁出）两个阶段后，职责收敛为**一行委托**：把 OpenAI SDK 的
         tool_call 交给 `permission.py` 的 `PermissionGate.check_tool_call()`
         八步判定链（模式判定 → 硬拒绝 → 预授权目录 → 自定义规则 → 会话内允许
@@ -183,6 +198,56 @@ class HookSystem:
             print(f"\033[2;31m[HOOK] ⚠ 权限门异常，已按拒绝处理: "
                   f"{type(e).__name__}: {e}\033[0m")
             return f"Error: Permission gate failure: {type(e).__name__}: {e}"
+
+    def plan_guard_hook(self, tool_call: dict):
+        """PreToolUse 钩子 —— 计划模式守卫（模式级，注册在权限校验**之前**）。
+
+        契约与 `permission_hook` **完全同款**（同一个 `HookSystem.trigger` 约定）：
+
+            返回 None   → 放行；
+            返回字符串  → 阻断，该字符串作为 tool_result 回填给模型。
+
+        为什么排在 `permission_hook` 之前（顺序即语义，勿回退）：
+          • 模式级限制问的是"这一轮整体以什么方式干"，比单条规则的拒绝理由
+            更可行动 —— 模型看到的是"改用 plan_write 提交计划"，而不是一句
+            "命令不在白名单内"；
+          • plan 模式下被拦下的集合**本就是权限链 allow 集合的真子集**
+            （非只读命令在权限链里也过不去），故不会掩盖任何硬拒绝语义。
+
+        未注入执行模式门时直接放行（独立 HookSystem / 子智能体兜底构造 /
+        单测直连的路径因此与改造前逐字节一致）。**非 plan 模式也直接放行**
+        —— 零开销，且工具参数解析失败不会误伤 normal / goal 路径。
+        """
+        gate = self.execution_gate
+        if gate is None:
+            return None
+        try:
+            if not gate.plan_blocks_writes():
+                return None
+        except Exception:  # noqa: BLE001 - 状态读取失败 → 不猜，放行
+            return None
+        # 只有 plan 生效时才解析参数：解析失败按 fail-closed 阻断（与权限链同款）
+        try:
+            tool_name = tool_call.function.name
+            raw_args = tool_call.function.arguments
+            tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except Exception:
+            return "Error: Plan mode guard: 工具参数解析失败"
+        # store 从权限门取（同一份 permissions.json 热加载缓存）—— plan 的只读
+        # 判定要叠加用户的 deny_patterns / dangerous_patterns，否则会破坏
+        # "plan 放行集合 ⊂ 权限链 allow 集合"这条不变量。
+        store = None
+        if self.permission_gate is not None:
+            try:
+                store = self.permission_gate.store.load()
+            except Exception:  # noqa: BLE001 - store 不可用则只用内置清单
+                store = None
+        try:
+            return gate.blocked_reason(tool_name, tool_args, store)
+        except Exception as e:  # noqa: BLE001 - fail-closed：守卫自身故障宁可错杀
+            print(f"\033[2;31m[HOOK] ⚠ 计划模式守卫异常，已按拒绝处理: "
+                  f"{type(e).__name__}: {e}\033[0m")
+            return f"Error: Plan mode guard failure: {type(e).__name__}: {e}"
 
     def log_hook(self, tool_call: dict):
         """
@@ -290,14 +355,18 @@ class HookSystem:
         """
         一键注册全部内置钩子。
 
-        注册顺序很重要:
-          • permission_hook 必须先于 log_hook —— 这样一旦权限被阻断,
+        注册顺序很重要（PreToolUse 内**次序即语义**）：
+          • plan_guard_hook 必须在 permission_hook 之前 —— 模式级限制更可行动，
+            且 plan 拦下的集合是权限链 allow 集合的子集，不会掩盖硬拒绝语义
+            （2026-09-25 任务执行模式，docs/frontend/22）；
+          • permission_hook 必须先于 log_hook —— 这样一旦权限被阻断，
             日志会反映"被阻断"的事实 (而不是显示一条最终未执行的成功日志);
           • 其余钩子顺序对功能无影响,按可读性排列。
         """
         self.register(self.USER_PROMPT_SUBMIT, self.context_inject_hook)  # 用户输入观察
-        self.register(self.PRE_TOOL_USE,       self.permission_hook)      # ① 权限校验 (先)
-        self.register(self.PRE_TOOL_USE,       self.log_hook)             # ② 调用日志  (后)
+        self.register(self.PRE_TOOL_USE,       self.plan_guard_hook)      # ① 执行模式 (最严)
+        self.register(self.PRE_TOOL_USE,       self.permission_hook)      # ② 权限校验
+        self.register(self.PRE_TOOL_USE,       self.log_hook)             # ③ 调用日志
         self.register(self.POST_TOOL_USE,      self.large_output_hook)    # 大输出告警
         self.register(self.STOP,               self.summary_hook)         # 会话结束摘要
 

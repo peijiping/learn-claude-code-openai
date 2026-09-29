@@ -17,13 +17,20 @@ export interface RefInput {
   is_dir?: boolean
 }
 
+/** chat 携带的**预选执行模式**（结构与 renderer 侧 ExecutionMode 一致）。 */
+export interface ExecModeInput {
+  mode: 'normal' | 'plan' | 'goal'
+  condition?: string
+}
+
 export interface AgentApi {
   /** 发起一次对话。
    *  attachments=本轮附件（`attachment_stage` 登记得到的 att_id 列表）；
    *  **只有附件没有正文时 text 传空串**（后端据此只插附件块，不插空文本块）。
    *  refs=本轮引用的工作空间路径（**零复制**，只传路径）；**只有引用没正文也是
-   *  合法发送**。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null) => Promise<void>
+   *  合法发送**。execMode=新建任务的**预选执行模式**（无会话时选好的 plan/goal，
+   *  随首条消息交给后端在建会话时落盘，首轮即生效）。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null, execMode?: ExecModeInput | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>
   /** 结构化提问作答 / 取消（ask_user）。fire-and-forget：回执走 `ask_resolved` 广播。 */
@@ -37,6 +44,14 @@ export interface AgentApi {
   sessionPermission: (sessionId: string, mode: string) => Promise<void>
   /** 新建任务（无会话）态切换目标工作空间权限档位；回执走 projects 广播 */
   projectPermission: (projectId: string, mode: string) => Promise<void>
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）────────────────────
+   * 与权限档位正交的另一条轴（normal / plan / goal）。
+   * `sessionExecMode` / `approvePlan` 同 sessionPermission 的 fire-and-forget
+   * （回执走 `execution_mode_changed` 广播 / `error` 信封）；`planRead` 有真回执
+   * （点对点 `plan_content`，形状与 file_content 同族，`reason` 非空 = 读不到）。 */
+  sessionExecMode: (sessionId: string, mode: string, condition?: string) => Promise<void>
+  approvePlan: (sessionId: string) => Promise<void>
+  planRead: (sessionId: string) => Promise<unknown>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>

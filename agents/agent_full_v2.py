@@ -51,9 +51,21 @@ from worktree import WorktreeManager
 from mcp_manager import MCPManager
 from workflow import WorkflowManager, register_default_workflows
 from goal import (
-    GoalController,
-    PromptGoalEvaluator,
     DEFAULT_STOP_HOOK_BLOCK_CAP,
+    GoalController,
+    GoalError,
+    MAX_GOAL_LENGTH,
+    PromptGoalEvaluator,
+)
+from execution_mode import (
+    MODE_GOAL,
+    MODE_NORMAL,
+    MODE_PLAN,
+    VALID_EXECUTION_MODES,
+    PLAN_STATUS_APPROVED,
+    PLAN_STATUS_READY,
+    ExecutionGate,
+    plan_file_for,
 )
 from skills import SkillLoader
 from llm_manage import LLMClient
@@ -88,6 +100,37 @@ log = get_logger("agent")
 MEMORY_INDEX_TAG = "memory_index"   # 记忆索引（L2 热段，变化最频繁）
 ENV_TAG = "env"                     # 运行环境（日期 / 星期 / 平台）的**会话期间变化**（L2 热段）
 PROJECT_RULES_TAG = "project_rules"  # 工作区指令文件（AGENTS.md）会话期间的变更全文
+# 任务执行模式（2026-09-25，docs/frontend/22）。revision 记的是**语义状态**
+# 而不是哈希：`plan-active` / `plan-exited` 两态互斥，天然幂等（同态不重复注入），
+# 且 `_last_injection_revision` 读回的值可直接当"上一态"用于判断要不要撤销。
+EXEC_MODE_TAG = "execution_mode"
+EXEC_REV_PLAN_ACTIVE = "plan-active"
+EXEC_REV_PLAN_EXITED = "plan-exited"
+
+# 态①：plan 激活且未批准 —— 禁止写操作（**追加进历史并落盘**，不是每轮临时拼接）
+PLAN_ACTIVE_REMINDER = (
+    "当前处于「计划模式」。禁止任何写操作与有副作用的调用：只能做只读探索\n"
+    "（run_read / run_glob / 只读 bash / 向用户提问），然后用 plan_write 提交计划文书，\n"
+    "等用户批准后再开始执行。若当前任务不适合产出计划（例如只是问答或诊断），\n"
+    "请直接说明原因并请用户关闭计划模式，不要反复尝试写操作。"
+)
+# 态②：已退出 plan —— 撤销提醒。
+# ⚠ 这一态**必须有**：上面的注入是 append 且落盘，不撤销的话模型读到的**最新指令
+# 仍是"禁止写操作"** → 表现为"用户点了批准执行，模型却拒绝干活"（2026-09-25 评审 P0）。
+PLAN_EXITED_REMINDER = (
+    "计划模式已结束，写操作已恢复，可以正常使用 run_write / run_edit / bash 等工具。\n"
+    "请按已批准的计划文书开始执行。"
+)
+# 态②-b：plan → **goal** 的直接切换（2026-09-27）—— 撤销提醒的变体。
+# ⚠ 为什么不能照抄上面那条：它的落点是"请按已批准的计划文书开始执行"，而这条路径
+# 恰恰是**计划未被批准就切走了**（plan 状态作废，文书文件仍留在 plans/ 下）。照抄会
+# 让模型去找一份它拿不到、也不该执行的计划 —— 表现为"切到目标模式后模型在找计划"。
+PLAN_EXITED_TO_GOAL_REMINDER = (
+    "计划模式已结束，并直接切换到了「目标模式」。写操作已恢复，可以正常使用\n"
+    "run_write / run_edit / bash 等工具。此前若产出过计划文书且尚未批准，该文书\n"
+    "已作废（文件仍保留在磁盘上，但不要再去执行它）。\n"
+    "请围绕已设定的目标条件继续工作，直到目标达成。"
+)
 
 
 # ── 「承诺未兑现」守卫（2026-09-14 事故后新增）──────────────────────
@@ -321,6 +364,22 @@ class Agent:
         )
         self.permission_gate.attach_tool_registry(self.tools)
         self.hook_system.set_permission_gate(self.permission_gate)
+
+        # 执行模式门（2026-09-25 任务执行模式，docs/frontend/22）：与权限门**并列**
+        # 的第二个横切门。策略本体在 execution_mode.py（只管 plan；goal 的真相恒在
+        # goal_controller.active，本门不持有任何 goal 状态）。
+        # - 每 Agent 实例一个：多会话天然隔离；
+        # - 注册在 hook 系统里，PreToolUse 时**先于** permission_hook 判定；
+        # - execution_mode_sink 由 SessionRuntime._bind_sink 注入（agent 侧没有 hub，
+        #   跨线程投递的唯一通道是它 → deliver → hub.broadcast）。
+        self.execution_gate = ExecutionGate()
+        self.hook_system.set_execution_gate(self.execution_gate)
+        # 事件投递出口（`{"session_id", "mode", "plan_status", "goal_condition"}`）：
+        # None = 未接线（CLI / 单测）→ 只落盘不推送，行为与改造前一致。
+        self.execution_mode_sink = None
+        # 计划文书写入回调（Agent 侧闭包，见 _bind_plan_sink）：ToolRegistry 拿不到
+        # session_id / data_root，路径必须在这里算好后注入。
+        self._bind_plan_sink()
 
         # 后台任务管理器：挂到本实例 tools 的 holder 上（实例级，非全局）
         self.background_manager = BackgroundManager()
@@ -698,6 +757,10 @@ class Agent:
         self._sync_task_board()
         self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
         self._restore_permission_state()  # 权限模式/会话内允许从元数据恢复
+        self._restore_execution_state()  # 执行模式（plan/goal）从元数据恢复
+        # 执行模式提醒按需尾部注入（两态对称）：进入会话这一刻就把"当前处于
+        # 计划模式"的约束摆到上下文尾部，否则模型会先看到历史里的旧状态。
+        self._sync_execution_mode()
         log.info("会话初始化: %s%s (resume=%s, messages=%d)",
                  self.session_prefix, self.session_id, resume, len(self.history_messages))
         return self.session_id
@@ -1114,6 +1177,8 @@ class Agent:
         self._sync_task_board()
         self._restore_usage_totals()  # 会话级 token 累计从元数据恢复
         self._restore_permission_state()  # 权限模式/会话内允许从元数据恢复
+        self._restore_execution_state()  # 执行模式（plan/goal）从元数据恢复
+        self._sync_execution_mode()       # 执行模式提醒（切回会话时按需补注）
         log.info("会话切换: %s%s -> %s%s (messages=%d)",
                  self.session_prefix, target_id, self.session_prefix,
                  self.session_id, len(self.history_messages))
@@ -1152,13 +1217,17 @@ class Agent:
         state = self.goal_controller.set_goal(condition, self.total_tokens)
         return f"Goal set: {state.condition}"
 
-    def clear_goal(self) -> str:
+    def clear_goal(self, reason: str = "cleared") -> str:
         """清除当前目标（对应 CLI 的 /goal clear，含同义别名）。
 
         清除后 agent_loop 的停止边界恢复"直接放行"；无目标时原样返回
         "No goal set"。
+
+        `reason` 只影响 `GoalController._record` 落下的状态日志（供事后追溯
+        "目标为什么没了"）：默认 `"cleared"` = 用户主动取消（点胶囊 ×）；
+        跨模式切换（plan ← goal）传更具体的值，便于区分"取消"与"切模式"。
         """
-        return self.goal_controller.clear()
+        return self.goal_controller.clear(reason)
 
     def goal_status(self) -> str:
         """返回当前目标状态文本（对应 CLI 的 /goal 无参数）。
@@ -1167,6 +1236,355 @@ class Agent:
         无激活目标：回显上次"达成/失败"结论，或 "No goal set"。
         """
         return self.goal_controller.status(self.total_tokens)
+
+    # ═══════════════════════════════════════════════════════════
+    #  任务执行模式（2026-09-25，docs/frontend/22）
+    #
+    #  两条**正交**的轴：权限回答"能不能 / 要不要审批"，执行模式回答
+    #  "这一轮以什么方式干"。两者状态独立、UI 入口独立、判定链**不合并**
+    #  （只是同一个 PreToolUse 事件上各判一次，plan 守卫排在权限之前）。
+    #
+    #  goal 侧是**薄委托**：进入/退出只转发既有 set_goal / clear_goal，
+    #  评估与 Stop 七分支判定一行不改；`execution_mode == "goal"` 只是
+    #  `goal_controller.active` 的投影（铁律，见 execution_state）。
+    # ═══════════════════════════════════════════════════════════
+
+    def _bind_plan_sink(self) -> None:
+        """把「计划文书写入」回调注入工具注册表（holder 范式，同 set_background_manager）。
+
+        ⚠️ 为什么必须是**闭包**、而不是把路径交给 ToolRegistry 自己算：
+        `ToolRegistry.__init__` 只有 `workdir` / `bash_cwd`，**没有** workspace、
+        没有 session_id、也没有 data_root —— 而计划文书落在**元数据目录**
+        （`~/.aigent/projects/<id>/plans/`），不是工作区里。让 registry 侧推断
+        必然推错。所以"算路径 → 原子写 → 标状态 → 落盘 → 推信封"五件事全部
+        收在这个闭包里，registry 只负责把 content 递进来。
+
+        写入是 **tmp + os.replace 原子写**（与项目其它落盘一致）：计划卡片会在
+        前端被读，半截文件比"读不到"更难排查。
+        """
+        def write_plan(content: str) -> str:
+            sid = self.session_id
+            if not sid:
+                return "Error: plan_write 失败：当前没有绑定的会话。"
+            path = plan_file_for(self.workspace, sid, self.session_prefix)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(
+                    f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                tmp.write_text(content, encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as e:
+                log.error("plan_write 落盘失败 session=%s: %s: %s",
+                          sid, type(e).__name__, e)
+                return f"Error: plan_write 写入失败：{e}"
+            self.execution_gate.mark_plan_ready(path)
+            self._persist_execution()
+            # 推送顺序契约（docs/frontend/22 §4.5）：**先** mode 变更信封（带
+            # plan_status="ready"）**再** plan_ready —— 保证前端处理卡片时 tag
+            # 状态已就位。两条都走 execution_mode_sink（唯一投递路径）。
+            self._emit_execution_changed()
+            self._emit_kind("plan_ready", {
+                "session_id": sid,
+                "plan_status": PLAN_STATUS_READY,
+                # 不带正文、不带路径：正文由前端调 `plan_read` 取（实时与回放
+                # 共用同一条链路），路径由 plan_content 回执带回。
+            })
+            return (
+                f"Plan written ({len(content)} chars). "
+                "等待用户批准后再开始执行。"
+            )
+
+        self.tools.set_plan_sink(write_plan)
+
+    # ── 事件投递（唯一通道）────────────────────────────────────────────
+    def _emit_kind(self, kind: str, payload: dict) -> None:
+        """经 `execution_mode_sink` 推一条控制信封。
+
+        为什么不让 agent 直接 broadcast：agent 侧**没有 hub**（全仓 `hub` 只在
+        ws_bridge），而 Stop 边界同步跑在**工作线程**。sink 由 SessionRuntime
+        注入为 `deliver(kind, payload)` —— `deliver` 内部是
+        `call_soon_threadsafe` + 广播全连接，**线程安全**，两条触发源
+        （用户点 tag / goal 自动回落）因此共用同一条投递路径。
+        未接线（CLI / 单测）→ 静默跳过，行为与改造前一致。
+        """
+        sink = self.execution_mode_sink
+        if sink is None:
+            return
+        try:
+            sink(kind, payload)
+        except Exception:  # noqa: BLE001 - 投递失败绝不影响业务
+            log.exception("执行模式事件投递失败: %s", kind)
+
+    def _emit_execution_changed(self) -> None:
+        """推 `execution_mode_changed`（形状见 `execution_state`）。"""
+        self._emit_kind("execution_mode_changed", self.execution_state())
+
+    def execution_state(self) -> dict:
+        """当前执行模式的快照（信封 / session_history 共用同一形状）。
+
+        ⚠️ **铁律校准**：goal 的唯一真相是 `goal_controller.active`，
+        `execution_gate.mode` 只是投影 —— 若 mode 说 goal 而 active 已空
+        （进程被杀 / meta 与内存不一致），**以 active 为准**回落 normal。
+        """
+        active = self.goal_controller.active
+        mode = self.execution_gate.mode
+        if mode == MODE_GOAL and active is None:
+            mode = MODE_NORMAL
+        return {
+            "session_id": self.session_id,
+            "mode": mode,
+            "plan_status": self.execution_gate.plan_status,
+            "plan_path": self.execution_gate.plan_path,
+            "goal_condition": active.condition if active is not None else None,
+        }
+
+    # ── 唯一入口：模式切换（薄委托）────────────────────────────────────
+    def set_execution_mode(self, mode: str, condition: str = "") -> str:
+        """切换任务执行模式。**返回空串 = 成功；非空串 = 拒绝原因。**
+
+        调用方（ws_bridge 的 `session_exec_mode`）把非空返回转成既有 `error`
+        信封 → 前端 toast，文案一字不改。`GoalError`（条件为空 / 超
+        `MAX_GOAL_LENGTH`）**原样上抛**，同样由调用方转 error 信封。
+
+        切换规则（唯一权威在此，前端只是友好层）：
+          - **跨模式直接切换**（2026-09-27 改）：plan ←→ goal **不再要求"先关闭再
+            切换"**。切过去 = 用户显式放弃被让位的那一方：
+              · 切 `plan`：有激活目标 → 转发既有 `clear_goal(reason="switched …")`
+              · 切 `goal`：处于 plan / 有文书状态 → `clear_plan()`（**磁盘上的计划
+                文书文件保留**，只清内存态与 meta 的 `plan_status`）
+            这两条都**不是"静默清"**：动作由用户点选触发，胶囊 tag 随广播即时熄掉；
+            模型侧由 `_sync_execution_mode()` 的两态注入负责告知模式已变。
+          - 切 `normal`：goal → 转发既有 `clear_goal()`；plan → 清 plan 状态
+          - 同模式重复切换 = 幂等成功（不改状态、不发广播）
+
+        ⚠️ 线程约束（评审 P1-5）：`GoalController` **没有锁**（对比 PermissionGate
+        自带 `threading.Lock`），而命令走 `asyncio.to_thread`、`agent_loop` 在工作
+        线程读同一对象 → **goal 的进入/退出不允许在 `rt.busy` 时进行**。该守卫在
+        ws_bridge（Agent 不知道 busy），本方法不做。plan 无此限制：gate 自带锁，
+        且守卫是"每次工具调用现场读"，在途轮的后续 tool_call 立即受新模式约束。
+        """
+        if mode not in VALID_EXECUTION_MODES:
+            return f"未知的执行模式：{mode!r}"
+        current = self.execution_gate.mode
+        if mode == current:
+            # 幂等：已在目标模式里，重复点击不重置任何状态（尤其不重置 plan_status）
+            return ""
+
+        if mode == MODE_PLAN:
+            if self.goal_controller.active is not None:
+                # 直接切换（2026-09-27）：用户点「计划模式」本身就是明确意图 ——
+                # 切过去即视为放弃当前目标。转发既有 clear_goal（带 reason，便于
+                # 事后区分"主动取消"与"切模式"），**不**再要求先手动关闭目标模式。
+                self.clear_goal("switched to plan mode")
+            self.execution_gate.set_plan_mode()
+        elif mode == MODE_GOAL:
+            if current == MODE_PLAN or self.execution_gate.plan_status is not None:
+                # 直接切换：退出 plan。`clear_plan()` 只清内存态与 meta 的
+                # `plan_status` / `plan_path`，**plans/ 下的文书文件保留**（下次在
+                # plan 模式产出即覆盖）；模型侧"禁止写操作"那条指令由
+                # `_sync_execution_mode()` 的 `plan-exited` 注入撤销。
+                self.execution_gate.clear_plan()
+            # 转发既有 API（空值 / MAX_GOAL_LENGTH 校验都在里面，GoalError 原样上抛）
+            state = self.goal_controller.set_goal(condition, self.total_tokens)
+            self._append_goal_set_message(state.condition)
+            self.execution_gate.set_mode(MODE_GOAL)
+        else:  # MODE_NORMAL
+            if current == MODE_GOAL:
+                self.clear_goal()          # 既有 API，clear() 内部会记录事件
+            if current == MODE_PLAN or self.execution_gate.plan_status is not None:
+                self.execution_gate.clear_plan()
+            self.execution_gate.set_mode(MODE_NORMAL)
+
+        self._persist_execution()
+        self._emit_execution_changed()
+        log.info("执行模式切换: %s%s %s -> %s",
+                 self.session_prefix, self.session_id, current, mode)
+        return ""
+
+    def approve_plan(self) -> str:
+        """批准计划文书：`plan_status=approved` + 模式回落 normal。
+
+        **不**在这里起执行轮 —— 续跑由 ws_bridge 决定（它才知道 `rt.busy`）。
+        返回空串 = 成功；非空串 = 拒绝原因（当前没有待批准的计划）。
+        """
+        if self.execution_gate.plan_status != PLAN_STATUS_READY:
+            return "当前没有待批准的计划文书。"
+        self.execution_gate.approve_plan()
+        self.execution_gate.set_mode(MODE_NORMAL)
+        self._persist_execution()
+        self._emit_execution_changed()
+        log.info("计划已批准: %s%s", self.session_prefix, self.session_id)
+        return ""
+
+    def _append_goal_set_message(self, condition: str) -> None:
+        """goal 设置时追加一条 `[Goal set]` 消息（与 Stop 边界 block 消息同族）。
+
+        为什么需要它：CLI 的 `/goal` 会在终端打印确认，而桌面端用户是点胶囊 tag
+        填条件 —— **未必再发一条相关消息**，模型需要立刻知道目标是什么。复用既有
+        消息族（`[Goal still active]` 的同款形态）而不是新造注入机制。
+        """
+        msg = {
+            "role": "user",
+            "content": (
+                "[Goal set]\n"
+                f"Condition: {condition}\n"
+                "Work toward this condition; the session will be evaluated "
+                "when you stop."
+            ),
+        }
+        self.history_messages.append(msg)
+        if self.session_manager is not None and self.session_file is not None:
+            self.session_manager.append_message_to_session(self.session_file, msg)
+
+    # ── 状态恢复与落盘 ─────────────────────────────────────────────────
+    def _new_goal_controller(self) -> GoalController:
+        """建一个空目标控制器（与 `__init__` 同参，供会话切换时重置）。"""
+        evaluator_model = os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model
+        goal_block_cap = int(
+            os.environ.get("GOAL_STOP_HOOK_BLOCK_CAP") or DEFAULT_STOP_HOOK_BLOCK_CAP
+        )
+        return GoalController(
+            PromptGoalEvaluator(self.llm_client, evaluator_model),
+            block_cap=goal_block_cap,
+        )
+
+    def _rebuild_goal_controller(self, condition: str) -> GoalController:
+        """用 meta 的 `goal_condition` 经**既有** `GoalController.restore()` 重建控制器。
+
+        喂料形状 = `[{"type": "goal_status", "condition": c, "active": True}]`，
+        与 `_record()` 的事件结构同形（`{type, condition, active, met, failed,
+        reason, iterations, duration}`）。注意 meta 名是 `goal_condition`、事件名是
+        `condition` —— **这层映射必须显式写**：`restore()` 直接取
+        `event["condition"]`，喂错键会 KeyError。
+
+        三处防御（评审 P1-1，缺一即踩坑）：
+          ① 空/空白条件**不得**构造事件 —— `restore()` 不做非空校验，
+             会复活一个 `condition=""` 的空目标（调用方已先做过非空判断）；
+          ② `consecutive_blocks` 归 0 —— `restore()` 不恢复它；
+          ③ 替换后**重新 set_llm** —— 新控制器的 evaluator 是新建的，
+             必须复用宿主当前的客户端与模型（否则热切换过的绑定会丢）。
+        """
+        evaluator_model = os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model
+        controller = GoalController.restore(
+            PromptGoalEvaluator(self.llm_client, evaluator_model),
+            [{"type": "goal_status", "condition": condition, "active": True}],
+            block_cap=self.goal_controller.block_cap,
+        )
+        controller.consecutive_blocks = 0
+        controller.set_llm(self.llm_client, evaluator_model)
+        return controller
+
+    def _restore_execution_state(self) -> None:
+        """init_session / switch_session 时恢复执行模式（挂载点与权限恢复相邻）。
+
+        失败不阻断会话加载（降级为 normal + 空目标）。
+        """
+        try:
+            meta = None
+            if self.session_manager is not None and self.session_id is not None:
+                meta = self.session_manager.load_meta(self.session_id)
+            meta = meta if isinstance(meta, dict) else {}
+
+            # ① plan：文书状态从 meta 恢复（plan 的真源就是它）
+            self.execution_gate.restore_plan_from_meta(meta)
+
+            # ② goal：meta 的 goal_condition 是 restore 的喂料
+            condition = meta.get("goal_condition")
+            if isinstance(condition, str) and condition.strip():
+                self.goal_controller = self._rebuild_goal_controller(condition.strip())
+            elif self.goal_controller.active is not None:
+                # 本会话 meta 里没有目标，而内存里还挂着一个 → 那是**上一个会话**
+                # 留下的（switch_session 不重建控制器）。既有实现的隐性缺陷；
+                # 目标变成可见的执行模式之后必须修掉，否则 A 会话设的目标会被
+                # B 会话继承，且 B 的胶囊 tag 会莫名亮起。
+                self.goal_controller = self._new_goal_controller()
+
+            # ③ 模式投影校准（铁律：goal 的真相恒在 active）
+            stored = meta.get("execution_mode")
+            if self.goal_controller.active is not None:
+                self.execution_gate.set_mode(MODE_GOAL)
+            elif (stored == MODE_PLAN
+                  and self.execution_gate.plan_status != PLAN_STATUS_APPROVED):
+                self.execution_gate.set_mode(MODE_PLAN)
+            else:
+                self.execution_gate.set_mode(MODE_NORMAL)
+            # 校准结果回写 meta：把"meta 说 goal 但 active 已空"这类不一致收敛掉
+            self._persist_execution()
+        except Exception:
+            log.exception("执行模式恢复失败（降级为 normal + 空目标）")
+
+    def _persist_execution(self) -> None:
+        """执行模式状态落会话 meta（**唯一落盘点**）。
+
+        不写工作空间级"最后更改值"：执行模式是**会话级**状态，没有继承源
+        （对照权限档位 —— 它有"本空间新会话默认档位"的产品含义，故有继承链）。
+
+        `goal_condition` 取 `goal_controller.active.condition`：active 为空时
+        写 `None` —— 这就是"achieved / failed 后自动清空目标"的实现，不需要
+        额外的判定分支。
+        """
+        try:
+            if self.session_manager is None or self.session_id is None:
+                return
+            active = self.goal_controller.active
+            self.session_manager.set_session_execution(
+                self.session_id,
+                execution_mode=self.execution_gate.mode,
+                plan_status=self.execution_gate.plan_status,
+                goal_condition=(active.condition if active is not None else None),
+            )
+        except Exception:
+            log.exception("执行模式落盘失败（内存已生效）")
+
+    def _on_goal_terminated(self) -> None:
+        """goal 达成 / 失败：模式回落 normal + 落盘 + 推送（撤胶囊 tag）。
+
+        只由 Stop 边界的 `achieved` / `failed` 两个分支调用 ——
+        `limit` / `error` 时目标**仍激活**，模式必须保持 goal（既有语义，勿动）。
+        """
+        self.execution_gate.set_mode(MODE_NORMAL)
+        self._persist_execution()
+        self._emit_execution_changed()
+
+    # ── 提示词注入（两态对称）──────────────────────────────────────────
+    def _sync_execution_mode(self) -> None:
+        """执行模式的尾部注入（**两态对称**，2026-09-25 评审 P0）。
+
+        机制与 `_sync_environment()` 完全同构：尾部追加、指纹幂等、绝不改历史
+        （注入块会被 `ws_bridge._history_to_ui` 按 `<system-reminder>` 前缀
+        过滤掉，不会漏成聊天气泡）。
+
+        **为什么必须有"退出"那一态**：注入是 append 进历史**并落盘**的，不是
+        每轮临时拼接。plan 期间历史里最后一条 reminder 是"禁止任何写操作"；
+        批准后若什么都不注入，模型读到的**最新指令仍是"禁止写操作"** →
+        用户点了「批准执行」，模型却拒绝干活。
+
+        指纹 = **语义状态**（`plan-active` / `plan-exited`），不是哈希：
+          - 同态重复调用零开销、不刷屏；
+          - 历史里从未注入过本 tag 且当前非 plan → 直接返回，否则每个新会话
+            都会莫名多一条"计划模式已结束"。
+
+        `plan-exited` 的**正文**按当前模式二选一（2026-09-27）：回落到 normal →
+        `PLAN_EXITED_REMINDER`（按已批准的计划执行）；直接切到 goal →
+        `PLAN_EXITED_TO_GOAL_REMINDER`（计划作废、围绕目标干活）。指纹不变 ——
+        它记的是"plan 这个语义态"，不是文案。
+        """
+        in_plan = self.execution_gate.plan_blocks_writes()
+        revision = EXEC_REV_PLAN_ACTIVE if in_plan else EXEC_REV_PLAN_EXITED
+        previous = self._last_injection_revision(EXEC_MODE_TAG)
+        if previous == revision:
+            return
+        if not previous and not in_plan:
+            return
+        if in_plan:
+            body = PLAN_ACTIVE_REMINDER
+        elif self.execution_gate.mode == MODE_GOAL:
+            body = PLAN_EXITED_TO_GOAL_REMINDER
+        else:
+            body = PLAN_EXITED_REMINDER
+        self._append_injection(EXEC_MODE_TAG, revision, body)
+        log.info("注入执行模式提醒: %s%s -> %s",
+                 self.session_prefix, self.session_id, revision)
 
     def compact(self) -> None:
         """手动触发上下文压缩（/compact）。"""
@@ -1696,6 +2114,12 @@ class Agent:
         self._sync_memory_index()
         self._sync_environment()
         self._sync_project_rules()
+        # 执行模式提醒（2026-09-25，docs/frontend/22）：**两态对称注入**。
+        # 放在 turn 起点而不是"点 tag 的那一刻"是刻意的 —— 点 tag 走的是
+        # asyncio.to_thread（事件循环线程），在 busy 时改 history_messages
+        # 会与工作线程的 agent_loop 抢同一个 list；而 turn 起点正好是"下一次
+        # LLM 调用之前"，语义上已经足够（模型一定读得到最新状态）。
+        self._sync_execution_mode()
         # 任务板兜底注入：这是"同会话中断后再发一条消息"这类场景的**唯一**覆盖点
         #（那条路径不经过 init_session / switch_session）。去重由 _history_has_task_board
         # 负责，压缩把注入段裁掉后也会在这里自动补注。
@@ -1879,10 +2303,16 @@ class Agent:
                     self._print(f"\033[33m[goal] achieved: {decision.reason}\033[0m")
                     log.info("goal achieved: %s%s %s",
                              self.session_prefix, self.session_id, decision.reason[:120])
+                    # 执行模式：目标终结 → 模式回落 normal + 落盘 + 推送（撤 tag）。
+                    # ⚠ 本处同步跑在**工作线程**（session_runtime 的 to_thread），
+                    # 且 agent 侧没有 hub —— 只能用 execution_mode_sink（其内部
+                    # 是 deliver → call_soon_threadsafe → hub.broadcast，线程安全）。
+                    self._on_goal_terminated()
                 elif decision.action == "failed":
                     self._print(f"\033[31m[goal] failed: {decision.reason}\033[0m")
                     log.warning("goal failed: %s%s %s",
                                 self.session_prefix, self.session_id, decision.reason[:120])
+                    self._on_goal_terminated()
                 elif decision.action == "limit":
                     self._print(f"\033[31m[goal] limit: {decision.reason}\033[0m")
                     log.warning("goal limit: %s%s 连续 block 超上限，强制结束 (%s)",

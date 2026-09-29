@@ -184,6 +184,14 @@ class SessionRuntime:
         # 此处必须同步重绑，否则子智能体（含后台子任务）的 tool_call 事件
         # 只打印到后端 stdout，永远到不了前端 UI。
         agent.subagent_runner.sinks = [agent.stream_sink]
+        # 执行模式事件出口（2026-09-25 任务执行模式，docs/frontend/22 §4.3 P1-3）：
+        # `execution_mode_changed` 有**两个触发源** —— 用户点胶囊 tag（事件循环侧，
+        # 经命令分支）与 goal 达成/失败后自动回落（**工作线程**侧，Stop 边界）。
+        # 二者必须只有**一条投递路径**，否则两套口径会漂移（项目里踩过同类）。
+        # agent 侧没有 `hub`（全仓 `hub` 只在 ws_bridge），故注入 `self._deliver`
+        # —— 其内部是 `call_soon_threadsafe` + 广播全连接，**线程安全**。
+        # 形状固定为 `(kind, payload)`，与 hub.broadcast 同参。
+        agent.execution_mode_sink = self._deliver
 
     def _bind_subagent_store(self, agent: Agent) -> None:
         """把子智能体旁路记录存储绑给本会话 Agent 的 SessionManager。

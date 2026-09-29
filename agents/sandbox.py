@@ -2,7 +2,7 @@
 """
 sandbox.py - 沙盒执行隔离（执行层的"绝对墙"，与权限管控策略层互补）
 
-定位（2026-09-22 沙盒功能，见 docs/frontend/19）：
+定位（2026-09-22 沙盒功能，见 docs/frontend/20）：
     权限管控（permission.py）= 策略层：决定"允不允许、要不要问用户"，靠静态
     分析工具调用参数（可被变量拼接/脚本中转绕过）。
     沙盒（本模块）= 执行层：进程真跑起来时 OS 层面实际能碰什么。接入点在
@@ -24,6 +24,18 @@ sandbox.py - 沙盒执行隔离（执行层的"绝对墙"，与权限管控策�
 
     策略细节（网络放行、敏感读屏蔽）全部体现在模板里 —— 用户编辑即改策略；
     config.json 只留总开关 SANDBOX_ENABLED 与后端选择 SANDBOX_BACKEND。
+
+    ⚠️ 改默认模板前必读（2026-09-24 修复两条 P0 后的结论）：
+    1. **工作区可能与"敏感目录"重叠**：桌面端新建 default 会话的工作区就是
+       `~/.aigent/projects/default/scratch`（paths.default_scratch_paths()）。
+       所以 seatbelt 侧必须在 `(deny file-read* (subpath "{{HOME}}/.aigent"))`
+       **之后**再放行 `{{WORKDIR}}`（Seatbelt 后写覆盖先写）；bwrap 侧则**不能**对
+       整个 `{{HOME}}/.aigent` 做 `--tmpfs`（后面的挂载会把先绑定的工作区挂空），
+       只能遮蔽 `{{HOME}}/.aigent/config`。
+    2. **默认模板只在首次访问落盘**（不覆盖用户文件）→ 改默认模板后存量用户不会
+       自动生效，需在设置页点「恢复默认模板」。
+    3. 模板是"allow-by-default + 定向 deny"，用户把 deny 行删掉 = 放宽策略，这是
+       有意设计（策略唯一出处就在模板里）。
 
 平台矩阵：
     macOS   SeatbeltBackend（sandbox-exec，系统自带零依赖）
@@ -65,13 +77,32 @@ DEFAULT_SEATBELT_PROFILE = """\
 (allow file-write* (literal "/dev/null") (literal "/dev/tty") (subpath "/dev/fd"))
 (deny network*)
 (allow network* (local ip))
-(deny file-read* (subpath "{{HOME}}/.ssh") (subpath "{{HOME}}/.aigent"))
+; ── 敏感面（次序有意义：Seatbelt **后写的规则覆盖先写的** —— 上面"deny 后跟 allow"
+;    的写例外也正是靠这条，所以下面的追加规则同样生效）────────────────────────
+; ① 整棵 ~/.aigent 不可读（凭证 / 其他工作空间的对话记录与元数据 / 日志）
+(deny file-read* (subpath "{{HOME}}/.aigent"))
+; ② **工作区读兜底重放行**：桌面端新建 default 会话的工作区就在
+;    {{HOME}}/.aigent/projects/default/scratch 下（见 paths.default_scratch_paths()），
+;    少了这一条，bash 连自己目录都读不了（ls / cat / python 全 Operation not permitted
+;    —— 2026-09-24 修前实测取证）。必须在 ① 之后。
+(allow file-read* (subpath "{{WORKDIR}}"))
+; ③ 同类凭证的读拒绝面（放在 ② 之后 → 即使工作区恰好落在这些目录里也仍然拦）
+(deny file-read* (subpath "{{HOME}}/.ssh") (subpath "{{HOME}}/.aws")
+      (subpath "{{HOME}}/.kube") (subpath "{{HOME}}/.docker")
+      (literal "{{HOME}}/.git-credentials") (literal "{{HOME}}/.npmrc"))
+; ④ 写面兜底：工作区 / 额外目录被设成 $HOME 时，也不许反手打开凭证与本应用配置
+(deny file-write* (subpath "{{HOME}}/.ssh") (subpath "{{HOME}}/.aigent/config"))
 """
 
+# Linux：bwrap 的挂载点**必须存在**（不确定时不要加遮蔽行，否则 bwrap 起不来 =
+# 所有 bash 命令失败）。故凭证屏蔽面只覆盖必然存在的 .ssh 与 ~/.aigent/config；
+# 要扩到 .aws/.kube 等需先确认 bwrap 是否自动创建挂载点（见 docs/frontend/20 §二.3）。
 DEFAULT_BWRAP_ARGS = """\
 --die-with-parent
 --new-session
 --unshare-ipc
+--unshare-net
+--unshare-pid
 --dev-bind /dev /dev
 --proc /proc
 --ro-bind / /
@@ -80,7 +111,7 @@ DEFAULT_BWRAP_ARGS = """\
 --tmpfs /tmp
 --tmpfs {{TMPDIR}}
 --tmpfs {{HOME}}/.ssh
---tmpfs {{HOME}}/.aigent
+--tmpfs {{HOME}}/.aigent/config
 --
 /bin/bash
 -c
@@ -112,7 +143,7 @@ def validate_template(kind: str, content: str) -> None:
     if missing:
         raise ValueError(
             f"沙盒模板缺少必需占位符：{', '.join(missing)}；"
-            f"可在设置页「恢复默认模板」找回"
+            f"请补回后再保存（或点「恢复默认模板」回到出厂策略）"
         )
 
 
@@ -129,10 +160,14 @@ def ensure_templates() -> None:
 
 
 def read_template(kind: str) -> str:
-    """读模板内容；不存在先补默认；读盘失败兜底返回默认内容（不让沙盒彻底失效）。"""
-    ensure_templates()
+    """读模板内容；不存在先补默认；读盘/建目录失败兜底返回默认内容（不让沙盒彻底失效）。
+
+    注意 `ensure_templates()` 也必须在兜底范围内：它的 `mkdir` 会抛 OSError
+    （SANDBOX_DIR 位置被占 / 只读），漏掉会穿透到 WS 命令处理链（2026-09-24 修）。
+    """
     default, path = _TEMPLATES[kind]
     try:
+        ensure_templates()
         return path.read_text(encoding="utf-8")
     except OSError as e:
         log.error("沙盒模板读取失败，使用默认内容: %s (%s)", path, e)
@@ -192,8 +227,11 @@ def _check_placeholders(kind: str, content: str) -> bool:
 
 
 # ── 沙盒拦截特征（run_bash 错误提示用）────────────────────────────
+# 只留能**指向沙盒**的特征串。刻意不含 "bwrap"：它同时也是合法路径/输出里可能出现的
+# 子串（2026-09-24 收窄），会把无关报错（chmod/kill/ulimit 的 EPERM、恰好含 bwrap 字样
+# 的输出）误报成"沙盒拦截"，反而误导模型去改沙盒配置。
 SANDBOX_BLOCK_MARKERS = ("Operation not permitted", "Read-only file system",
-                         "sandbox_exec", "bwrap")
+                         "sandbox-exec", "sandbox_exec")
 
 
 def looks_blocked_by_sandbox(stderr: str) -> bool:
@@ -340,8 +378,17 @@ def get_backend() -> SandboxBackend | None:
 
 
 def backend_status() -> dict:
-    """设置页状态行数据：平台、探测到的后端名、是否可用。"""
+    """设置页状态行数据：平台、探测到的后端名、是否可用、不可用原因。
+
+    `reason`：ok（可用）/ off（后端被 SANDBOX_BACKEND=off 显式关掉）/ unsupported
+    （平台没有可用后端）。**off 必须回 backend_available=False** —— 否则前端状态行
+    只判 available，会出现"用户已把沙盒关掉、界面还写生效中"（2026-09-24 修）。
+    注意这是"后端"状态，与总开关 `sandbox_enabled` 正交：两者都要看才能渲染状态行。
+    """
     pref = backend_preference()
+    if pref == "off":
+        return {"platform": sys.platform, "backend": None,
+                "backend_available": False, "reason": "off"}
     if pref in _BACKENDS:
         backend = _BACKENDS[pref]()
         available = backend.is_available()
@@ -357,4 +404,5 @@ def backend_status() -> dict:
         "platform": sys.platform,
         "backend": detected,
         "backend_available": available,
+        "reason": "ok" if available else "unsupported",
     }

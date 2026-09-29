@@ -389,7 +389,7 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null; attachments?: unknown[] | null; refs?: unknown[] | null }) => {
+  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null; attachments?: unknown[] | null; refs?: unknown[] | null; exec_mode?: string | null; exec_condition?: string | null }) => {
     // ⚠️ 不能只判 text：**纯附件消息 / 纯引用消息（正文为空）都是合法发送**。
     // 历史 bug 就是这里把"只发了图片没打字"的消息静默丢掉；引用上线时同样
     // 必须把 `refs` 加进来，否则"只 @ 了一个文件就发送"会被无声丢弃。
@@ -399,6 +399,15 @@ function createWindow(): void {
     const sessionId = typeof payload.session_id === 'string' && payload.session_id ? payload.session_id : undefined
     // project_id：新建任务的归属工作空间（已有会话由后端按 session_id 解析归属）
     const projectId = typeof payload.project_id === 'string' && payload.project_id ? payload.project_id : undefined
+    // exec_mode：新建任务的**预选执行模式**（2026-09-27，docs/frontend/22 §2.5）。
+    // 形状校验与前两处同款（白名单 + 非空），condition 仅在 goal 时透传。
+    // **只对新建生效**：已有会话的模式切换走 `session_exec_mode`（会话级状态，别走这条）。
+    const execMode =
+      sessionId === undefined && ['plan', 'goal'].includes(String(payload.exec_mode ?? ''))
+        ? String(payload.exec_mode)
+        : undefined
+    const execCondition =
+      execMode === 'goal' && typeof payload.exec_condition === 'string' ? payload.exec_condition : undefined
     ws.send(JSON.stringify({
       kind: 'chat',
       payload: {
@@ -408,7 +417,9 @@ function createWindow(): void {
         ...(payload.overrides ? { overrides: payload.overrides } : {}),
         ...(payload.model_id ? { model_id: payload.model_id } : {}),
         ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
-        ...(payload.refs?.length ? { refs: payload.refs } : {})
+        ...(payload.refs?.length ? { refs: payload.refs } : {}),
+        ...(execMode !== undefined ? { exec_mode: execMode } : {}),
+        ...(execCondition !== undefined ? { exec_condition: execCondition } : {})
       }
     }))
   })
@@ -494,6 +505,43 @@ function createWindow(): void {
       kind: 'project_permission',
       payload: { project_id: payload.project_id, mode }
     }))
+  })
+
+  // ── 任务执行模式（2026-09-25，docs/frontend/22）───────────────────────
+  // 与权限档位**正交**的另一条轴。三个命令：
+  //   session_exec_mode / plan_approve —— **fire-and-forget**（同 session_permission）：
+  //     回执走 `execution_mode_changed` **广播** / 既有 `error` 信封，主进程拿点对点
+  //     回包没有意义；而且 pending 表按 kind FIFO 配对、无 id，同 kind 并发会串台。
+  //   plan_read —— 有真回执（`plan_content` 点对点），走 request()（同 agent:readFile）。
+  ipcMain.handle('agent:sessionExecMode', (e, payload: { session_id?: string; mode?: string; condition?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    const mode = payload.mode
+    if (mode !== 'normal' && mode !== 'plan' && mode !== 'goal') return
+    // condition 只在 goal 时有意义：非 goal 一律不带（避免脏值落进 payload）。
+    // 内容校验（空 / 超 MAX_GOAL_LENGTH）由后端 GoalError 统一负责，文案原样回 error 信封。
+    const condition = mode === 'goal' && typeof payload.condition === 'string' ? payload.condition : undefined
+    ws.send(JSON.stringify({
+      kind: 'session_exec_mode',
+      payload: {
+        session_id: payload.session_id,
+        mode,
+        ...(condition !== undefined ? { condition } : {})
+      }
+    }))
+  })
+
+  ipcMain.handle('agent:planApprove', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    ws.send(JSON.stringify({
+      kind: 'plan_approve',
+      payload: { session_id: payload.session_id }
+    }))
+  })
+
+  ipcMain.handle('agent:planRead', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    // 点对点回执 `plan_content`（同 file_content 的配对方式）
+    return request('plan_read', 'plan_content', { session_id: payload.session_id })
   })
 
   ipcMain.handle('agent:switchSession', (e, payload: { session_id?: string }) => {

@@ -14,7 +14,9 @@
 - 幂等：迟到 / 重复 / 非法 decision / 未知 request_id 一律 False、不二次唤醒；
 - **等待期不持锁**：request 阻塞期间主线程 `resolve` 立即生效
   （把 `done.wait()` 写进锁内的话这里会死锁 —— 本模块最要命的回归）；
-- 撞车 fail-closed：同会话第二个并发审批立即拒绝，不排队；
+- 并发在途（2026-09-25 修正）：同会话多个审批各自广播、各自结算、互不干扰
+  （原为"撞车 fail-closed：第二个并发审批立即拒绝"——后台子智能体并发触发时
+  会把第二个静默拒绝且前端收不到卡片，已改为允许并发）；
 - 重放：`pending_payloads()` 只含**已广播**的请求（announced 闸门）；
 - 载荷收敛：超长 args 字符串值截断（防大信封）；
 - `deliver` 抛异常不影响审批返回（钩子层契约：绝不向上抛）。
@@ -315,17 +317,93 @@ class TestApprovalTimeoutAndStop(_BrokerTestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  撞车 / 载荷收敛 / 投递容错
+#  并发在途 / 载荷收敛 / 投递容错
 # ═══════════════════════════════════════════════════════════════════
 
 class TestApprovalEdgeCases(_BrokerTestCase):
-    def test_concurrent_request_fail_closed(self):
-        """同会话撞车（理论不可达，防御性回归）：第二个并发审批立即拒绝。"""
-        with self.requester() as rq:
-            second = self.broker.request(
-                **_request_kwargs(tool_call_id="toolu_conflict"))
-            self.assertEqual(second, APPROVE_DENY)  # fail-closed 拒绝，不排队
-            self.settle_and_join(rq, APPROVE_DENY)
+    def test_concurrent_requests_settle_independently(self):
+        """同会话并发在途（2026-09-25 修正）：各自广播、各自结算、互不干扰。
+
+        生产触发源：后台子智能体在各自 daemon 线程里进 PreToolUse，与主智能体
+        或其它子智能体的审批同时挂起。原实现撞车 fail-closed（静默拒绝第二个、
+        不广播卡片），用户侧看到的是"权限被莫名拒绝"，且不知道是撞车。
+        """
+        results: dict = {}
+
+        def second_request():
+            results["toolu_second"] = self.broker.request(
+                **_request_kwargs(tool_call_id="toolu_second"))
+
+        with self.requester() as first:            # 第一个挂起（toolu_fake_1）
+            t2 = threading.Thread(target=second_request, daemon=True)
+            t2.start()
+            try:
+                # 就绪判据**不能**再用 has_pending()：第一个已使其恒为真，会抢在
+                # 第二个注册/广播之前就开始结算 → 改为数载荷条数。
+                deadline = time.time() + 3.0
+                while (time.time() < deadline
+                       and len(self.broker.pending_payloads()) < 2):
+                    time.sleep(0.005)
+                pends = self.broker.pending_payloads()
+                self.assertEqual(len(pends), 2, "第二个并发审批未在途（仍被拒？）")
+                ids = {p["tool_call_id"]: p["request_id"] for p in pends}
+                self.assertEqual(set(ids), {"toolu_fake_1", "toolu_second"})
+                self.assertEqual(len(self.events_of("approval_request")), 2)
+                # 分别结算（允许一次 / 拒绝）：互不串味
+                self.assertTrue(
+                    self.broker.resolve(ids["toolu_fake_1"], APPROVE_ALLOW_ONCE))
+                self.assertTrue(
+                    self.broker.resolve(ids["toolu_second"], APPROVE_DENY))
+                deadline = time.time() + 1.0
+                while time.time() < deadline and not first.finished:
+                    time.sleep(0.005)
+            finally:
+                t2.join(timeout=5.0)
+
+        self.assertIsNone(first.exc)
+        self.assertEqual(first.result, APPROVE_ALLOW_ONCE)
+        self.assertEqual(results.get("toolu_second"), APPROVE_DENY)
+        self.assertEqual(self.broker.pending_payloads(), [])
+        by_tool = {e["tool_call_id"]: e["status"]
+                   for e in self.events_of("approval_resolved")}
+        self.assertEqual(by_tool, {"toolu_fake_1": OUTCOME_ALLOWED_ONCE,
+                                   "toolu_second": OUTCOME_DENIED})
+
+    def test_two_requests_same_tool_call_id_both_settle(self):
+        """同一 tool_call_id 的两条并发审批不互相覆盖（键控是 request_id）。
+
+        子智能体重试同一工具、或主/子恰好撞同一 id 时，请求 id 独立生成，
+        各自的唤醒原语（done）独立 —— 断言两条都能拿到自己的结局。
+        """
+        ids: list = []
+        results: list = []
+
+        def run():
+            results.append(self.broker.request(
+                **_request_kwargs(tool_call_id="toolu_same")))
+
+        with self.requester(tool_call_id="toolu_same") as first:
+            t2 = threading.Thread(target=run, daemon=True)
+            t2.start()
+            try:
+                deadline = time.time() + 3.0
+                while (time.time() < deadline
+                       and len(self.broker.pending_payloads()) < 2):
+                    time.sleep(0.005)
+                pends = self.broker.pending_payloads()
+                self.assertEqual(len(pends), 2)
+                ids = [p["request_id"] for p in pends]
+                self.assertEqual(len(set(ids)), 2, "request_id 必须互不相同")
+                for rid in ids:
+                    self.assertTrue(self.broker.resolve(rid, APPROVE_ALLOW_ONCE))
+                deadline = time.time() + 1.0
+                while time.time() < deadline and not first.finished:
+                    time.sleep(0.005)
+            finally:
+                t2.join(timeout=5.0)
+
+        self.assertEqual(first.result, APPROVE_ALLOW_ONCE)
+        self.assertEqual(results, [APPROVE_ALLOW_ONCE])
 
     def test_args_clipped_in_broadcast(self):
         """超长 args 字符串截断：防 run_write 携带整份文件内容撑爆广播。"""

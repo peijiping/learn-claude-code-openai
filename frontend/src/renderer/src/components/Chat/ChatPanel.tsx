@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { hasSendableContent, isSendableAttachment, useAgentStore } from '@store/agentStore'
+import { hasSendableContent, isSendableAttachment, showToast, useAgentStore } from '@store/agentStore'
 import MessageList from './MessageList'
 import InputBox from './InputBox'
 import TaskBoard from './TaskBoard'
@@ -21,6 +21,10 @@ export default function ChatPanel(): JSX.Element {
   const [draft, setDraft] = useState<EditorSnapshot>(EMPTY_DRAFT)
   // 自增即"清空输入框"信号（清空走编辑器命令，不做受控同步）
   const [clearSignal, setClearSignal] = useState(0)
+  /** 自增即"聚焦输入框"信号（计划卡片的「继续修改」，2026-09-25）。
+   *  与 `clearSignal` 同一范式：编号信号 + 编辑器命令，**不做受控同步**
+   *  （回灌会冲掉光标 / 打断拼音输入）。 */
+  const [focusSignal, setFocusSignal] = useState(0)
   /** 本会话是否有**在途提问**（ask_user 面板正在等作答）。
    *
    *  此时输入区整块让位：面板与输入框并存会同时给出两条作答路径 ——
@@ -64,6 +68,14 @@ export default function ChatPanel(): JSX.Element {
     setClearSignal((n) => n + 1)
   }
 
+  /** 计划卡片「继续修改」（2026-09-25）：只聚焦输入框 + 给一句提示，
+   *  **不自动发消息** —— 自动发会把一句系统提示当成用户意图送进会话。
+   *  计划模式此刻仍生效（mode=plan），用户可以自然语言描述要改什么。 */
+  const handleRevisePlan = (): void => {
+    setFocusSignal((n) => n + 1)
+    showToast('请描述要调整的地方，计划模式仍生效', 'info', 3000)
+  }
+
   // 全局兜底：任何落在 composer 之外的 dragover/drop 都必须 preventDefault。
   // 否则 Electron 会把它当成"导航到这个文件"→ 整个窗口被替换成文件内容（白屏事故）。
   // 这里只拦不处理：真正的投放逻辑在 InputBox 的 composer 上。
@@ -86,7 +98,7 @@ export default function ChatPanel(): JSX.Element {
           <div className="brand-text">Anything for You</div>
         </div>
       ) : (
-        <MessageList />
+        <MessageList onRevisePlan={handleRevisePlan} />
       )}
 
       {/* 任务面板：固定在输入框上方（有未完成任务组时才渲染） */}
@@ -103,6 +115,7 @@ export default function ChatPanel(): JSX.Element {
           onChange={setDraft}
           onSend={doSend}
           clearSignal={clearSignal}
+          focusSignal={focusSignal}
           suspended={askOpen}
           attachments={draftAttachments}
           onStagePaths={(paths) => void stageAttachments(paths)}

@@ -25,7 +25,7 @@ from typing import Callable, Optional
 
 from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
 import paths  # 运行期读 paths.TASKS_DIR（测试/CLI 会临时改写模块级值，不能静态捕获）
-from paths import DEFAULT_PROJECT_SLUG, task_files_for_session
+from paths import DEFAULT_PROJECT_SLUG, plan_file_for_session, task_files_for_session
 from logger import get_logger
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
@@ -41,6 +41,12 @@ SESSION_ID_LEN = 10
 
 # token 消耗统计的四字段（与 LLM usage 投影结构一致，会话级累计/轮级明细共用）
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "cached_tokens", "total_tokens")
+
+# 「不修改该项」哨兵（2026-09-25，任务执行模式）。
+# 与 None 严格区分：`set_session_execution(..., goal_condition=None)` 表示
+# **显式把目标条件清空**（goal 达成/清除时必须能落盘 None），而省略参数
+# 才表示"本项不改"。若用 None 兼任"不改"，清空就永远写不进去。
+_UNSET: object = object()
 
 # ── 右侧面板（2026-09-23，docs/frontend/19）────────────────────────────
 # 会话级 UI 状态，与 unread / permission_mode / usage_totals 同源，随
@@ -1329,7 +1335,40 @@ class SessionManager:
             # 写在这里只为**可发现性**（一份 meta 摆在眼前能看出有哪些字段）；
             # 读路径一律 `.get()`，存量 meta 缺该字段与 None 同义。
             "right_panel": None,
+            # ── 任务执行模式（2026-09-25，docs/frontend/22）──────────────
+            # 独立于权限档位的一条正交轴：normal（默认）/ plan / goal。
+            # None = 未记录 = normal（零迁移；前端按 "normal" 兜底渲染）。
+            # ⚠ 语义边界：`execution_mode == "goal"` **不是** goal 的真相 ——
+            # 真相恒为 `GoalController.active`，本字段只是 UI 投影（去重推送用）。
+            "execution_mode": None,
+            # 计划文书状态：None（未产出）/ "ready"（待批准）/ "approved"。
+            # 这是 plan 的**真源**（execution_mode 只是它的投影）。
+            "plan_status": None,
+            # 目标完成条件：**只作 GoalController.restore 的喂料**（最小落盘投影），
+            # active=True 时记 condition，clear/achieved/failed 时置 None。
+            # 它不是"第二个目标存储"—— 不要拿它当 goal 状态的读源。
+            "goal_condition": None,
         }
+
+    def _plans_file_for(self, session_id: str) -> Path:
+        """本会话的计划文书路径（2026-09-25 任务执行模式）。
+
+        口径**唯一**在 `paths.plan_file_for_session` —— 写入端（Agent 的
+        `plan_write` 闭包）与清理端（本类的两处级联）必须同源，否则会出现
+        "删了会话却把文书永久留在磁盘上"（清理静默失效，无任何报错）。
+        """
+        return plan_file_for_session(
+            session_id, self.session_prefix,
+            self.chat_history_dir.parent / paths.PLANS_DIRNAME,
+        )
+
+    def plan_file_for(self, session_id: str) -> Path:
+        """本会话计划文书的绝对路径（**公开入口**，供桥层 / 回执组装调用）。
+
+        口径唯一在 `_plans_file_for` → `paths.plan_file_for_session`；本方法只是
+        去掉下划线的对外别名，避免 `ws_bridge` 触碰私有成员造成第二处拼接。
+        """
+        return self._plans_file_for(session_id)
 
     def _meta_entry_for(self, session_file: Path) -> dict:
         """取某会话的元数据条目：优先独立 meta 文件，回退 index.jsonl（存量会话）。"""
@@ -1588,6 +1627,33 @@ class SessionManager:
             touch=False,
         )
 
+    def set_session_execution(self, session_id: str, *,
+                              execution_mode: object = _UNSET,
+                              plan_status: object = _UNSET,
+                              goal_condition: object = _UNSET) -> dict:
+        """记录会话的任务执行模式状态（2026-09-25，docs/frontend/22）。
+
+        **部分更新**语义：参数省略（`_UNSET`）= 本项不改；显式传值（含 `None`）
+        = 写入。`None` 与省略必须区分开 —— 否则"goal 达成后把 goal_condition
+        清空"这条落盘永远写不进去。
+
+        字段语义（详见 `_new_entry` 的注释）：
+        - `execution_mode`：`None | "normal" | "plan" | "goal"`，**仅 UI 投影**；
+        - `plan_status`：`None | "ready" | "approved"`，plan 的真源；
+        - `goal_condition`：`GoalController.restore` 的喂料，active 时记条件。
+
+        模式/状态切换是 UI 操作，不是对话内容变化 → touch=False（不把会话顶到
+        列表最前）。
+        """
+        def mutate(e):
+            if execution_mode is not _UNSET:
+                e["execution_mode"] = execution_mode
+            if plan_status is not _UNSET:
+                e["plan_status"] = plan_status
+            if goal_condition is not _UNSET:
+                e["goal_condition"] = goal_condition
+        return self._update_entry(session_id, mutate, touch=False)
+
     def set_session_ui(self, session_id: str, ui: dict | None) -> dict:
         """记录会话的右侧面板状态（2026-09-23，docs/frontend/19）。
 
@@ -1682,6 +1748,13 @@ class SessionManager:
                 task_file.unlink()
             except OSError as e:
                 log.error("删除任务文件失败 %s: %s", task_file.name, e)
+        # 计划文书与会话同生共死（2026-09-25 任务执行模式）。
+        # **只在这一处与 clear_session 两处清** —— trash_session（软删除）
+        # 刻意保留文件：还原会话后计划卡片仍要能读到正文。
+        try:
+            self._plans_file_for(session_id).unlink(missing_ok=True)
+        except OSError as e:
+            log.error("删除计划文书失败 session=%s: %s", session_id, e)
         with self._index_lock:
             if self.meta_file(session_id).exists():
                 try:
@@ -1705,7 +1778,7 @@ class SessionManager:
         Returns:
             [{id, title, title_source, status, created_at, updated_at,
               trashed_at, file, model_id, project, usage_totals, unread,
-              permission_mode}, ...]
+              permission_mode, execution_mode, plan_status}, ...]
             按「最后修改时间」（元数据 updated_at，mtime 兜底）降序 —— 最近使用的在前
         """
         self.backfill_index()
@@ -1736,6 +1809,21 @@ class SessionManager:
                 # meta 无记录（存量会话）时前端按 "default" 兜底渲染；真实判定
                 # 以后端 gate 继承链为准，此字段只服务展示。
                 "permission_mode": meta.get("permission_mode") or "default",
+                # 任务执行模式（2026-09-25，docs/frontend/22）：**断线重连 / 整页
+                # 重载后恢复胶囊 tag 的唯一通道**。为什么不挂 session_history：
+                # 连接建立时的重放序列不含 session_history，而它只在收到
+                # session_switch 之后才发出；前端重连只做 resetTransient() +
+                # listSessions()。与 permission_mode / unread 同通道即天然覆盖。
+                "execution_mode": meta.get("execution_mode") or "normal",
+                "plan_status": meta.get("plan_status"),
+                # 计划文书路径：**派生**而非落 meta —— 落到哪个文件由 sid 唯一
+                # 决定（`plan_file_for_session`），再存一份就是第二真相源。仅在有
+                # 计划状态时给出，前端据此在重连后重建计划卡片外壳（正文仍经
+                # `plan_read` 拉取，见 docs/frontend/22 §4.5）。
+                "plan_path": (str(self._plans_file_for(sid))
+                              if meta.get("plan_status") else None),
+                # 目标条件（goal 模式胶囊 tag 的文案）。仅 mode=goal 时非空。
+                "goal_condition": meta.get("goal_condition"),
             })
         sessions = [s for s in sessions if s.get("status") == status]
         # 排序键与会话列表展示解耦：list_sessions 内单独算 key（含 mtime 兜底），
@@ -1795,6 +1883,22 @@ class SessionManager:
             if sid:
                 try:
                     self._update_entry(sid, lambda e: e.pop("usage_totals", None))
+                except FileNotFoundError:
+                    pass
+
+            # 计划文书与会话内容同生共死（2026-09-25 任务执行模式）：文书文件删掉，
+            # 三个执行模式字段一并归零 —— 否则会留下"plan_status=approved 但文书
+            # 已不存在"的僵尸状态，前端切回来会渲染一张读不到正文的卡片。
+            if sid:
+                try:
+                    self._plans_file_for(sid).unlink(missing_ok=True)
+                except OSError as e:
+                    log.error("删除计划文书失败 session=%s: %s", sid, e)
+                try:
+                    self._update_entry(sid, lambda e: e.update({
+                        "execution_mode": None, "plan_status": None,
+                        "goal_condition": None,
+                    }), touch=False)
                 except FileNotFoundError:
                     pass
 

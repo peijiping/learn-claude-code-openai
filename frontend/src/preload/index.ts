@@ -18,6 +18,13 @@ interface RefInput {
   is_dir?: boolean
 }
 
+/** chat 携带的**预选执行模式**（与 renderer 侧 ExecutionMode 同构；preload 属 node
+ *  侧 tsconfig，不跨到 renderer 取类型）。 */
+interface ExecModeInput {
+  mode: 'normal' | 'plan' | 'goal'
+  condition?: string
+}
+
 /**
  * preload - 渲染进程与主进程之间唯一的"合规通道"。
  * 只暴露白名单 API（不透出原始 ipcRenderer），contextIsolation 开启下安全。
@@ -29,9 +36,11 @@ const agent = {
    * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。
    * attachments=本轮附件（附件登记得到的 att_id 列表）；**只有附件无正文时 text 传空串**。
    * refs=本轮引用的工作空间路径（**零复制**：只传路径，后端校验越界后挂中性引用块）；
-   * **只有引用无正文同样是合法发送**。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}), ...(refs?.length ? { refs } : {}) }),
+   * **只有引用无正文同样是合法发送**。
+   * execMode=新建任务的**预选执行模式**（无会话时选好的 plan/goal，随首条消息交给后端
+   * 在建会话时落盘，首轮即生效）；缺省/null = 不设置（见 docs/frontend/22 §2.5）。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null, execMode?: ExecModeInput | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}), ...(refs?.length ? { refs } : {}), ...(execMode ? { exec_mode: execMode.mode, ...(execMode.condition ? { exec_condition: execMode.condition } : {}) } : {}) }),
 
   /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
    * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
@@ -60,6 +69,24 @@ const agent = {
     ipcRenderer.invoke('agent:sessionPermission', { session_id: sessionId, mode }),
   projectPermission: (projectId: string, mode: string): Promise<void> =>
     ipcRenderer.invoke('agent:projectPermission', { project_id: projectId, mode }),
+
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）────────────────────
+   * 与权限档位**正交**的另一条轴（normal / plan / goal）。三条命令：
+   * - `sessionExecMode` / `approvePlan`：同 sessionPermission 的 **fire-and-forget**
+   *   —— 回执分别走 `execution_mode_changed` 广播与既有 `error` 信封，别改成 request()。
+   * - `planRead`：**有真回执**（点对点 `plan_content`），需 await；形状与 file_content
+   *   同族（`reason` 非空 = 读不到，属常规降级而非异常）。
+   * ⚠ 计划文书在**元数据目录**里，读不到时不能用 readFile 兜底（越界）。 */
+  sessionExecMode: (sessionId: string, mode: string, condition?: string): Promise<void> =>
+    ipcRenderer.invoke('agent:sessionExecMode', {
+      session_id: sessionId,
+      mode,
+      ...(condition !== undefined ? { condition } : {})
+    }),
+  approvePlan: (sessionId: string): Promise<void> =>
+    ipcRenderer.invoke('agent:planApprove', { session_id: sessionId }),
+  planRead: (sessionId: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:planRead', { session_id: sessionId }),
 
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (sessionId: string): Promise<{ session_id: string; message_count: number }> =>

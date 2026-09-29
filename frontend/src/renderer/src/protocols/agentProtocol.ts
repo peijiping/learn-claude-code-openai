@@ -233,6 +233,17 @@ export interface HistoryAskUser {
 /** 权限模式：default = 敏感操作逐次审批；full_access = 跳过审批（硬拒绝仍生效） */
 export type PermissionMode = 'default' | 'full_access'
 
+/** 任务执行模式（2026-09-25，docs/frontend/22）：与权限档位**正交**的另一条轴。
+ *  - `normal` 什么都不显示（默认，**零占位**）
+ *  - `plan`   先出计划文书，未经批准不得改动系统（写操作被 PreToolUse 守卫拦下）
+ *  - `goal`   朝一个明确条件反复推进直到达成 —— 是对既有 `GoalController` 的
+ *             **投影**，唯一真相是 `goal_controller.active`（后端铁律，见 execution_state）
+ *  两条轴概念独立、状态独立、UI 入口独立、**判定链不合并**。 */
+export type ExecutionMode = 'normal' | 'plan' | 'goal'
+
+/** 计划文书状态（`plan` 模式）：ready = 已产出待批准；approved = 已批准（卡片转只读）。 */
+export type PlanStatus = 'ready' | 'approved'
+
 /** 审批触发类型（后端 permission.py 的 Decision.trigger） */
 export type ApprovalTrigger =
   | 'dangerous_pattern'
@@ -279,7 +290,12 @@ export type UiEvent =
   | { kind: 'sessions_trashed'; payload: { sessions: SessionMeta[] } }
   | { kind: 'session'; payload: { session_id: string; message_count: number; /** 新会话所属工作空间 id（前端据此对齐活动空间） */ project_id?: string } }
   | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
-  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; /** 该会话当前权限档位（2026-09-22）：切会话时恢复盾牌 chip 选中态 */ permission_mode?: PermissionMode; /** 右侧面板状态（2026-09-23）：切会话时恢复"开着的标签 + 当前激活" */ right_panel?: RPanelPersist | null } }
+  | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; /** 该会话当前权限档位（2026-09-22）：切会话时恢复盾牌 chip 选中态 */ permission_mode?: PermissionMode; /** 右侧面板状态（2026-09-23）：切会话时恢复"开着的标签 + 当前激活" */ right_panel?: RPanelPersist | null; /** ── 任务执行模式 4 字段（2026-09-25，docs/frontend/22）─────────────
+   *  切会话 / 回放时恢复胶囊 tag 与计划卡片外壳。`plan_path` 由后端**派生**给出
+   *  （落点由 sid 唯一决定，不落 meta）；正文仍经 `plan_read` 拉取。
+   *  ⚠ 断线重连**不走这条信道**（重放序列不含 session_history）→ 恢复还依赖
+   *  `sessions` 列表载荷的同名 4 字段，两处都要带上。 */
+    execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
@@ -327,6 +343,20 @@ export type UiEvent =
   /** 会话权限模式已切换（session_permission 的回执广播）：前端同步盾牌 chip。
    *  以后端广播为准（不做乐观更新）—— 传输层丢失时乐观 UI 会说谎。 */
   | { kind: 'permission_changed'; payload: { session_id: string; mode: PermissionMode; source?: string } }
+  /** 任务执行模式已切换（2026-09-25，docs/frontend/22）。**三条来源共用同一条
+   *  投递路径**（用户点 tag 切模式 / goal 达成自动回落 / plan 批准续跑）—— 后端
+   *  `Agent.execution_mode_sink` 统一投递，避免两套口径漂移。
+   *  与 `permission_changed` 同款：前端**不做乐观更新**，tag 选中态只认这条广播。 */
+  | { kind: 'execution_mode_changed'; payload: ExecutionModeChangedPayload }
+  /** 计划文书已产出（`plan_write` 落盘后推）。**不带正文、不带路径** —— 正文由
+   *  `plan_read` 拉取（实时与回放共用同一条链路），路径由 `plan_content` 回执带回。
+   *  推送顺序契约：**先** `execution_mode_changed`（已带 `plan_status="ready"`）
+   *  **再** 本信封，保证前端处理卡片时 tag 状态已就位。 */
+  | { kind: 'plan_ready'; payload: { session_id: string; plan_status: PlanStatus } }
+  /** 计划文书正文（应答 `plan_read` 命令）。**点对点信封** —— 同 `file_content`：
+   *  不进 isKnownAgentEvent 白名单（当流式事件处理会静默丢消息）。形状与其同族，
+   *  前端复用一套降级字段解析。 */
+  | { kind: 'plan_content'; payload: PlanContentPayload }
 
 /** 附件种类（与后端 attachments.KIND_* 对齐） */
 export type AttachmentKind = 'image' | 'document' | 'text'
@@ -537,6 +567,46 @@ export interface FileContentPayload {
   pdf_path: string
   /** Office 降级给用户看的原因（"未检测到 LibreOffice…"）；成功时为空串。 */
   office_hint: string
+}
+
+/** 计划文书正文（应答 `plan_read`，docs/frontend/22 §4.5）。
+ *
+ *  **形状刻意与 `FileContentPayload` 同族**（同一套降级字段），前端复用一套解析：
+ *  - `reason` 非空 = 读不到（文件被清理 / 空间目录不可用），前端渲染占位块而非白屏；
+ *  - `too_large` = 超过 `refs.file_preview_max_bytes()`（512KB）→ **一点内容都不给**
+ *    （"宁可不给，不给半个"），`text` 为空串。
+ *
+ *  为什么**不是** `file_read`：后者的根被 `resolve_within(workdir)` 钉死在工作区，
+ *  而文书落在**元数据目录** `<data_root>/plans/` → 天然越界（default 空间整体禁用）。
+ *  故后端单开一条命令，此处也单开一个信封类型。 */
+export interface PlanContentPayload {
+  project_id?: string
+  session_id?: string
+  path: string
+  name: string
+  size: number
+  mtime: number
+  encoding: string
+  binary: boolean
+  too_large: boolean
+  truncated: boolean
+  lines: number
+  text: string
+  reason: string
+}
+
+/** 执行模式变更广播载荷（`execution_mode_changed`）。
+ *  与后端 `Agent.execution_state()` **逐字段同形** —— 那个方法同时服务本信封与
+ *  `session_history` 的 4 字段，前端契约因此只有一份。 */
+export interface ExecutionModeChangedPayload {
+  session_id: string
+  mode: ExecutionMode
+  /** plan 状态（非 plan 模式时为 null）。 */
+  plan_status: PlanStatus | null
+  /** 计划文书路径（无计划状态时为 null）。 */
+  plan_path: string | null
+  /** 目标条件（goal 模式）。 */
+  goal_condition: string | null
 }
 
 /** 变更面板里的一行文件（`path` 是**仓库相对路径**）。 */
@@ -879,7 +949,9 @@ export interface LlmModelsResult {
 }
 
 /** 沙盒设置回执（设置页「沙盒」页，docs/frontend/20）。
- *  get 回执与 save 回执同构（save 多带 applied/errors），前端整份替换 store。 */
+ *  get 回执与 save 回执同构（save 多带 applied/errors），前端整份替换 store。
+ *  注意状态行需要 `sandbox_enabled` 与 `backend_available` **两个**字段一起判：
+ *  只看后者会出现"开关已关、界面还写生效中"（2026-09-24 修）。 */
 export interface SandboxConfigResult {
   /** 后端 sys.platform（darwin / linux / win32 …） */
   platform: string
@@ -887,6 +959,8 @@ export interface SandboxConfigResult {
   backend: string | null
   /** 后端是否可用（false = 启用后也会裸跑，状态行提示） */
   backend_available: boolean
+  /** 后端不可用原因：ok / off（SANDBOX_BACKEND=off）/ unsupported / error */
+  reason?: string | null
   /** 沙盒总开关（config.json 的 SANDBOX_ENABLED，保存后热生效） */
   sandbox_enabled: boolean
   /** macOS Seatbelt profile 模板内容（~/.aigent/sandbox/seatbelt.sb） */
@@ -936,6 +1010,18 @@ export interface SessionMeta {
   /** 该会话当前权限档位（2026-09-22 权限管控）：盾牌 chip 的权威数据源之一。
    *  老会话/老后端缺省时按 "default" 处理。 */
   permission_mode?: PermissionMode
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）─────────────────────
+   *  ⚠ **断线重连 / 整页重载后恢复胶囊 tag 的唯一通道**：连接重放序列不含
+   *  `session_history`（它只在收到 `session_switch` 后才发），前端重连只做
+   *  `resetTransient()` + `listSessions()` —— 与 `permission_mode`/`unread`
+   *  同通道即天然覆盖。老会话/老后端缺省时按 `'normal'` 处理（零占位）。 */
+  execution_mode?: ExecutionMode
+  /** 计划文书状态：非空才会渲染计划卡片外壳（正文经 `plan_read` 拉取）。 */
+  plan_status?: PlanStatus | null
+  /** 计划文书落点（后端**派生**给出，非 meta 字段）。仅 `plan_status` 非空时有值。 */
+  plan_path?: string | null
+  /** 目标条件（goal 模式胶囊 tag 的文案）。仅 `execution_mode === 'goal'` 时非空。 */
+  goal_condition?: string | null
 }
 
 /**
@@ -1036,6 +1122,17 @@ export type ControlKind =
    *  fire-and-forget：成功后后端广播 `projects` 刷新（无会话号，不带
    *  permission_changed）—— chip 选中态由 projects 广播驱动。 */
   | 'project_permission'
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）─────────────────────
+   *  与权限档位**正交**：权限回答"能不能做/要不要审批"，执行模式回答"以什么方式做"。
+   *  - `session_exec_mode`：切换 normal/plan/goal。fire-and-forget，回执走
+   *    `execution_mode_changed` **广播**（多窗口一致）；失败走既有 `error` 信封。
+   *  - `plan_approve`：批准计划文书 → `plan_status=approved` + mode 回落 normal +
+   *    自动续跑一轮。fire-and-forget（该命令不回内容，等流式事件）。
+   *  - `plan_read`：读计划文书正文（**不是 file_read**，文书在元数据目录里）→
+   *    点对点回执 `plan_content`。 */
+  | 'session_exec_mode'
+  | 'plan_approve'
+  | 'plan_read'
   /** 右侧面板状态上报（2026-09-23，docs/frontend/19）。**fire-and-forget，
    *  无点对点回包** —— 与 ask_answer 同款：主进程 pending 表按 kind FIFO 配对
    *  且无 id，同 kind 并发会串台。前端做 400ms 防抖合并上报，丢一两条只影响
@@ -1078,6 +1175,17 @@ export interface ChatPayload {
    *  把「路径清单 + 内容不在上下文中、需要时用 run_read」注入模型上下文。
    *  与 attachments 是**并列且独立**的两条通道。 */
   refs?: RefInput[]
+  /** 新建任务的**预选执行模式**（2026-09-27）。**仅无会话**（`session_id` 缺失）
+   *  时有意义：后端在**建会话时**把它写进该会话 meta，Agent 构造时
+   *  `_restore_execution_state` 读回 → 对**首轮即生效**。
+   *
+   *  为什么不能等 `session` 信封回来再发 `session_exec_mode`：那时 turn 已
+   *  `rt.busy`，goal 会被评审 P1-5 的 busy 守卫拒掉（docs/frontend/22 §2.4）。
+   *  `'normal'` / 缺省 = 不设置（新会话默认档，零字段）。 */
+  exec_mode?: ExecutionMode
+  /** 预选模式的目标条件（仅 `exec_mode === 'goal'` 时读取；空 / 超 4000 字由后端
+   *  忽略整个预选，新会话回落 normal —— 草稿态**绝不阻断发送**）。 */
+  exec_condition?: string
 }
 
 /** 前端 → 后端：提交选择题答案（kind='ask_answer'）。
@@ -1114,6 +1222,26 @@ export interface SessionPermissionPayload {
 export interface ProjectPermissionPayload {
   project_id: string
   mode: PermissionMode
+}
+
+/** 前端 → 后端：切换会话执行模式（kind='session_exec_mode'，fire-and-forget）。
+ *  成功后后端广播 `execution_mode_changed`（前端 tag 只认广播）。`condition` 仅
+ *  `mode === 'goal'` 时有意义（空/超 4000 字由后端 `GoalError` 原样回 error 信封）。 */
+export interface SessionExecModePayload {
+  session_id: string
+  mode: ExecutionMode
+  condition?: string
+}
+
+/** 前端 → 后端：批准计划文书（kind='plan_approve'，fire-and-forget）。
+ *  后端在空闲时自动追加"[计划已批准]"续跑指令并起一轮；忙碌/有待答提问时只落状态。 */
+export interface PlanApprovePayload {
+  session_id: string
+}
+
+/** 前端 → 后端：读计划文书正文（kind='plan_read'）→ 点对点回执 `plan_content`。 */
+export interface PlanReadPayload {
+  session_id: string
 }
 
 /** chat 携带的附件线索（真实元数据以磁盘上的 meta.json 为准，前端字段只是线索） */

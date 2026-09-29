@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import replace as dc_replace
@@ -34,6 +35,15 @@ from attachments import (
 from config import load as load_config
 from config import CONFIG_FILE
 import sandbox as sandbox_mod
+from execution_mode import (
+    MODE_GOAL,
+    MODE_NORMAL,
+    MODE_PLAN,
+    VALID_EXECUTION_MODES,
+    plan_content_payload,
+    read_plan_file,
+)
+from goal import GoalError, MAX_GOAL_LENGTH
 from interaction import status_of_result
 from llm_config import (
     caps_allow_image, fetch_remote_models, get_config, get_model_by_id,
@@ -45,6 +55,7 @@ from paths import (
     DEFAULT_PROJECT_ID,
     WorkspacePaths,
     default_scratch_paths,
+    plan_file_for_session,
     workspace_paths,
 )
 # 引用（@-mention，2026-09-21）：与附件**完全独立**的一条通道 —— 不复制、不存储，
@@ -98,6 +109,15 @@ if DEBUG_PORT:
         log.warning("联调钩子: debugpy 未就绪, 本次不联调: %s", e)
 
 PORT = int(os.environ.get("AGENT_WS_PORT", "8765"))
+
+# 计划批准后的续跑指令（`plan_approve` 在会话空闲时用它起一轮，2026-09-25）。
+# 与其它"系统代发"不同，这里**刻意**是一条真实 user 消息：它要落进历史，模型
+# 据此知道"计划已批准、可以写操作了"（撤销 plan 提醒另由
+# `agent_full_v2._sync_execution_mode` 的 `plan-exited` 注入负责，二者互补）。
+PLAN_APPROVED_RESUME_TEXT = (
+    "[计划已批准] 用户批准了你的计划文书，现在开始按计划执行。"
+    "可以正常使用 run_write / run_edit / bash 等写操作。"
+)
 
 # 全局 Agent 仅用于：大模型配置热切换（reload_llm_bindings）、会话标题生成、
 # 以及 goal/tasks/skills 等查询；"跑对话"不再走它——并发会话各自持有一个
@@ -665,13 +685,22 @@ def _save_sandbox_enabled(enabled: bool) -> None:
     config.load() 走 setdefault（不覆盖已有值），重跑也不会生效 —— 必须就地
     覆写 env（同 llm_config.py 的热切换先例）。sandbox.py 每次使用时读 env，
     所以覆写后下一条 bash 命令立即按新开关执行。
+
+    **失败语义（2026-09-24 加固）**：任何异常都抛给调用方（转成回执 errors），
+    但绝不"兜底成 {} 再回写" —— config.json 是用户可能手改过的文件，读不出来就
+    拒绝写，否则会把其余键**整份抹掉**（数据灾难）。env 只在落盘成功后才覆写，
+    避免"内存里关着、磁盘上开着"的假一致。
     """
-    data = {}
+    data: dict = {}
     if CONFIG_FILE.exists():
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            data = {}
+        except (json.JSONDecodeError, OSError) as e:
+            raise ValueError(
+                f"{CONFIG_FILE} 无法解析，已拒绝覆写以免抹掉其它配置：{e}"
+            ) from e
+        if not isinstance(data, dict):
+            raise ValueError(f"{CONFIG_FILE} 顶层不是 JSON 对象，已拒绝覆写")
     data["SANDBOX_ENABLED"] = "1" if enabled else "0"
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(
@@ -679,6 +708,60 @@ def _save_sandbox_enabled(enabled: bool) -> None:
     )
     os.environ["SANDBOX_ENABLED"] = "1" if enabled else "0"
     log.info("沙盒开关已保存并生效: %s", enabled)
+
+
+def _sandbox_payload_sync(applied: bool | None = None,
+                          errors: list[str] | None = None) -> dict:
+    """沙盒设置页回执载荷（get/save 共用，**逐字段兜底**）。
+
+    为什么逐字段 try：`handle()` 的命令分发链**没有兜底 try/except**，这里抛出去会
+    直接掀掉整条 WS 连接（表现为前端掉线重连）。所以任何一项探测失败都降级成中性值
+    并记日志，回执照发（前端不至于永远停在"读取沙盒设置…"）。
+
+    本函数会**阻塞**（含后端探测的 subprocess 试跑），只允许经
+    `_sandbox_payload()` 在线程里调用，别在事件循环里直接调。
+    """
+    collected: list[str] = list(errors or [])
+    try:
+        status = sandbox_mod.backend_status()
+    except Exception as exc:  # noqa: BLE001
+        log.error("沙盒后端状态探测失败: %s: %s", type(exc).__name__, exc)
+        status = {"platform": sys.platform, "backend": None,
+                  "backend_available": False, "reason": "error"}
+        collected.append(f"后端探测失败：{exc}")
+    try:
+        enabled = sandbox_mod.sandbox_enabled()
+    except Exception as exc:  # noqa: BLE001
+        log.error("沙盒开关读取失败: %s: %s", type(exc).__name__, exc)
+        enabled = False
+    templates: dict[str, str] = {}
+    for field, tpl_kind in (("seatbelt_profile", "seatbelt"), ("bwrap_args", "bwrap")):
+        try:
+            templates[field] = sandbox_mod.read_template(tpl_kind)
+        except Exception as exc:  # noqa: BLE001
+            log.error("沙盒模板读取失败 %s: %s: %s", tpl_kind, type(exc).__name__, exc)
+            templates[field] = ""
+            collected.append(f"{tpl_kind} 模板读取失败：{exc}")
+    payload = {
+        "platform": status.get("platform") or sys.platform,
+        "backend": status.get("backend"),
+        "backend_available": bool(status.get("backend_available")),
+        "reason": status.get("reason"),
+        "sandbox_enabled": enabled,
+        **templates,
+        "seatbelt_path": str(sandbox_mod.SEATBELT_FILE),
+        "bwrap_path": str(sandbox_mod.BWRAP_FILE),
+    }
+    if applied is not None:
+        payload["applied"] = applied
+        payload["errors"] = collected
+    return payload
+
+
+async def _sandbox_payload(applied: bool | None = None,
+                           errors: list[str] | None = None) -> dict:
+    """`_sandbox_payload_sync` 的异步外壳（探测含 subprocess 试跑，必须下线程）。"""
+    return await asyncio.to_thread(_sandbox_payload_sync, applied, errors)
 
 
 def _refresh_permission_dirs() -> int:
@@ -811,6 +894,29 @@ def git_diff_disabled(raw_path, *, project_id: str = "", session_id: str = "",
         "too_large": False,
         "binary": False,
         "untracked": False,
+    }
+
+
+# ── 计划文书（2026-09-25 任务执行模式，docs/frontend/22）─────────────────
+# 计划文书落在**元数据目录** `<data_root>/plans/session_<sid>.md`，不在工作区内，
+# 因此读取**不能**复用 `file_read`（它的根被 `resolve_within(workdir, …)` 钉死）。
+# 读取与回执形状的实现放在 `execution_mode.py`（plan 域，且无模块级副作用，
+# 便于单测）—— 这里只做归属解析与命令编排。
+
+def _exec_mode_fields(sm, sid: str, meta: dict) -> dict:
+    """`session_history` 的执行模式 4 字段（**两处构造点共用**，避免口径分叉）。
+
+    `plan_path` **派生**而非落 meta：落到哪个文件由 sid 唯一决定（口径在
+    `SessionManager.plan_file_for` → `paths.plan_file_for_session`），再存一份
+    就是第二真相源。仅在有计划状态时给出 —— 前端据此重建计划卡片外壳，
+    正文仍经 `plan_read` 拉取（docs/frontend/22 §4.5）。
+    """
+    meta = meta if isinstance(meta, dict) else {}
+    return {
+        "execution_mode": meta.get("execution_mode") or "normal",
+        "plan_status": meta.get("plan_status"),
+        "plan_path": (str(sm.plan_file_for(sid)) if meta.get("plan_status") else None),
+        "goal_condition": meta.get("goal_condition"),
     }
 
 
@@ -1261,6 +1367,60 @@ async def handle(ws):
                         sm.set_session_model, new_sid,
                         model_id=payload.get("model_id"),
                     )
+                    # ── 预选执行模式随首条消息落地（2026-09-27，docs/frontend/22 §2.5）──
+                    # "执行方式"两项在**无会话**时也可选（前端记为 `pendingExecMode`
+                    # 草稿），随首条 chat 一起送到这里。**必须在这一刻写 meta**：
+                    #   · 迟一步（前端等 `session` 信封回来再发 session_exec_mode）会撞
+                    #     `rt.busy` —— 那时 turn 已经派发，goal 被评审 P1-5 的守卫拒掉；
+                    #   · 写 meta 即够：Agent 在 `build_agent()` 里 `switch_session`
+                    #     → `_restore_execution_state` 读回，**本轮开始前就已生效**。
+                    # 非法值（未知 mode / goal 缺条件 / 条件超长）**静默忽略** ——
+                    # 草稿态绝不阻断发送；用户可从胶囊没亮、或随后的 sessions 广播看出。
+                    pending_exec = str(payload.get("exec_mode") or "")
+                    pending_cond = str(payload.get("exec_condition") or "").strip()
+                    if pending_exec in (MODE_PLAN, MODE_GOAL):
+                        if pending_exec == MODE_GOAL and (
+                                not pending_cond or len(pending_cond) > MAX_GOAL_LENGTH):
+                            log.warning(
+                                "chat 预选执行模式被忽略（goal 条件非法）session_%s len=%d",
+                                sid, len(pending_cond))
+                        else:
+                            try:
+                                await asyncio.to_thread(
+                                    sm.set_session_execution, new_sid,
+                                    execution_mode=pending_exec,
+                                    plan_status=None,
+                                    goal_condition=(pending_cond
+                                                    if pending_exec == MODE_GOAL else None),
+                                )
+                                # goal 还要**显式告知模型**目标是什么：预选路径没有
+                                # 走 `Agent.set_execution_mode`，也就没有它内部的
+                                # `_append_goal_set_message`；而 `_restore_execution_state`
+                                # 只重建控制器、不补这条消息（否则切会话时会重复注入）。
+                                # 在这里补一次即等价（消息形状逐字对齐 `_append_goal_set_message`，
+                                # 与"用户中途点胶囊设目标"产生的历史一模一样）。
+                                # plan 侧不用补：`_sync_execution_mode()` 会在 switch_session
+                                # 时按指纹注入 <system-reminder>（幂等，不会重复）。
+                                if pending_exec == MODE_GOAL:
+                                    await asyncio.to_thread(
+                                        sm.append_message_to_session, new_file, {
+                                            "role": "user",
+                                            "content": (
+                                                "[Goal set]\n"
+                                                f"Condition: {pending_cond}\n"
+                                                "Work toward this condition; the session "
+                                                "will be evaluated when you stop."
+                                            ),
+                                        })
+                                log.info("新会话预选执行模式: session_%s -> %s",
+                                         sid, pending_exec)
+                            except Exception as exc:  # noqa: BLE001 - 预选失败不阻断发送
+                                log.error(
+                                    "预选执行模式落盘失败 session_%s mode=%s: %s: %s",
+                                    sid, pending_exec, type(exc).__name__, exc)
+                    elif pending_exec:
+                        log.warning("chat 忽略未知的 exec_mode=%r session_%s",
+                                    pending_exec, sid)
                     # 默认标题：创建会话元数据时即用首条消息前 30 字，列表立刻可读；
                     # 首轮结束后再由 _finalize_title_after_turn 用 LLM 总结精炼（≤20 字）。
                     # 纯附件消息（正文为空）用 `[附件] 文件名` 兜底、纯引用消息用
@@ -1614,6 +1774,191 @@ async def handle(ws):
                 hub.broadcast("permission_changed", {
                     "session_id": sid, "mode": mode, "source": "user"})
 
+            elif kind == "session_exec_mode":
+                # 任务执行模式切换（2026-09-25，docs/frontend/22）。与权限档位**正交**：
+                # 权限回答"能不能做 / 要不要审批"，执行模式回答"以什么方式做"。状态独立、
+                # UI 入口独立、判定链**不合并**（hooks 里 plan 守卫与 permission 各判一次）。
+                #
+                # 双路径（评审 P1-7 —— **禁止**照抄 `switchPermission` 的 `if (!sid) return`
+                # 静默丢弃）：
+                #   ① 会话在跑（rt + agent 已构造）：走 `Agent.set_execution_mode` 薄委托
+                #      —— 内存即时生效 + 落 meta + 推 `execution_mode_changed`；
+                #   ② 会话已建但未构造 Agent（选中但未发消息 / 重启后）：只写 meta，
+                #      下次构造 Agent 时 `_restore_execution_state` 读回。
+                # 失败（条件非法 / 会话不存在）→ 既有 `error` 信封，
+                # 文案取自 Agent / GoalError，前端 toast 一字不改。
+                sid = str(payload.get("session_id") or "")
+                mode = str(payload.get("mode") or "")
+                if not sid:
+                    await safe_send(ws, _envelope("error", {
+                        "msg": "请先发送一条消息创建会话，再设置任务执行模式"}))
+                    continue
+                if mode not in VALID_EXECUTION_MODES:
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"未知的执行模式：{mode}"}))
+                    continue
+                pid = _SID_PROJECT.get(sid) or _project_of_session(sid)
+                _SID_PROJECT[sid] = pid
+                rt = registry.get(sid) if registry is not None else None
+                # goal 的进入/退出**不许在 rt.busy 时即时生效**（评审 P1-5）：
+                # `GoalController` **没有任何锁**，而本命令经 `asyncio.to_thread`、
+                # `agent_loop` 在工作线程读同一对象 → 跨线程竞争。凡「当前模式或目标
+                # 模式涉及 goal」且本会话 turn 在跑，一律拒绝（前端提示稍后再试）。
+                # plan 无此限制：gate 自带锁，且守卫是"每次工具调用现场读"。
+                if rt is not None and rt.busy and rt.agent is not None:
+                    cur = rt.agent.execution_gate.mode
+                    if mode == MODE_GOAL or cur == MODE_GOAL:
+                        await safe_send(ws, _envelope("error", {
+                            "msg": "该会话正在执行，请先停止或等本轮结束后再切换目标模式"}))
+                        continue
+                if rt is not None and rt.agent is not None:
+                    # ① 会话在跑：薄委托给 Agent（互斥判定 / 落盘 / 推送都在里面）
+                    try:
+                        err = await asyncio.to_thread(
+                            rt.agent.set_execution_mode, mode,
+                            str(payload.get("condition") or ""))
+                    except GoalError as exc:
+                        await safe_send(ws, _envelope("error", {"msg": str(exc)}))
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - 桥层兜底，绝不打死连接
+                        log.error("session_exec_mode 失败 session_%s mode=%s: %s: %s",
+                                  sid, mode, type(exc).__name__, exc)
+                        await safe_send(ws, _envelope("error", {
+                            "msg": f"切换执行模式失败：{exc}"}))
+                        continue
+                    if err:
+                        await safe_send(ws, _envelope("error", {"msg": err}))
+                        continue
+                    log.info("session_exec_mode: session_%s -> %s", sid, mode)
+                    continue  # 模式变更信封已由 Agent 内部推（唯一投递路径）
+                # ② 未跑分支：无 Agent 可委托 → 只写 meta（同 session_permission 未跑分支）
+                sm = _ensure_session_manager(pid)
+                if not sm.get_session_file(sid).exists():
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"session {sid} not found"}))
+                    continue
+                condition = str(payload.get("condition") or "").strip()
+                if mode == MODE_GOAL:
+                    # 条件就地校验：无 Agent 时没有 GoalController 可转发，
+                    # 复用 goal 的同一常量（不另造口径，文案与 GoalError 一致）
+                    if not condition:
+                        await safe_send(ws, _envelope("error", {
+                            "msg": "goal condition cannot be empty"}))
+                        continue
+                    if len(condition) > MAX_GOAL_LENGTH:
+                        await safe_send(ws, _envelope("error", {
+                            "msg": f"goal condition cannot exceed "
+                                   f"{MAX_GOAL_LENGTH} characters"}))
+                        continue
+                # 跨模式直接切换（2026-09-27）：本分支**不再**有互斥拒绝 —— 与 Agent
+                # 侧同一口径（`Agent.set_execution_mode`）。被让位那一方的状态一并写空
+                # （显式传 `None` = 写入空值，区别于省略 = 不改），否则下次构造 Agent
+                # 时 `_restore_execution_state` 会把旧状态原样读回来。
+                # ⚠️ plan → goal 只清 meta 投影，**不删** plans/ 下的文书文件。
+                try:
+                    if mode == MODE_PLAN:
+                        await asyncio.to_thread(
+                            sm.set_session_execution, sid,
+                            execution_mode=MODE_PLAN, plan_status=None,
+                            goal_condition=None)
+                    elif mode == MODE_GOAL:
+                        await asyncio.to_thread(
+                            sm.set_session_execution, sid,
+                            execution_mode=MODE_GOAL, plan_status=None,
+                            goal_condition=condition)
+                    else:  # normal：三字段一起归零
+                        await asyncio.to_thread(
+                            sm.set_session_execution, sid,
+                            execution_mode=MODE_NORMAL, plan_status=None,
+                            goal_condition=None)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("session_exec_mode 落盘失败 session_%s mode=%s: %s: %s",
+                              sid, mode, type(exc).__name__, exc)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"切换执行模式失败：{exc}"}))
+                    continue
+                log.info("session_exec_mode(未跑会话): session_%s -> %s", sid, mode)
+                # 未跑会话无 Agent，自行组装与 execution_state 同形状的信封广播
+                # （多窗口一致，同 permission_changed 口径）
+                hub.broadcast("execution_mode_changed", {
+                    "session_id": sid,
+                    "mode": mode,
+                    "plan_status": None,
+                    "plan_path": None,
+                    "goal_condition": (condition if mode == MODE_GOAL else None),
+                })
+
+            elif kind == "plan_approve":
+                # 批准计划文书（2026-09-25，docs/frontend/22 §4.6#1）。
+                # 语义：`plan_status=approved` + mode 回落 normal + **自动起一轮执行**。
+                # ⚠ 忙碌守卫：`rt.busy` 时**只落状态**（`Agent.approve_plan` 内部完成
+                # 落盘与推送），不抢跑一轮（两线程同写会话 jsonl 的既有禁忌）；返回的
+                # 提示由前端 toast 展示。空闲则追加一条"[计划已批准]"续跑指令后
+                # 走 `rt.start_turn`（与 chat 同一入口，状态机 / 停止链路天然复用）。
+                sid = str(payload.get("session_id") or "")
+                rt = registry.get(sid) if registry is not None else None
+                if not sid or rt is None or rt.agent is None:
+                    await safe_send(ws, _envelope("error", {
+                        "msg": "当前会话没有待批准的计划（会话未开始或已结束）"}))
+                    continue
+                try:
+                    err = await asyncio.to_thread(rt.agent.approve_plan)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("plan_approve 失败 session_%s: %s: %s",
+                              sid, type(exc).__name__, exc)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"批准计划失败：{exc}"}))
+                    continue
+                if err:
+                    await safe_send(ws, _envelope("error", {"msg": err}))
+                    continue
+                log.info("plan_approve: session_%s 已批准", sid)
+                if rt.busy:
+                    await safe_send(ws, _envelope("error", {
+                        "msg": "计划已批准。当前回合结束后请再发一条消息开始执行",
+                    }))
+                    continue
+                if rt.has_pending_interaction():
+                    await safe_send(ws, _envelope("error", {
+                        "msg": "计划已批准。当前有等待回答的提问，请先作答",
+                    }))
+                    continue
+                try:
+                    asyncio.create_task(rt.start_turn(PLAN_APPROVED_RESUME_TEXT))
+                except Exception as exc:  # noqa: BLE001
+                    log.error("plan_approve 续跑派发失败 session_%s: %s", sid, exc)
+                    await safe_send(ws, _envelope("error", {
+                        "msg": f"计划已批准，但启动执行失败：{exc}"}))
+
+            elif kind == "plan_read":
+                # 计划文书正文读取（2026-09-25，docs/frontend/22 §4.5）。
+                # **不能**复用 file_read：后者的根被 `resolve_within(workdir)` 钉死，
+                # 而文书落在**元数据目录** `<data_root>/plans/` → 天然越界（default
+                # 空间更是整体禁用）。这里按 sid → pid → data_root/plans 直读，点对点
+                # 回执 `plan_content`（形状与 file_content 同族，前端复用一套解析）。
+                sid = str(payload.get("session_id") or "")
+                if not sid:
+                    await safe_send(ws, _envelope("plan_content", plan_content_payload(
+                        "", reason="缺少 session_id")))
+                    continue
+                pid = _SID_PROJECT.get(sid) or _project_of_session(sid)
+                _SID_PROJECT[sid] = pid
+                sm = _ensure_session_manager(pid)  # 与 pid 同源，避免两处解析分叉
+                try:
+                    meta = await asyncio.to_thread(sm.load_meta, sid) or {}
+                    ws_paths = _workspace_for_session(pid, meta)
+                except Exception as exc:  # noqa: BLE001 - 空间不可用 → 降级形状
+                    log.warning("plan_read 解析工作空间失败 session=%s: %s", sid, exc)
+                    await safe_send(ws, _envelope("plan_content", plan_content_payload(
+                        "", project_id=pid, session_id=sid,
+                        reason="该工作空间的目录当前不可用（已被移动或删除）")))
+                    continue
+                path = plan_file_for_session(sid, sm.session_prefix, ws_paths.plans_dir)
+                content = await asyncio.to_thread(read_plan_file, path)
+                content["project_id"] = pid
+                content["session_id"] = sid
+                await safe_send(ws, _envelope("plan_content", content))
+
             elif kind == "project_permission":
                 # 新建任务（无会话）态切换**目标工作空间**的权限档位
                 # （docs/frontend/17 §5.2）：只写 projects.json 的「最后更改值」，
@@ -1684,6 +2029,9 @@ async def handle(ws):
                         "permission_mode": meta.get("permission_mode") or "default",
                         # 右侧面板状态（2026-09-23，docs/frontend/19）
                         "right_panel": meta.get("right_panel"),
+                        # 任务执行模式（2026-09-25，docs/frontend/22 §4.3）：
+                        # 切会话时恢复胶囊 tag 与计划卡片外壳
+                        **_exec_mode_fields(sm, sid, meta),
                     }))
                     # 任务板照常补发：只读 .tasks/，不触碰会话文件，无重写风险
                     await _reply_task_board(ws, sm, sid)
@@ -1712,6 +2060,9 @@ async def handle(ws):
                         "permission_mode": meta.get("permission_mode") or "default",
                         # 右侧面板状态（2026-09-23，docs/frontend/19）
                         "right_panel": meta.get("right_panel"),
+                        # 任务执行模式（2026-09-25，docs/frontend/22 §4.3）：
+                        # 切会话时恢复胶囊 tag 与计划卡片外壳
+                        **_exec_mode_fields(sm, sid, meta),
                     }))
                     # 任务板补发：只发未完成组 → 已结束的组切回来不显示
                     await _reply_task_board(ws, sm, sid)
@@ -1974,7 +2325,16 @@ async def handle(ws):
                 await safe_send(ws, _envelope("sessions_trashed", {"sessions": items}))
 
             elif kind == "goal_status":
-                text = await asyncio.to_thread(agent.goal_status)
+                # 2026-09-25：改读**会话自己的** Agent。原先读模块级全局 `agent`
+                # （只代表 default 空间，且从不持有会话级目标）—— 多会话下必然答错。
+                # 会话未构造 Agent（选中但未发消息）→ 占位文本，与"无目标"同款。
+                sid_q = str(payload.get("session_id") or "")
+                rt_q = (registry.get(sid_q)
+                        if (registry is not None and sid_q) else None)
+                if rt_q is not None and rt_q.agent is not None:
+                    text = await asyncio.to_thread(rt_q.agent.goal_status)
+                else:
+                    text = "No goal set"
                 await safe_send(ws, _envelope("goal_status", {"text": text}))
 
             elif kind == "tasks":
@@ -2069,60 +2429,61 @@ async def handle(ws):
             elif kind == "sandbox_config_get":
                 # 沙盒设置页读：平台/后端状态 + 开关 + 两个模板文件内容。
                 # 模板不存在（首次）先补默认，保证编辑器永远有内容可展示。
-                status = await asyncio.to_thread(sandbox_mod.backend_status)
-                seatbelt = await asyncio.to_thread(sandbox_mod.read_template, "seatbelt")
-                bwrap = await asyncio.to_thread(sandbox_mod.read_template, "bwrap")
-                await safe_send(ws, _envelope("sandbox_config", {
-                    "platform": status["platform"],
-                    "backend": status["backend"],
-                    "backend_available": status["backend_available"],
-                    "sandbox_enabled": sandbox_mod.sandbox_enabled(),
-                    "seatbelt_profile": seatbelt,
-                    "bwrap_args": bwrap,
-                    "seatbelt_path": str(sandbox_mod.SEATBELT_FILE),
-                    "bwrap_path": str(sandbox_mod.BWRAP_FILE),
-                }))
+                # 载荷逐字段兜底（见 _sandbox_payload）：探测失败也要回执，否则
+                # 前端会永远停在"读取沙盒设置…"（同权限页曾踩的"塌成加载态"）。
+                await safe_send(ws, _envelope(
+                    "sandbox_config", await _sandbox_payload()))
 
             elif kind == "sandbox_config_save":
                 # 字段部分更新：sandbox_enabled（开关热生效）/
                 # seatbelt_profile、bwrap_args（模板覆写，缺占位符拒存）/
                 # reset（恢复默认模板）。回执为权威源，前端以回执重绘。
+                #
+                # 两条硬约束（2026-09-24 修）：
+                # 1. **先全量校验，无错才落盘**（原先是逐字段写 + 错误累加，会出现
+                #    "bwrap 已落盘、回执却说 applied=false"的半写假象）；
+                # 2. **校验失败不额外发 error 信封** —— 那一封会被前端当全局 toast
+                #    （agentStore `case 'error'`），而设置页的约定是"错误内联展示、
+                #    不 toast"（要对着文本改，toast 一闪而过等于没提示）。
                 errors: list[str] = []
                 enabled = payload.get("sandbox_enabled")
-                if isinstance(enabled, bool):
-                    await asyncio.to_thread(_save_sandbox_enabled, enabled)
+                if enabled is not None and not isinstance(enabled, bool):
+                    errors.append("sandbox_enabled 必须是布尔值")
+                    enabled = None
+                templates: list[tuple[str, str]] = []  # (tpl_kind, content)
                 for field, tpl_kind in (("seatbelt_profile", "seatbelt"),
                                         ("bwrap_args", "bwrap")):
-                    if field in payload:
-                        content = payload.get(field)
-                        if not isinstance(content, str):
-                            errors.append(f"{field} 必须是字符串")
-                            continue
-                        try:
+                    if field not in payload:
+                        continue
+                    content = payload.get(field)
+                    if not isinstance(content, str):
+                        errors.append(f"{field} 必须是字符串")
+                        continue
+                    try:
+                        sandbox_mod.validate_template(tpl_kind, content)
+                    except ValueError as exc:
+                        errors.append(str(exc))
+                        continue
+                    templates.append((tpl_kind, content))
+                reset = payload.get("reset")
+                if reset is not None and reset not in ("seatbelt", "bwrap"):
+                    errors.append(f"reset 只接受 seatbelt / bwrap，收到 {reset!r}")
+                    reset = None
+                if not errors:
+                    try:
+                        if enabled is not None:
+                            await asyncio.to_thread(_save_sandbox_enabled, enabled)
+                        for tpl_kind, content in templates:
                             await asyncio.to_thread(
                                 sandbox_mod.save_template, tpl_kind, content)
-                        except ValueError as exc:
-                            errors.append(str(exc))
-                reset = payload.get("reset")
-                if reset in ("seatbelt", "bwrap"):
-                    await asyncio.to_thread(sandbox_mod.reset_template, reset)
-                if errors:
-                    await safe_send(ws, _envelope("error", {"msg": "；".join(errors)}))
-                status = await asyncio.to_thread(sandbox_mod.backend_status)
-                seatbelt = await asyncio.to_thread(sandbox_mod.read_template, "seatbelt")
-                bwrap = await asyncio.to_thread(sandbox_mod.read_template, "bwrap")
-                await safe_send(ws, _envelope("sandbox_config", {
-                    "platform": status["platform"],
-                    "backend": status["backend"],
-                    "backend_available": status["backend_available"],
-                    "sandbox_enabled": sandbox_mod.sandbox_enabled(),
-                    "seatbelt_profile": seatbelt,
-                    "bwrap_args": bwrap,
-                    "seatbelt_path": str(sandbox_mod.SEATBELT_FILE),
-                    "bwrap_path": str(sandbox_mod.BWRAP_FILE),
-                    "applied": not errors,
-                    "errors": errors,
-                }))
+                        if reset is not None:
+                            await asyncio.to_thread(sandbox_mod.reset_template, reset)
+                    except Exception as exc:  # noqa: BLE001 - 落盘失败只回回执
+                        log.error("沙盒配置落盘失败: %s: %s", type(exc).__name__, exc)
+                        errors.append(f"保存失败：{exc}")
+                await safe_send(ws, _envelope(
+                    "sandbox_config",
+                    await _sandbox_payload(applied=not errors, errors=errors)))
 
             elif kind == "llm_models_fetch":
                 # 「刷新」按钮：调 GET {base_url}/models 拉取该连接可用的模型 id 列表。

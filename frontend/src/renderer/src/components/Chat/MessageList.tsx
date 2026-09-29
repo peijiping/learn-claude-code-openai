@@ -2,11 +2,19 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useAgentStore } from '@store/agentStore'
 import MessageItem from './MessageItem'
 import ApprovalCard from './ApprovalCard'
+import PlanCard from './PlanCard'
 
 /** 距容器底部多少像素内视为「贴底」（用户未主动上翻） */
 const STICKY_THRESHOLD = 48
 
-export default function MessageList(): JSX.Element {
+interface MessageListProps {
+  /** 计划卡片「继续修改」的动作（由 `ChatPanel` 承担：聚焦输入框 + 提示）。
+   *  刻意**不在这里**直接去 focus DOM —— 输入区归 `InputBox` 管，跨组件摸它的
+   *  contenteditable 会把"谁拥有焦点"这件事变成两处。 */
+  onRevisePlan: () => void
+}
+
+export default function MessageList({ onRevisePlan }: MessageListProps): JSX.Element {
   const messages = useAgentStore((s) => s.messages)
   const activeSession = useAgentStore((s) => s.activeSession)
   /** 在途审批表（稳定引用）：zustand v5 的 useStore 直接跑在
@@ -35,6 +43,11 @@ export default function MessageList(): JSX.Element {
       ),
     [approvalTable, messages]
   )
+  /** 执行模式相关（2026-09-25，docs/frontend/22）：胶囊 tag 选中的会话若已有计划
+   *  卡片状态，就在消息流**末尾**渲染固定块。`undefined` = 本会话无计划（多数情况），
+   *  selector 直接取对象引用（缺条目时 undefined，引用稳定）—— 派生计算放 `useMemo`。 */
+  const plan = useAgentStore((s) => (s.activeSession ? s.planBySession[s.activeSession] : undefined))
+  const approvePlan = useAgentStore((s) => s.approvePlan)
   const containerRef = useRef<HTMLDivElement>(null)
   const stickyRef = useRef(true)
   const prevSessionRef = useRef(activeSession)
@@ -56,7 +69,7 @@ export default function MessageList(): JSX.Element {
       // 直接赋值滚动位置：即时吸底，避免 smooth 动画被流式输出高频触发而上下跳动
       el.scrollTop = el.scrollHeight
     }
-  }, [messages, activeSession, orphanApprovals])
+  }, [messages, activeSession, orphanApprovals, plan])
 
   return (
     // 两层结构：外层 .msgscroll 是**占满对话区全宽**的滚动视口（滚轮落在内容列两侧的
@@ -71,6 +84,10 @@ export default function MessageList(): JSX.Element {
         {orphanApprovals.map((a) => (
           <ApprovalCard key={a.requestId} approval={a} />
         ))}
+        {/* 计划卡片：同为**消息流末尾固定块**（docs/frontend/22 §6.3）。
+            为什么不做消息级锚定：事件不带 message_id、Message 类型无 plan 字段，
+            而 plan_status + plan_path 就足以还原卡片 → 实时与回放天然一致。 */}
+        {plan && <PlanCard plan={plan} onApprove={approvePlan} onRevise={onRevisePlan} />}
       </div>
     </div>
   )

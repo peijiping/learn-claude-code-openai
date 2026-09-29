@@ -1520,6 +1520,14 @@
 .sbx-status.warn::before {
   content: '▲ ';
 }
+/* off = 总开关已关闭（中性灰、空心点）：避免"关着开关、状态行还亮绿/亮黄"的误导 */
+.sbx-status.off {
+  color: var(--color-text-secondary);
+  opacity: 0.75;
+}
+.sbx-status.off::before {
+  content: '○ ';
+}
 
 /* 保存校验错误（后端回执 errors，内联展示不 toast） */
 .sbx-error {

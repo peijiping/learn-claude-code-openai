@@ -151,8 +151,12 @@ class BrowserAgentBridge implements AgentApi {
     modelId?: string | null,
     projectId?: string | null,
     attachments?: Parameters<AgentApi['send']>[5],
-    refs?: Parameters<AgentApi['send']>[6]
+    refs?: Parameters<AgentApi['send']>[6],
+    execMode?: Parameters<AgentApi['send']>[7]
   ): Promise<void> {
+    // exec_mode / exec_condition：新建任务的预选执行模式（2026-09-27）。只对**新建**
+    // 生效（后端只认无 session_id 的那条 chat），所以与主进程 handler 同款先判 sessionId。
+    const pend = typeof sessionId === 'string' && sessionId ? null : execMode
     this.sendRaw(JSON.stringify({
       kind: 'chat',
       payload: {
@@ -162,7 +166,9 @@ class BrowserAgentBridge implements AgentApi {
         ...(overrides ? { overrides } : {}),
         ...(modelId ? { model_id: modelId } : {}),
         ...(attachments?.length ? { attachments } : {}),
-        ...(refs?.length ? { refs } : {})
+        ...(refs?.length ? { refs } : {}),
+        ...(pend && pend.mode !== 'normal' ? { exec_mode: pend.mode } : {}),
+        ...(pend && pend.mode === 'goal' && pend.condition ? { exec_condition: pend.condition } : {})
       }
     }))
     return Promise.resolve()
@@ -221,6 +227,28 @@ class BrowserAgentBridge implements AgentApi {
       payload: { project_id: projectId, mode }
     }))
     return Promise.resolve()
+  }
+  // 任务执行模式（2026-09-25，docs/frontend/22）：与权限轴正交。
+  // sessionExecMode / approvePlan 同 session_permission 的 fire-and-forget
+  // （后端无点对点应答信封，回执走 execution_mode_changed 广播 / error 信封）；
+  // planRead 有真回执（plan_content 点对点），走 request() —— 与 readFile 同款。
+  sessionExecMode(sessionId: string, mode: string, condition?: string): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'session_exec_mode',
+      payload: { session_id: sessionId, mode, ...(condition !== undefined ? { condition } : {}) }
+    }))
+    return Promise.resolve()
+  }
+  approvePlan(sessionId: string): Promise<void> {
+    this.sendRaw(JSON.stringify({
+      kind: 'plan_approve',
+      payload: { session_id: sessionId }
+    }))
+    return Promise.resolve()
+  }
+  async planRead(sessionId: string): Promise<unknown> {
+    if (typeof sessionId !== 'string' || !sessionId) return null
+    return this.request('plan_read', 'plan_content', { session_id: sessionId })
   }
   switchSession(sessionId: string): Promise<{ session_id: string; message_count: number }> {
     // 历史回放经由 session / session_history 事件信封驱动 store，无需等待应答

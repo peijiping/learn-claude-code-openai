@@ -4,7 +4,7 @@ import { create } from 'zustand'
 // 这里只用到三件事：接收 `session_history` 里的 right_panel、切会话时收尾、
 // 删会话/断线重连时清缓存。
 import { flushRightPanelPending, useRightPanelStore } from './rightPanelStore'
-import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, ExecutionMode, ExecutionModeChangedPayload, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, PlanContentPayload, PlanStatus, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -16,6 +16,122 @@ export interface SessionOverrides {
 
 /** 按模型 id 分别保存的会话级参数覆盖（每个模型各自独立，互不串改） */
 export type SessionOverridesMap = Record<string, SessionOverrides>
+
+/** 计划卡片状态（2026-09-25，docs/frontend/22 §6.8）：**每会话一条**（单份覆盖）。
+ *
+ *  - 卡片**外壳**由 `status` + `path` 决定（`plan_ready` 广播 / `session_history`
+ *    / `sessions` 列表载荷都能重建）；
+ *  - 正文**必须**经 `plan_read` 拉取后落在 `content` —— 信封与列表载荷都不带正文
+ *    （实时与回放共用同一条链路，避免两套口径）。 */
+export interface PlanState {
+  /** 文书落点（后端**派生**给出）。空串 = 未知，仍可尝试 plan_read。 */
+  path: string
+  status: PlanStatus
+  /** 正文（plan_read 回执填充）；`undefined` = 尚未拉取。 */
+  content?: string
+  /** 拉取失败原因（文件被清理 / 空间目录不可用）→ 卡片渲染占位块而非白屏。 */
+  reason?: string
+  /** 正文超限（`too_large`）整份拒绝：**宁可不给，不给半个**。 */
+  tooLarge?: boolean
+}
+
+/** 从 `sessions` 列表载荷同步执行模式两桶（2026-09-25，docs/frontend/22 §6.8 P1-13）。
+ *
+ *  ⚠️ **这是断线重连 / 整页重载后恢复 tag 与卡片壳的唯一通道**：连接重放序列
+ *  不含 `session_history`（它只在收到 `session_switch` 后才发），前端重连只做
+ *  `resetTransient()` + `listSessions()` —— 与 `permission_mode` / `unread` 同
+ *  通道即天然覆盖。
+ *
+ *  只覆盖列表里出现的会话（不删桶里其它键：可能有刚切走 / 在途的会话）；
+ *  无变化时**返回原引用**，避免 zustand 无谓重渲染。 */
+function mergeExecFromSessions(
+  prevMode: Record<string, ExecutionMode>,
+  prevPlan: Record<string, PlanState>,
+  list: SessionMeta[]
+): { executionModeBySession: Record<string, ExecutionMode>; planBySession: Record<string, PlanState> } {
+  let mode = prevMode
+  let plan = prevPlan
+  for (const x of list) {
+    const m = x.execution_mode ?? 'normal'
+    if (prevMode[x.id] !== m) mode = { ...mode, [x.id]: m }
+    const st = x.plan_status
+    if (st === 'ready' || st === 'approved') {
+      const cur = prevPlan[x.id]
+      const path = x.plan_path ?? ''
+      if (!cur || cur.path !== path || cur.status !== st) {
+        plan = { ...plan, [x.id]: { ...(cur ?? {}), path, status: st } as PlanState }
+      }
+    }
+  }
+  return { executionModeBySession: mode, planBySession: plan }
+}
+
+/** 从两桶里按会话 id 批量删除（**删会话 / 删工作空间时显式调用**）。
+ *
+ *  ⚠️ 刻意**不**照抄 `permissionModeBySession` —— 那个桶在 clearSession /
+ *  newSession / trashSession / deleteSessions / removeProject 五处都不删，属既有
+ *  泄漏（评审 P1-14）；新轴不继承这个缺陷（照 `rightPanelStore.dropSessions` 范式）。
+ *  无实际删除时返回**原引用**，避免 zustand 无谓重渲染。 */
+function dropExecBuckets(
+  prevMode: Record<string, ExecutionMode>,
+  prevPlan: Record<string, PlanState>,
+  ids: string[]
+): { executionModeBySession: Record<string, ExecutionMode>; planBySession: Record<string, PlanState> } {
+  const mode = { ...prevMode }
+  const plan = { ...prevPlan }
+  let changed = false
+  for (const id of ids) {
+    if (id in mode) {
+      delete mode[id]
+      changed = true
+    }
+    if (id in plan) {
+      delete plan[id]
+      changed = true
+    }
+  }
+  if (!changed) return { executionModeBySession: prevMode, planBySession: prevPlan }
+  return { executionModeBySession: mode, planBySession: plan }
+}
+
+/** 某会话当前的执行模式 —— tag 选中态的**唯一 fallback 链**（与权限 chip 同款）：
+ *  `executionModeBySession`（广播 / session_history / sessions 列表驱动）
+ *  → `sessions` 列表该会话的 `execution_mode` → `'normal'`（零占位）。 */
+function execModeOf(
+  s: { executionModeBySession: Record<string, ExecutionMode>; sessions: SessionMeta[] },
+  sid: string
+): ExecutionMode {
+  return s.executionModeBySession[sid] ?? s.sessions.find((x) => x.id === sid)?.execution_mode ?? 'normal'
+}
+
+/** 把 `plan_read` 回执合并进 plan 桶（**点对点路径的唯一写入口**）。
+ *
+ *  读不到是**常规降级**（文书被清理 / 空间目录不可用 / 超 512KB 整份拒绝）——
+ *  落 `reason` 让卡片渲染占位块，绝不抛、也绝不白屏。`reason` 与 `tooLarge`
+ *  语义不同但都表示"没有正文"：前者给用户看原因，后者供样式区分。 */
+function mergePlanContent(
+  prev: Record<string, PlanState>,
+  sid: string,
+  payload: PlanContentPayload | null
+): Record<string, PlanState> {
+  const cur = prev[sid]
+  if (!cur) return prev
+  const ok = !!payload && !payload.reason && !payload.too_large
+  if (ok) {
+    const p = payload as PlanContentPayload
+    return { ...prev, [sid]: { path: p.path || cur.path, status: cur.status, content: p.text } }
+  }
+  return {
+    ...prev,
+    [sid]: {
+      path: payload?.path || cur.path,
+      status: cur.status,
+      ...(cur.content !== undefined ? { content: cur.content } : {}),
+      reason: payload?.reason || '计划文书暂时读不到',
+      tooLarge: Boolean(payload?.too_large)
+    }
+  }
+}
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
@@ -468,6 +584,27 @@ interface AgentState {
    *  与 `session_history.permission_mode` 恢复驱动。缺条目时 chip 落
    *  sessions 列表 → 所属工作空间 → 'default' 的 fallback 链。 */
   permissionModeBySession: Record<string, PermissionMode>
+  /** 每个会话当前的**任务执行模式**（胶囊 tag 的选中态，2026-09-25 docs/frontend/22）。
+   *  与权限档位**正交**：由 `execution_mode_changed` 广播、`session_history` 的
+   *  `execution_mode`、以及 **`sessions` 列表载荷**（断线重连 / 整页重载的唯一
+   *  恢复通道，P1-13）三处驱动。缺条目视作 `'normal'` → **零占位**（不渲染任何元素）。 */
+  executionModeBySession: Record<string, ExecutionMode>
+  /** 每个会话的计划卡片状态（每会话一条，单份覆盖）。`plan_status='approved'`
+   *  的卡片属历史，退出 plan 模式时刻意**不删**（要留在消息流里）。 */
+  planBySession: Record<string, PlanState>
+  /** ── 新建任务（无会话）态的**预选**执行模式草稿（2026-09-27）───────────
+   *  无会话时「执行方式」两项**不再置灰**：点选先记在这里（胶囊 tag 立即显示），
+   *  随首条消息经 `chat.exec_mode` 交给后端，由后端在**建会话时**写进该会话 meta，
+   *  Agent 构造时 `_restore_execution_state` 读回 → 对**首轮即生效**。
+   *
+   *  为什么必须随 `chat` 带、而不是等 `session` 信封回来再发 `session_exec_mode`：
+   *  那时 turn 已经 `rt.busy`，goal 会被评审 P1-5 的守卫拒掉（见 docs/frontend/22 §2.4）。
+   *
+   *  **仅在 `activeSession === null` 时被读取**；`newSession()` 重置（新任务默认
+   *  normal —— 执行模式是会话级状态，无继承源，不照抄权限档位的"空间默认值"）。 */
+  pendingExecMode: ExecutionMode
+  /** 无会话态预选的目标条件（goal 草稿；`pendingExecMode !== 'goal'` 时恒空串） */
+  pendingExecGoalCondition: string
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -514,6 +651,22 @@ interface AgentState {
    *  只写 projects.json 的「最后更改值」，作为该空间新会话的默认档位 ——
    *  fire-and-forget：chip 选中态由随后的 `projects` 广播驱动（不乐观更新）。 */
   switchProjectPermission: (mode: PermissionMode) => void
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）─────────────────────
+   * 切换当前会话的执行模式。**fire-and-forget、不乐观更新** —— tag 选中态只认
+   * 后端 `execution_mode_changed` 广播（与 switchPermission 同口径：传输丢失时
+   *  乐观 UI 会说谎）。`condition` 仅 `mode === 'goal'` 时有意义；后端校验失败
+   *  （空 / 超 4000 字）回既有 `error` 信封，文案原样 toast。plan ↔ goal 属
+   *  **跨模式直接切换**（2026-09-27），前端不做互斥预检。
+   *
+   * **无会话（新建任务）时不再拒绝**（2026-09-27）：改写 `pendingExecMode` 草稿
+   * （见 AgentState 上该字段的注释）—— 任何情况下都点得动。 */
+  switchExecMode: (mode: ExecutionMode, condition?: string) => void
+  /** 批准当前会话的计划文书（fire-and-forget）。后端在空闲时自动起一轮执行；
+   *  忙碌 / 有待答提问时只落状态并回 `error` 信封提示。卡片转只读等广播。 */
+  approvePlan: () => void
+  /** 拉取某会话的计划文书正文（`plan_read`）→ 填进 `planBySession[sid]`。
+   *  文件被清理 / 空间目录不可用时落 `reason`（**不抛**），卡片渲染占位块。 */
+  fetchPlanContent: (sid: string) => Promise<void>
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
   /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
@@ -1287,6 +1440,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   interactionBySession: {},
   approvalBySession: {},
   permissionModeBySession: {},
+  executionModeBySession: {},
+  planBySession: {},
+  pendingExecMode: 'normal',
+  pendingExecGoalCondition: '',
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
@@ -1371,8 +1528,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）；
     // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位；
     // refs 只带路径，后端做越界校验后挂中性引用块（**不复制、不读内容**）。
+    // execMode：新建任务的**预选执行模式草稿**（2026-09-27）—— 必须随这条 chat 走，
+    // 后端在建会话时落 meta，首轮起就按该模式跑；normal / 已有会话恒不带。
+    const pend = sid === null ? get().pendingExecMode : 'normal'
+    const execMode =
+      pend === 'normal'
+        ? null
+        : { mode: pend, ...(pend === 'goal' ? { condition: get().pendingExecGoalCondition } : {}) }
     window.agent
-      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs)
+      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs, execMode)
       .catch(() => set({ isSending: false }))
   },
 
@@ -1515,6 +1679,56 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     window.agent.projectPermission(pid, mode)
   },
 
+  /** 切换执行模式。fire-and-forget、**不乐观更新**（tag 只认广播）。
+   *
+   *  **无会话 = 记草稿，不拒绝**（2026-09-27 改）：执行模式是会话级状态、此刻确实
+   *  没有归属，但"选不了"比"选了待落地"差得多 —— 草稿由 `send()` 随首条消息
+   *  交给后端在**建会话时**落 meta（见 `pendingExecMode` 的注释）。原先那条
+   *  「请先发送一条消息创建会话」的 toast 与 `+` 菜单的对应置灰一并删除：**
+   *  两项在任何情况下都可选**。 */
+  switchExecMode: (mode, condition) => {
+    const s = get()
+    const sid = s.activeSession
+    if (!sid) {
+      const cond = mode === 'goal' ? (condition ?? '') : ''
+      if (s.pendingExecMode === mode && s.pendingExecGoalCondition === cond) return
+      set({ pendingExecMode: mode, pendingExecGoalCondition: cond })
+      return
+    }
+    // 同模式重复点击 = 幂等短路（少一次往返）。**跨模式直接切换**（2026-09-27 改）：
+    // plan ↔ goal 不再要求"先关闭再切换"—— 后端 `set_execution_mode` 是唯一权威，
+    // 被让位那一方的状态（目标 / plan 状态）由后端一并清理（plans/ 下的文书文件
+    // 保留），前端不再拦截、也不再弹"请先关闭…"的提示。
+    const cur = execModeOf(s, sid)
+    if (cur === mode) return
+    window.agent.sessionExecMode(sid, mode, mode === 'goal' ? (condition ?? '') : undefined)
+  },
+
+  /** 批准计划文书。fire-and-forget：卡片转只读等 `execution_mode_changed` 广播
+   *  （后端 `approve_plan` 内部落盘 + 推送）；续跑由后端在空闲时自动发起。 */
+  approvePlan: () => {
+    const sid = get().activeSession
+    if (!sid) return
+    window.agent.approvePlan(sid)
+  },
+
+  /** 拉取计划文书正文。**点对点**（同右栏 `readFile`）：结果只由这里的返回值落库，
+   *  `handleEvent` 不为 `plan_content` 设分支 —— 与 `file_content` 同一条既有约定。 */
+  fetchPlanContent: async (sid) => {
+    if (!sid) return
+    let payload: PlanContentPayload | null = null
+    try {
+      payload = (await window.agent.planRead(sid)) as PlanContentPayload | null
+    } catch {
+      payload = null
+    }
+    set((s) => {
+      // 卡片壳已不在（切走 / 被清理 / 已批准后又换了会话）→ 丢弃迟到回执
+      if (!s.planBySession[sid]) return s
+      return { ...s, planBySession: mergePlanContent(s.planBySession, sid, payload) }
+    })
+  },
+
   handleEvent: (ev) => {
     if (ev.kind === 'event') {
       // 按 session_id 路由到对应会话缓冲；后台会话增量各自累积，显示会话投影实时更新
@@ -1567,6 +1781,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         const curPid = cur ? list.find((x) => x.id === cur)?.project : undefined
         set((s) => ({
           sessions: list,
+          // 执行模式 4 字段随列表一起恢复（**断线重连 / 整页重载的唯一通道**，
+          // P1-13）—— 与 permission_mode / unread 同通道，见 mergeExecFromSessions。
+          ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, list),
           ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
         }))
         break
@@ -1596,6 +1813,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (typeof sid !== 'string' || !sid) break
         const newPid = typeof sp?.project_id === 'string' && sp.project_id ? sp.project_id : null
         const wasFresh = get().pendingFresh !== null
+        // 预选执行模式的**交接**（2026-09-27）：草稿已随首条 chat 交出去（`chat.exec_mode`
+        // → 后端建会话时写 meta），这里把它的值登记进新会话桶并清空草稿。
+        // **不是乐观更新**：真值由紧随其后的 `sessions` 广播校准（后端忽略非法值时
+        // 这里会被纠正回 normal）；登记只是为了"草稿已清、会话态未到"的那几毫秒
+        // 不闪一下胶囊。非 fresh（别的窗口建的会话）不动本窗口草稿。
+        const handed = wasFresh ? get().pendingExecMode : 'normal'
         set((s) => {
           // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话 id）
           let messagesBySession = s.messagesBySession
@@ -1610,7 +1833,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             messages: messagesBySession[sid] ?? [],
       isSending: s.runningSessions.includes(sid) || s.bgSessions.includes(sid),
       // 活动空间对齐到新会话的归属（点空间 B 的「+」新建时，活动空间可能还停在 A）
-            ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {})
+            ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {}),
+            ...(handed !== 'normal'
+              ? { executionModeBySession: { ...s.executionModeBySession, [sid]: handed } }
+              : {}),
+            ...(wasFresh
+              ? { pendingExecMode: 'normal' as ExecutionMode, pendingExecGoalCondition: '' }
+              : {})
           }
         })
         // 新建会话由首条消息落号：把当前选定的模型与按模型参数覆盖写入该会话元数据
@@ -1704,7 +1933,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null } | null
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
         // 右栏状态：**在 `set(...)` 之外**调用。两个理由：
         // ① 它是另一个 store 的 action，放进更新函数会破坏"更新函数必须纯"的前提
@@ -1714,7 +1943,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         useRightPanelStore.getState().applySessionUi(payload.session_id, payload.right_panel)
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null }
           // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
           // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
           // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
@@ -1725,13 +1954,38 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           const permissionModeBySession = p.permission_mode
             ? { ...s.permissionModeBySession, [p.session_id]: p.permission_mode }
             : s.permissionModeBySession
+          // 任务执行模式（2026-09-25）：切会话 / 回放时恢复胶囊 tag 与计划卡片**外壳**。
+          // 正文不在这里 —— 由紧随 `set()` 之后的 `plan_read` 拉取（同一份数据两个
+          // 消费者会分叉，故只留一条链路）。缺字段（老后端 / 老会话）视作 normal。
+          const executionModeBySession = p.execution_mode
+            ? { ...s.executionModeBySession, [p.session_id]: p.execution_mode }
+            : s.executionModeBySession
+          const planBySession =
+            p.plan_status === 'ready' || p.plan_status === 'approved'
+              ? {
+                  ...s.planBySession,
+                  [p.session_id]: {
+                    ...(s.planBySession[p.session_id] ?? {}),
+                    path: p.plan_path ?? s.planBySession[p.session_id]?.path ?? '',
+                    status: p.plan_status
+                  } as PlanState
+                }
+              : p.execution_mode !== 'plan' && s.planBySession[p.session_id]
+                ? // 回放通道的同一条纪律（与 `execution_mode_changed` 分支一致）：模式不是
+                  // plan（normal / **goal**）且 meta 里没有任何计划状态 → 该会话**没有**
+                  // 计划文书状态了，留着的旧壳只会变成一张点不动的卡片。已批准过的会话
+                  // 走上面那支（`plan_status` 恒为 "approved"，approve 不清它）。
+                  (({ [p.session_id]: _dropped, ...rest }) => rest)(s.planBySession)
+                : s.planBySession
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
           const buf = s.messagesBySession[p.session_id] ?? []
           const hasLive =
             (s.runningSessions.includes(p.session_id) || s.bgSessions.includes(p.session_id)) &&
             buf.length > 0
-          if (hasLive) return { ...s, taskBoardBySession }
+          if (hasLive) {
+            return { ...s, taskBoardBySession, executionModeBySession, planBySession }
+          }
           const histBuf = historyToMessage(p.session_id, p.messages)
           const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
           const messages = s.activeSession === p.session_id ? histBuf : s.messages
@@ -1746,7 +2000,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
           if (s.activeSession !== p.session_id) {
-            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession, permissionModeBySession }
+            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession, permissionModeBySession, executionModeBySession, planBySession }
           }
           return {
             ...s,
@@ -1757,10 +2011,23 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             overridesByModel,
             taskBoardBySession,
             permissionModeBySession,
+            executionModeBySession,
+            planBySession,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
             lastOverridesByModel: overridesByModel,
           }
         })
+        // 计划卡片正文：**必须放在 `set()` 之外**（副作用，不是纯更新；StrictMode 下
+        // 放进更新函数会发两次请求）。仅在"有卡片壳但还没正文"时拉一次，避免每次
+        // 切会话都重复请求。用 `plan_read` 而非 `file_read`：文书在元数据目录里，
+        // 后者被 `resolve_within(workdir)` 钉死在工作区 → 越界（docs/frontend/22 §4.5）。
+        const sid = payload.session_id
+        if (
+          (payload.plan_status === 'ready' || payload.plan_status === 'approved') &&
+          get().planBySession[sid]?.content === undefined
+        ) {
+          void get().fetchPlanContent(sid)
+        }
         break
       }
       case 'goal_status':
@@ -1990,6 +2257,93 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         showToast(msg, 'error', 4000)
         break
       }
+      case 'execution_mode_changed': {
+        // 执行模式已切换（2026-09-25，docs/frontend/22）：**三条来源共用同一条投递
+        // 路径** —— 用户点 tag 切模式 / goal 达成自动回落 / plan 批准续跑。与
+        // permission_changed 同款：以广播为准，**不做乐观更新**（传输丢失时乐观 UI
+        // 会说谎）。plan 与 goal 互斥判定的唯一权威也在后端，这里只负责投影。
+        const p = ev.payload as ExecutionModeChangedPayload | null
+        const sid = p?.session_id
+        const mode = p?.mode
+        if (typeof sid !== 'string' || !sid) break
+        if (mode !== 'normal' && mode !== 'plan' && mode !== 'goal') break
+        set((s) => {
+          // plan 状态：信封带 plan_status 时同步（含 approved）；**不带时一律不动**
+          // `planBySession` —— 已批准的卡片属历史，退出 plan 模式要留在消息流里（§6.8）。
+          //
+          // 唯一例外（2026-09-25 实施期修正，2026-09-27 扩展）：**plan_status 为空
+          // 且当前不在 plan 模式**（回落 normal，或**跨模式直接切到 goal**）→ 连壳
+          // 一起撤。否则卡片会留在消息流里显示"待批准"+可点的「批准执行」，而后端
+          // 已把 plan 状态清空、点下去只会换来一句
+          // `当前没有待批准的计划文书。` 的 error toast —— 死按钮 + 内存与磁盘背离。
+          // 已批准过的卡片不受影响：`approve_plan` 只回落 mode、**不清 plan_status**，
+          // 所以它此后每条信封都带 `plan_status:"approved"`（走上面的分支）。
+          const st = p.plan_status
+          let planBySession = s.planBySession
+          if (st === 'ready' || st === 'approved') {
+            const cur = s.planBySession[sid]
+            planBySession = {
+              ...planBySession,
+              [sid]: {
+                path: p.plan_path ?? cur?.path ?? '',
+                status: st,
+                ...(cur?.content !== undefined ? { content: cur.content } : {}),
+                ...(cur?.reason ? { reason: cur.reason } : {}),
+                ...(cur?.tooLarge ? { tooLarge: true } : {})
+              }
+            }
+          } else if (mode !== 'plan' && s.planBySession[sid]) {
+            // normal 与 **goal**（跨模式直接切换）都要撤：这两种模式下后端
+            // plan_status 已空，壳留着就是死按钮。
+            const { [sid]: _dropped, ...rest } = s.planBySession
+            planBySession = rest
+          }
+          return {
+            ...s,
+            executionModeBySession: { ...s.executionModeBySession, [sid]: mode },
+            planBySession,
+            // `sessions` 列表条目同步：tag 的 fallback 链读它；也保证多窗口一致。
+            sessions: s.sessions.map((x) =>
+              x.id === sid
+                ? {
+                    ...x,
+                    execution_mode: mode,
+                    ...(st === 'ready' || st === 'approved'
+                      ? { plan_status: st, plan_path: p.plan_path ?? null }
+                      : {}),
+                    goal_condition: p.goal_condition ?? null
+                  }
+                : x
+            )
+          }
+        })
+        break
+      }
+      case 'plan_ready': {
+        // 计划文书已产出：**只记卡片壳，正文另拉**。信封刻意不带正文（避免"实时
+        // 与回放"两套数据口径）。推送顺序契约保证前一条 `execution_mode_changed`
+        // 已带 `plan_status="ready"`，但这里不依赖它 —— 重复写同值无害，反而能兜住
+        // 广播丢失。拉正文是异步副作用 → 必须在 `set()` 之外。
+        const p = ev.payload as { session_id?: string; plan_status?: PlanStatus } | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const cur = s.planBySession[sid]
+          return {
+            ...s,
+            planBySession: {
+              ...s.planBySession,
+              [sid]: {
+                path: cur?.path ?? '',
+                status: 'ready' as const,
+                ...(cur?.content !== undefined ? { content: cur.content } : {})
+              }
+            }
+          }
+        })
+        void get().fetchPlanContent(sid)
+        break
+      }
     }
   },
 
@@ -1997,7 +2351,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     try {
       const list = (await window.agent.listSessions()) as SessionMeta[]
       if (!Array.isArray(list)) return
-      set({ sessions: list })
+      // 与 `sessions` 信封同口径：列表是执行模式（tag / 卡片壳）的恢复通道之一
+      set((s) => ({ sessions: list, ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, list) }))
     } catch {
       /* 忽略 */
     }
@@ -2038,6 +2393,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       sessionModelId: s.lastSessionModelId,
       overridesByModel: s.lastOverridesByModel,
       pendingProjectId: projectId ?? s.pendingProjectId ?? s.activeProject,
+      // 预选执行模式**不跨新任务继承**（执行模式是会话级状态、无继承源；带过去等于
+      // 让用户在下一条任务里"莫名开着计划模式"）。模型继承是另一条轴，见上一行。
+      pendingExecMode: 'normal',
+      pendingExecGoalCondition: '',
       // 新建任务 = 换一条消息，附件草稿必须跟着清（否则会把上一个任务的附件带过去）。
       // 未发送的草稿文件由后端 GC 兜底回收。
       draftAttachments: []
@@ -2130,7 +2489,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       const gone = get()
         .sessions.filter((x) => sessionProjectId(x) === projectId)
         .map((x) => x.id)
-      set((s) => ({ sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId) }))
+      set((s) => ({
+        sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId),
+        // 执行模式两桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
+        ...dropExecBuckets(s.executionModeBySession, s.planBySession, gone)
+      }))
       // 右栏：被删会话的内存桶一起清掉。**这是既有分桶的缺口**
       // （`sessions` 过滤了但 messagesBySession 等没有人清），本 store 不照抄这个缺陷。
       useRightPanelStore.getState().dropSessions(gone)
@@ -2261,6 +2624,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set((s) => ({
         sessions: s.sessions.filter((x) => !remove.has(x.id)),
         trashSessions: s.trashSessions.filter((x) => !remove.has(x.id)),
+        // 执行模式两桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
+        ...dropExecBuckets(s.executionModeBySession, s.planBySession, deleted)
       }))
       // 右栏：同步丢内存桶（含把该 sid 还压着的待写盘条目一并撤掉，
       // 否则防抖定时器到点会往一个已删除的会话写 meta）

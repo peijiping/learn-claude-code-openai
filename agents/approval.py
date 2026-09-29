@@ -34,11 +34,24 @@ PreToolUse（turn 工作线程）里同步调用 `gate.check_tool_call` → 本�
 `PermissionGate.check_tool_call` 不在 try 内调用本模块，因此 `request()`
 任何异常都必须就地消化并降级为 `deny`（fail-closed：宁可多拒，不可放行）。
 
-独占性
-------
-同会话同一时刻至多一个在途审批（工具串行执行，`permission_hook` 在
-PreToolUse 顺序触发）。万一撞车（理论不可达）：fail-closed 直接拒绝本次，
-不排队 —— 排队会让两条审批卡片叠在消息流里且语义混乱。
+并发性（2026-09-25 修正，原为「独占性」）
+----------------------------------------
+同会话**允许任意多个在途审批**：`_pending` 按 request_id 键控，每个请求
+独立阻塞、独立结算，互不影响。
+
+原实现只允许一个在途，撞车 fail-closed 直接拒绝第二个。其前提是
+"PreToolUse 串行" —— 该前提**只对主智能体成立**（`agent_full_v2.py` 的四个
+执行桶都在 turn 工作线程里顺序触发 `hook_system.trigger("PreToolUse")`）；
+**后台子智能体跑在各自 daemon 线程**（`background_manager` 起线程 →
+`subagent.run()` → `subagent.py` 的 PreToolUse），两个后台子智能体同时需要
+审批时，第二个会被**静默自动拒绝**（只有 log.warning，前端收不到任何卡片），
+用户侧表现为"权限被莫名拒绝、且不知道为什么"。
+
+原「拒绝排队」的理由是"两条审批卡片会叠在消息流里、语义混乱"，该理由已失效：
+前端按 **`tool_call_id`** 把卡片锚定到**各自的工具行**（`MessageItem.tsx`：
+主智能体工具条 / 子智能体工具行，且子智能体的卡片刻意渲染在折叠块**外** ——
+块默认折叠，审批是"必须现在做决定"的交互）。N 张卡片天然分散在 N 个锚点，
+不会叠在一起。`subagent_id` 字段**不需要**（路由靠 tool_call_id）。
 
 依赖方向：`permission → 本模块零依赖`（broker 由 SessionRuntime 注入 gate）；
 本模块 import permission 的**纯常量**（APPROVE_* / VALID_DECISIONS），无环。
@@ -152,8 +165,11 @@ class ApprovalBroker:
     由 runtime 在 `build_agent()` 里注入给该会话 Agent 的
     `permission_gate`（`gate.attach_broker(broker)`）。
 
-    **同一会话同一时刻至多一个在途审批**（PreToolUse 串行触发），
-    pending 表用 dict 只是为了按 request_id 精确配对与幂等丢弃迟到作答。
+    **同会话可同时存在多个在途审批**（2026-09-25）：主智能体的四个执行桶在
+    turn 工作线程里顺序触发，但后台子智能体在各自 daemon 线程里并发触发，
+    所以"并发在途"是正常情形而非异常。`_pending` 按 request_id 键控，
+    每个请求独立阻塞（各自的 `done`）、独立结算，前端按 `tool_call_id`
+    把卡片锚定到各自的工具行。
     """
 
     def __init__(self, session_id: str, deliver=None):
@@ -192,13 +208,11 @@ class ApprovalBroker:
             with self._lock:  # ← 只在注册期持锁
                 if self._closed:
                     return OUTCOME_STOPPED
-                if self._pending:
-                    # 理论不可达（PreToolUse 串行）；万一撞车 fail-closed 拒绝。
-                    # 返回值须对齐 APPROVE_* 契约（"deny"），不能返回裸结局词
-                    # "denied"（那是 approval_resolved.status 的词族）。
-                    log.warning("session_%s 审批撞车（已有在途请求），本次自动拒绝",
-                                self._sid)
-                    return APPROVE_DENY
+                # 并发在途是**正常情形**，不是撞车（2026-09-25 修正）：后台
+                # 子智能体在各自 daemon 线程里进 PreToolUse，与主智能体/其它
+                # 子智能体的审批同时挂起。原先此处 fail-closed 直接拒绝第二个，
+                # 前端收不到卡片 → 用户看到"权限被莫名拒绝"。现在不做数量限制，
+                # 各请求按 request_id 独立结算（前端按 tool_call_id 各自锚定卡片）。
                 pend = ApprovalPending(
                     request_id="apr_" + uuid.uuid4().hex[:10],
                     session_id=self._sid,
