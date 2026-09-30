@@ -28,8 +28,10 @@ export interface AgentApi {
    *  attachments=本轮附件（`attachment_stage` 登记得到的 att_id 列表）；
    *  **只有附件没有正文时 text 传空串**（后端据此只插附件块，不插空文本块）。
    *  refs=本轮引用的工作空间路径（**零复制**，只传路径）；**只有引用没正文也是
-   *  合法发送**。execMode=新建任务的**预选执行模式**（无会话时选好的 plan/goal，
-   *  随首条消息交给后端在建会话时落盘，首轮即生效）。 */
+   *  合法发送**。execMode=随本条消息落地的执行模式（2026-09-30 起两种含义）：
+   *  无会话 = 新建任务的**预选**（plan/goal，后端在建会话时落盘，首轮即生效）；
+   *  **已有会话 + goal** = 目标模式的**武装位**（条件就是本条消息的正文，后端在
+   *  派发 turn 之前落地 —— 见 docs/frontend/22 §2.6）。 */
   send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null, execMode?: ExecModeInput | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>

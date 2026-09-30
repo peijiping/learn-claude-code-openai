@@ -23,7 +23,6 @@ import {
 import { useWorkspaceRefs } from '@hooks/useWorkspaceRefs'
 import PlusMenu, { PLUS_MENU_LABELS, type PlusMenuKey } from './PlusMenu'
 import ExecutionModeTag from './ExecutionModeTag'
-import GoalInputDialog from './GoalInputDialog'
 import AttachmentBar, { type AttachmentView } from './AttachmentBar'
 import DropOverlay from './DropOverlay'
 import RefPicker from './RefPicker'
@@ -44,10 +43,6 @@ interface InputBoxProps {
   onSend: () => void
   /** 发送后自增 → 清空编辑器并聚焦（清空走命令，不走受控同步） */
   clearSignal: number
-  /** 自增 → 仅把焦点收回编辑器（计划卡片「继续修改」，2026-09-25）。
-   *  与 `clearSignal` 同一范式（编号信号 + 编辑器命令），**不预填任何文字**：
-   *  预置提示等于替用户写好了要说的话，很容易被直接发出去。 */
-  focusSignal: number
   /** 附件草稿（三条入口都写入 store，这里只读展示） */
   attachments: DraftAttachment[]
   /** 把一批本地绝对路径登记为附件（原生对话框 / 拖拽 / 粘贴共用） */
@@ -106,7 +101,6 @@ export default function InputBox({
   onChange,
   onSend,
   clearSignal,
-  focusSignal,
   attachments,
   onStagePaths,
   onRemoveAttachment,
@@ -150,15 +144,24 @@ export default function InputBox({
     return s.projects.find((p) => p.id === pid)?.permission_mode ?? 'default'
   })
   const switchExecMode = useAgentStore((s) => s.switchExecMode)
+  /** 目标模式**武装态**（2026-09-30，docs/frontend/22 §2.6）：已有会话点了「目标模式」
+   *  、条件还没定 —— 下一条指令的正文即目标条件。仅用于给胶囊加提示 + 兜住
+   *  "点了没反馈"的空窗（真值随后由 `execution_mode_changed` / `sessions` 校准）。 */
+  const goalArmed = useAgentStore((s) =>
+    s.activeSession ? !!s.goalArmBySession[s.activeSession] : false
+  )
   /** 执行模式（2026-09-25，docs/frontend/22）：胶囊 tag 的选中态。fallback 链与
    *  权限 chip 同款：`executionModeBySession`（广播 / session_history / sessions
    *  列表）→ `sessions` 列表该会话的 `execution_mode` → `'normal'`（**零占位**）。
    *  **无会话（新建任务）读 `pendingExecMode` 草稿**（2026-09-27）：执行模式确实
    *  是会话级状态、此刻没有归属，但"选不了"比"选了待落地"差得多 —— 草稿随首条
-   *  消息经 `chat.exec_mode` 落进新会话元数据，首轮即生效。 */
+   *  消息经 `chat.exec_mode` 落进新会话元数据，首轮即生效。
+   *  **已有会话的武装态优先于 fallback 链**（2026-09-30）：后端此刻还是旧模式，
+   *  但用户已明确要进目标模式 —— 胶囊必须当场亮（否则点菜单毫无反馈）。 */
   const execMode: ExecutionMode = useAgentStore((s) => {
     const sid = s.activeSession
     if (!sid) return s.pendingExecMode
+    if (s.goalArmBySession[sid]) return 'goal'
     return s.executionModeBySession[sid] ?? s.sessions.find((x) => x.id === sid)?.execution_mode ?? 'normal'
   })
   const execPlanStatus = useAgentStore((s) =>
@@ -182,8 +185,6 @@ export default function InputBox({
   const [wsOpen, setWsOpen] = useState(false)
   // 权限档位下拉（盾牌 chip 点开）：两档（默认 / 完全访问），仿 ws-picker
   const [permOpen, setPermOpen] = useState(false)
-  // 目标条件输入弹层（`+` 菜单点「目标模式」触发；受控挂载，见 GoalInputDialog）
-  const [goalDialogOpen, setGoalDialogOpen] = useState(false)
   const [hoveredPanel, setHoveredPanel] = useState<{ id: string; x: number; y: number } | null>(null)
   const [ctxTooltip, setCtxTooltip] = useState(false)
   // 面板以 Portal 渲染在 body 顶层，离开菜单项会先触发 onMouseLeave，
@@ -435,13 +436,6 @@ export default function InputBox({
     ed.commands.focus()
   }, [clearSignal])
 
-  // 仅聚焦（计划卡片「继续修改」）：**不碰内容、不预填文字** —— 预置提示等于
-  // 替用户写好了要说的话，很容易被直接发出去；只把光标交回用户手上。
-  useEffect(() => {
-    if (focusSignal <= 0) return
-    editorRef.current?.chain().focus().run()
-  }, [focusSignal])
-
   // 拖拽计数：dragenter/dragleave 会在进入子元素时成对冒泡，只用布尔量会让遮罩
   // 疯狂闪断 —— 用深度计数，归零才收起。
   const dragDepth = useRef(0)
@@ -510,9 +504,12 @@ export default function InputBox({
     }
     if (key === 'goalMode') {
       if (execMode === 'goal') return
-      // 目标模式要先填完成条件 → 弹输入层（提交后才发命令 / 落草稿）。
-      // 从 plan 切进来同样直接：**不再**弹"请先关闭计划模式"。
-      setGoalDialogOpen(true)
+      // 目标模式**不再弹框要条件**（2026-09-30，docs/frontend/22 §2.6）：点选即进
+      // 目标模式，**下一条指令的正文就是目标条件**。已有会话记的是 store 里的
+      // 武装位（本地草稿，后端毫不知情）；无会话记 `pendingExecMode` 草稿 —— 两者
+      // 都在 `send()` 里随 `chat.exec_mode/exec_condition` 交给后端落地。
+      // 从 plan 切进来同样直接：跨模式清场由后端 `set_execution_mode` 一并做。
+      switchExecMode('goal')
       return
     }
     showToast(`「${PLUS_MENU_LABELS[key]}」功能待开发`, 'info', 2000)
@@ -662,7 +659,7 @@ export default function InputBox({
                   </div>
                   <div
                     role="menuitem"
-                    className={`perm-menu-item ${permMode === 'full_access' ? 'active' : ''}`}
+                    className={`perm-menu-item full ${permMode === 'full_access' ? 'active' : ''}`}
                     onClick={() => {
                       setPermOpen(false)
                       if (permMode !== 'full_access') {
@@ -747,6 +744,7 @@ export default function InputBox({
             mode={execMode}
             planStatus={execPlanStatus}
             goalCondition={execGoalCondition}
+            goalArmed={goalArmed}
             onClose={() => switchExecMode('normal')}
           />
         </div>
@@ -900,19 +898,6 @@ export default function InputBox({
 
       {/* 拖拽遮罩：pointer-events:none，不能挡住 drop 的落点 */}
       <DropOverlay visible={dragging} />
-
-      {/* 目标条件输入弹层（2026-09-25）：受控挂载 + Portal 到 body（脱离 composer 的
-          overflow / 层叠上下文）。提交后：有会话 → 发 session_exec_mode(mode='goal')，
-          选中态由随后的 execution_mode_changed 广播校正；无会话 → 记为 pendingExecMode
-          草稿（随首条消息经 chat.exec_mode 落地，见 execMode 注释）。 */}
-      <GoalInputDialog
-        open={goalDialogOpen}
-        onCancel={() => setGoalDialogOpen(false)}
-        onSubmit={(condition) => {
-          setGoalDialogOpen(false)
-          switchExecMode('goal', condition)
-        }}
-      />
     </div>
   )
 }

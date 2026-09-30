@@ -8,13 +8,15 @@ import PlanCard from './PlanCard'
 const STICKY_THRESHOLD = 48
 
 interface MessageListProps {
-  /** 计划卡片「继续修改」的动作（由 `ChatPanel` 承担：聚焦输入框 + 提示）。
-   *  刻意**不在这里**直接去 focus DOM —— 输入区归 `InputBox` 管，跨组件摸它的
-   *  contenteditable 会把"谁拥有焦点"这件事变成两处。 */
-  onRevisePlan: () => void
+  /** 计划卡片「选择操作」（2026-09-29 二次改版）：把操作栏（`PlanActionBar`）请回
+   *  输入区位置。**可选** —— 操作栏已经在输入区里时 `ChatPanel` 传 `undefined`，
+   *  卡片因此不渲染这枚按钮（同一件事不出现两个入口）。
+   *  刻意**不在这里**直接调 store —— "让操作栏出现"的决定权留在 `ChatPanel`
+   *  （它才是布局的拥有者），这里只做透传。 */
+  onPlanChoose?: () => void
 }
 
-export default function MessageList({ onRevisePlan }: MessageListProps): JSX.Element {
+export default function MessageList({ onPlanChoose }: MessageListProps): JSX.Element {
   const messages = useAgentStore((s) => s.messages)
   const activeSession = useAgentStore((s) => s.activeSession)
   /** 在途审批表（稳定引用）：zustand v5 的 useStore 直接跑在
@@ -47,7 +49,6 @@ export default function MessageList({ onRevisePlan }: MessageListProps): JSX.Ele
    *  卡片状态，就在消息流**末尾**渲染固定块。`undefined` = 本会话无计划（多数情况），
    *  selector 直接取对象引用（缺条目时 undefined，引用稳定）—— 派生计算放 `useMemo`。 */
   const plan = useAgentStore((s) => (s.activeSession ? s.planBySession[s.activeSession] : undefined))
-  const approvePlan = useAgentStore((s) => s.approvePlan)
   const containerRef = useRef<HTMLDivElement>(null)
   const stickyRef = useRef(true)
   const prevSessionRef = useRef(activeSession)
@@ -84,10 +85,13 @@ export default function MessageList({ onRevisePlan }: MessageListProps): JSX.Ele
         {orphanApprovals.map((a) => (
           <ApprovalCard key={a.requestId} approval={a} />
         ))}
-        {/* 计划卡片：同为**消息流末尾固定块**（docs/frontend/22 §6.3）。
+        {/* 计划卡片：贴消息流末尾的**锚点行**（docs/frontend/22 §7.3）。
+            2026-09-29 二次改版后它**不再渲染正文、也不再承载操作** —— 正文在
+            「生成即打开」的右栏里，操作在输入区位置的操作栏里。它只负责标出
+            "这里产出过一份计划"并给两个入口（打开文档 / 选择操作）。
             为什么不做消息级锚定：事件不带 message_id、Message 类型无 plan 字段，
-            而 plan_status + plan_path 就足以还原卡片 → 实时与回放天然一致。 */}
-        {plan && <PlanCard plan={plan} onApprove={approvePlan} onRevise={onRevisePlan} />}
+            而 plan_status + plan_path 就足以还原锚点 → 实时与回放天然一致。 */}
+        {plan && <PlanCard plan={plan} onChoose={onPlanChoose} />}
       </div>
     </div>
   )

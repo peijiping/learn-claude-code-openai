@@ -453,11 +453,16 @@ class TestGoalTerminationAndSink(_AgentTest):
         kinds = [k for k, _ in self.sink_calls]
         self.assertEqual(kinds, ["execution_mode_changed"])
         payload = self.sink_calls[0][1]
+        # `goal_round` / `goal_started_at` 是 2026-09-30 目标可见化新增的投影
+        # 字段（常驻目标条要靠它在重连后显示正确的"第 N 轮"），plan 下恒 None。
         self.assertEqual(set(payload.keys()),
                          {"session_id", "mode", "plan_status",
-                          "plan_path", "goal_condition"})
+                          "plan_path", "goal_condition",
+                          "goal_round", "goal_started_at"})
         self.assertEqual(payload["session_id"], SID)
         self.assertEqual(payload["mode"], MODE_PLAN)
+        self.assertIsNone(payload["goal_round"])
+        self.assertIsNone(payload["goal_started_at"])
 
     def test_same_mode_emits_nothing(self):
         a = self._make_agent()

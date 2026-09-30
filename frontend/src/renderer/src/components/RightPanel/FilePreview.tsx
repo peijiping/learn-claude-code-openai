@@ -1,15 +1,33 @@
 import { useEffect, useMemo, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
 import { showToast } from '@store/agentStore'
 import { EMPTY_LIVE, useRightPanelStore } from '@store/rightPanelStore'
 import { fileStreamUrl, reportFileStream } from '@lib/fileStream'
+import { safeUrlTransform } from '@lib/pathLinks'
+import { sameWorkspaceFile } from '@lib/rpanelTabs'
 import RPanelState from './RPanelState'
+
+/** remark 插件数组提到模块级：身份稳定，避免每次渲染重建插件表
+ *  （react-markdown 会把新数组当场次不同的插件表处理，导致整棵 markdown 树重挂）。 */
+const REMARK_PLUGINS = [remarkGfm]
 
 interface FilePreviewProps {
   sid: string
   /** 当前激活的文件标签（绝对路径 + 显示名） */
   path: string
   name: string
+}
+
+/** 该文件是不是 Markdown（按扩展名）。
+ *
+ *  为什么值得单开一条分支（2026-09-29）：**计划文书就是 Markdown**
+ *  （`.aiagent/plan/<name>.md`），而它现在**只在这里显示** —— 对话里的卡片已不再铺
+ *  正文。给用户看 `#` / `|` 的源码，等于把"正文改由右栏承载"这一改版的收益丢掉。
+ *  上限仍由后端文本口径管（512KB / 截断横幅），这里只决定"怎么渲染"。 */
+function isMarkdownPath(p: string): boolean {
+  return /\.(md|markdown)$/i.test(p)
 }
 
 /** 人话尺寸（预览头里的 "12.3 KB"）。只在此处用到，不值得做成公共模块。 */
@@ -52,7 +70,9 @@ function PdfEmbed({ src, nonce }: { src: string; nonce: number }): JSX.Element {
  * - `pdf`   → `<embed type="application/pdf">` 交给内置 PDF viewer；
  * - `office`→ 有 `pdf_path` 渲染转出的 PDF（LibreOffice 在场），否则 `text`
  *   是文本抽取降级（顶部琥珀横幅给 `office_hint`，版式丢失如实说明）；
- * - `text` / `binary` → 代码视图 / 平级空态（原有行为）。
+ * - `*.md` / `*.markdown` → **渲染成排版好的正文**（2026-09-29；计划文书走这条，
+ *   见 `isMarkdownPath`）；
+ * - 其余 `text` / `binary` → 代码视图 / 平级空态（原有行为）。
  *
  * ⚠️ **超限**与**截断**必须分开表达：超限是"一点内容都没读"（整屏替换成说明），
  * 截断是"读到了但尾部砍了"（正文照常渲染 + 顶部琥珀条）。混起来会让用户
@@ -76,8 +96,18 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
   }, [path])
 
   // 自校验：主进程的请求配对**按 kind FIFO、没有 request id**（19 篇 §4.4），
-  // 慢回执可能属于上一个被点开的文件 —— 路径对不上就当它没到（进而在下面显示"读取中"）。
-  const data = preview && preview.path === path ? preview : null
+  // 慢回执可能属于上一个被点开的文件 —— 不是同一个文件就当它没到（进而在下面显示"读取中"）。
+  //
+  // ⚠️ 「同一个文件」按 `sameWorkspaceFile` 判，**不能用 `===`**：标签 path 可能是
+  // 工作空间**相对**路径（计划文书走 `plan_path` 口径），而回执里的 `path` 恒为后端
+  // `resolve_within()` 解析出的**绝对**路径。字面比较会让有效回执被判丢，`data` 永远
+  // 为 null → 预览区一直"正在读取…"（2026-09-29 用户实测）。
+  const data = preview && sameWorkspaceFile(preview.path, path) ? preview : null
+
+  /** 交给系统文件管理器/本机应用的路径**必须是绝对的**（`shell.openPath` 拿相对路径
+   *  是按进程 cwd 解析的，等于点了没反应）。回执里有解析好的绝对路径就用它 ——
+   *  计划文书的标签 path 是相对的，只有回执才知道它落在磁盘哪儿。 */
+  const osPath = data?.path || path
 
   // 标签激活后懒读：只有当前激活的文件才发请求（其余标签切过去时再读）
   useEffect(() => {
@@ -145,7 +175,7 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
         sub={sub}
         action={
           missing ? (
-            <button className="rpanel-btn" onClick={() => void window.agent.openInFinder(path)}>
+            <button className="rpanel-btn" onClick={() => void window.agent.openInFinder(osPath)}>
               <Icon name="externalLink" size={13} />
               在 Finder 中显示
             </button>
@@ -192,7 +222,7 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
           title={`文件过大（${formatBytes(data.size)}），已停止加载`}
           sub="为避免占满内存，超过上限的文件不会读取内容"
           action={
-            <button className="rpanel-btn" onClick={() => void window.agent.openInFinder(path)}>
+            <button className="rpanel-btn" onClick={() => void window.agent.openInFinder(osPath)}>
               <Icon name="externalLink" size={13} />
               用本机应用打开
             </button>
@@ -300,7 +330,54 @@ export default function FilePreview({ sid, path, name }: FilePreviewProps): JSX.
     )
   }
 
-  // 9) 正常文本（可能带"被截断"横幅）
+  // 9) Markdown：**渲染**而不是给源码（2026-09-29）。
+  //    这条分支的存在理由是计划文书：它是 Markdown，且现在只在这里显示（对话里的
+  //    卡片已不再铺正文），给源码等于把这一改版的最大收益丢掉。
+  //    渲染纪律与消息正文同源（21 篇 §6.1 事故）：**绝不产出可导航元素** —— 外链交主进程
+  //    `setWindowOpenHandler → shell.openExternal`，其余链接一律降级为纯文本
+  //    （渲染层一导航，整个应用就没了）。表格包 `.table-scroll` 防止宽表撑爆面板。
+  if (isMarkdownPath(path)) {
+    return (
+      <div className="rpanel-preview">
+        {head}
+        {data.truncated ? (
+          <div className="rpanel-notice">
+            <Icon name="clock" size={13} />
+            <span className="rpanel-notice__text">
+              内容过长，仅显示前 {data.lines || lines.length} 行
+            </span>
+          </div>
+        ) : null}
+        <div className="rpanel-md">
+          <div className="markdown-body">
+            <ReactMarkdown
+              remarkPlugins={REMARK_PLUGINS}
+              urlTransform={safeUrlTransform}
+              components={{
+                table: ({ children }) => (
+                  <div className="table-scroll">
+                    <table>{children}</table>
+                  </div>
+                ),
+                a: ({ href, children }) =>
+                  /^(https?:)?\/\//i.test(String(href ?? '')) ? (
+                    <a href={String(href)} target="_blank" rel="noreferrer noopener">
+                      {children}
+                    </a>
+                  ) : (
+                    <span>{children}</span>
+                  )
+              }}
+            >
+              {data.text}
+            </ReactMarkdown>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 10) 正常文本（可能带"被截断"横幅）
   return (
     <div className="rpanel-preview">
       {head}

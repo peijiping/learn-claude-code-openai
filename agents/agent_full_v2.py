@@ -31,7 +31,9 @@ from subagent import SubAgent
 from background_manager import BackgroundManager
 from teammate_manager import TeammateManager
 from paths import (SKILLS_DIR, WORKTREE_DIR, MCP_CONFIG, DEFAULT_PROJECT_ID,
-                   WorkspacePaths, workspace_paths)
+                   WorkspacePaths, workspace_paths,
+                   plan_dir_for, plan_display_path, plan_file_for_session,
+                   plan_relpath, resolve_plan_path)
 from attachments import (
     build_tool_images_message,
     expand_content_for_model,
@@ -65,7 +67,6 @@ from execution_mode import (
     PLAN_STATUS_APPROVED,
     PLAN_STATUS_READY,
     ExecutionGate,
-    plan_file_for,
 )
 from skills import SkillLoader
 from llm_manage import LLMClient
@@ -111,7 +112,9 @@ EXEC_REV_PLAN_EXITED = "plan-exited"
 PLAN_ACTIVE_REMINDER = (
     "当前处于「计划模式」。禁止任何写操作与有副作用的调用：只能做只读探索\n"
     "（run_read / run_glob / 只读 bash / 向用户提问），然后用 plan_write 提交计划文书，\n"
-    "等用户批准后再开始执行。若当前任务不适合产出计划（例如只是问答或诊断），\n"
+    "等用户批准后再开始执行。文书会写到工作空间的 .aiagent/plan/ 下并在右侧面板展示，\n"
+    "所以请给一个简短、一眼看懂主题的名字（name 参数）。\n"
+    "若当前任务不适合产出计划（例如只是问答或诊断），\n"
     "请直接说明原因并请用户关闭计划模式，不要反复尝试写操作。"
 )
 # 态②：已退出 plan —— 撤销提醒。
@@ -177,6 +180,29 @@ _ZERO_USAGE = {
 # 任意扩展字段），但发给 LLM 的 messages 只投影固定字段——发送边界统一
 # 过滤，jsonl 新增任何字段都不会漏进 API（用户契约：读取不设限，发送白名单）。
 MODEL_MSG_FIELDS = ("role", "content", "reasoning_content", "tool_calls", "tool_call_id")
+
+
+def _is_display_only_goal_record(message) -> bool:
+    """这条消息是否**只服务界面展示**、不该进模型上下文？
+
+    2026-09-30 目标可见化（docs/frontend/22 §6.6）：目标每轮的 Stop 裁决结果要
+    落成一条**可回放的 user 行**（旁挂 `goal` 元数据），但它对模型是噪音 ——
+    `achieved`/`failed` 之后目标已经是死的，`limit`/`error`/`defer` 的结论也
+    不该被模型当成新指令去响应。
+
+    唯一的例外是 `block`：那条的正文本身就是"你没做完，这是差在哪，继续"的
+    反馈，是 goal 回环的**唯一驱动力**，必须保留（它就长 `[Goal still active]`
+    的样子）。
+
+    `set`（`[Goal set]`）与 `instruction`（用户原话）同样不该剔：前者告知模型
+    目标是什么、后者就是用户输入本身。判据只看 `kind`/`action`，不看原文。
+    """
+    if not isinstance(message, dict):
+        return False
+    marker = message.get("goal")
+    return (isinstance(marker, dict)
+            and marker.get("kind") == "check"
+            and marker.get("action") != "block")
 
 
 def _text_of_message(message) -> str:
@@ -470,6 +496,15 @@ class Agent:
         )
         # 累计 token 消耗：agent_loop 每次响应后累加（goal 状态展示"目标期间花费"用）
         self.total_tokens = 0
+
+        # ── 目标检查结果（2026-09-30 目标可见化，docs/frontend/22 §6.6）──
+        # 每轮 Stop 裁决的展示快照，**待落盘队列**。为什么排队而不当场写：
+        # Stop 边界发生在最后一条 assistant 消息之后，当场 append 会让
+        # `_finalize_turn_usage` 找不到末行 assistant（本轮 usage/model_info
+        # 永久丢失），并让 `run_turn` 的返回值变成检查记录。故：
+        #   - block：循环内即时落盘（其后必然还有 assistant 消息，安全）；
+        #   - defer/achieved/failed/limit/error：入队，turn 收尾统一 flush。
+        self._pending_goal_checks: list[dict] = []
 
         # ── token 消耗统计（主循环 + 子智能体全计入）──────────────────
         # _turn_usage：轮级累计（run_turn / run_background_followup 开头重置），
@@ -1043,6 +1078,11 @@ class Agent:
                 supports_image=supports_image,
             )
             for m in self.history_messages
+            # 目标检查记录（2026-09-30）：非 block 的那些整条不进上下文。
+            # 白名单投影只能剔**字段**，剔不了**整条消息** —— 这批记录
+            # content 为空串（评估器读到等于没读），但留着仍会占位并被模型
+            # 当成"用户说了段空话"。故在列表推导里直接过滤（判据见该函数）。
+            if not _is_display_only_goal_record(m)
         ]
         # 引用（@-mention，2026-09-21）：把中性的 `{"type":"ref"}` 块合并成一段
         # 「路径清单 + 内容不在上下文中、需要时用 run_read」的说明文本块。与附件同一
@@ -1051,7 +1091,8 @@ class Agent:
         # 由结构成立（tests/test_agent_model_messages.py 有身份断言钉住这一点）。
         return [expand_ref_blocks_for_model(m) for m in projected]
 
-    def run_turn(self, user_query: str | list) -> str:
+    def run_turn(self, user_query: str | list,
+                 goal_instruction: str | None = None) -> str:
         """
         跑一轮非交互对话（CLI / cron / TUI 共用）。返回最终回复文本。
 
@@ -1059,6 +1100,13 @@ class Agent:
         存量路径全是这一种，行为逐字节不变）；桌面端带附件时是
         `[文本块 + 附件引用块...]` 的多模态数组（由 ws_bridge 组装，引用块里
         只有元数据，文件字节由 `_model_messages` 在发送边界展开）。
+
+        `goal_instruction`（2026-09-30 目标可见化，docs/frontend/22 §6.6）：
+        本条消息是否**就是被设为执行目标的那条指令**。非 None 时给落盘的 user
+        行挂 `goal={"kind":"instruction","condition":...}`，前端据此在这条消息上
+        渲染「已设为执行目标」徽标，切会话回放时同样可见。由 ws_bridge 显式
+        透传 —— 它是**唯一**算得出"这条就是目标指令"的地方（条件优先取显式
+        `exec_condition`，其次才是消息正文），agent 侧不做反查猜测。
 
         agent_loop 内部仍会打印 thinking / 本轮回复（保持现状 UX）；
         本方法额外返回历史最后一条消息的文本，供调用方打印。
@@ -1084,7 +1132,15 @@ class Agent:
         self.hook_system.trigger("UserPromptSubmit", prompt_text)
         log.info("turn 开始: %s%s user_query=%r",
                  self.session_prefix, self.session_id, prompt_text[:100])
-        self.history_messages.append({"role": "user", "content": user_query})
+        user_msg = {"role": "user", "content": user_query}
+        # 目标指令标记（2026-09-30）：只加字段、不改正文口径 —— 无 goal 的
+        # 消息连字段都不多一个，与改造前的 jsonl 形状逐字节一致。
+        if goal_instruction is not None:
+            user_msg["goal"] = {
+                "kind": "instruction",
+                "condition": goal_instruction,
+            }
+        self.history_messages.append(user_msg)
         self.session_manager.append_message_to_session(
             self.session_file, self.history_messages[-1]
         )
@@ -1095,6 +1151,10 @@ class Agent:
         self.agent_loop()
         self._finalize_turn_usage()
         last = self.history_messages[-1].get("content", "")
+        # 目标检查记录延迟到这里落盘：必须排在 `_finalize_turn_usage` **之后**
+        #（否则末行不是 assistant，本轮 usage/model_info 会永久丢失），也要排在
+        # 算出 `last` **之后**（否则 run_turn 的返回值会变成检查记录的正文）。
+        self._flush_goal_checks()
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         log.info("turn 结束: %s%s (tokens累计=%d)",
@@ -1124,6 +1184,8 @@ class Agent:
         self.agent_loop()
         self._finalize_turn_usage()
         last = self.history_messages[-1].get("content", "")
+        # 与 run_turn 同款：检查记录必须在 usage 收尾与 `last` 取值之后落盘
+        self._flush_goal_checks()
         if isinstance(last, list):
             return "".join(b.get("text", "") for b in last if isinstance(b, dict))
         return str(last)
@@ -1254,21 +1316,30 @@ class Agent:
 
         ⚠️ 为什么必须是**闭包**、而不是把路径交给 ToolRegistry 自己算：
         `ToolRegistry.__init__` 只有 `workdir` / `bash_cwd`，**没有** workspace、
-        没有 session_id、也没有 data_root —— 而计划文书落在**元数据目录**
-        （`~/.aigent/projects/<id>/plans/`），不是工作区里。让 registry 侧推断
-        必然推错。所以"算路径 → 原子写 → 标状态 → 落盘 → 推信封"五件事全部
-        收在这个闭包里，registry 只负责把 content 递进来。
+        没有 session_id、也没有工作空间根 —— 而计划文书落在
+        `<工作空间根>/.aiagent/plan/`（2026-09-29 起，不再进元数据目录）。
+        让 registry 侧推断必然推错。所以"清洁名字 → 算路径 → 原子写 → 标状态 →
+        落盘 → 推信封"全部收在这个闭包里，registry 只负责把 content / name 递进来。
 
         写入是 **tmp + os.replace 原子写**（与项目其它落盘一致）：计划卡片会在
         前端被读，半截文件比"读不到"更难排查。
+
+        名字口径（三条都在 `paths`，此处**不再自己拼**）：
+          · `plan_dir_for(workdir)` —— 目录由后端强制，模型定不了；
+          · `resolve_plan_path(...)` —— 同名不撞车；本会话上一版的那份**允许覆盖**
+            （单份覆盖语义），别人的那份绝不碰；
+          · 换名重新产出后清掉本会话上一版（否则工作区里会留下没人认领的旧文书）。
         """
-        def write_plan(content: str) -> str:
+        def write_plan(content: str, name: str = "") -> str:
             sid = self.session_id
             if not sid:
                 return "Error: plan_write 失败：当前没有绑定的会话。"
-            path = plan_file_for(self.workspace, sid, self.session_prefix)
+            workdir = self.workspace.workdir
+            plan_dir = plan_dir_for(workdir)
+            prev_name = self.execution_gate.plan_name or ""
+            path = resolve_plan_path(plan_dir, name, prev_name)
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                plan_dir.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_name(
                     f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
                 tmp.write_text(content, encoding="utf-8")
@@ -1277,20 +1348,30 @@ class Agent:
                 log.error("plan_write 落盘失败 session=%s: %s: %s",
                           sid, type(e).__name__, e)
                 return f"Error: plan_write 写入失败：{e}"
-            self.execution_gate.mark_plan_ready(path)
+            # 同一会话换名重新产出 → 清掉上一版（best-effort：清不掉只是留个死文件，
+            # **绝不能**因此让刚落盘的这一份算失败）。
+            if prev_name and prev_name != path.name:
+                try:
+                    (plan_dir / prev_name).unlink(missing_ok=True)
+                except OSError as e:
+                    log.warning("清理上一版计划文书失败 %s: %s", prev_name, e)
+            self.execution_gate.mark_plan_ready(path, path.name)
             self._persist_execution()
             # 推送顺序契约（docs/frontend/22 §4.5）：**先** mode 变更信封（带
-            # plan_status="ready"）**再** plan_ready —— 保证前端处理卡片时 tag
-            # 状态已就位。两条都走 execution_mode_sink（唯一投递路径）。
+            # plan_status="ready" 与 plan_path）**再** plan_ready —— 保证前端处理
+            # 卡片时 tag 状态已就位。两条都走 execution_mode_sink（唯一投递路径）。
             self._emit_execution_changed()
             self._emit_kind("plan_ready", {
                 "session_id": sid,
                 "plan_status": PLAN_STATUS_READY,
-                # 不带正文、不带路径：正文由前端调 `plan_read` 取（实时与回放
-                # 共用同一条链路），路径由 plan_content 回执带回。
+                # 带**相对工作空间**的路径（右栏标签、file_read 的口径都是它）。
+                # 正文仍由前端调 `plan_read` 取（实时与回放共用同一条链路）。
+                "plan_path": plan_relpath(path.name),
+                "plan_name": path.name,
             })
             return (
-                f"Plan written ({len(content)} chars). "
+                f"Plan written ({len(content)} chars) → "
+                f"{plan_relpath(path.name)}. "
                 "等待用户批准后再开始执行。"
             )
 
@@ -1334,9 +1415,28 @@ class Agent:
             "session_id": self.session_id,
             "mode": mode,
             "plan_status": self.execution_gate.plan_status,
-            "plan_path": self.execution_gate.plan_path,
+            "plan_path": self._plan_display_path(),
             "goal_condition": active.condition if active is not None else None,
+            # 目标运行期指标（2026-09-30）：常驻目标条据此显示「第 N 轮」。
+            # 与 `goal_condition` 一样只是投影，active 为空时一律 None。
+            "goal_round": active.iterations if active is not None else None,
+            "goal_started_at": active.set_at if active is not None else None,
         }
+
+    def _plan_display_path(self) -> str | None:
+        """计划文书**对外**的路径（共用判据在 `paths.plan_display_path`）。
+
+        - 有 `plan_name`（2026-09-29 起产出的文书）→ 相对工作空间的
+          `.aiagent/plan/<name>.md`（右栏标签与 `file_read` 都用这个口径）；
+        - 无 `plan_name` 但有 `plan_status` → **存量会话**，文书躺在旧的元数据目录，
+          这里回退给出旧的绝对路径（卡片能显示、正文能读，只是不进右栏）；
+        - 无计划状态 → `None`（`plan_name` 在重规划期间会先于状态存在，不能拿它
+          当"有计划"的判据 —— 前端会据此渲染一张空卡片）。
+        """
+        legacy = str(plan_file_for_session(
+            self.session_id, self.session_prefix, self.workspace.plans_dir))
+        return plan_display_path(
+            self.execution_gate.plan_status, self.execution_gate.plan_name, legacy)
 
     # ── 唯一入口：模式切换（薄委托）────────────────────────────────────
     def set_execution_mode(self, mode: str, condition: str = "") -> str:
@@ -1422,6 +1522,10 @@ class Agent:
         为什么需要它：CLI 的 `/goal` 会在终端打印确认，而桌面端用户是点胶囊 tag
         填条件 —— **未必再发一条相关消息**，模型需要立刻知道目标是什么。复用既有
         消息族（`[Goal still active]` 的同款形态）而不是新造注入机制。
+
+        2026-09-30 目标可见化：额外挂 `goal` 元数据（`kind="set"`）。正文口径
+        一字不改（模型照旧读到完整指令），前端则据此把它渲染成「目标设定」卡片，
+        而不是一条长得像用户说话的 `[Goal set] Condition: …` 气泡。
         """
         msg = {
             "role": "user",
@@ -1431,10 +1535,80 @@ class Agent:
                 "Work toward this condition; the session will be evaluated "
                 "when you stop."
             ),
+            "goal": {"kind": "set", "condition": condition},
         }
         self.history_messages.append(msg)
         if self.session_manager is not None and self.session_file is not None:
             self.session_manager.append_message_to_session(self.session_file, msg)
+
+    # ── 目标检查结果的出口（2026-09-30 目标可见化，docs/frontend/22 §6.6）──
+    def _note_goal_check(self, decision, *, inline: bool = False) -> dict | None:
+        """一次 Stop 裁决的出口：上行事件 + 轮次回写 meta +（择时）落盘。
+
+        `goal_controller.last_check` 是控制器算好的展示快照
+        （`condition/round/elapsed/tokens/at`），这里只负责分发到三个出口：
+
+        1. **上行**：`goal_check` 信封（走 `_emit_kind` → sink → 线程安全广播），
+           前端即时在对话流里插一张检查卡。agent 侧**没有 hub**，绝不能直接
+           `hub.broadcast`（Stop 边界同步跑在工作线程）。
+        2. **轮次回写**：`goal_round` 落 meta —— 常驻目标条靠它在重连/切会话后
+           显示正确的"第 N 轮"（`session_history` 只在切换会话时发，靠不住）。
+        3. **落盘**：`inline=True`（仅 block）返回快照、由调用方挂到既有的
+           `[Goal still active]` 消息上一起落盘；否则入队，等 turn 收尾统一写。
+
+        **为什么只有 block 能当场落盘**：Stop 边界发生在最后一条 assistant 消息
+        **之后** —— 当场 append 一条新消息会让 `_finalize_turn_usage` 找不到末行
+        assistant（本轮 usage/model_info 永久丢失），也会让 `run_turn` 的返回值
+        变成检查记录的正文。block 不受影响：它之后必然还有 assistant 消息。
+
+        返回快照（无快照时 None）供 block 分支组装消息用。
+        """
+        check = dict(self.goal_controller.last_check or {})
+        if not check:
+            return None
+        check["action"] = decision.action
+        check["reason"] = decision.reason
+        self._emit_kind(
+            "goal_check", {"session_id": self.session_id, "kind": "check", **check}
+        )
+        try:
+            if self.session_manager is not None and self.session_id is not None:
+                self.session_manager.set_session_execution(
+                    self.session_id, goal_round=check.get("round")
+                )
+        except Exception:
+            log.exception("目标轮次落盘失败（内存已生效）")
+        if not inline:
+            self._pending_goal_checks.append(check)
+        return check
+
+    def _append_goal_check(self, check: dict) -> None:
+        """把一份检查快照落成一条 jsonl 行（user role + `goal` 元数据）。
+
+        `content` 恒为空串：这条记录**不进模型上下文**（由
+        `_is_display_only_goal_record` 整条过滤），空正文让评估器的 transcript
+        也读不到它 —— 界面上有记录、模型侧零污染。
+        """
+        msg = {
+            "role": "user",
+            "content": "",
+            "goal": {"kind": "check", **check},
+        }
+        self.history_messages.append(msg)
+        if self.session_manager is not None and self.session_file is not None:
+            self.session_manager.append_message_to_session(self.session_file, msg)
+
+    def _flush_goal_checks(self) -> None:
+        """turn 收尾：把排队的检查记录按产生顺序逐条落盘。
+
+        调用点只有 `run_turn` / `run_background_followup` 的收尾处，且**必须**
+        排在 `_finalize_turn_usage()` 与 `last` 取值之后（见 `_note_goal_check`）。
+        """
+        if not self._pending_goal_checks:
+            return
+        pending, self._pending_goal_checks = self._pending_goal_checks, []
+        for check in pending:
+            self._append_goal_check(check)
 
     # ── 状态恢复与落盘 ─────────────────────────────────────────────────
     def _new_goal_controller(self) -> GoalController:
@@ -1448,7 +1622,8 @@ class Agent:
             block_cap=goal_block_cap,
         )
 
-    def _rebuild_goal_controller(self, condition: str) -> GoalController:
+    def _rebuild_goal_controller(self, condition: str, meta: dict | None = None
+                                 ) -> GoalController:
         """用 meta 的 `goal_condition` 经**既有** `GoalController.restore()` 重建控制器。
 
         喂料形状 = `[{"type": "goal_status", "condition": c, "active": True}]`，
@@ -1463,6 +1638,13 @@ class Agent:
           ② `consecutive_blocks` 归 0 —— `restore()` 不恢复它；
           ③ 替换后**重新 set_llm** —— 新控制器的 evaluator 是新建的，
              必须复用宿主当前的客户端与模型（否则热切换过的绑定会丢）。
+
+        `meta`（2026-09-30 目标可见化）：`restore()` 按设计只恢复 condition、
+        把轮次/时长归零（见其 docstring：恢复时无合理延续）。但常驻目标条要显示
+        「第 N 轮」、检查卡要显示"已运行多久"，归零会让**每次切会话都像新设了
+        一次目标**。故这里用 meta 落盘的 `goal_round` / `goal_started_at` /
+        `goal_tokens_at_start` 覆盖回去，让跨重启的计时与轮次连续。
+        存量会话（升级前）这三个字段是 None → 保持 `restore()` 的归零语义。
         """
         evaluator_model = os.environ.get("GOAL_EVALUATOR_MODEL_ID") or self.model
         controller = GoalController.restore(
@@ -1472,6 +1654,19 @@ class Agent:
         )
         controller.consecutive_blocks = 0
         controller.set_llm(self.llm_client, evaluator_model)
+
+        meta = meta if isinstance(meta, dict) else {}
+        active = controller.active
+        if active is not None:
+            stored_round = meta.get("goal_round")
+            if isinstance(stored_round, int) and stored_round >= 0:
+                active.iterations = stored_round
+            stored_started = meta.get("goal_started_at")
+            if isinstance(stored_started, (int, float)) and stored_started > 0:
+                active.set_at = float(stored_started)
+            stored_tokens = meta.get("goal_tokens_at_start")
+            if isinstance(stored_tokens, int) and stored_tokens >= 0:
+                active.tokens_at_start = stored_tokens
         return controller
 
     def _restore_execution_state(self) -> None:
@@ -1491,7 +1686,8 @@ class Agent:
             # ② goal：meta 的 goal_condition 是 restore 的喂料
             condition = meta.get("goal_condition")
             if isinstance(condition, str) and condition.strip():
-                self.goal_controller = self._rebuild_goal_controller(condition.strip())
+                self.goal_controller = self._rebuild_goal_controller(
+                    condition.strip(), meta)
             elif self.goal_controller.active is not None:
                 # 本会话 meta 里没有目标，而内存里还挂着一个 → 那是**上一个会话**
                 # 留下的（switch_session 不重建控制器）。既有实现的隐性缺陷；
@@ -1522,6 +1718,9 @@ class Agent:
         `goal_condition` 取 `goal_controller.active.condition`：active 为空时
         写 `None` —— 这就是"achieved / failed 后自动清空目标"的实现，不需要
         额外的判定分支。
+
+        `plan_name`（2026-09-29 新增）：模型给的文件名。**必须落盘** —— 路径再也
+        不由 sid 推出，不存这一份，切会话 / 重启后就找不到自己的文书了。
         """
         try:
             if self.session_manager is None or self.session_id is None:
@@ -1531,7 +1730,15 @@ class Agent:
                 self.session_id,
                 execution_mode=self.execution_gate.mode,
                 plan_status=self.execution_gate.plan_status,
+                plan_name=self.execution_gate.plan_name,
                 goal_condition=(active.condition if active is not None else None),
+                # 目标运行期指标（2026-09-30）：跟 goal_condition 同生共死 ——
+                # active 为空时一并写 None，否则清空后的会话会带着陈旧的
+                # "第 7 轮"复活成一张幽灵目标条。
+                goal_round=(active.iterations if active is not None else None),
+                goal_started_at=(active.set_at if active is not None else None),
+                goal_tokens_at_start=(
+                    active.tokens_at_start if active is not None else None),
             )
         except Exception:
             log.exception("执行模式落盘失败（内存已生效）")
@@ -2263,10 +2470,19 @@ class Agent:
                 decision = self.goal_controller.evaluate_after_turn(
                     self.history_messages,
                     background_running=self.background_manager.has_running(),
+                    # 目标期间 token 消耗 = 当前累计 - 设目标时的累计（在 goal.py
+                    # 的 snapshot 里算）。没有它，检查卡就报不出"这轮烧了多少"。
+                    current_tokens=self.total_tokens,
                 )
                 if decision.action == "block":
                     # 目标未达成：把目标条件与评估器理由回注入消息（同时落盘），
-                    # continue 回环让 Worker 看到反馈后继续朝目标干活
+                    # continue 回环让 Worker 看到反馈后继续朝目标干活。
+                    #
+                    # 2026-09-30 目标可见化：这条消息**同时**是给用户的检查记录 ——
+                    # 挂 `goal` 元数据后，前端渲染成「第 N 轮 · 未达成 · 偏差：…」
+                    # 的检查卡，而不是一段给模型看的英文。`inline=True` 表示由本
+                    # 分支自己落盘（block 之后必有 assistant 消息，当场写是安全的）。
+                    check = self._note_goal_check(decision, inline=True)
                     condition = (
                         self.goal_controller.active.condition
                         if self.goal_controller.active else ""
@@ -2280,6 +2496,8 @@ class Agent:
                             "Continue working and surface the missing evidence."
                         ),
                     }
+                    if check is not None:
+                        block_msg["goal"] = {"kind": "check", **check}
                     self.history_messages.append(block_msg)
                     self.session_manager.append_message_to_session(
                         self.session_file, block_msg
@@ -2294,6 +2512,9 @@ class Agent:
                     self._print(f"\033[33m[goal] defer: {decision.reason}\033[0m")
                     log.info("goal defer: %s%s 后台任务在跑，暂缓判定 (%s)",
                              self.session_prefix, self.session_id, decision.reason[:120])
+                    # 检查记录入队，由 run_turn 收尾统一落盘（此刻末行是 assistant，
+                    # 不能动 —— 见 `_note_goal_check` 的"为什么只有 block 能当场写"）
+                    self._note_goal_check(decision)
                     return
                 # 终止态只打印结论供用户感知，目标状态已由控制器内部处理：
                 #   achieved（达成，清目标）/ failed（无法完成，清目标）/
@@ -2303,6 +2524,9 @@ class Agent:
                     self._print(f"\033[33m[goal] achieved: {decision.reason}\033[0m")
                     log.info("goal achieved: %s%s %s",
                              self.session_prefix, self.session_id, decision.reason[:120])
+                    # ⚠ 必须**先**记检查结果再回落模式：`_on_goal_terminated`
+                    # 会把目标清空，随后控制器就算不出 condition/elapsed/tokens 了。
+                    self._note_goal_check(decision)
                     # 执行模式：目标终结 → 模式回落 normal + 落盘 + 推送（撤 tag）。
                     # ⚠ 本处同步跑在**工作线程**（session_runtime 的 to_thread），
                     # 且 agent 侧没有 hub —— 只能用 execution_mode_sink（其内部
@@ -2312,15 +2536,20 @@ class Agent:
                     self._print(f"\033[31m[goal] failed: {decision.reason}\033[0m")
                     log.warning("goal failed: %s%s %s",
                                 self.session_prefix, self.session_id, decision.reason[:120])
+                    self._note_goal_check(decision)   # 同上：先记再清
                     self._on_goal_terminated()
                 elif decision.action == "limit":
                     self._print(f"\033[31m[goal] limit: {decision.reason}\033[0m")
                     log.warning("goal limit: %s%s 连续 block 超上限，强制结束 (%s)",
                                 self.session_prefix, self.session_id, decision.reason[:120])
+                    # limit 后目标**仍激活**：检查卡要写明"已跑满 N 轮仍未达成，
+                    # 目标保持"，否则用户会以为目标没了。
+                    self._note_goal_check(decision)
                 elif decision.action == "error":
                     self._print(f"\033[31m[goal] evaluation error: {decision.reason}\033[0m")
                     log.error("goal 评估器出错: %s%s %s",
                               self.session_prefix, self.session_id, decision.reason[:120])
+                    self._note_goal_check(decision)
                 # allow（无目标）与各终止态 → 走原有 Stop hook 流程
                 # （钩子返回非 None 仍可强制续跑，goal 之外的第二道拦截不受影响）
                 force = self.hook_system.trigger("Stop", self.history_messages)

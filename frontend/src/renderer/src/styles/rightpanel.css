@@ -571,6 +571,27 @@ body.is-resizing .chat {
   cursor: text;
 }
 
+/* ── Markdown 文件面（2026-09-29）─────────────────────────────────────
+   `*.md` 文件走这条：**渲染排版**而不是给源码。加它的直接动机是计划文书
+   （`.aiagent/plan/<name>.md`）—— 它现在只在这里显示（对话里的卡片已不再铺正文），
+   给源码等于把这一改版的收益丢掉。
+   与代码面（深底等宽）刻意不同：Markdown 是**文档**，沿用 `.markdown-body`
+   那一套既有排版语言（`global.css`，全局作用域，故右栏直接用得上）。
+   ⚠️ 与 `.rpanel-code` 同一份**高度链纪律**：`flex:1` + `min-height:0` 缺一即塌
+   （见下方"媒体面"注释里记的那次事故）。 */
+.rpanel-md {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--color-bg-main);
+  /* ⚠️ body 全局 user-select: none（global.css:21）→ 正文必须显式放开，
+     否则右栏里一个字都选不中、复制不了 */
+  user-select: text;
+  cursor: text;
+}
+
 /* ── 媒体面：图片 / PDF（多格式预览，2026-09-23，docs/frontend/21）─────
    ⚠️ 这三条是**高度链的最后一环**，缺一条都会塌：
    `.rpanel-body(flex:1,min-height:0)` → `.rpanel-preview(flex:1,min-height:0)`

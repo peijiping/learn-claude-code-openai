@@ -7,6 +7,10 @@ interface ExecutionModeTagProps {
   mode: ExecutionMode
   /** goal 模式的目标条件（进 title 提示；null/空 = 不展示条件） */
   goalCondition?: string | null
+  /** goal 模式的**武装态**（2026-09-30，docs/frontend/22 §2.6）：已点「目标模式」、
+   *  条件待第一条指令给出。此时胶囊已经亮着但后端还是旧模式 —— 提示语必须说清
+   *  "下一条指令即目标"，否则用户会以为模式没生效、或以为目标凭空设好了。 */
+  goalArmed?: boolean
   /** plan 模式下的文书状态：ready = 待批准 / approved = 已批准 */
   planStatus?: PlanStatus | null
   /** 点胶囊右侧的 `×` → 回到 normal。
@@ -31,6 +35,7 @@ interface ExecutionModeTagProps {
 export default function ExecutionModeTag({
   mode,
   goalCondition,
+  goalArmed,
   planStatus,
   onClose
 }: ExecutionModeTagProps): JSX.Element | null {
@@ -43,12 +48,19 @@ export default function ExecutionModeTag({
       : planStatus === 'approved'
         ? '计划模式：计划已批准，正在执行。点 × 关闭'
         : '计划模式：先出方案，未经批准不得改动系统。点 × 关闭'
-    : goalCondition
-      ? `目标模式：${goalCondition}。点 × 关闭`
-      : '目标模式：朝一个明确条件反复推进直到达成。点 × 关闭'
+    : goalArmed
+      ? '目标模式：下一条指令将作为目标条件，之后朝它反复推进。点 × 关闭'
+      : goalCondition
+        ? `目标模式：${goalCondition}。点 × 关闭`
+        : '目标模式：朝一个明确条件反复推进直到达成。点 × 关闭'
   return (
     // data-exec-mode：交互验证（CDP）与后续样式扩展都靠它定位，不放 class 里
-    <span className={`exec-chip ${isPlan ? 'plan' : 'goal'}`} data-exec-mode={mode} title={hint}>
+    <span
+      className={`exec-chip ${isPlan ? 'plan' : 'goal'}${goalArmed ? ' armed' : ''}`}
+      data-exec-mode={mode}
+      data-goal-armed={goalArmed ? '1' : undefined}
+      title={hint}
+    >
       <Icon name={isPlan ? 'listTodo' : 'target'} size={13} />
       <span className="exec-chip-label">{label}</span>
       <button

@@ -10,9 +10,10 @@ paths.py - 路径配置（单一事实来源）
 - AGENTS.md 规则：工作目录相关常量统一在此管理，禁止在业务模块内重复声明
 """
 
+import re
 import shutil
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from config import AIGENT_HOME, CONFIG_DIR, migrate_legacy
 
@@ -91,16 +92,31 @@ DEFAULT_SCRATCH_DIR = DATA_ROOT / "scratch"
 ATTACHMENTS_DIRNAME = ".attachments"
 DRAFT_ATTACHMENTS_DIRNAME = "_draft"
 
-# ── 计划文书目录（2026-09-25，任务执行模式，docs/frontend/22）─────────────────
-# 布局：
+# ── 计划文书目录（任务执行模式，docs/frontend/22）─────────────────────────────
+# **2026-09-29 改版：文书落到工作空间里，不再进元数据目录。**
 #
-#   ~/.aigent/projects/<id>/plans/session_<sid>.md
+#   旧（2026-09-25 ~ 2026-09-29）：~/.aigent/projects/<id>/plans/session_<sid>.md
+#   新（2026-09-29 起）：          <工作空间根>/.aiagent/plan/<模型命名>.md
 #
-# 落**元数据目录**而不是工作区，理由有两条（都很硬）：
-#   1. 计划文书是会话级产物，与会话 jsonl / .tasks 同源，删会话即随 meta 级联清理；
-#   2. 写进用户的项目目录会污染仓库（而且是"每会话一个文件"的持续污染）。
-# 与 `.attachments` 同策略：由运行期按需创建（`plan_write` 落盘时 mkdir parents），
-# 不进 WORKSPACE_SUBDIRS —— 没用过计划模式的用户永远不会看到这个目录。
+# 为什么改：计划文书回答的是"接下来要怎么改**这个项目**"，跟代码放在一起才看得见、
+# 能进版本库、能直接在编辑器里改。落在 `~/.aigent` 的那一版，用户根本找不到它。
+#
+# 改版带来的三条**连带约束**（改动时三处必须一起看）：
+#   1. 文件名由**模型**给（`plan_write` 的 `name` 参数）→ 落盘前必须清洗
+#      （`plan_filename` / `resolve_plan_path`，只让模型定名字、定不了目录）；
+#   2. 路径再也无法由 sid 推出 → meta 落 `plan_name`（非绝对路径，工作空间整体
+#      搬家也不会失效），前端据此拼右栏标签路径；
+#   3. 会话删除/清空**不再**删文书 —— 它此时是工作区里的项目文件（用户资产），
+#      不是会话的临时产物。旧的两处级联清理随之删除，见 docs/frontend/22 §4.5。
+#
+# 与既有 `.aigent/`（工具缓存，在 `refs.DEFAULT_IGNORE_DIRS` 里被剪枝）刻意区分：
+# `.aiagent/` 是**给用户看的产物目录**，不进忽略清单 —— 计划文书要能在文件树里看见。
+PLAN_DIR_PARTS = (".aiagent", "plan")
+# 计划文书单份文件名长度上限（含扩展名）：模型给的 name 超长即截断
+PLAN_NAME_MAX = 60
+
+# ⚠️ **旧落点，只用于存量会话回退读取**（2026-09-29 起的写入一律走 `PLAN_DIR_PARTS`）。
+# 删掉它会让升级前的会话"卡片一下读不到正文"；相关测试见 tests/test_plan_artifact.py。
 PLANS_DIRNAME = "plans"
 
 
@@ -188,13 +204,21 @@ class WorkspacePaths:
 
     @property
     def plans_dir(self) -> Path:
-        """计划文书根（`plans/`，任务执行模式）。
+        """**旧**计划文书根（`<data_root>/plans/`，2026-09-25 版落点）。
 
-        任何"计划文书在哪个空间"的解析都必须经本属性 —— 与其它运行期目录同一
-        口径（模块级常量只代表 default 空间）。文件名口径见
-        `execution_mode.plan_relpath`（`<prefix><sid>.md`，与会话 jsonl 同源）。
+        ⚠️ 2026-09-29 起写入统一走 `plan_dir_for(workdir)`（工作空间内的
+        `.aiagent/plan/`）；本属性只服务于**存量会话的回退读取**，不要在新代码里
+        用它算落点。新口径见 `PLAN_DIR_PARTS` 上方的说明。
         """
         return self.data_root / PLANS_DIRNAME
+
+    @property
+    def plan_dir(self) -> Path:
+        """**现**计划文书根（`<工作空间根>/.aiagent/plan/`，2026-09-29 起）。
+
+        与 `plans_dir` 并存是刻意的：前者是写入与展示口径，后者是存量回退口径。
+        """
+        return plan_dir_for(self.workdir)
 
 
 def workspace_paths(project_id: str, root: Path | str | None = None) -> WorkspacePaths:
@@ -396,17 +420,115 @@ def task_file_for_session(session_id: str, session_prefix: str = "session_",
 
 def plan_file_for_session(session_id: str, session_prefix: str = "session_",
                           plans_dir: Path | None = None) -> Path:
-    """指定会话的计划文书路径（任务执行模式，docs/frontend/22）。
+    """**旧**口径：指定会话的计划文书路径（`<plans_dir>/<prefix><sid>.md`）。
 
-    ⚠️ **这是 会话 ↔ 计划文书文件名口径的唯一出处**（与 `task_scope_file` 同款
-    约束）：`agent_full_v2` 的 `plan_write` 闭包、`ws_bridge` 的 `plan_read`、
-    以及 `SessionManager` 的三处级联清理必须同源 —— 任何一边漂移都会导致
-    "写得到、读不到"或"清理静默失效"。
+    ⚠️ 2026-09-29 起**只用于存量会话的回退读取**（旧会话的文书确实躺在那里）。
+    新写入一律走 `plan_dir_for` + `resolve_plan_path`（工作空间内、模型命名）。
 
-    `plans_dir` 为该会话**所属工作空间**的 `plans/` 目录（缺省 = default 空间）。
+    `plans_dir` 为该会话**所属工作空间**的旧 `plans/` 目录（缺省 = default 空间）。
     """
     base = plans_dir if plans_dir is not None else (DATA_ROOT / PLANS_DIRNAME)
     return base / f"{session_prefix}{session_id}.md"
+
+
+# ── 计划文书（2026-09-29 起口径：工作空间内 + 模型命名）─────────────────────
+# 这是「计划文书路径」的**唯一出处**：写入端（Agent 的 `plan_write` 闭包）、
+# 读取端（`ws_bridge.plan_read`）、展示端（`session_manage.list_sessions` 的
+# `plan_path`）全部经这里，任何一处自己拼字符串都会造成"写得到、读不到"。
+
+# 文件名里**不允许**出现的字符（Windows 保留字符 + 控制字符 + 反斜杠）。
+# 目录分隔符 `/` 也在此列 —— 模型只能定名字，定不了目录。
+_PLAN_NAME_BAD = re.compile(r"[\x00-\x1f\x7f/\\:*?\"<>|]+")
+
+
+def plan_filename(raw_name: str | None, fallback: str = "plan") -> str:
+    """把（模型给的）名字清洗成一个安全的**文件名**（恒以 `.md` 结尾）。
+
+    安全约束（缺一不可 —— 这是模型可控的唯一一段路径）：
+      · 只取 basename：`..` / `a/b` / `/etc/x` / `C:\\x` 里的目录部分全部剥掉；
+      · 去控制字符与 Windows 保留字符（含反斜杠），空白折叠成 `-`；
+      · 去首尾的 `.`、`-`、空白（`..` / `.hidden` / `-` 这类会被清成空 → 走 fallback）；
+      · 截断到 `PLAN_NAME_MAX`（截断后可能又露出尾部点号，再清一次）；
+      · 清洗后为空 → `fallback`（保证**永远**有一个能落盘的名字）。
+    """
+    text = str(raw_name or "").strip()
+    # Windows 上的目录分隔符也要当分隔符切（`Path` 在 macOS 上不认反斜杠）
+    text = text.replace("\\", "/").split("/")[-1]
+    text = _PLAN_NAME_BAD.sub("-", text)
+    text = re.sub(r"\s+", "-", text)
+    if text.lower().endswith(".md"):
+        text = text[:-3]
+    text = text.strip(" .-")
+    if len(text) > PLAN_NAME_MAX:
+        text = text[:PLAN_NAME_MAX].strip(" .-")
+    if not text:
+        text = str(fallback or "plan").strip(" .-") or "plan"
+    return f"{text}.md"
+
+
+def plan_relpath(raw_name: str | None) -> str:
+    """文书**相对工作空间**的路径（POSIX 风格，恒为 `.aiagent/plan/<name>.md`）。
+
+    为什么给相对路径而不是绝对路径：① meta 里不存绝对路径，工作空间整体搬家后
+    仍然有效；② 右栏标签、`file_read` 的路径口径本来就是"相对工作空间根"。
+    """
+    return str(PurePosixPath(*PLAN_DIR_PARTS) / plan_filename(raw_name))
+
+
+def plan_dir_for(workdir: Path | str) -> Path:
+    """文书目录（绝对）：`<工作空间根>/.aiagent/plan/`。"""
+    return Path(workdir).joinpath(*PLAN_DIR_PARTS)
+
+
+def plan_display_path(plan_status: str | None, plan_name: str | None,
+                      legacy_path: str | None = None) -> str | None:
+    """计划文书**对外**的路径 —— 三个出口共用的唯一判据。
+
+    出口共三处，必须逐字同口径，否则症状是"某一条通道漏了回退逻辑"（表现为
+    重连后卡片点不开 / 标签路径对不上）：
+      ① `Agent.execution_state()` → `execution_mode_changed` 广播；
+      ② `ws_bridge._exec_mode_fields()` → `session_history`；
+      ③ `SessionManager.list_sessions()` → `sessions` 列表（断线重连的唯一通道）。
+
+    | `plan_status` | `plan_name` | 返回 |
+    | --- | --- | --- |
+    | 空 | 任意 | `None`（**没有计划状态就没有路径** —— `plan_name` 在重规划期间会先于状态存在，拿它当判据会让前端渲染一张空卡片） |
+    | 非空 | 有 | 相对工作空间的 `.aiagent/plan/<name>.md`（新口径） |
+    | 非空 | 无 | `legacy_path`（**存量会话**：文书还在旧的元数据目录里） |
+    """
+    if not plan_status:
+        return None
+    if plan_name:
+        return plan_relpath(plan_name)
+    return legacy_path or None
+
+
+def resolve_plan_path(plan_dir: Path | str, raw_name: str | None,
+                      previous_name: str | None = None) -> Path:
+    """算出这份计划文书的**最终落点**（同名不撞车）。
+
+    规则（`previous_name` = 本会话上一版文书的文件名，可为空）：
+      1. 目标不存在，或目标就是**本会话上一版**的文件 → 直接用（重规划 = 覆盖）；
+      2. 目标存在且属于**别的会话** → 依次试 `<stem>-2.md` / `-3.md` …（最多 98 次），
+         绝不覆盖别人的计划；
+      3. 全都占满（极端）→ 仍返回原目标（退化为覆盖，不阻断落盘）。
+
+    为什么必须有这一层：文件名现在由模型给，两个会话取同一个"重构方案"是完全可能的，
+    而文书一旦互相覆盖，前端卡片就会显示另一份计划的正文。
+    """
+    base = Path(plan_dir)
+    name = plan_filename(raw_name)
+    candidate = base / name
+    if previous_name and name == plan_filename(previous_name):
+        return candidate
+    if not candidate.exists():
+        return candidate
+    stem = name[:-3]
+    for i in range(2, 100):
+        alt = base / f"{stem}-{i}.md"
+        if not alt.exists():
+            return alt
+    return candidate
 
 
 def task_files_for_session(session_id: str, session_prefix: str = "session_",

@@ -244,6 +244,51 @@ export type ExecutionMode = 'normal' | 'plan' | 'goal'
 /** 计划文书状态（`plan` 模式）：ready = 已产出待批准；approved = 已批准（卡片转只读）。 */
 export type PlanStatus = 'ready' | 'approved'
 
+/** 目标 Stop 裁决的结论（后端 `StopDecision.action`）。
+ *  与 `goal.py` 的 action 词族逐字对齐：
+ *  - block    未达成，回环继续（**唯一会进模型上下文**的一档）
+ *  - achieved 已达成（目标已清空）
+ *  - failed   判定无法完成（目标已清空）
+ *  - limit    连续 block 超上限，强制结束（**目标保持激活**）
+ *  - error    评估器调用出错（**目标保持激活**）
+ *  - defer    后台任务仍在跑，本轮暂缓判定（**目标保持激活**） */
+export type GoalAction = 'block' | 'achieved' | 'failed' | 'limit' | 'error' | 'defer'
+
+/** 目标模式的消息级标记（2026-09-30 目标可见化，docs/frontend/22 §6.6）。
+ *
+ *  四处同形（jsonl user 行的 `goal` 字段 / `goal_check` 事件载荷 /
+ *  后端 `GoalState.snapshot()` / 前端 `Message.goal`），因此只有一个类型。
+ *
+ *  `kind` 的三种取值对应三条完全不同的渲染路径：
+ *  - `instruction` 用户那条**被设为目标**的指令 → 照常渲染气泡 + 挂「已设为执行目标」徽标
+ *  - `set`         `[Goal set]` 内部消息 → 渲染成「目标设定」卡片（不显示原英文正文）
+ *  - `check`       每轮 Stop 裁决结果 → 渲染成「目标检查」卡片
+ */
+export interface GoalMarker {
+  kind: 'instruction' | 'set' | 'check'
+  /** 目标条件（三种 kind 都有；`check` 里是快照当时的条件） */
+  condition?: string
+  /** 结论（仅 `kind === 'check'`） */
+  action?: GoalAction
+  /** 第几轮（= 后端 `GoalController.active.iterations`，每完成一次评估 +1）。
+   *  检查卡片显示该值；常驻目标条显示 `round + 1`（当前进行/即将进行的一轮）。 */
+  round?: number
+  /** 评估器给出的判定理由 / 偏差说明（仅 `kind === 'check'`） */
+  reason?: string
+  /** 目标已运行秒数（仅 `kind === 'check'`） */
+  elapsed?: number
+  /** 目标期间消耗的 token（仅 `kind === 'check'`） */
+  tokens?: number
+  /** 记录时间（ISO，秒级本地时间） */
+  at?: string
+  /** **仅前端乐观态使用**（2026-09-30）：`send()` 在发送那一刻给目标指令消息
+   *  打上徽标时置 true，表示"这条还没有被后端确认"。后端若因条件非法静默忽略
+   *  整个目标预选（它不回复执），没人会来纠正这枚徽标 —— 故由 `settleGoalBadges`
+   *  在后端给出权威模式时收敛：goal → 摘掉 pending（徽标留下）；非 goal → 整枚撤掉。
+   *  落盘的 jsonl 与回放**永远不带这个字段**。 */
+  pending?: boolean
+}
+
 /** 审批触发类型（后端 permission.py 的 Decision.trigger） */
 export type ApprovalTrigger =
   | 'dangerous_pattern'
@@ -281,6 +326,22 @@ export type UiEvent =
   | { kind: 'pong'; payload: { msg?: string } }
   | { kind: 'error'; payload: { msg?: string } }
   | { kind: 'goal_status'; payload: { text: string } }
+  /** 目标检查结果（2026-09-30 目标可见化，docs/frontend/22 §6.2）。
+   *  每轮 Stop 裁决后由 Agent 经 `_emit_kind` 推送（线程安全），前端把它
+   *  按时间顺序 append 进该会话的消息流，渲染成一张「目标检查」卡片。
+   *  与落盘的 jsonl 记录（user 行旁挂 `goal`）**同源同形** —— 实时与回放
+   *  共用同一个渲染组件，不存在两套口径。 */
+  | { kind: 'goal_check'; payload: {
+      session_id: string
+      kind: 'check'
+      action: GoalAction
+      round: number
+      reason: string
+      condition: string
+      elapsed: number
+      tokens: number
+      at: string
+    } }
   | { kind: 'tasks'; payload: { text: string } }
   | { kind: 'skills'; payload: { text: string } }
   | { kind: 'sessions'; payload: { sessions: SessionMeta[] } }
@@ -291,11 +352,15 @@ export type UiEvent =
   | { kind: 'session'; payload: { session_id: string; message_count: number; /** 新会话所属工作空间 id（前端据此对齐活动空间） */ project_id?: string } }
   | { kind: 'session_status'; payload: { session_id: string; status: SessionRunStatus } }
   | { kind: 'session_history'; payload: { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; /** 该会话当前权限档位（2026-09-22）：切会话时恢复盾牌 chip 选中态 */ permission_mode?: PermissionMode; /** 右侧面板状态（2026-09-23）：切会话时恢复"开着的标签 + 当前激活" */ right_panel?: RPanelPersist | null; /** ── 任务执行模式 4 字段（2026-09-25，docs/frontend/22）─────────────
-   *  切会话 / 回放时恢复胶囊 tag 与计划卡片外壳。`plan_path` 由后端**派生**给出
-   *  （落点由 sid 唯一决定，不落 meta）；正文仍经 `plan_read` 拉取。
+   *  切会话 / 回放时恢复胶囊 tag 与计划卡片外壳。
+   *  `plan_path`（2026-09-29 改口径）：**相对工作空间**的 `.aiagent/plan/<name>.md`，
+   *  由后端按 meta 的 `plan_name` 拼出；存量会话回退旧的元数据目录绝对路径。
+  *  正文仍经 `plan_read` 拉取。
    *  ⚠ 断线重连**不走这条信道**（重放序列不含 session_history）→ 恢复还依赖
-   *  `sessions` 列表载荷的同名 4 字段，两处都要带上。 */
-    execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null } }
+   *  `sessions` 列表载荷的同名 4 字段，两处都要带上。
+   *  `goal_round` / `goal_started_at`（2026-09-30 目标可见化）：常驻目标条要在
+   *  切会话后显示正确的「第 N 轮」与已运行时长（同 `goal_condition` 是可空投影）。 */
+    execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null; goal_round?: number | null; goal_started_at?: number | null } }
   | { kind: 'session_model'; payload: { session_id: string; model_id?: string | null; overrides?: SessionModelOverridesMap | null } }
   | { kind: 'session_delete_result'; payload: { deleted: string[]; failed: string[] } }
   /** 附件登记结果（应答 `attachment_stage`：items=成功项 / failed=逐条原因） */
@@ -348,11 +413,16 @@ export type UiEvent =
    *  `Agent.execution_mode_sink` 统一投递，避免两套口径漂移。
    *  与 `permission_changed` 同款：前端**不做乐观更新**，tag 选中态只认这条广播。 */
   | { kind: 'execution_mode_changed'; payload: ExecutionModeChangedPayload }
-  /** 计划文书已产出（`plan_write` 落盘后推）。**不带正文、不带路径** —— 正文由
-   *  `plan_read` 拉取（实时与回放共用同一条链路），路径由 `plan_content` 回执带回。
-   *  推送顺序契约：**先** `execution_mode_changed`（已带 `plan_status="ready"`）
-   *  **再** 本信封，保证前端处理卡片时 tag 状态已就位。 */
-  | { kind: 'plan_ready'; payload: { session_id: string; plan_status: PlanStatus } }
+  /** 计划文书已产出（`plan_write` 落盘后推）。**不带正文** —— 正文由
+   *  `plan_read` 拉取（实时与回放共用同一条链路）。
+   *  推送顺序契约：**先** `execution_mode_changed`（已带 `plan_status="ready"`
+   *  与 `plan_path`）**再** 本信封，保证前端处理卡片时 tag 状态已就位。
+   *
+   *  `plan_path`（2026-09-29）：相对工作空间的 `.aiagent/plan/<name>.md`。
+   *  前端拿它**自动打开右侧面板**并落一枚文件标签 —— 这正是"文书放进工作区"
+   *  换来的能力（旧口径在元数据目录里，右栏读不到）。`plan_name` 是文件名，
+   *  供标签标题显示。 */
+  | { kind: 'plan_ready'; payload: { session_id: string; plan_status: PlanStatus; plan_path?: string | null; plan_name?: string | null } }
   /** 计划文书正文（应答 `plan_read` 命令）。**点对点信封** —— 同 `file_content`：
    *  不进 isKnownAgentEvent 白名单（当流式事件处理会静默丢消息）。形状与其同族，
    *  前端复用一套降级字段解析。 */
@@ -576,9 +646,10 @@ export interface FileContentPayload {
  *  - `too_large` = 超过 `refs.file_preview_max_bytes()`（512KB）→ **一点内容都不给**
  *    （"宁可不给，不给半个"），`text` 为空串。
  *
- *  为什么**不是** `file_read`：后者的根被 `resolve_within(workdir)` 钉死在工作区，
- *  而文书落在**元数据目录** `<data_root>/plans/` → 天然越界（default 空间整体禁用）。
- *  故后端单开一条命令，此处也单开一个信封类型。 */
+ *  为什么仍**不是** `file_read`：卡片只知道 sid，路径要由后端从 meta 的
+ *  `plan_name` 解析（口径唯一），而且本回执的形状是 plan 专用的最小子集
+ *  （不带 image/pdf/office 那套分派字段）。2026-09-29 起文书虽已在工作空间内，
+ *  读取链路仍保持独立 —— 越界校验由后端用 `resolve_within` 兜住。 */
 export interface PlanContentPayload {
   project_id?: string
   session_id?: string
@@ -603,10 +674,17 @@ export interface ExecutionModeChangedPayload {
   mode: ExecutionMode
   /** plan 状态（非 plan 模式时为 null）。 */
   plan_status: PlanStatus | null
-  /** 计划文书路径（无计划状态时为 null）。 */
+  /** 计划文书路径（无计划状态时为 null）。**相对工作空间**
+   *  （`.aiagent/plan/<name>.md`）；存量会话是旧的元数据目录绝对路径。
+   *  相对路径是右栏标签与 `file_read` 的天然口径，故直接用它开面板。 */
   plan_path: string | null
   /** 目标条件（goal 模式）。 */
   goal_condition: string | null
+  /** 目标已完成/进行到第几轮（= 后端 `active.iterations`）。非 goal 时为 null。
+   *  常驻目标条显示的是 `goal_round + 1`（当前进行/即将进行的一轮）。 */
+  goal_round: number | null
+  /** 目标设置时刻（Unix 秒）。常驻目标条据此本地 tick 出"已运行多久"。 */
+  goal_started_at: number | null
 }
 
 /** 变更面板里的一行文件（`path` 是**仓库相对路径**）。 */
@@ -695,7 +773,10 @@ export interface HistorySubAgent {
 }
 
 export interface HistoryMessage {
-  role: 'user' | 'assistant'
+  /** `goal_check`（2026-09-30 目标可见化）：目标检查/设定的展示卡，不是对话
+   *  的一轮 —— 后端 `_history_to_ui` 把落盘 user 行旁挂的 `goal` 标记
+   *  （kind=check/set）转成它，渲染端由 `MessageItem` 单独分支处理。 */
+  role: 'user' | 'assistant' | 'goal_check'
   content: string
   /** 消息记录时间（jsonl created_at，秒级 ISO 本地时间如 2026-09-18T10:30:00；
    *  老会话行缺省 → 右下角不显示时间） */
@@ -722,6 +803,12 @@ export interface HistoryMessage {
    *  这些提问**不会**出现在 `toolCalls` 里（不以普通工具条展示）。
    *  **无提问时连字段都不带** —— 与改造前逐字节一致。 */
   askUsers?: HistoryAskUser[]
+  /** 目标模式标记（2026-09-30 目标可见化，docs/frontend/22 §6.6）。
+   *  - `instruction`：这条 user 消息就是被设为执行目标的那条指令 → 挂徽标；
+   *  - `check` / `set`：本轮检查结果 / 目标设定 → 后端已把 role 转成
+   *    `goal_check`（走卡片渲染），此字段只用于承载内容。
+   *  **无标记的老消息不带这个字段** —— 回放形状与改造前逐字节一致。 */
+  goal?: GoalMarker
 }
 
 /** 模型能力声明（输入/输出模态：text / image / video / pdf） */
@@ -1018,10 +1105,18 @@ export interface SessionMeta {
   execution_mode?: ExecutionMode
   /** 计划文书状态：非空才会渲染计划卡片外壳（正文经 `plan_read` 拉取）。 */
   plan_status?: PlanStatus | null
-  /** 计划文书落点（后端**派生**给出，非 meta 字段）。仅 `plan_status` 非空时有值。 */
+  /** 计划文书落点（2026-09-29 改口径）：**相对工作空间**的
+   *  `.aiagent/plan/<name>.md`（由后端按 meta 的 `plan_name` 拼出）。
+   *  仅 `plan_status` 非空时有值；存量会话为旧口径的绝对路径。 */
   plan_path?: string | null
   /** 目标条件（goal 模式胶囊 tag 的文案）。仅 `execution_mode === 'goal'` 时非空。 */
   goal_condition?: string | null
+  /** 目标已完成的评估轮次（= 后端 `GoalController.active.iterations`）。
+   *  常驻目标条显示 `goal_round + 1`。老会话/老后端缺省 → 当作 0。 */
+  goal_round?: number | null
+  /** 目标设置时刻（Unix 秒）。常驻目标条据此本地 tick 出"已运行多久"；
+   *  缺省则不显示时长（零占位，不编一个假起点）。 */
+  goal_started_at?: number | null
 }
 
 /**
@@ -1175,16 +1270,24 @@ export interface ChatPayload {
    *  把「路径清单 + 内容不在上下文中、需要时用 run_read」注入模型上下文。
    *  与 attachments 是**并列且独立**的两条通道。 */
   refs?: RefInput[]
-  /** 新建任务的**预选执行模式**（2026-09-27）。**仅无会话**（`session_id` 缺失）
-   *  时有意义：后端在**建会话时**把它写进该会话 meta，Agent 构造时
-   *  `_restore_execution_state` 读回 → 对**首轮即生效**。
+  /** 随本条消息一起落地的**执行模式**（2026-09-27 起）。两种含义：
    *
-   *  为什么不能等 `session` 信封回来再发 `session_exec_mode`：那时 turn 已
-   *  `rt.busy`，goal 会被评审 P1-5 的 busy 守卫拒掉（docs/frontend/22 §2.4）。
-   *  `'normal'` / 缺省 = 不设置（新会话默认档，零字段）。 */
+   *  ① **新建任务**（`session_id` 缺失）：**预选草稿**。后端在**建会话时**把它写进
+   *     该会话 meta，Agent 构造时 `_restore_execution_state` 读回 → 对**首轮即生效**。
+   *
+   *  ② **已有会话 + `'goal'`**（2026-09-30，docs/frontend/22 §2.6）：目标模式的
+   *     **武装位** —— 点「目标模式」不再弹框问条件，条件取**本条消息的正文**，
+   *     后端在**派发 turn 之前**落地（那一刻才既有条件、又不撞 `rt.busy`）。
+   *
+   *  两条路径都**不能**改成"等 `session` 信封回来再发 `session_exec_mode`"：
+   *  ①会撞 `rt.busy`（评审 P1-5 的 busy 守卫），②则根本发不出去（条件在那时还不存在，
+   *  `GoalController` 拒空条件）。plan 仍只走 ①：plan 的真源是后端 gate，必须即时生效。
+   *  `'normal'` / 缺省 = 不设置（零字段）。 */
   exec_mode?: ExecutionMode
-  /** 预选模式的目标条件（仅 `exec_mode === 'goal'` 时读取；空 / 超 4000 字由后端
-   *  忽略整个预选，新会话回落 normal —— 草稿态**绝不阻断发送**）。 */
+  /** 目标条件（仅 `exec_mode === 'goal'` 时读取）。**留空即用本条消息的正文**
+   *  —— 这正是"首条指令即目标"（正文也为空时用 `[附件] 文件名` / `[引用] 文件名`
+   *  兜底）。超 4000 字 / 兜底后仍为空 → 后端忽略整个预选（草稿态**绝不阻断发送**，
+   *  胶囊随后的 `sessions` 广播自行纠正）。 */
   exec_condition?: string
 }
 
@@ -1226,7 +1329,12 @@ export interface ProjectPermissionPayload {
 
 /** 前端 → 后端：切换会话执行模式（kind='session_exec_mode'，fire-and-forget）。
  *  成功后后端广播 `execution_mode_changed`（前端 tag 只认广播）。`condition` 仅
- *  `mode === 'goal'` 时有意义（空/超 4000 字由后端 `GoalError` 原样回 error 信封）。 */
+ *  `mode === 'goal'` 时有意义（空/超 4000 字由后端 `GoalError` 原样回 error 信封）。
+ *
+ *  ⚠️ 2026-09-30 起 goal 的**常规入口不再走这里**：桌面端点「目标模式」是"武装"
+ *  （条件 = 下一条指令的正文），随 `chat.exec_mode/exec_condition` 落地，因为空条件
+ *  在本命令里必被拒、且本命令是"即时生效"语义（`rt.busy` 时更是直接拒绝）。
+ *  本命令保留给"后端已是 goal 时的关闭 / 跨模式切 plan / 其它客户端"。 */
 export interface SessionExecModePayload {
   session_id: string
   mode: ExecutionMode

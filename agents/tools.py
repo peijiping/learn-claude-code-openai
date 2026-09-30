@@ -889,15 +889,21 @@ class ToolRegistry:
         }
 
     def _run_plan_write(self, kw: dict) -> str:
-        """plan_write 处理器：把正文交给 Agent 注入的闭包落盘。
+        """plan_write 处理器：把正文（+ 模型取的名字）交给 Agent 注入的闭包落盘。
 
         工具层铁律：**永远返回字符串、绝不向上抛异常**（见模块头与
         `execute` 的注释）。未注入 sink（子智能体 / CLI 之外的独立构造 /
         单测直连）时返回明确 Error 文本，而不是抛异常打死整轮。
+
+        `name` 只做**类型兜底**：真清洗（去掉目录分隔符 / 保留字符 / 空名回退）
+        在 `paths.plan_filename` —— 那里是名字口径的唯一出处，此处再写一遍
+        就是第二份规则。空 / 缺省 / 非字符串一律交给下游回退。
         """
         content = kw.get("content")
         if not isinstance(content, str) or not content.strip():
             return "Error: plan_write 需要非空的 content（计划正文 Markdown）。"
+        raw_name = kw.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
         sink = self._plan_sink
         if sink is None:
             return (
@@ -905,7 +911,7 @@ class ToolRegistry:
                 "请改用普通回复说明你的计划。"
             )
         try:
-            return sink(content)
+            return sink(content, name)
         except Exception as e:  # noqa: BLE001 - 工具层绝不向上抛
             log.error("plan_write 处理器异常: %s: %s", type(e).__name__, e, exc_info=True)
             return f"Error: plan_write 执行失败: {type(e).__name__}: {e}"
@@ -1069,10 +1075,11 @@ class ToolRegistry:
                 #         "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
                 #     }, "required": ["items"]}
                 # }},
-                # ── 计划文书（2026-09-25 任务执行模式，docs/frontend/22）──────
-                # schema 只有 `content` 一个参数（**不设 path**）：落点由后端**强制**
-                # 为 `<元数据目录>/plans/<prefix><sid>.md`，模型无从指定 —— 比
-                # "有 path 但被忽略"更干净，也不会给模型"我能换地方写"的错觉。
+                # ── 计划文书（任务执行模式，docs/frontend/22）──────────────────
+                # 落点（2026-09-29 改版）：`<工作空间>/.aiagent/plan/<name>.md`。
+                # **目录由后端强制**（模型定不了；`name` 里的任何目录分隔符都会被
+                # 清洗掉），模型只定**文件名** —— 比"给 path 但忽略中间段"干净，
+                # 又保住了"每份计划有个一眼看得懂的名字"这件事。
                 # 工具**常驻**工具列表（不做按模式动态裁剪：那会牵动
                 # tools / base_tools / main_agent_tools / default_agent_tools 多处
                 # 传参点）；非 plan 模式下调用会被 plan 守卫拦下。
@@ -1082,9 +1089,16 @@ class ToolRegistry:
                         "写入/覆盖本会话的计划文书（仅在计划模式下可用）。"
                         "在计划模式下完成只读探索后，用本工具提交实施计划：目标、"
                         "步骤分解、涉及文件、风险与验证方式。用户批准后才会开始执行。"
+                        "文书会写到工作空间的 .aiagent/plan/ 下，用户会在右侧面板里看到它。"
                         "不要用它保存代码、笔记或任何交付文档。"
                     ),
                     "parameters": {"type": "object", "properties": {
+                        "name": {"type": "string",
+                                 "description": (
+                                     "计划文书的文件名（不要带目录、可带或不带 .md）。"
+                                     "用简短、一眼看懂主题的名字，例如「nav-tree 接口实现计划」"
+                                     "「沙盒改造方案」。留空则自动取一个。"
+                                 )},
                         "content": {"type": "string",
                                     "description": "计划正文（Markdown 格式）"},
                     }, "required": ["content"]}

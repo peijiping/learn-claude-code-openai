@@ -18,6 +18,8 @@ import MessageMenu from './MessageMenu'
 import AttachmentBar, { isDegraded } from './AttachmentBar'
 import AskUserBlock from './AskUserBlock'
 import ApprovalCard from './ApprovalCard'
+import GoalBadge from './GoalBadge'
+import GoalCheckCard from './GoalCheckCard'
 import RefBar from './RefBar'
 import RefText from './RefText'
 import { useRightPanelStore } from '@store/rightPanelStore'
@@ -404,11 +406,29 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     void navigator.clipboard.writeText(msg.content || '')
   }
 
+  // ── 目标卡片（2026-09-30 目标可见化，docs/frontend/22 §7.6）────────────
+  // 单独一条分支：它不是对话的一轮（没有气泡、没有 thinking / 工具条 / footer），
+  // 也没有"用户还是助手"的归属 —— 是系统对目标状态的播报。实时（`goal_check`
+  // 信封）与回放（jsonl 的 `goal` 标记）产出**同一个消息对象**，故只有这一处。
+  // 必须放在 user/assistant 两个分支**之前**：它既不是 user 也不是 assistant。
+  if (msg.role === 'goal_check') {
+    return (
+      <div className="msg-row goal-check-row">
+        <GoalCheckCard marker={msg.goal} />
+      </div>
+    )
+  }
+
   if (msg.role === 'user') {
     return (
       <>
         <div className="msg-row user" onContextMenu={openMenu}>
           <div className="msg-bubble user">
+            {/* 目标指令徽标（2026-09-30 目标可见化）：这条消息就是**被设为执行目标**
+                的那条指令 —— 用户的原话诉求「用户被设为目标的指令消息要标出来，
+                已设为执行目标」。目标设定的完整交代由紧随其后的「目标已设定」卡片
+                承担，这里只标"就是这条"。 */}
+            {msg.goal?.kind === 'instruction' && <GoalBadge marker={msg.goal} />}
             {/* 附件（2026-09-20）：实时消息来自草稿项、回放消息来自后端 harvest，
                 形状一致 → 图片显示缩略图、其它显示文件 chip；点击在 Finder 中定位原文件 */}
             {msg.attachments && msg.attachments.length > 0 && (
@@ -498,21 +518,11 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
       <div className="msg-row assistant" onContextMenu={openMenu}>
         <div className="assistant-body">
           <ThinkingBox text={msg.thinking} open={false} active={msg.thinkingActive} />
-          {msg.toolCalls.map((t) => (
-            <ToolCallBar key={t.id} tool={t} />
-          ))}
-          {/* 在途审批卡片（主工具）：锚定到触发的工具条下方 */}
-          {mainApprovals.map((a) => (
-            <ApprovalCard key={a.requestId} approval={a} />
-          ))}
-          {msg.subagents.map((s) => (
-            <SubAgentBlock key={s.id} block={s} />
-          ))}
-          {/* 在途审批卡片（子智能体工具）：渲染在折叠块外，保证可见 */}
-          {subApprovals.map((a) => (
-            <ApprovalCard key={a.requestId} approval={a} />
-          ))}
-          {/* 正文与结构化提问小结块（ask_user）按**当时的先后**交错渲染：
+          {/* ── 正文（2026-09-29 改版：上移到工具条之前）──────────────────────
+              模型的话总在动作之前（"我先读一下这个文件，再给结论"），所以正文
+              排在工具调用**之上**才符合时间顺序 —— 改造前正文挂在工具条 / 子智能体
+              块**下方**，读起来像"先干活后说话"（用户反馈，见 02 篇消息结构）。
+              正文与结构化提问小结块（ask_user）仍按**当时的先后**交错渲染：
               提问之前说的话在卡片上方，提问之后续写的正文（实时路径整轮合并进
               一条消息）留在卡片下方 —— 见上面 `parts` 的切分规则。
               `pending` 的那条**不渲染**：此刻输入区上方的面板正承载交互，
@@ -535,6 +545,20 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
           {/* 全文都是提问、没有正文（或正文还没开吐）时，光标单独兜一块空正文：
               与改造前的 `content` 为空时的渲染一致 */}
           {msg.streaming && !lastText && <MarkdownBody text="" cursor />}
+          {msg.toolCalls.map((t) => (
+            <ToolCallBar key={t.id} tool={t} />
+          ))}
+          {/* 在途审批卡片（主工具）：锚定到触发的工具条下方 */}
+          {mainApprovals.map((a) => (
+            <ApprovalCard key={a.requestId} approval={a} />
+          ))}
+          {msg.subagents.map((s) => (
+            <SubAgentBlock key={s.id} block={s} />
+          ))}
+          {/* 在途审批卡片（子智能体工具）：渲染在折叠块外，保证可见 */}
+          {subApprovals.map((a) => (
+            <ApprovalCard key={a.requestId} approval={a} />
+          ))}
           {!msg.streaming && usage}
           {!msg.streaming && switchText && (
             <div className="model-switch-notice" title="已切换模型">

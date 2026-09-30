@@ -399,12 +399,19 @@ function createWindow(): void {
     const sessionId = typeof payload.session_id === 'string' && payload.session_id ? payload.session_id : undefined
     // project_id：新建任务的归属工作空间（已有会话由后端按 session_id 解析归属）
     const projectId = typeof payload.project_id === 'string' && payload.project_id ? payload.project_id : undefined
-    // exec_mode：新建任务的**预选执行模式**（2026-09-27，docs/frontend/22 §2.5）。
+    // exec_mode：**目标模式 = 首条指令即目标**（2026-09-30，docs/frontend/22 §2.6）。
+    // 两种含义共用同一对字段：
+    //   · 新建任务（无 session_id）→ 预选执行模式草稿（2026-09-27 起）；
+    //   · **已有会话 + goal** → 目标模式的**武装位**：条件就是这条消息的正文，
+    //     随 `chat` 送到后端，由后端在**派发 turn 之前**落地（那时既有条件、又还
+    //     没 `rt.busy`）。这条路径必须放行 —— 拦截它 = 目标模式点了没反应。
+    // plan 仍只对新建生效：已有会话的 plan 切换走 `session_exec_mode`（plan 的真源
+    // 是后端 gate，必须即时生效；goal 则相反，它必须等条件）。
     // 形状校验与前两处同款（白名单 + 非空），condition 仅在 goal 时透传。
-    // **只对新建生效**：已有会话的模式切换走 `session_exec_mode`（会话级状态，别走这条）。
+    const rawExecMode = String(payload.exec_mode ?? '')
     const execMode =
-      sessionId === undefined && ['plan', 'goal'].includes(String(payload.exec_mode ?? ''))
-        ? String(payload.exec_mode)
+      rawExecMode === 'goal' || (sessionId === undefined && rawExecMode === 'plan')
+        ? rawExecMode
         : undefined
     const execCondition =
       execMode === 'goal' && typeof payload.exec_condition === 'string' ? payload.exec_condition : undefined

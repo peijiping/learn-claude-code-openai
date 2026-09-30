@@ -55,7 +55,9 @@ from paths import (
     DEFAULT_PROJECT_ID,
     WorkspacePaths,
     default_scratch_paths,
+    plan_display_path,
     plan_file_for_session,
+    plan_relpath,
     workspace_paths,
 )
 # 引用（@-mention，2026-09-21）：与附件**完全独立**的一条通道 —— 不复制、不存储，
@@ -67,6 +69,7 @@ from refs import (
     normalize_refs,
     read_workspace_file,
     ref_title_hint,
+    resolve_within,
 )
 # 右栏「变更」面板（2026-09-23）：git 取数放在 Python 侧，唯一理由是**口径唯一** ——
 # "当前工作空间根"只由 paths.WorkspacePaths 定义，让 Electron 再推一遍必然分叉。
@@ -897,26 +900,38 @@ def git_diff_disabled(raw_path, *, project_id: str = "", session_id: str = "",
     }
 
 
-# ── 计划文书（2026-09-25 任务执行模式，docs/frontend/22）─────────────────
-# 计划文书落在**元数据目录** `<data_root>/plans/session_<sid>.md`，不在工作区内，
-# 因此读取**不能**复用 `file_read`（它的根被 `resolve_within(workdir, …)` 钉死）。
-# 读取与回执形状的实现放在 `execution_mode.py`（plan 域，且无模块级副作用，
-# 便于单测）—— 这里只做归属解析与命令编排。
+# ── 计划文书（任务执行模式，docs/frontend/22）────────────────────────────
+# 2026-09-29 起文书落在**工作空间内**：`<工作空间根>/.aiagent/plan/<模型命名>.md`
+# （名字由模型给、目录由后端强制，口径唯一在 `paths.plan_filename` /
+# `paths.plan_dir_for`）。因此：
+#   · `plan_path` 对外是**相对工作空间**的路径（右栏标签 / `file_read` 的口径），
+#     由 meta 的 `plan_name` 拼出；
+#   · `plan_read` 按 meta 的记录解析（不再由 sid 推路径），并用 `resolve_within`
+#     兜一道 —— meta 是可手改的，绝不允许它把读取引到工作空间之外；
+#   · 存量会话（meta 无 `plan_name`）回退旧的元数据目录口径，照样能读。
 
 def _exec_mode_fields(sm, sid: str, meta: dict) -> dict:
-    """`session_history` 的执行模式 4 字段（**两处构造点共用**，避免口径分叉）。
+    """`session_history` 的执行模式字段（**两处构造点共用**，避免口径分叉）。
 
-    `plan_path` **派生**而非落 meta：落到哪个文件由 sid 唯一决定（口径在
-    `SessionManager.plan_file_for` → `paths.plan_file_for_session`），再存一份
-    就是第二真相源。仅在有计划状态时给出 —— 前端据此重建计划卡片外壳，
-    正文仍经 `plan_read` 拉取（docs/frontend/22 §4.5）。
+    `plan_path` 的判据在 `paths.plan_display_path`（**三个出口共用同一个函数**：
+    本处 / `Agent.execution_state` / `SessionManager.list_sessions`）—— 新口径给
+    相对工作空间的 `.aiagent/plan/<name>.md`，存量会话回退旧的元数据目录绝对路径。
+    前端据此重建计划卡片外壳与右栏标签，正文仍经 `plan_read` 拉取。
+
+    `goal_round` / `goal_started_at`（2026-09-30 目标可见化）：常驻目标条要在
+    切会话后显示正确的「第 N 轮」与已运行时长。语义与 `goal_condition` 一样是
+    **投影**（真相恒为 `GoalController.active`），active 为空时 meta 里是 None。
     """
     meta = meta if isinstance(meta, dict) else {}
     return {
         "execution_mode": meta.get("execution_mode") or "normal",
         "plan_status": meta.get("plan_status"),
-        "plan_path": (str(sm.plan_file_for(sid)) if meta.get("plan_status") else None),
+        "plan_path": plan_display_path(
+            meta.get("plan_status"), meta.get("plan_name"),
+            str(sm.plan_file_for(sid))),
         "goal_condition": meta.get("goal_condition"),
+        "goal_round": meta.get("goal_round"),
+        "goal_started_at": meta.get("goal_started_at"),
     }
 
 
@@ -971,6 +986,26 @@ def _attachment_title_hint(payload: dict) -> str:
         if isinstance(att, dict) and str(att.get("name") or "").strip():
             return f"[附件] {att['name']}"
     return ""
+
+
+def _goal_condition_from_message(raw: str, text: str, payload: dict) -> str:
+    """目标模式的**首条指令即目标**（2026-09-30，docs/frontend/22 §2.6）。
+
+    点「目标模式」不再弹框问条件：前端只做**武装**（本地态），条件取「下一条指令
+    的正文」，随同一条 `chat` 送到（`exec_condition`）。正文为空（纯附件 / 纯引用）
+    时用 `[附件] 文件名` / `[引用] 文件名` 兜底 —— 与默认标题同一口径，**绝不产生
+    空条件**（`GoalController.set_goal` 对空条件抛 `GoalError`）。
+
+    `raw` 是前端**显式**给的条件（保留给旧客户端 / 未来"手动改目标"入口），非空时
+    优先于消息正文。返回空串 = 本次没有可用条件，调用方应静默忽略整个目标预选
+    （武装态绝不阻断发送）。
+    """
+    cond = (raw or "").strip()
+    if cond:
+        return cond
+    return ((text or "").strip()
+            or _attachment_title_hint(payload)
+            or ref_title_hint(payload.get("refs")) or "")
 
 
 def _effective_model_id(sm: SessionManager, sid: str, payload: dict) -> str | None:
@@ -1159,6 +1194,22 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
             # （run_read 调用）里可见，不必在这里重复表达。
             if is_tool_images_message(m):
                 continue
+            # 目标模式标记（2026-09-30，docs/frontend/22 §6.6）：落盘的 user 行可能
+            # 旁挂 `goal` 元数据，两种 kind 走两条路：
+            #   - `check`（每轮 Stop 裁决结果）与 `set`（`[Goal set]`）：**都不是
+            #     用户说的话** → 转成 `role:"goal_check"` 的展示卡，不再产出用户
+            #     气泡（否则回放里会冒出 `[Goal set] Condition: …` 这种怪消息）；
+            #   - `instruction`（被设为目标的那条指令）：就是用户原话 → 照常渲染成
+            #     气泡，只额外透传 `goal`，前端据此挂「已设为执行目标」徽标。
+            # 分流必须放在 `<system-reminder>` 前缀判断**之前** —— 判据按 kind 走，
+            # 不依赖正文内容（check 记录的 content 是空串，本就不命中前缀）。
+            goal_marker = m.get("goal") if isinstance(m.get("goal"), dict) else None
+            if goal_marker and goal_marker.get("kind") in ("check", "set"):
+                card = {"role": "goal_check", "goal": goal_marker}
+                if m.get("created_at"):
+                    card["created_at"] = m["created_at"]
+                ui.append(card)
+                continue
             content = _text_of(m.get("content"))
             if content.startswith("<system-reminder>"):
                 continue
@@ -1179,6 +1230,10 @@ def _history_to_ui(messages: list, subagent_records: list | None = None) -> list
             # 消息记录时间（jsonl created_at，秒级 ISO 本地时间；老行缺省）
             if m.get("created_at"):
                 ui_msg["created_at"] = m["created_at"]
+            # 目标指令徽标的数据源（2026-09-30）：**只在确有标记时才加字段** ——
+            # 无 goal 的消息连字段都不多一个，与改造前的回放形状逐字节一致。
+            if goal_marker:
+                ui_msg["goal"] = goal_marker
             ui.append(ui_msg)
         elif role == "assistant":
             tool_calls = []
@@ -1313,6 +1368,18 @@ async def handle(ws):
                 # 派发后立即继续读命令 → 任意会话可后台执行、切换不断流。
                 sid = payload.get("session_id")
                 text = payload.get("text", "")
+                # 本条消息会不会**当场建出**新会话（下方预选执行模式有两条落地路径，
+                # 二者必须互斥：fresh 走"建会话时写 meta"，已有会话走"派发前生效"）。
+                fresh_session = sid is None
+                # 「本条消息就是被设为执行目标的那条指令」的条件文本（2026-09-30
+                # 目标可见化，docs/frontend/22 §6.6）。两条命中路径（fresh 预选 /
+                # 已有会话武装）各自填，随 `start_turn` 透传给 `run_turn`，由后者
+                # 给落盘的 user 行打 `goal` 标记 —— 前端据此在这条消息上渲染
+                # 「已设为执行目标」徽标，切会话回放同样可见。
+                # why 在这里算：**只有桥层**同时知道"本条是首条消息"与"要不要进
+                # goal 模式"（条件口径 `_goal_condition_from_message` 也在这层），
+                # agent 侧没有任何信息可反查（正文与条件在有附件时并不相等）。
+                goal_instruction: str | None = None
                 # 目标工作空间：新建会话时由前端显式带上（点哪个空间的「+」就进哪个
                 # 空间）；老前端 / 未带时用当前活动空间。**显式优先**，不依赖进程级
                 # 活动态 —— 两个窗口并发时各发各的，不会互相串空间。
@@ -1377,7 +1444,10 @@ async def handle(ws):
                     # 非法值（未知 mode / goal 缺条件 / 条件超长）**静默忽略** ——
                     # 草稿态绝不阻断发送；用户可从胶囊没亮、或随后的 sessions 广播看出。
                     pending_exec = str(payload.get("exec_mode") or "")
-                    pending_cond = str(payload.get("exec_condition") or "").strip()
+                    # goal 的条件 = 本条消息（「首条指令即目标」，2026-09-30）：前端
+                    # 点「目标模式」不再弹框问条件，只武装本地态，条件随首条 chat 到达。
+                    pending_cond = _goal_condition_from_message(
+                        str(payload.get("exec_condition") or ""), text, payload)
                     if pending_exec in (MODE_PLAN, MODE_GOAL):
                         if pending_exec == MODE_GOAL and (
                                 not pending_cond or len(pending_cond) > MAX_GOAL_LENGTH):
@@ -1411,7 +1481,13 @@ async def handle(ws):
                                                 "Work toward this condition; the session "
                                                 "will be evaluated when you stop."
                                             ),
+                                            # 展示标记（2026-09-30）：回放时渲染成
+                                            # 「目标设定」卡片，而不是一条怪气泡。
+                                            "goal": {"kind": "set",
+                                                     "condition": pending_cond},
                                         })
+                                    # 首条消息即目标指令 → 打徽标（见上面的声明）
+                                    goal_instruction = pending_cond
                                 log.info("新会话预选执行模式: session_%s -> %s",
                                          sid, pending_exec)
                             except Exception as exc:  # noqa: BLE001 - 预选失败不阻断发送
@@ -1544,12 +1620,96 @@ async def handle(ws):
                 title_src = (text if text.strip()
                              else _attachment_title_hint(payload)
                              or ref_title_hint(payload.get("refs")))
+                # ── 已有会话的「目标模式：首条指令即目标」（2026-09-30，docs/frontend/22 §2.6）──
+                # 点「目标模式」不再弹框问条件：前端只**武装**（本地态），条件在这一刻
+                # 才成立（= 本条消息的正文），所以落地只能在**这里** —— 位置是硬约束，
+                # 三条路径都验过：
+                #   · `session_exec_mode` 命令：那时还没有条件 → `GoalError` 必拒；
+                #   · turn 派发之后再设：`rt.busy=True` → 撞评审 P1-5 的 busy 守卫
+                #     （`GoalController` 无锁，工作线程正在读同一对象）；
+                #   · 这里：busy 守卫已过、turn 未派发 → 与"用户中途点胶囊设目标"
+                #     同一时序、同一落盘路径。
+                # fresh 会话不走这里（`fresh_session`）：它已在上面的建会话分支落过
+                # meta + `[Goal set]`，再走一遍会重复注入。
+                armed_exec = str(payload.get("exec_mode") or "")
+                if armed_exec == MODE_GOAL and not fresh_session:
+                    goal_cond = _goal_condition_from_message(
+                        str(payload.get("exec_condition") or ""), text, payload)
+                    if not goal_cond or len(goal_cond) > MAX_GOAL_LENGTH:
+                        # 武装态绝不阻断发送（同 fresh 分支口径）：条件非法就按普通消息发，
+                        # 前端胶囊随后的 `sessions` 广播自行纠正。
+                        log.warning("chat 目标模式被忽略（条件非法）session_%s len=%d",
+                                    sid, len(goal_cond))
+                    elif rt.agent is not None:
+                        # ① Agent 已构造（本会话至少跑过一轮）：薄委托给既有切换入口 ——
+                        # 跨模式清场（plan → goal）、`[Goal set]` 消息、落盘与
+                        # `execution_mode_changed` 广播都在里面，桥层不重复做。
+                        try:
+                            err = await asyncio.to_thread(
+                                rt.agent.set_execution_mode, MODE_GOAL, goal_cond)
+                        except GoalError as exc:
+                            err = str(exc)
+                        except Exception as exc:  # noqa: BLE001 - 绝不打死连接
+                            err = f"{type(exc).__name__}: {exc}"
+                        if err:
+                            log.warning("chat 目标模式被拒 session_%s: %s", sid, err)
+                        else:
+                            # 本条消息即目标指令 → 打徽标（Agent 侧补的 `[Goal set]`
+                            # 消息自带 `goal` 标记，这里只管本条 user 行）
+                            goal_instruction = goal_cond
+                            log.info("chat 目标模式生效（首条指令即目标）session_%s", sid)
+                    else:
+                        # ② Agent 尚未构造（选中但从未发过消息 / 重启后第一次发）：
+                        # 只写 meta —— 紧随其后的 `start_turn` → `build_agent()` →
+                        # `switch_session` → `_restore_execution_state` 读回，首轮即生效。
+                        # `[Goal set]` 必须手工补一次：restore 路径只重建控制器、**不**补
+                        # 这条消息（否则切会话会重复注入）；形状与
+                        # `Agent._append_goal_set_message` 逐字对齐。
+                        try:
+                            await asyncio.to_thread(
+                                sm.set_session_execution, sid,
+                                execution_mode=MODE_GOAL, plan_status=None,
+                                plan_name=None, goal_condition=goal_cond,
+                                # 目标运行期指标初值（2026-09-30）：此刻控制器还没
+                                # 建（Agent 未构造），轮次恒 0、起点就是现在。
+                                # 不写的话常驻目标条在首次重连时会没有轮次可显示。
+                                goal_round=0, goal_started_at=time.time())
+                            await asyncio.to_thread(
+                                sm.append_message_to_session,
+                                sm.get_session_file(sid), {
+                                    "role": "user",
+                                    "content": (
+                                        "[Goal set]\n"
+                                        f"Condition: {goal_cond}\n"
+                                        "Work toward this condition; the session "
+                                        "will be evaluated when you stop."
+                                    ),
+                                    "goal": {"kind": "set", "condition": goal_cond},
+                                })
+                        except Exception as exc:  # noqa: BLE001 - 失败不阻断发送
+                            log.error("chat 目标模式落盘失败 session_%s: %s: %s",
+                                      sid, type(exc).__name__, exc)
+                        else:
+                            goal_instruction = goal_cond   # 本条消息即目标指令
+                            # 未跑会话无 Agent 推信封 → 自行组装与 `execution_state`
+                            # 同形状的广播（多窗口一致，同 session_exec_mode 口径）
+                            hub.broadcast("execution_mode_changed", {
+                                "session_id": sid, "mode": MODE_GOAL,
+                                "plan_status": None, "plan_path": None,
+                                "goal_condition": goal_cond,
+                                "goal_round": 0,
+                                "goal_started_at": time.time(),
+                            })
+                            log.info("chat 目标模式已落 meta（agent 未构造）session_%s", sid)
+                elif armed_exec:
+                    log.warning("chat 忽略未知的 exec_mode=%r session_%s", armed_exec, sid)
                 # 后台线程跑 turn；事件循环继续处理其它命令（切换 / 其它会话 / stop）
                 log.info("chat 派发: session_%s text=%r attachments=%d refs=%d",
                          sid, text[:80], len(attachment_records), len(ref_records))
                 turn_task = asyncio.create_task(
                     rt.start_turn(user_query, reasoning_effort=reasoning_effort,
-                                  max_context=max_context)
+                                  max_context=max_context,
+                                  goal_instruction=goal_instruction)
                 )
                 if first_turn:
                     # 第一轮 run_turn 执行完之后，再调用一次大模型总结生成标题（≤20 字）
@@ -1854,23 +2014,39 @@ async def handle(ws):
                 # 侧同一口径（`Agent.set_execution_mode`）。被让位那一方的状态一并写空
                 # （显式传 `None` = 写入空值，区别于省略 = 不改），否则下次构造 Agent
                 # 时 `_restore_execution_state` 会把旧状态原样读回来。
-                # ⚠️ plan → goal 只清 meta 投影，**不删** plans/ 下的文书文件。
+                # ⚠️ 切走 plan 只清 meta 投影 + `plan_name`，**不删**工作区里的文书
+                # 文件（2026-09-29 起文书在 `<工作空间>/.aiagent/plan/`，是项目文件）。
+                # 切 plan → **保留** `plan_name`：同一会话重规划要覆盖自己那一份，
+                # 丢了名字就会被当成"别人的文件"另起一个 `-2`（与 gate.set_plan_mode 同款）。
+                # 目标运行期指标（2026-09-30 目标可见化）：goal_round / goal_started_at
+                # 随三处落盘一并维护 —— 常驻目标条的重连恢复源就是 meta 这两个字段，
+                # 漏清会让"切走 goal 后"的目标条带着陈旧轮次复活。
+                goal_started_now = time.time()
                 try:
                     if mode == MODE_PLAN:
                         await asyncio.to_thread(
                             sm.set_session_execution, sid,
                             execution_mode=MODE_PLAN, plan_status=None,
-                            goal_condition=None)
+                            goal_condition=None,
+                            goal_round=None, goal_started_at=None,
+                            goal_tokens_at_start=None)
                     elif mode == MODE_GOAL:
                         await asyncio.to_thread(
                             sm.set_session_execution, sid,
                             execution_mode=MODE_GOAL, plan_status=None,
-                            goal_condition=condition)
-                    else:  # normal：三字段一起归零
+                            plan_name=None,
+                            goal_condition=condition,
+                            # 未跑会话没有 Agent/控制器 → 轮次从 0 起、起点是现在
+                            goal_round=0, goal_started_at=goal_started_now,
+                            goal_tokens_at_start=0)
+                    else:  # normal：执行模式四字段一起归零
                         await asyncio.to_thread(
                             sm.set_session_execution, sid,
                             execution_mode=MODE_NORMAL, plan_status=None,
-                            goal_condition=None)
+                            plan_name=None,
+                            goal_condition=None,
+                            goal_round=None, goal_started_at=None,
+                            goal_tokens_at_start=None)
                 except Exception as exc:  # noqa: BLE001
                     log.error("session_exec_mode 落盘失败 session_%s mode=%s: %s: %s",
                               sid, mode, type(exc).__name__, exc)
@@ -1886,6 +2062,9 @@ async def handle(ws):
                     "plan_status": None,
                     "plan_path": None,
                     "goal_condition": (condition if mode == MODE_GOAL else None),
+                    "goal_round": (0 if mode == MODE_GOAL else None),
+                    "goal_started_at": (goal_started_now
+                                        if mode == MODE_GOAL else None),
                 })
 
             elif kind == "plan_approve":
@@ -1931,11 +2110,14 @@ async def handle(ws):
                         "msg": f"计划已批准，但启动执行失败：{exc}"}))
 
             elif kind == "plan_read":
-                # 计划文书正文读取（2026-09-25，docs/frontend/22 §4.5）。
-                # **不能**复用 file_read：后者的根被 `resolve_within(workdir)` 钉死，
-                # 而文书落在**元数据目录** `<data_root>/plans/` → 天然越界（default
-                # 空间更是整体禁用）。这里按 sid → pid → data_root/plans 直读，点对点
-                # 回执 `plan_content`（形状与 file_content 同族，前端复用一套解析）。
+                # 计划文书正文读取（docs/frontend/22 §4.5）。
+                # **不复用 file_read**：后者要求前端自己带完整路径，而卡片壳只知道
+                # sid；这里的路径由后端从 meta 的 `plan_name` 解析（口径唯一），
+                # 点对点回执 `plan_content`（形状与 file_content 同族，前端复用解析）。
+                #
+                # 2026-09-29 改版：文书已在工作空间内，但读取仍**不**走
+                # `read_workspace_file`（那条路会按扩展名分派 image/pdf/office 分支，
+                # 与 `plan_content` 的字段契约不符）。改为"解析路径 + `read_plan_file`"。
                 sid = str(payload.get("session_id") or "")
                 if not sid:
                     await safe_send(ws, _envelope("plan_content", plan_content_payload(
@@ -1953,7 +2135,26 @@ async def handle(ws):
                         "", project_id=pid, session_id=sid,
                         reason="该工作空间的目录当前不可用（已被移动或删除）")))
                     continue
-                path = plan_file_for_session(sid, sm.session_prefix, ws_paths.plans_dir)
+                name = meta.get("plan_name")
+                path = None
+                if name:
+                    # `plan_relpath` 内部已把 name 清洗成**纯文件名**（目录分隔符、
+                    # `..`、盘符全被剥掉，见 `paths.plan_filename`）—— 所以这条路径
+                    # 恒落在工作空间内，手改 meta 也无法把读取引到外面去
+                    # （联调实测：把 plan_name 改成 `../../../../etc/hosts` 会被清洗成
+                    # `.aiagent/plan/hosts.md`，读不到就是读不到，不越界）。
+                    # `resolve_within` 是**第二道**兜底：防的是清洗规则将来出现漏洞，
+                    # 不是当前会走到这条分支 —— 留着它，代价是一次字符串运算。
+                    path = resolve_within(ws_paths.workdir, plan_relpath(name))
+                    if path is None:
+                        log.warning("plan_read 路径越界 session=%s name=%r", sid, name)
+                        await safe_send(ws, _envelope("plan_content", plan_content_payload(
+                            "", project_id=pid, session_id=sid,
+                            reason="计划文书的路径不在当前工作空间内")))
+                        continue
+                else:  # 存量会话：旧口径（元数据目录）
+                    path = plan_file_for_session(
+                        sid, sm.session_prefix, ws_paths.plans_dir)
                 content = await asyncio.to_thread(read_plan_file, path)
                 content["project_id"] = pid
                 content["session_id"] = sid

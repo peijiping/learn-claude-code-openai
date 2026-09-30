@@ -53,6 +53,51 @@ export function tabKey(tab: RPanelTab): string {
   return tab.kind === 'view' ? viewTabKey(tab.view) : fileTabKey(tab.path)
 }
 
+/**
+ * 两串路径**是不是同一个文件** —— 容忍「工作空间相对」与「后端绝对」两种形态。
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * 为什么不能直接 `===`（2026-09-29 用户实测：计划文书一直转圈）
+ * ════════════════════════════════════════════════════════════════════
+ * 右栏的**文件标签 path 有两种合法形态**，来源不同、都改不了：
+ *
+ * | 来源 | 形态 | 例子 |
+ * |---|---|---|
+ * | 文件树 / git 变更 / 正文链接 | **绝对**路径 | `/Users/x/ws/.aiagent/plan/a.md` |
+ * | 计划文书（`plan_path`，由 meta 的 `plan_name` 现算） | **工作空间相对**路径 | `.aiagent/plan/a.md` |
+ *
+ * 而 `file_read` 回执里的 `payload.path` 恒为后端 `resolve_within()` 解析出的
+ * **绝对**路径（图片/PDF 的 `aigent-file://` 报备也依赖它）。于是"这内容是不是我要的"
+ * 这三个判断点（`FilePreview` 取 data、`ensurePreview` 短路、`applyFileContent` 自校验）
+ * 用 `===` 时，计划文书的回执会被判成"别人的慢回执"丢掉 —— `previewLoading` 永远
+ * 为真，预览区就**一直转圈**（走绝对路径的文件树/链接从没暴露这个不符）。
+ *
+ * 判定规则（宁可漏合、不可错合）：
+ * - 归一化（`\` → `/`、剥 `./` 前缀与结尾 `/`）后完全相同 → 真；
+ * - 一绝对一相对时，要求**相对那串是绝对那串的完整尾段**（按 `/` 边界），
+ *   故 `.aiagent/plan/a.md` 不会命中 `/ws/.aiagent/plan/aa.md`；
+ * - 两串同为绝对 / 同为相对且不同 → 假。
+ *
+ * 反向用途同样成立：`openFileTab` 用它去**重**——同一份文件从两种入口进来，
+ * 命中已有标签就只激活，不再开出第二枚（后端 `normalize_right_panel` 只按字面
+ * 去重，两种形态落盘会变成两枚标签）。
+ */
+export function sameWorkspaceFile(a: string, b: string): boolean {
+  if (!a || !b) return false
+  const norm = (p: string): string =>
+    p.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/+$/, '')
+  const na = norm(a)
+  const nb = norm(b)
+  if (!na || !nb) return false
+  if (na === nb) return true
+  const aAbs = na.startsWith('/')
+  const bAbs = nb.startsWith('/')
+  if (aAbs === bAbs) return false
+  const rel = aAbs ? nb : na
+  const abs = aAbs ? na : nb
+  return abs.endsWith('/' + rel)
+}
+
 /** 绝对路径取文件名（显示用）。与输入区 `@` 胶囊同口径：只给 basename。 */
 export function basenameOf(path: string): string {
   const clean = (path || '').replace(/\/+$/, '')
@@ -116,13 +161,17 @@ export function addViewTab(tabs: RPanelTab[], view: RPanelView): TabSet {
  * 打开一个文件标签 —— **预览位 / 常驻位的全部语义都在这里**。
  *
  * 四条硬规则（目的是"同一文件永远只有一枚标签"，且"用户手动开的不会被顶掉"）：
- * 1. 该 path 已在**常驻位** → 只激活（**不新建、不消耗预览位**）；
- * 2. 该 path 已在**预览位** → 会话来源只激活；树来源**就地升级为常驻**
+ * 1. 该文件已在**常驻位** → 只激活（**不新建、不消耗预览位**）；
+ * 2. 该文件已在**预览位** → 会话来源只激活；树来源**就地升级为常驻**
  *    （去掉斜体与来源点，但仍是一枚标签，不产生两枚同名）；
  * 3. 否则新增：会话来源落**预览位**（全场唯一，已有预览位就**就地替换** ——
  *    保持原位置，标签栏不跳动）；树来源落常驻位；
  * 4. 新增时的**位置**一律由 `fileTabAnchor` 决定（紧跟最后一个文件相关标签），
  *    不是一律追加到栏尾 —— 那正是"文件标签跳到终端右边"的根因，见该函数注释。
+ *
+ * ⚠️ 1/2 两条的「该文件」按 `sameWorkspaceFile` 判 —— **不是按 path 字面**：
+ *    同一份文件有两种合法形态（计划文书是工作空间相对路径，树/链接是绝对路径），
+ *    字面去重会让「打开文档」与「树里点开」开出两枚指向同一文件的标签。
  */
 export function openFileTab(
   set: TabSet,
@@ -131,13 +180,15 @@ export function openFileTab(
 ): TabSet {
   const path = String(file?.path ?? '')
   if (!path) return set
-  const name = (file?.name || '').trim() || basenameOf(path)
-  const key = fileTabKey(path)
-  const idx = set.tabs.findIndex((t) => t.kind === 'file' && t.path === path)
+  const idx = set.tabs.findIndex((t) => t.kind === 'file' && sameWorkspaceFile(t.path, path))
 
   if (idx >= 0) {
     const found = set.tabs[idx]
-    if (found.kind !== 'file' || found.pinned || origin === 'chat') {
+    if (found.kind !== 'file') return set
+    // 命中的可能是**另一种形态**的同一份文件（计划文书相对 / 树绝对）→ 激活的是
+    // 已有那一枚，标签的 path 与显示名都保持原样（`key` 必须由它算）。
+    const key = fileTabKey(found.path)
+    if (found.pinned || origin === 'chat') {
       // 常驻命中 / 预览位命中且来源也是会话 → 只激活
       return { tabs: set.tabs, active: key }
     }
@@ -146,6 +197,8 @@ export function openFileTab(
     return evictOverflow({ tabs, active: key })
   }
 
+  const key = fileTabKey(path)
+  const name = (file?.name || '').trim() || basenameOf(path)
   const at = fileTabAnchor(set.tabs)
   const tabs = set.tabs.slice()
   if (origin === 'tree') {

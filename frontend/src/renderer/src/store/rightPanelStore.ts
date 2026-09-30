@@ -17,6 +17,7 @@ import {
   normalizePersist,
   openFileTab as openFileTabPure,
   pinTab as pinTabPure,
+  sameWorkspaceFile,
   tabKey,
   type FileTabOrigin
 } from '@lib/rpanelTabs'
@@ -58,9 +59,12 @@ export interface RPanelLive {
   expanded: Record<string, boolean>
   /** 树尚未加载时暂存"要展开到哪个文件"，回执到达后消费掉 */
   pendingReveal: string
-  /** 最近一次成功读取的预览内容（渲染前必须校验 `path` 与激活标签一致） */
+  /** 最近一次成功读取的预览内容（渲染前必须校验它与激活标签是**同一个文件**，
+   *  判据 `sameWorkspaceFile` —— 两种路径形态见 `lib/rpanelTabs`） */
   preview: FileContentPayload | null
-  /** 在途预览请求的路径（'' = 没有在途）；回执按它自校验，防慢回执覆盖新选中 */
+  /** 在途预览请求的路径（'' = 没有在途）；回执按它自校验，防慢回执覆盖新选中。
+   *  **恒为「前端请求时用的那一串」**，不随后端回执改写成解析后的绝对路径 ——
+   *  计划的相对路径与回执的绝对路径混进这一个字段，下一次比较就必然失败。 */
   previewPath: string
   previewLoading: boolean
   previewError: string
@@ -505,9 +509,10 @@ export const useRightPanelStore = create<RightPanelState>((set, get) => {
       }
       const cur = get().liveBySession[sid]
       if (!cur) return
+      const hasSame = !!cur.preview && sameWorkspaceFile(cur.preview.path, path)
       // 已经在读同一个文件、或已有它的内容 → 不重发（本地切换零延迟）
-      if (cur.previewPath === path && (cur.previewLoading || cur.preview?.path === path)) return
-      if (cur.preview?.path === path && !cur.previewError) {
+      if (cur.previewPath === path && (cur.previewLoading || hasSame)) return
+      if (hasSame && !cur.previewError) {
         mutateLive(sid, (l) => ({ ...l, previewPath: path }))
         return
       }
@@ -585,15 +590,19 @@ export const useRightPanelStore = create<RightPanelState>((set, get) => {
         else if (p.kind === 'office' && p.pdf_path) reportFileStream([p.pdf_path])
       }
       mutateLive(sid, (l) => {
-        // 自校验：晚到的回执不得覆盖新选中（主进程 pending 表按 kind 配对、无 id）
-        if (p && l.previewPath && p.path !== l.previewPath) return l
+        // 自校验：晚到的回执不得覆盖新选中（主进程 pending 表按 kind 配对、无 id）。
+        // 比较用 `sameWorkspaceFile`：请求路径可能是工作空间相对（计划文书），
+        // 而回执里的 `path` 恒为后端解析出的绝对路径 —— 字面比较会把**有效回执**
+        // 也当慢回执丢掉，`previewLoading` 就永远清不掉（一直转圈）。
+        if (p && l.previewPath && !sameWorkspaceFile(l.previewPath, p.path)) return l
         return {
           ...l,
           preview: p ?? l.preview,
           previewLoading: false,
           // 后端把"读不到"也当正常结果回（内容里带 reason），只有传输层失败才走这里
           previewError: p ? '' : (error ?? ''),
-          previewPath: p ? p.path : l.previewPath
+          // 保持"请求时那一串"（不改成回执的绝对路径）：它同时是下一次自校验的基准
+          previewPath: l.previewPath
         }
       })
     },

@@ -39,7 +39,6 @@ from execution_mode import (  # noqa: E402
     ExecutionGate,
     bash_is_read_only,
     block_message,
-    plan_relpath,
     split_command_segments,
     tokenize,
 )
@@ -213,7 +212,8 @@ class TestExecutionGateState(unittest.TestCase):
     def test_initial_state(self):
         g = ExecutionGate()
         self.assertEqual(g.snapshot(), {
-            "mode": MODE_NORMAL, "plan_status": None, "plan_path": None})
+            "mode": MODE_NORMAL, "plan_status": None, "plan_path": None,
+            "plan_name": None})
 
     def test_plan_roundtrip(self):
         g = ExecutionGate()
@@ -328,10 +328,70 @@ class TestBlockedReason(unittest.TestCase):
         self.assertIn("run_write", msg)
 
 
-class TestPlanPathHelpers(unittest.TestCase):
-    def test_plan_relpath(self):
-        self.assertEqual(plan_relpath("abc123"), "session_abc123.md")
-        self.assertEqual(plan_relpath("abc123", "s_"), "s_abc123.md")
+class TestPlanDisplayPath(unittest.TestCase):
+    """`paths.plan_display_path`：三个出口（信封 / session_history / 列表）共用的判据。"""
+
+    def setUp(self):
+        from paths import plan_display_path
+        self.f = plan_display_path
+
+    def test_new_artifact_gives_relative_path(self):
+        self.assertEqual(self.f(PLAN_STATUS_READY, "重构方案.md"),
+                         ".aiagent/plan/重构方案.md")
+
+    def test_legacy_session_falls_back_to_absolute(self):
+        """存量会话（meta 无 plan_name）→ 旧的元数据目录绝对路径。"""
+        self.assertEqual(self.f(PLAN_STATUS_READY, None, "/tmp/plans/session_a.md"),
+                         "/tmp/plans/session_a.md")
+
+    def test_no_plan_status_gives_none(self):
+        """没有计划状态就没有路径 —— 即使名字还在（重规划期间的状态）。"""
+        self.assertIsNone(self.f(None, "重构方案.md", "/tmp/plans/x.md"))
+        self.assertIsNone(self.f(None, None))
+        self.assertIsNone(self.f(PLAN_STATUS_READY, None))
+
+
+class TestExecutionGateHoldsPlanName(unittest.TestCase):
+    """gate 必须记住**模型给的文件名** —— 它是 meta `plan_name` 的唯一来源。"""
+
+    def test_mark_ready_records_path_and_name(self):
+        g = ExecutionGate()
+        g.set_plan_mode()
+        g.mark_plan_ready("/ws/.aiagent/plan/方案.md", "方案.md")
+        self.assertEqual(g.plan_status, PLAN_STATUS_READY)
+        self.assertEqual(g.plan_name, "方案.md")
+        self.assertEqual(g.snapshot()["plan_name"], "方案.md")
+
+    def test_set_plan_mode_keeps_previous_name(self):
+        """重规划要覆盖**自己**那一份 → 进入可写态不清名字（否则会被当成别人的文件）。"""
+        g = ExecutionGate()
+        g.set_plan_mode()
+        g.mark_plan_ready("/ws/.aiagent/plan/方案.md", "方案.md")
+        g.set_plan_mode()
+        self.assertIsNone(g.plan_status)
+        self.assertEqual(g.plan_name, "方案.md")
+
+    def test_clear_plan_drops_name(self):
+        g = ExecutionGate()
+        g.set_plan_mode()
+        g.mark_plan_ready("/ws/.aiagent/plan/方案.md", "方案.md")
+        g.clear_plan()
+        self.assertIsNone(g.plan_name)
+        self.assertIsNone(g.plan_path)
+
+    def test_restore_from_meta_round_trip(self):
+        g = ExecutionGate()
+        g.restore_plan_from_meta({"plan_status": PLAN_STATUS_READY,
+                                  "plan_name": "方案.md"})
+        self.assertEqual(g.plan_status, PLAN_STATUS_READY)
+        self.assertEqual(g.plan_name, "方案.md")
+
+    def test_restore_ignores_bad_name(self):
+        for bad in (None, "", "   ", 123, ["x"]):
+            g = ExecutionGate()
+            g.restore_plan_from_meta({"plan_status": PLAN_STATUS_READY,
+                                      "plan_name": bad})
+            self.assertIsNone(g.plan_name, msg=repr(bad))
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -48,7 +48,6 @@ from permission import (
     split_command_segments,
     tokenize,
 )
-from paths import PLANS_DIRNAME, plan_file_for_session
 from refs import file_preview_max_bytes
 from logger import get_logger
 
@@ -260,28 +259,22 @@ def bash_is_read_only(command: str, store: dict | None = None) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  计划文书路径（唯一口径）
+#  计划文书路径（**口径已迁到 `paths.py`**，2026-09-29）
 # ═══════════════════════════════════════════════════════════════════════════
-
-def plan_relpath(session_id: str, session_prefix: str = "session_") -> str:
-    """计划文书的**文件名**（与会话 jsonl / `.tasks` 同源口径）。"""
-    return f"{session_prefix}{session_id}.md"
-
-
-def plan_file_for(paths, session_id: str, session_prefix: str = "session_") -> Path:
-    """计划文书的绝对路径：`<元数据目录>/plans/<prefix><sid>.md`。
-
-    `paths` 为 `paths.WorkspacePaths`（取其 `plans_dir`）。
-    **路径口径的唯一实现是 `paths.plan_file_for_session`** —— 本函数只是把
-    路径束的 `plans_dir` 喂进去的便捷入口（避免调用方各拼一遍口令）。
-    """
-    return plan_file_for_session(
-        session_id, session_prefix, paths.plans_dir)
-
-
-def plans_dirname() -> str:
-    """计划文书目录名（透出给需要自拼路径的调用方，避免第二出处）。"""
-    return PLANS_DIRNAME
+# 2026-09-25 版这里放过 `plan_relpath(sid)` / `plan_file_for(paths, sid)` /
+# `plans_dirname()` —— 那一版的落点是"由 sid 唯一决定"的
+# `<元数据目录>/plans/session_<sid>.md`。2026-09-29 改成"工作空间内 + 模型命名"
+# 之后，路径再也不由 sid 决定，于是整套口径收进 `paths.py`：
+#
+#   `paths.plan_dir_for(workdir)`             → <工作空间根>/.aiagent/plan/
+#   `paths.plan_filename(raw_name)`           → 清洗模型给的名字（恒 .md 结尾）
+#   `paths.plan_relpath(raw_name)`            → 相对工作空间的展示/读取路径
+#   `paths.resolve_plan_path(dir, name, prev)` → 同名不撞车的最终落点
+#   `paths.plan_display_path(status, name, legacy)` → 三个出口共用的对外路径判据
+#
+# **刻意不再在这里留同名包装**：两个模块各有一个 `plan_relpath` 是纯粹的
+# 事故隐患（签名还不一样），读代码的人一定会拿错。
+# 存量会话（升级前产出的文书）仍走 `paths.plan_file_for_session` 回退读取。
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -408,6 +401,10 @@ class ExecutionGate:
         self.plan_status: str | None = None
         # 文书路径（str | None）；仅用于展示与回执，真相仍是磁盘
         self.plan_path: str | None = None
+        # 文书文件名（`<name>.md`，2026-09-29 起由**模型**给名字）。
+        # 它是 meta 里 `plan_name` 的唯一来源 —— 路径再也不由 sid 推出，
+        # 所以这份名字必须落盘，否则切会话/重启后就找不到自己的文书了。
+        self.plan_name: str | None = None
 
     # ── 状态读写 ───────────────────────────────────────────────────────
     def snapshot(self) -> dict:
@@ -417,6 +414,7 @@ class ExecutionGate:
                 "mode": self.mode,
                 "plan_status": self.plan_status,
                 "plan_path": self.plan_path,
+                "plan_name": self.plan_name,
             }
 
     def set_mode(self, mode: str) -> None:
@@ -427,17 +425,26 @@ class ExecutionGate:
             self.mode = mode
 
     def set_plan_mode(self) -> None:
-        """进入计划模式：清掉上一份文书的**状态**（文件保留，下次产出即覆盖）。"""
+        """进入计划模式：清掉上一份文书的**状态**（文件保留，下次产出即覆盖）。
+
+        `plan_name` **刻意保留**：它记的是"本会话当前的文书文件"，重规划时
+        `paths.resolve_plan_path(..., previous_name=plan_name)` 据此直接覆盖自己那一份
+        （而不是被当成"别人的文件"另起一个 `-2`）。文书路径仅在 `plan_status`
+        非空时才对外可见 —— 见 `Agent._plan_display_path`。
+        """
         with self._lock:
             self.mode = MODE_PLAN
             self.plan_status = None
 
-    def mark_plan_ready(self, path: str | Path | None) -> None:
+    def mark_plan_ready(self, path: str | Path | None,
+                        name: str | None = None) -> None:
         """`plan_write` 成功：文书就绪，等待批准。"""
         with self._lock:
             self.plan_status = PLAN_STATUS_READY
             if path is not None:
                 self.plan_path = str(path)
+            if name:
+                self.plan_name = str(name)
 
     def approve_plan(self) -> None:
         """批准计划：文书转 approved（模式回落由 Agent 统一负责）。"""
@@ -445,22 +452,28 @@ class ExecutionGate:
             self.plan_status = PLAN_STATUS_APPROVED
 
     def clear_plan(self) -> None:
-        """退出计划模式：清状态 + 清路径（模式回落由 Agent 统一负责）。"""
+        """退出计划模式：清状态 + 清路径 + 清文件名（模式回落由 Agent 统一负责）。"""
         with self._lock:
             self.plan_status = None
             self.plan_path = None
+            self.plan_name = None
 
     def restore_plan_from_meta(self, meta: dict | None) -> None:
         """init_session / switch_session 时从会话元数据恢复 plan 状态。
 
         只认合法状态值；meta 无记录（存量会话）→ 回到"未产出文书"。
+        `plan_name` 一并恢复 —— 写入端与恢复端必须同源，否则切会话后
+        `plan_path` 会退化成存量口径（读不到自己刚写的文书）。
         """
         meta = meta if isinstance(meta, dict) else {}
         status = meta.get("plan_status")
         if status not in VALID_PLAN_STATUSES:
             status = None
+        name = meta.get("plan_name")
         with self._lock:
             self.plan_status = status
+            self.plan_name = (str(name) if isinstance(name, str) and name.strip()
+                              else None)
 
     # ── 判定（PreToolUse 守卫的唯一入口）────────────────────────────────
     def blocked_reason(self, tool_name: str, tool_args: Any = None,

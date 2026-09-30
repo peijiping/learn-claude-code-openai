@@ -154,9 +154,12 @@ class BrowserAgentBridge implements AgentApi {
     refs?: Parameters<AgentApi['send']>[6],
     execMode?: Parameters<AgentApi['send']>[7]
   ): Promise<void> {
-    // exec_mode / exec_condition：新建任务的预选执行模式（2026-09-27）。只对**新建**
-    // 生效（后端只认无 session_id 的那条 chat），所以与主进程 handler 同款先判 sessionId。
-    const pend = typeof sessionId === 'string' && sessionId ? null : execMode
+    // exec_mode / exec_condition：两种含义共用同一对字段 —— 新建任务的预选执行模式
+    // （2026-09-27）与**已有会话的目标模式武装位**（2026-09-30，docs/frontend/22 §2.6：
+    // 条件就是这条消息的正文，后端在派发 turn 之前落地）。plan 仍只对新建生效，
+    // 已有会话的 plan 切换走 `session_exec_mode`（与主进程 handler 同款判据）。
+    const pend =
+      execMode && (sessionId ? execMode.mode === 'goal' : true) ? execMode : null
     this.sendRaw(JSON.stringify({
       kind: 'chat',
       payload: {

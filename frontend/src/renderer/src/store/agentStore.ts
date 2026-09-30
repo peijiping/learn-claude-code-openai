@@ -4,7 +4,7 @@ import { create } from 'zustand'
 // 这里只用到三件事：接收 `session_history` 里的 right_panel、切会话时收尾、
 // 删会话/断线重连时清缓存。
 import { flushRightPanelPending, useRightPanelStore } from './rightPanelStore'
-import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, ExecutionMode, ExecutionModeChangedPayload, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, PlanContentPayload, PlanStatus, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, ExecutionMode, ExecutionModeChangedPayload, GoalAction, GoalMarker, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, PlanContentPayload, PlanStatus, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -20,11 +20,14 @@ export type SessionOverridesMap = Record<string, SessionOverrides>
 /** 计划卡片状态（2026-09-25，docs/frontend/22 §6.8）：**每会话一条**（单份覆盖）。
  *
  *  - 卡片**外壳**由 `status` + `path` 决定（`plan_ready` 广播 / `session_history`
- *    / `sessions` 列表载荷都能重建）；
+ *    / `sessions` 列表载荷都能重建）；**重建不无条件** —— 壳的存活另有判据
+ *    （见 `planShellAlive`）：`approved` 的壳不会从任何通道复活（2026-09-29 四次改版）。
  *  - 正文**必须**经 `plan_read` 拉取后落在 `content` —— 信封与列表载荷都不带正文
  *    （实时与回放共用同一条链路，避免两套口径）。 */
 export interface PlanState {
-  /** 文书落点（后端**派生**给出）。空串 = 未知，仍可尝试 plan_read。 */
+  /** 文书落点。2026-09-29 起是**相对工作空间**的 `.aiagent/plan/<name>.md`
+   *  （右栏标签与 `file_read` 都用这个口径）；存量会话是旧的元数据目录绝对路径。
+   *  空串 = 未知（理论上不该发生：三条恢复通道都会带上它）。 */
   path: string
   status: PlanStatus
   /** 正文（plan_read 回执填充）；`undefined` = 尚未拉取。 */
@@ -33,6 +36,113 @@ export interface PlanState {
   reason?: string
   /** 正文超限（`too_large`）整份拒绝：**宁可不给，不给半个**。 */
   tooLarge?: boolean
+}
+
+/** 锚点行存活判据（2026-09-29 四次改版，docs/frontend/22 §7.5）：
+ *  **壳只在「有一份待批准的计划」期间存在** —— 即 `status === 'ready'`。
+ *
+ *  上一版让 `approved` 也恒留（理由是"作为历史"），但壳贴在消息流**末尾**、不锚定产出
+ *  它的那条消息（事件不带 `message_id`，这条链不存在）—— 于是它既不是历史（不跟着历史
+ *  走），也不是状态（`approve_plan` 的语义就是"落 approved + mode 回落 normal"，卡片上
+ *  那句"正在按计划执行"当场已经是错的），只剩一条过期横幅赖在流末尾直到会话结束。
+ *  用户实测报的就是这个（2026-09-29）：批准之后它再没有任何可做的事，却一直占着屏幕。
+ *
+ *  **为什么只看 `status`、不看 `mode`**：批准与"清空计划状态"在后端都伴随 mode 离开
+ *  plan，所以 `approved` 直接判死即可；而 `ready` 恒活 —— 若给 `ready` 也加上 mode
+ *  条件，前一条 `execution_mode_changed` 一旦丢失（断线），壳就永远建不出来。
+ *
+ *  ⚠️ 这条判据被**三条通道共用**：广播 `execution_mode_changed` / 回放 `session_history` /
+ *  列表重建 `mergeExecFromSessions`（断线重连 + 整页重载的唯一恢复源，而 `resetTransient`
+ *  并不清 `planBySession`）。**漏改任何一条，壳都会从那个入口复活** —— 上一版正是漏了
+ *  后两条，"批准后横幅赖着不走"因此不是修一处能好的。
+ *
+ *  返回值同时是一个**类型谓词**：为真时 `status` 必是 `'ready'`。 */
+function planShellAlive(status: PlanStatus | null | undefined): status is 'ready' {
+  return status === 'ready'
+}
+
+/** 常驻目标条的存活判据（2026-09-30 目标可见化，docs/frontend/22 §7.6）。
+ *
+ *  「目标模式的**唯一真相**是后端 `GoalController.active`，`execution_mode` 只是
+ *  它的投影」—— 所以目标条存在当且仅当 `mode === 'goal'` **且**条件非空。
+ *  两个条件都要：`mode` 说 goal 而条件为空，是投影与真相不一致的中间态（后端
+ *  `execution_state()` 的铁律校准就是干这个的），此时渲染一条没有目标的目标条
+ *  只会让用户困惑。
+ *
+ *  ⚠️ 与 `planShellAlive` 同款纪律：这条判据被**四条来源共用** ——
+ *  ① 广播 `execution_mode_changed`；② 回放 `session_history`；
+ *  ③ 列表重建 `mergeExecFromSessions`（断线重连 / 整页重载的**唯一**恢复源）；
+ *  ④ 实时 `goal_check`（只更新轮次，不改存亡）。
+ *  **漏改任何一条，目标条就会从那个入口复活或消失**。
+ *
+ *  返回值同时是一个**类型谓词**：为真时 `condition` 必是 string。 */
+export function goalBarAlive(
+  mode: ExecutionMode,
+  condition: string | null | undefined
+): condition is string {
+  return mode === 'goal' && !!condition
+}
+
+/** 常驻目标条的状态（**每会话一条**）。
+ *
+ *  `round` = 后端 `GoalController.active.iterations`（已完成的评估次数）；
+ *  条上显示 `round + 1`（当前进行 / 即将进行的那一轮）—— 这个 +1 只在这里做一次，
+ *  组件不得自算（两处口径分会打架：检查卡片显示的是 `round`，不是 `+1`）。 */
+export interface GoalBarState {
+  condition: string
+  /** 已完成的评估轮次（0 = 目标刚设、还没评估过）。 */
+  round: number
+  /** 目标设置时刻（Unix 秒）；缺省 = 不知道起点，不显示时长（不编假值）。 */
+  startedAt: number | null
+}
+
+/** 常驻目标条对外展示的轮次（**唯一口径**）：已完成的轮次 + 1。
+ *  无目标条时为 0（组件据 `goalBarAlive` 判存亡，不会渲染这个值）。 */
+export function goalBarRoundLabel(bar: GoalBarState | undefined): number {
+  return bar ? bar.round + 1 : 0
+}
+
+/** 目标指令徽标的**乐观态收敛**（2026-09-30 目标可见化）。
+ *
+ *  「这条是目标指令」这个事实，后端要等 `chat` 到达、算完条件才知道；而前端在
+ *  `send()` 那一刻就一清二楚 —— 所以徽标只能**乐观**打（否则要为一个纯展示需求
+ *  新增一条"这条消息已被确认为目标指令"的信封，不值当）。
+ *
+ *  代价是：后端若**静默忽略**整份目标预选（条件为空 / 超 `MAX_GOAL_LENGTH` /
+ *  被 busy 守卫拒掉，见 ws_bridge 的两处 `log.warning`），不会有任何回执 ——
+ *  那枚徽标就会一直挂着，让用户以为会话在目标模式下。
+ *
+ *  收敛点因此是**后端给出的权威模式**（判据与 `execution_mode` 同源）：
+ *  - `goal`     → 摘掉 `pending`，徽标留下（事实成立）；
+ *  - 非 `goal`  → **整枚撤掉**（这次预选没被接受）。
+ *
+ *  ⚠️ 只动 `pending === true` 的那些 —— **已确认**的历史徽标（早先那次目标指令）
+ *  绝不能被顺手清掉：目标达成后 mode 回落 normal，若按 mode 一刀切，
+ *  用户会看到"我刚才设的目标"徽标凭空消失。 */
+function settleGoalBadges(
+  prev: Record<string, Message[]>,
+  sids: string[],
+  inGoalMode: (sid: string) => boolean
+): Record<string, Message[]> {
+  let out = prev
+  for (const sid of sids) {
+    const buf = prev[sid]
+    if (!buf) continue
+    let hit = false
+    const next = buf.map((m) => {
+      if (m.goal?.kind !== 'instruction' || !m.goal.pending) return m
+      hit = true
+      if (inGoalMode(sid)) {
+        return { ...m, goal: { ...m.goal, pending: undefined } }
+      }
+      // 整枚撤掉：连 `goal` 键一起摘（而不是置 undefined），保持"无标记的消息
+      // 连字段都不多一个"这条形状约定。
+      const { goal: _droppedGoal, ...rest } = m
+      return rest
+    })
+    if (hit) out = { ...out, [sid]: next }
+  }
+  return out
 }
 
 /** 从 `sessions` 列表载荷同步执行模式两桶（2026-09-25，docs/frontend/22 §6.8 P1-13）。
@@ -47,38 +157,78 @@ export interface PlanState {
 function mergeExecFromSessions(
   prevMode: Record<string, ExecutionMode>,
   prevPlan: Record<string, PlanState>,
+  prevBar: Record<string, GoalBarState>,
   list: SessionMeta[]
-): { executionModeBySession: Record<string, ExecutionMode>; planBySession: Record<string, PlanState> } {
+): {
+  executionModeBySession: Record<string, ExecutionMode>
+  planBySession: Record<string, PlanState>
+  goalBarBySession: Record<string, GoalBarState>
+} {
   let mode = prevMode
   let plan = prevPlan
+  let bar = prevBar
   for (const x of list) {
     const m = x.execution_mode ?? 'normal'
     if (prevMode[x.id] !== m) mode = { ...mode, [x.id]: m }
     const st = x.plan_status
-    if (st === 'ready' || st === 'approved') {
+    if (planShellAlive(st)) {
       const cur = prevPlan[x.id]
       const path = x.plan_path ?? ''
       if (!cur || cur.path !== path || cur.status !== st) {
         plan = { ...plan, [x.id]: { ...(cur ?? {}), path, status: st } as PlanState }
       }
+    } else if (m !== 'plan' && plan[x.id]) {
+      // 模式已离开 plan（含"已批准 + 回落 normal"）→ 撤壳。断线重连时内存里的旧壳
+      // 不会被 `resetTransient` 清掉（它只清 running/bg/isSending/interaction/approval），
+      // 这里是唯一的校准点：少了这一步，用户批准后一断线重连，横幅就从列表载荷里复活。
+      const { [x.id]: _dropped, ...rest } = plan
+      plan = rest
+    }
+    // 常驻目标条（2026-09-30）：判据 `goalBarAlive` 与广播 / 回放两条通道共用。
+    // 这条通道是**断线重连 / 整页重载的唯一恢复源** —— 少了它，目标条会消失
+    // （或带着旧条件复活），而 `resetTransient` 并不清这个桶。
+    const cond = x.goal_condition
+    if (goalBarAlive(m, cond)) {
+      const cur = prevBar[x.id]
+      const round = typeof x.goal_round === 'number' ? x.goal_round : 0
+      const startedAt = typeof x.goal_started_at === 'number' ? x.goal_started_at : null
+      if (!cur || cur.condition !== cond || cur.round !== round
+          || cur.startedAt !== startedAt) {
+        bar = { ...bar, [x.id]: { condition: cond, round, startedAt } }
+      }
+    } else if (bar[x.id]) {
+      // 目标已结束（achieved/failed/用户点 ×）或条件为空 → 撤条（同上面的撤壳语义）
+      const { [x.id]: _droppedBar, ...rest } = bar
+      bar = rest
     }
   }
-  return { executionModeBySession: mode, planBySession: plan }
+  return { executionModeBySession: mode, planBySession: plan, goalBarBySession: bar }
 }
 
-/** 从两桶里按会话 id 批量删除（**删会话 / 删工作空间时显式调用**）。
+/** 从三桶里按会话 id 批量删除（**删会话 / 删工作空间时显式调用**）。
  *
  *  ⚠️ 刻意**不**照抄 `permissionModeBySession` —— 那个桶在 clearSession /
  *  newSession / trashSession / deleteSessions / removeProject 五处都不删，属既有
  *  泄漏（评审 P1-14）；新轴不继承这个缺陷（照 `rightPanelStore.dropSessions` 范式）。
+ *  `goalArmBySession`（目标模式武装态，2026-09-30）同批清 —— 会话都没了，
+ *  一条"等着下一条指令当目标"的孤儿草稿没有意义。
  *  无实际删除时返回**原引用**，避免 zustand 无谓重渲染。 */
 function dropExecBuckets(
   prevMode: Record<string, ExecutionMode>,
   prevPlan: Record<string, PlanState>,
+  prevArm: Record<string, boolean>,
+  prevBar: Record<string, GoalBarState>,
   ids: string[]
-): { executionModeBySession: Record<string, ExecutionMode>; planBySession: Record<string, PlanState> } {
+): {
+  executionModeBySession: Record<string, ExecutionMode>
+  planBySession: Record<string, PlanState>
+  goalArmBySession: Record<string, boolean>
+  goalBarBySession: Record<string, GoalBarState>
+} {
   const mode = { ...prevMode }
   const plan = { ...prevPlan }
+  const arm = { ...prevArm }
+  const bar = { ...prevBar }
   let changed = false
   for (const id of ids) {
     if (id in mode) {
@@ -89,9 +239,29 @@ function dropExecBuckets(
       delete plan[id]
       changed = true
     }
+    if (id in arm) {
+      delete arm[id]
+      changed = true
+    }
+    if (id in bar) {
+      delete bar[id]
+      changed = true
+    }
   }
-  if (!changed) return { executionModeBySession: prevMode, planBySession: prevPlan }
-  return { executionModeBySession: mode, planBySession: plan }
+  if (!changed) {
+    return {
+      executionModeBySession: prevMode,
+      planBySession: prevPlan,
+      goalArmBySession: prevArm,
+      goalBarBySession: prevBar
+    }
+  }
+  return {
+    executionModeBySession: mode,
+    planBySession: plan,
+    goalArmBySession: arm,
+    goalBarBySession: bar
+  }
 }
 
 /** 某会话当前的执行模式 —— tag 选中态的**唯一 fallback 链**（与权限 chip 同款）：
@@ -108,7 +278,12 @@ function execModeOf(
  *
  *  读不到是**常规降级**（文书被清理 / 空间目录不可用 / 超 512KB 整份拒绝）——
  *  落 `reason` 让卡片渲染占位块，绝不抛、也绝不白屏。`reason` 与 `tooLarge`
- *  语义不同但都表示"没有正文"：前者给用户看原因，后者供样式区分。 */
+ *  语义不同但都表示"没有正文"：前者给用户看原因，后者供样式区分。
+ *
+ *  `path` **一律沿用外壳里的那一份**（来自 `plan_ready` / `session_history` /
+ *  `sessions` 列表，2026-09-29 起是**相对工作空间**的 `.aiagent/plan/<name>.md`）。
+ *  刻意**不**用回执里的 `payload.path`：那是后端解析出来的绝对路径，两者混进同一个
+ *  字段会让"用哪个路径开右栏"变成随机的 —— 右栏按 path 去重，两种形态会开出两枚标签。 */
 function mergePlanContent(
   prev: Record<string, PlanState>,
   sid: string,
@@ -119,18 +294,50 @@ function mergePlanContent(
   const ok = !!payload && !payload.reason && !payload.too_large
   if (ok) {
     const p = payload as PlanContentPayload
-    return { ...prev, [sid]: { path: p.path || cur.path, status: cur.status, content: p.text } }
+    return { ...prev, [sid]: { path: cur.path, status: cur.status, content: p.text } }
   }
   return {
     ...prev,
     [sid]: {
-      path: payload?.path || cur.path,
+      path: cur.path,
       status: cur.status,
       ...(cur.content !== undefined ? { content: cur.content } : {}),
       reason: payload?.reason || '计划文书暂时读不到',
       tooLarge: Boolean(payload?.too_large)
     }
   }
+}
+
+/** 该计划文书路径能否在右栏打开 —— 即"是不是**工作空间相对**路径"。
+ *
+ *  2026-09-29 起新文书是相对路径（`.aiagent/plan/<name>.md`）；
+ *  **存量会话**（升级前产出）拿到的是旧的元数据目录**绝对路径**，右栏的
+ *  `resolve_within(workdir, …)` 会拒掉它（"路径不在当前工作空间内"）。
+ *  与其给用户一枚点下去必然失败的死按钮，不如只在新格式下显示它。
+ *
+ *  判据**只有这一处**：计划卡片（锚点）与计划操作栏都要决定"要不要给「打开文档」"，
+ *  两处各写一遍就会出现"其中一处漏了回退判断"的经典分叉。
+ */
+export function isPlanDocOpenable(path: string): boolean {
+  if (!path) return false
+  if (path.startsWith('/')) return false                    // POSIX 绝对路径
+  return !/^[A-Za-z]:[\\/]/.test(path)                      // Windows 盘符
+}
+
+/** 在右栏打开计划文书（`plan_ready` 自动展示 + 卡片点开后复用**同一入口**）。
+ *
+ *  为什么能这么简单：2026-09-29 起文书写在**工作空间内**，于是它天然落在
+ *  `file_read` 的沙箱根里 —— 直接复用既有的文件标签机制即可，不需要为"计划文书"
+ *  再开一条右栏通道（旧口径在元数据目录里，右栏根本读不到，这也是当初不做预览的原因）。
+ *
+ *  `origin='tree'` = 落**常驻位**（不复用预览位）：计划文书是"这一轮要看的东西"，
+ *  不该被随后点开的源码文件顶掉。
+ *
+ *  **不**主动调 `ensurePreview`：标签激活后 `FilePreview` 自己会发请求（见该组件
+ *  `useEffect`），这里再发一次只会被 `ensurePreview` 的"同 path 在途"短路吃掉。 */
+export function openPlanDocInPanel(sid: string, path: string, name = ''): void {
+  if (!sid || !path) return
+  useRightPanelStore.getState().openFileTab(sid, { path, name: name || undefined }, 'tree')
 }
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
@@ -412,7 +619,11 @@ export interface MessageUsage {
 
 export interface Message {
   id: string
-  role: 'user' | 'assistant'
+  /** `goal_check`（2026-09-30 目标可见化）：目标检查/设定的展示卡 —— 它不是
+   *  对话的一轮（没有 thinking / toolCalls / streaming 语义），`MessageItem`
+   *  对它单独走一条渲染分支。实时由 `goal_check` 信封 append，回放由
+   *  `historyToMessage` 从后端 `role:"goal_check"` 的历史项还原。 */
+  role: 'user' | 'assistant' | 'goal_check'
   content: string
   /** 消息记录时间：回放来自 jsonl created_at，实时消息在创建时本地打点
    *  （秒级 ISO 本地时间，与后端 _now_iso 同构；老会话行缺省不显示） */
@@ -442,6 +653,13 @@ export interface Message {
   /** user 消息引用的工作空间路径（实时由 `serializeDoc` 收集，回放由后端 harvest）。
    *  **只有引用没有正文也是合法发送**。与 attachments 是并列且独立的通道。 */
   refs?: MessageRef[]
+  /** 目标模式标记（2026-09-30 目标可见化，docs/frontend/22 §6.6）。
+   *  - `instruction`（user 消息上）：这条就是**被设为执行目标**的那条指令 →
+   *    气泡头部挂「已设为执行目标」徽标。实时由 `send()` 乐观打标（后端若因条件
+   *    非法静默忽略，`execution_mode_changed` 到达时会把徽标剥掉），回放来自 jsonl。
+   *  - `check` / `set`（`role === 'goal_check'` 的展示卡上）：检查结果 / 目标设定，
+   *    由 `GoalCheckCard` 渲染。 */
+  goal?: GoalMarker
 }
 
 /** 输入区的附件草稿项。
@@ -589,9 +807,33 @@ interface AgentState {
    *  `execution_mode`、以及 **`sessions` 列表载荷**（断线重连 / 整页重载的唯一
    *  恢复通道，P1-13）三处驱动。缺条目视作 `'normal'` → **零占位**（不渲染任何元素）。 */
   executionModeBySession: Record<string, ExecutionMode>
-  /** 每个会话的计划卡片状态（每会话一条，单份覆盖）。`plan_status='approved'`
-   *  的卡片属历史，退出 plan 模式时刻意**不删**（要留在消息流里）。 */
+  /** 每个会话的计划卡片状态（每会话一条，单份覆盖）。**只装"待批准"（`ready`）的壳**
+   *  —— 2026-09-29 四次改版：`approved` 不再留在消息流里当"历史"（判据见 `planShellAlive`；
+   *  批准后 mode 回落 normal，卡片上那句"正在按计划执行"当场就是错的）。 */
   planBySession: Record<string, PlanState>
+  /** ── 目标模式的**武装态**（2026-09-30，docs/frontend/22 §2.6）──────────
+   *  「点目标模式不再弹框问条件」：前端只把意图记在这里（true = 武装），条件取
+   *  **下一条指令的正文**，随那条 `chat.exec_condition` 一起交给后端，由后端在
+   *  派发 turn **之前**落地（那时才既有条件、又不撞 `rt.busy`）。
+   *
+   *  为什么条件必须等指令到达：`GoalController.set_goal` 拒绝空条件，点选那一刻
+   *  根本没有条件可写；而 `session_exec_mode` 是"即时生效"语义，改不了这个事实。
+   *
+   *  **按会话存**（`activeSession` 为键）：与 `pendingExecMode`（无会话草稿）语义
+   *  等价但归属不同 —— 后者属于"还没建出来的新会话"，不合并成一条真值来源。
+   *  清理：发送时随 `chat` 交出、`execution_mode_changed` 广播到达时兜底清、
+   *  `clearSession` / 删会话 / 删空间时随执行模式两桶一并清。 */
+  goalArmBySession: Record<string, boolean>
+  /** ── 常驻目标条（2026-09-30 目标可见化，docs/frontend/22 §7.6）────────────
+   *  目标全程激活期间，输入区上方常驻一行「🎯 当前目标：xxx · 第 N 轮」。
+   *  目标可能连跑很多轮 —— 没有这条，用户只有在胶囊 tag 上才看得出"还开着"。
+   *
+   *  **四条来源**（与 `planBySession` 同款纪律，判据一律 `goalBarAlive`）：
+   *  ① 广播 `execution_mode_changed`；② 回放 `session_history`；
+   *  ③ 列表重建 `mergeExecFromSessions`（断线重连 / 整页重载的唯一恢复源）；
+   *  ④ 实时 `goal_check`（只更新 `round`，不改存亡）。
+   *  清理：`dropExecBuckets` 第 4 桶 + `clearSession`。 */
+  goalBarBySession: Record<string, GoalBarState>
   /** ── 新建任务（无会话）态的**预选**执行模式草稿（2026-09-27）───────────
    *  无会话时「执行方式」两项**不再置灰**：点选先记在这里（胶囊 tag 立即显示），
    *  随首条消息经 `chat.exec_mode` 交给后端，由后端在**建会话时**写进该会话 meta，
@@ -601,9 +843,13 @@ interface AgentState {
    *  那时 turn 已经 `rt.busy`，goal 会被评审 P1-5 的守卫拒掉（见 docs/frontend/22 §2.4）。
    *
    *  **仅在 `activeSession === null` 时被读取**；`newSession()` 重置（新任务默认
-   *  normal —— 执行模式是会话级状态，无继承源，不照抄权限档位的"空间默认值"）。 */
+   *  normal —— 执行模式是会话级状态，无继承源，不照抄权限档位的"空间默认值"）。
+   *  已有会话的执行模式**不走这里**：goal 走 `goalArmBySession`，plan 直接发命令。 */
   pendingExecMode: ExecutionMode
-  /** 无会话态预选的目标条件（goal 草稿；`pendingExecMode !== 'goal'` 时恒空串） */
+  /** 无会话态预选的目标条件：**恒空串**（2026-09-30 起点「目标模式」不再弹框填条件
+   *  —— 条件改由首条消息的正文充当，见 `chat.exec_condition` 与 §2.6）。
+   *  字段保留：后端 `exec_condition` 的语义（"显式条件优先"）仍需一个入口，
+   *  且旧客户端可能仍带值。 */
   pendingExecGoalCondition: string
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
@@ -1058,7 +1304,11 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       // 回放：user 消息引用的工作空间路径（同上，无引用时后端连字段都不发）
       ...(m.refs && m.refs.length ? { refs: m.refs } : {}),
       // 回放：结构化提问的只读小结块（无提问时连字段都不多一个）
-      ...(askUsers.length ? { askUsers } : {})
+      ...(askUsers.length ? { askUsers } : {}),
+      // 回放：目标模式标记（2026-09-30）——`instruction` 挂「已设为执行目标」徽标，
+      // `check`/`set` 由 `GoalCheckCard` 渲染。**无标记的老消息连字段都不多一个**，
+      // 与改造前的回放形状逐字节一致。
+      ...(m.goal ? { goal: m.goal } : {})
     }
   })
 }
@@ -1442,6 +1692,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   permissionModeBySession: {},
   executionModeBySession: {},
   planBySession: {},
+  goalArmBySession: {},
+  goalBarBySession: {},
   pendingExecMode: 'normal',
   pendingExecGoalCondition: '',
   overridesByModel: {},
@@ -1504,10 +1756,37 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       seenRefs.add(path)
       msgRefs.push({ path, name: String(r?.name ?? ''), is_dir: !!r?.is_dir })
     }
+    // ── 目标指令判定（2026-09-30，docs/frontend/22 §2.6/§6.6）──
+    // 提到 userMsg 构造**之前**：徽标要在造出这条消息的那一刻就挂上。
+    // 两条来源：无会话读 `pendingExecMode` 草稿；已有会话读 `goalArmBySession` 武装位。
+    // ⚠️ 在途提问（ask_user）期间发消息 = **作答**（后端把正文原样回填、不另起
+    // turn，见 ws_bridge 的 `resolve_ask_free_text`）—— 那不是"第一条指令"，
+    // 拿它当目标会当场设错。故此时**不交棒**，武装位留到真正的下一条指令。
+    const askPending = sid !== null && !!get().interactionBySession[sid]
+    const pend =
+      sid === null
+        ? get().pendingExecMode
+        : get().goalArmBySession[sid] && !askPending
+          ? 'goal'
+          : 'normal'
+    const armedGoal = pend === 'goal'
+    // 目标条件**就是本条消息的正文**（`t`）——显式填过的条件（`pendingExecGoalCondition`，
+    // 无会话的老入口）优先；正文为空（纯附件 / 纯引用）由后端用 `[附件] 文件名` /
+    // `[引用] 文件名` 兜底（`_goal_condition_from_message`）。
+    const goalCondition = armedGoal
+      ? get().pendingExecGoalCondition || t
+      : null
     const userMsg: Message = {
       id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso(),
       ...(attRefs.length ? { attachments: attRefs } : {}),
-      ...(msgRefs.length ? { refs: msgRefs } : {})
+      ...(msgRefs.length ? { refs: msgRefs } : {}),
+      // 乐观打标（**唯一一处乐观更新**，2026-09-30）：发送那一刻前端就知道这条
+      // 是目标指令（后端要等命令到达、算完条件才知道），所以徽标当场亮。
+      // `pending: true` 标记"未经后端确认" —— 后端若因条件非法**静默忽略**整份
+      // 预选（不回复执），靠 `settleGoalBadges` 在后端给出权威模式时撤掉它。
+      ...(goalCondition
+        ? { goal: { kind: 'instruction' as const, condition: goalCondition, pending: true } }
+        : {})
     }
     const assMsg: Message = {
       id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso()
@@ -1528,13 +1807,28 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）；
     // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位；
     // refs 只带路径，后端做越界校验后挂中性引用块（**不复制、不读内容**）。
-    // execMode：新建任务的**预选执行模式草稿**（2026-09-27）—— 必须随这条 chat 走，
-    // 后端在建会话时落 meta，首轮起就按该模式跑；normal / 已有会话恒不带。
-    const pend = sid === null ? get().pendingExecMode : 'normal'
+    // ── execMode：「目标模式 = 首条指令即目标」（2026-09-30，docs/frontend/22 §2.6）──
+    // `askPending` / `pend` / `armedGoal` / 条件都已在**上方**算出（造 userMsg 时要挂
+    // 徽标），这里只负责组装载荷。plan 模式无条件，直接透传。
     const execMode =
       pend === 'normal'
         ? null
-        : { mode: pend, ...(pend === 'goal' ? { condition: get().pendingExecGoalCondition } : {}) }
+        : pend === 'goal'
+          ? { mode: 'goal' as const, condition: goalCondition ?? t }
+          : { mode: 'plan' as const }
+    if (armedGoal && sid !== null) {
+      // 武装态**已交出**：清掉它，并顺手把选中态登记进该会话桶 —— 目的只是"草稿已清、
+      // 广播未到"的那几毫秒不闪一下胶囊（与 `session` 事件的 `handed` 同款：
+      // **不是乐观更新**，真值随后由 `execution_mode_changed` / `sessions` 广播校准；
+      // 后端若忽略整个预选，这里会被纠正回 normal）。
+      set((s) => {
+        const { [sid]: _handed, ...goalArmBySession } = s.goalArmBySession
+        return {
+          goalArmBySession,
+          executionModeBySession: { ...s.executionModeBySession, [sid]: 'goal' }
+        }
+      })
+    }
     window.agent
       .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs, execMode)
       .catch(() => set({ isSending: false }))
@@ -1685,23 +1979,45 @@ export const useAgentStore = create<AgentState>((set, get) => ({
    *  没有归属，但"选不了"比"选了待落地"差得多 —— 草稿由 `send()` 随首条消息
    *  交给后端在**建会话时**落 meta（见 `pendingExecMode` 的注释）。原先那条
    *  「请先发送一条消息创建会话」的 toast 与 `+` 菜单的对应置灰一并删除：**
-   *  两项在任何情况下都可选**。 */
+   *  两项在任何情况下都可选**。
+   *
+   *  **已有会话的 goal = 只记"武装位"**（2026-09-30，§2.6）：点「目标模式」不再弹框
+   *  问条件 —— 条件由**下一条指令的正文**充当，因此这一刻**不发任何后端命令**
+   *  （空条件必被 `GoalController` 拒；改发 normal 又会把用户的 plan 顺手杀掉）。
+   *  真值落地在 `send()` 随 `chat.exec_mode/exec_condition` 走的路径上。 */
   switchExecMode: (mode, condition) => {
     const s = get()
     const sid = s.activeSession
+    const cond = mode === 'goal' ? (condition ?? '') : ''
     if (!sid) {
-      const cond = mode === 'goal' ? (condition ?? '') : ''
       if (s.pendingExecMode === mode && s.pendingExecGoalCondition === cond) return
       set({ pendingExecMode: mode, pendingExecGoalCondition: cond })
+      return
+    }
+    if (mode === 'goal') {
+      // 幂等短路：已武装 / 后端已是 goal（后者连条件都不用问）
+      if (s.goalArmBySession[sid] || execModeOf(s, sid) === 'goal') return
+      set({ goalArmBySession: { ...s.goalArmBySession, [sid]: true } })
+      return
+    }
+    if (s.goalArmBySession[sid]) {
+      // 撤武装：**只清本地位**。后端此刻仍是武装前那个模式（武装从未落地），
+      // 胶囊随 fallback 链自动回到真值（normal / plan），不必也不该发命令。
+      const { [sid]: _disarmed, ...goalArmBySession } = s.goalArmBySession
+      set({ goalArmBySession })
+      // 唯一例外：用户直接点了「计划模式」（跨模式意图）—— plan 的真源在后端，
+      // 必须真发一条；后端若本来就在 plan，这条是幂等空操作。
+      if (mode === 'plan') window.agent.sessionExecMode(sid, mode)
       return
     }
     // 同模式重复点击 = 幂等短路（少一次往返）。**跨模式直接切换**（2026-09-27 改）：
     // plan ↔ goal 不再要求"先关闭再切换"—— 后端 `set_execution_mode` 是唯一权威，
     // 被让位那一方的状态（目标 / plan 状态）由后端一并清理（plans/ 下的文书文件
     // 保留），前端不再拦截、也不再弹"请先关闭…"的提示。
-    const cur = execModeOf(s, sid)
-    if (cur === mode) return
-    window.agent.sessionExecMode(sid, mode, mode === 'goal' ? (condition ?? '') : undefined)
+    // 注意 `mode` 到此已被收窄成 `'normal' | 'plan'`（goal 在上面两条分支里就已经
+    // 返回了）—— 所以这里**不带 condition**：goal 的条件只走"武装 → 首条指令"那条路。
+    if (execModeOf(s, sid) === mode) return
+    window.agent.sessionExecMode(sid, mode)
   },
 
   /** 批准计划文书。fire-and-forget：卡片转只读等 `execution_mode_changed` 广播
@@ -1779,13 +2095,29 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         // 显示成另一个空间，接下来的「+」会把新任务建到那个空间去。
         const cur = get().activeSession
         const curPid = cur ? list.find((x) => x.id === cur)?.project : undefined
-        set((s) => ({
-          sessions: list,
-          // 执行模式 4 字段随列表一起恢复（**断线重连 / 整页重载的唯一通道**，
-          // P1-13）—— 与 permission_mode / unread 同通道，见 mergeExecFromSessions。
-          ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, list),
-          ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
-        }))
+        set((s) => {
+          // 乐观徽标收敛（2026-09-30）：这条也是权威模式来源之一 —— 首条消息就
+          // 预选 goal 的**新会话**路径不推 `execution_mode_changed`（它靠
+          // `_restore_execution_state` 生效），确认/撤销只能在这里落地。
+          const messagesBySession = settleGoalBadges(
+            s.messagesBySession,
+            list.map((x) => x.id),
+            (sid) => list.find((x) => x.id === sid)?.execution_mode === 'goal'
+          )
+          return {
+            sessions: list,
+            // 执行模式 4 字段随列表一起恢复（**断线重连 / 整页重载的唯一通道**，
+            // P1-13）—— 与 permission_mode / unread 同通道，见 mergeExecFromSessions。
+            ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, s.goalBarBySession, list),
+            messagesBySession,
+            // `messages` 是 activeSession 的投影快照（不是 getter）→ 徽标被撤掉时
+            // 必须一并刷新，否则用户要切一次会话才看到变化。
+            messages: s.activeSession
+              ? (messagesBySession[s.activeSession] ?? s.messages)
+              : s.messages,
+            ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
+          }
+        })
         break
       }
       case 'projects': {
@@ -1933,7 +2265,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null } | null
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null; goal_round?: number | null; goal_started_at?: number | null } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
         // 右栏状态：**在 `set(...)` 之外**调用。两个理由：
         // ① 它是另一个 store 的 action，放进更新函数会破坏"更新函数必须纯"的前提
@@ -1943,7 +2275,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         useRightPanelStore.getState().applySessionUi(payload.session_id, payload.right_panel)
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null; goal_round?: number | null; goal_started_at?: number | null }
           // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
           // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
           // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
@@ -1961,7 +2293,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             ? { ...s.executionModeBySession, [p.session_id]: p.execution_mode }
             : s.executionModeBySession
           const planBySession =
-            p.plan_status === 'ready' || p.plan_status === 'approved'
+            planShellAlive(p.plan_status)
               ? {
                   ...s.planBySession,
                   [p.session_id]: {
@@ -1971,12 +2303,30 @@ export const useAgentStore = create<AgentState>((set, get) => ({
                   } as PlanState
                 }
               : p.execution_mode !== 'plan' && s.planBySession[p.session_id]
-                ? // 回放通道的同一条纪律（与 `execution_mode_changed` 分支一致）：模式不是
-                  // plan（normal / **goal**）且 meta 里没有任何计划状态 → 该会话**没有**
-                  // 计划文书状态了，留着的旧壳只会变成一张点不动的卡片。已批准过的会话
-                  // 走上面那支（`plan_status` 恒为 "approved"，approve 不清它）。
+                ? // 回放通道的同一条纪律（判据见 `planShellAlive`，与 `execution_mode_changed`
+                  // 分支一致）：模式不是 plan（normal / **goal**）→ 撤壳。既覆盖"meta 里
+                  // 已无计划状态"（旧壳会变成一张点不动的卡片），也覆盖"**已批准**后切进
+                  // 这个会话"（决策已作出，壳不该跟着回放回来）。
                   (({ [p.session_id]: _dropped, ...rest }) => rest)(s.planBySession)
                 : s.planBySession
+          // 常驻目标条（2026-09-30 目标可见化）：回放通道的同一条判据（`goalBarAlive`，
+          // 与广播 / 列表重建共用）。**必须与上面的撤壳同款处理"反向"分支** ——
+          // 回放一个已结束目标的会话时，内存里的旧目标条要撤掉，否则它会带着
+          // 上一个目标的条件赖在输入区上方。
+          const goalBarBySession = goalBarAlive(p.execution_mode ?? 'normal', p.goal_condition)
+            ? {
+                ...s.goalBarBySession,
+                [p.session_id]: {
+                  condition: p.goal_condition as string,
+                  round: typeof p.goal_round === 'number' ? p.goal_round : 0,
+                  startedAt: typeof p.goal_started_at === 'number'
+                    ? p.goal_started_at
+                    : null
+                }
+              }
+            : s.goalBarBySession[p.session_id]
+              ? (({ [p.session_id]: _droppedBar, ...rest }) => rest)(s.goalBarBySession)
+              : s.goalBarBySession
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
           const buf = s.messagesBySession[p.session_id] ?? []
@@ -1984,7 +2334,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             (s.runningSessions.includes(p.session_id) || s.bgSessions.includes(p.session_id)) &&
             buf.length > 0
           if (hasLive) {
-            return { ...s, taskBoardBySession, executionModeBySession, planBySession }
+            return { ...s, taskBoardBySession, executionModeBySession, planBySession, goalBarBySession }
           }
           const histBuf = historyToMessage(p.session_id, p.messages)
           const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
@@ -2000,7 +2350,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
           if (s.activeSession !== p.session_id) {
-            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession, permissionModeBySession, executionModeBySession, planBySession }
+            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession, permissionModeBySession, executionModeBySession, planBySession, goalBarBySession }
           }
           return {
             ...s,
@@ -2013,6 +2363,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             permissionModeBySession,
             executionModeBySession,
             planBySession,
+            goalBarBySession,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
             lastOverridesByModel: overridesByModel,
           }
@@ -2022,12 +2373,74 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         // 切会话都重复请求。用 `plan_read` 而非 `file_read`：文书在元数据目录里，
         // 后者被 `resolve_within(workdir)` 钉死在工作区 → 越界（docs/frontend/22 §4.5）。
         const sid = payload.session_id
-        if (
-          (payload.plan_status === 'ready' || payload.plan_status === 'approved') &&
-          get().planBySession[sid]?.content === undefined
-        ) {
+        if (planShellAlive(payload.plan_status) && get().planBySession[sid]?.content === undefined) {
           void get().fetchPlanContent(sid)
         }
+        break
+      }
+      case 'goal_check': {
+        // 目标检查结果（2026-09-30 目标可见化，docs/frontend/22 §6.2）：把这一轮的
+        // Stop 裁决按时间顺序 append 进该会话的消息流，渲染成一张检查卡。
+        //
+        // 为什么 append 一条 Message 而不是另起一个面板/横幅：用户要的是「每轮执行完
+        // 的偏差输出到**对话界面**」—— 它就该长在对话流里、跟着历史走。落盘的 jsonl
+        // 记录与这里同源同形（都由 `GoalState.snapshot()` + action/reason 组成），
+        // 切会话回放由 `_history_to_ui` + `historyToMessage` 重建同一条消息对象，
+        // **实时与回放共用 `GoalCheckCard` 一套渲染**，不存在两套口径。
+        const p = ev.payload as {
+          session_id?: string
+          kind?: string
+          action?: GoalAction
+          round?: number
+          reason?: string
+          condition?: string
+          elapsed?: number
+          tokens?: number
+          at?: string
+        } | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid || !p?.action) break
+        const marker: GoalMarker = {
+          kind: 'check',
+          action: p.action,
+          round: typeof p.round === 'number' ? p.round : 0,
+          reason: p.reason ?? '',
+          condition: p.condition ?? '',
+          elapsed: typeof p.elapsed === 'number' ? p.elapsed : 0,
+          tokens: typeof p.tokens === 'number' ? p.tokens : 0,
+          at: p.at
+        }
+        const card: Message = {
+          id: mid(),
+          role: 'goal_check',
+          content: '',
+          created_at: p.at,
+          thinking: '',
+          thinkingActive: false,
+          toolCalls: [],
+          subagents: [],
+          activeToolId: null,
+          streaming: false,
+          usage: null,
+          goal: marker
+        }
+        set((s) => {
+          const buf = [...(s.messagesBySession[sid] ?? []), card]
+          const messagesBySession = { ...s.messagesBySession, [sid]: buf }
+          // 常驻目标条的轮次随之推进（`round` = 后端已完成的评估次数）。
+          // 这里**只管数字，不管存亡** —— 目标成没成由 `execution_mode_changed` 决定
+          // （判据 `goalBarAlive` 只在该通道与另外两条恢复通道里用）。
+          const cur = s.goalBarBySession[sid]
+          const goalBarBySession = cur
+            ? { ...s.goalBarBySession, [sid]: { ...cur, round: marker.round ?? cur.round } }
+            : s.goalBarBySession
+          return {
+            ...s,
+            messagesBySession,
+            messages: s.activeSession === sid ? buf : s.messages,
+            goalBarBySession
+          }
+        })
         break
       }
       case 'goal_status':
@@ -2268,19 +2681,60 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (typeof sid !== 'string' || !sid) break
         if (mode !== 'normal' && mode !== 'plan' && mode !== 'goal') break
         set((s) => {
-          // plan 状态：信封带 plan_status 时同步（含 approved）；**不带时一律不动**
-          // `planBySession` —— 已批准的卡片属历史，退出 plan 模式要留在消息流里（§6.8）。
-          //
-          // 唯一例外（2026-09-25 实施期修正，2026-09-27 扩展）：**plan_status 为空
-          // 且当前不在 plan 模式**（回落 normal，或**跨模式直接切到 goal**）→ 连壳
-          // 一起撤。否则卡片会留在消息流里显示"待批准"+可点的「批准执行」，而后端
-          // 已把 plan 状态清空、点下去只会换来一句
-          // `当前没有待批准的计划文书。` 的 error toast —— 死按钮 + 内存与磁盘背离。
-          // 已批准过的卡片不受影响：`approve_plan` 只回落 mode、**不清 plan_status**，
-          // 所以它此后每条信封都带 `plan_status:"approved"`（走上面的分支）。
+          // ── 锚点行的存活判据（2026-09-29 四次改版，docs/frontend/22 §7.5）──────────
+          // 唯一的判据在 `planShellAlive`（三条通道共用）：**壳只在"有待批准的计划"
+          // 期间存在**。`approved` 不再恒留 —— 用户实测"批准后横幅赖在消息流末尾不走"。
+          // 这里因此只剩两条支路：
+          //   ① 判据为真 → 建 / 更新壳；
+          //   ② 判据为假且模式已不是 plan → 撤壳。
+          // 支路 ② 顺带兜住 `plan_status` 也为空的场景（回落 normal，或**跨模式直接
+          // 切到 goal**，2026-09-25 实施期修正 / 2026-09-27 扩展）：否则卡片会留在
+          // 消息流里显示"待批准"+ 可点的「批准执行」，而后端已把 plan 状态清空、
+          // 点下去只会换来一句 `当前没有待批准的计划文书。` 的 error toast ——
+          // 死按钮 + 内存与磁盘背离。
           const st = p.plan_status
+          // 武装态兜底清（2026-09-30，§2.6）：本条广播是"本会话模式的唯一权威"——
+          // 无论它来自首条指令落地（我们已在前一刻清过）、别的窗口的操作、还是
+          // goal 达成后的自动回落，留着一枚武装位都会让胶囊与真值打架。
+          let goalArmBySession = s.goalArmBySession
+          if (goalArmBySession[sid]) {
+            const { [sid]: _settled, ...rest } = goalArmBySession
+            goalArmBySession = rest
+          }
+          // ── 常驻目标条（2026-09-30，docs/frontend/22 §7.6）───────────────────
+          // 判据 `goalBarAlive`（与回放 / 列表重建两条通道共用）：mode=goal **且**
+          // 条件非空才存在。撤条覆盖三种情形：目标达成/失败（mode 回落 normal）、
+          // 用户点胶囊 ×、跨模式切到 plan。
+          let goalBarBySession = s.goalBarBySession
+          if (goalBarAlive(mode, p.goal_condition)) {
+            const cur = s.goalBarBySession[sid]
+            goalBarBySession = {
+              ...goalBarBySession,
+              [sid]: {
+                condition: p.goal_condition,
+                // 轮次缺省沿用本地值：`execution_mode_changed` 多数由"模式刚切换"
+                // 触发（那一刻后端还没评估过），真正的推进靠 `goal_check` 事件。
+                round: typeof p.goal_round === 'number'
+                  ? p.goal_round
+                  : (cur?.round ?? 0),
+                startedAt: typeof p.goal_started_at === 'number'
+                  ? p.goal_started_at
+                  : (cur?.startedAt ?? null)
+              }
+            }
+          } else if (goalBarBySession[sid]) {
+            const { [sid]: _droppedBar, ...rest } = goalBarBySession
+            goalBarBySession = rest
+          }
+          // 乐观徽标收敛（见 `settleGoalBadges`）：本广播是"本会话模式的唯一权威"，
+          // 据此确认（mode=goal）或撤销（其余）这次预选打下的徽标。
+          const messagesBySession = settleGoalBadges(
+            s.messagesBySession,
+            [sid],
+            () => mode === 'goal'
+          )
           let planBySession = s.planBySession
-          if (st === 'ready' || st === 'approved') {
+          if (planShellAlive(st)) {
             const cur = s.planBySession[sid]
             planBySession = {
               ...planBySession,
@@ -2293,8 +2747,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
               }
             }
           } else if (mode !== 'plan' && s.planBySession[sid]) {
-            // normal 与 **goal**（跨模式直接切换）都要撤：这两种模式下后端
-            // plan_status 已空，壳留着就是死按钮。
+            // 「已批准 + 模式回落」（判据为假的主路径）与"plan_status 已清空"（normal /
+            // **goal**）都要撤：前者决策已作出、壳的职责已尽；后者壳留着就是死按钮。
             const { [sid]: _dropped, ...rest } = s.planBySession
             planBySession = rest
           }
@@ -2302,12 +2756,21 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             ...s,
             executionModeBySession: { ...s.executionModeBySession, [sid]: mode },
             planBySession,
+            goalArmBySession,
+            goalBarBySession,
+            messagesBySession,
+            messages: s.activeSession === sid
+              ? (messagesBySession[sid] ?? s.messages)
+              : s.messages,
             // `sessions` 列表条目同步：tag 的 fallback 链读它；也保证多窗口一致。
             sessions: s.sessions.map((x) =>
               x.id === sid
                 ? {
                     ...x,
                     execution_mode: mode,
+                    // 列表条目**忠实镜像**后端 meta（含 `approved`）—— 撤不撤壳是消费端
+                    // 的事（`mergeExecFromSessions` 用 `planShellAlive` 判）。这里若也
+                    // 收窄成只写 `ready`，断线重连那边就少了一份"该撤壳"的依据。
                     ...(st === 'ready' || st === 'approved'
                       ? { plan_status: st, plan_path: p.plan_path ?? null }
                       : {}),
@@ -2324,9 +2787,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         // 与回放"两套数据口径）。推送顺序契约保证前一条 `execution_mode_changed`
         // 已带 `plan_status="ready"`，但这里不依赖它 —— 重复写同值无害，反而能兜住
         // 广播丢失。拉正文是异步副作用 → 必须在 `set()` 之外。
-        const p = ev.payload as { session_id?: string; plan_status?: PlanStatus } | null
+        const p = ev.payload as {
+          session_id?: string
+          plan_status?: PlanStatus
+          plan_path?: string | null
+          plan_name?: string | null
+        } | null
         const sid = p?.session_id
         if (typeof sid !== 'string' || !sid) break
+        const docPath = typeof p?.plan_path === 'string' ? p.plan_path : ''
         set((s) => {
           const cur = s.planBySession[sid]
           return {
@@ -2334,7 +2803,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             planBySession: {
               ...s.planBySession,
               [sid]: {
-                path: cur?.path ?? '',
+                path: docPath || cur?.path || '',
                 status: 'ready' as const,
                 ...(cur?.content !== undefined ? { content: cur.content } : {})
               }
@@ -2342,6 +2811,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           }
         })
         void get().fetchPlanContent(sid)
+        // **主动把产出物摆到眼前**（2026-09-29 需求）：文书在工作空间里，右栏直接
+        // 打开一枚常驻标签。两条纪律：
+        //   ① 只对**当前会话**开 —— 后台会话产出计划不该抢走用户眼前的视图；
+        //   ② 副作用放 `set()` 之外（与 fetchPlanContent 同款）。
+        // 这里不受"不乐观更新"约束：它不改 tag/卡片的选中态，只是替用户开一扇看得见
+        // 产出物的窗（随时可关）；面板开合本身有既有持久化，不该由这条件去猜测。
+        if (docPath && get().activeSession === sid) {
+          openPlanDocInPanel(sid, docPath, p?.plan_name || '')
+        }
         break
       }
     }
@@ -2352,7 +2830,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       const list = (await window.agent.listSessions()) as SessionMeta[]
       if (!Array.isArray(list)) return
       // 与 `sessions` 信封同口径：列表是执行模式（tag / 卡片壳）的恢复通道之一
-      set((s) => ({ sessions: list, ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, list) }))
+      set((s) => ({ sessions: list, ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, s.goalBarBySession, list) }))
     } catch {
       /* 忽略 */
     }
@@ -2491,8 +2969,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         .map((x) => x.id)
       set((s) => ({
         sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId),
-        // 执行模式两桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
-        ...dropExecBuckets(s.executionModeBySession, s.planBySession, gone)
+        // 执行模式三桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
+        ...dropExecBuckets(s.executionModeBySession, s.planBySession, s.goalArmBySession, s.goalBarBySession, gone)
       }))
       // 右栏：被删会话的内存桶一起清掉。**这是既有分桶的缺口**
       // （`sessions` 过滤了但 messagesBySession 等没有人清），本 store 不照抄这个缺陷。
@@ -2566,7 +3044,22 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       delete messagesBySession[sid]
       // 清空会话同步清掉 token 统计（后端 meta 的 usage_totals 已一并清除）
       const { [sid]: _drop, ...sessionUsageBySession } = s.sessionUsageBySession
-      return { ...s, messagesBySession, messages: [], activeSession: sid, sessionUsageBySession }
+      // 武装态一并清（2026-09-30）：后端把执行模式四字段归零了，"等下一条指令当目标"
+      // 这条本地位自然也该没了 —— 留着就会给一个已经归零的会话点亮目标模式胶囊。
+      const { [sid]: _disarmed, ...goalArmBySession } = s.goalArmBySession
+      // 常驻目标条一并清（2026-09-30）：后端把 goal 四字段（含新增的
+      // goal_round/goal_started_at）全归零了，条再留着就会变成一条"目标为空"
+      // 的幽灵横幅 —— 而它的关闭按钮点了也没用（后端已无目标可清）。
+      const { [sid]: _droppedBar, ...goalBarBySession } = s.goalBarBySession
+      return {
+        ...s,
+        messagesBySession,
+        messages: [],
+        activeSession: sid,
+        sessionUsageBySession,
+        goalArmBySession,
+        goalBarBySession
+      }
     })
     get().refreshSessions()
   },
@@ -2624,8 +3117,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set((s) => ({
         sessions: s.sessions.filter((x) => !remove.has(x.id)),
         trashSessions: s.trashSessions.filter((x) => !remove.has(x.id)),
-        // 执行模式两桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
-        ...dropExecBuckets(s.executionModeBySession, s.planBySession, deleted)
+        // 执行模式三桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
+        ...dropExecBuckets(s.executionModeBySession, s.planBySession, s.goalArmBySession, s.goalBarBySession, deleted)
       }))
       // 右栏：同步丢内存桶（含把该 sid 还压着的待写盘条目一并撤掉，
       // 否则防抖定时器到点会往一个已删除的会话写 meta）

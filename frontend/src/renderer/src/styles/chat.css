@@ -1993,12 +1993,12 @@
   cursor: default;
   opacity: 0.85;
 }
-/* 完全访问：琥珀色提示「已放开」 */
+/* 完全访问：粉红警示「已放开」（2026-09-29，原琥珀 → 粉红，提高警示度） */
 .perm-chip.full {
-  color: var(--color-warn);
+  color: var(--color-alert-pink);
 }
 .perm-chip.full:hover:not(:disabled) {
-  color: var(--color-warn);
+  color: var(--color-alert-pink);
 }
 .perm-menu-mask {
   position: fixed;
@@ -2052,6 +2052,16 @@
 .perm-menu-item svg {
   flex: none;
 }
+/* 完全访问项：文字与图标用粉红警示（含**选中态** —— 覆盖 .active 的 accent 紫），
+   让这个「放开审批」的高危档位在下拉里始终一眼可辨（2026-09-29）。 */
+.perm-menu-item.full,
+.perm-menu-item.full.active {
+  color: var(--color-alert-pink);
+}
+.perm-menu-item.full .perm-menu-desc {
+  color: var(--color-alert-pink);
+  opacity: 0.7;
+}
 
 
 /* ── 正文裸路径 / file:// 链接命中后的内部跳转（2026-09-23，docs/frontend/21）──
@@ -2085,9 +2095,15 @@
 
 /* ══════════════════════════════════════════════════════════════════════
    任务执行模式（2026-09-25，docs/frontend/22）
-   - .exec-chip*  ：输入区工具栏的胶囊 tag（计划 / 目标）
-   - .goal-dialog*：目标条件输入弹层（Portal 到 body）
-   - .plan-card*  ：消息流**末尾**的计划卡片
+   - .exec-chip*  ：输入区工具栏的胶囊 tag（计划 / 目标）；`.armed` = 目标模式
+                    "等下一条指令当目标"的虚线态（2026-09-30 起，弹层已下线）
+   - .plan-card*  ：消息流末尾的**锚点行**（只标出"这里产出过一份计划"；
+                    2026-09-29 二次改版后**不再渲染正文**，正文在右栏；
+                    四次改版后它**只在待批准（`ready`）期间存在** —— 原先的
+                    `.plan-card.approved` / `.plan-card-badge.approved` 已删）
+   - .plan-bar*   ：输入区位置的操作栏（`PlanActionBar`）—— 待批准期间顶替
+                    输入框，与自由输入互斥；`.chat--plan` 负责隐藏 `.composer`
+   - .plan-opt*   ：四个固定选项的选项式选择框（卡片与操作栏共用这一套形态）
    ⚠ 必须落在 main.tsx 已引的 7 个 css 之一（本文件 ✓）—— 写进游离 css 会
    规则从未生效、且构建全绿查不出来（21 篇 §6.2 事故）。
    ══════════════════════════════════════════════════════════════════════ */
@@ -2144,96 +2160,13 @@
   background: rgba(0, 0, 0, 0.08);
 }
 
-/* ── 目标条件输入弹层 ────────────────────────────────────────────────
-   Portal 到 body → 固定居中，不受 composer 的 overflow / 层叠上下文影响。
-   z-index 取 1000/1001：高于输入区工具栏菜单（900/901），低于设置弹窗。 */
-.goal-dialog-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.28);
-  z-index: 1000;
-}
-.goal-dialog {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(520px, calc(100vw - 48px));
-  padding: var(--sp-4);
-  background: var(--color-bg-main);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.2));
-  z-index: 1001;
-}
-.goal-dialog-title {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  color: var(--color-text-primary);
-  font-size: var(--fs-md);
-  font-weight: 600;
-}
-.goal-dialog-desc {
-  margin-top: var(--sp-1);
-  color: var(--color-text-secondary);
-  font-size: var(--fs-sm);
-  line-height: 1.6;
-}
-.goal-dialog-input {
-  display: block;
-  width: 100%;
-  margin-top: var(--sp-3);
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background: var(--color-bg-main);
-  color: var(--color-text-primary);
-  font-family: inherit;
-  font-size: var(--fs-md);
-  line-height: 1.6;
-  resize: vertical;
-  outline: none;
-}
-.goal-dialog-input:focus {
-  border-color: var(--color-accent);
-}
-.goal-dialog-hint {
-  margin-top: var(--sp-1);
-  font-size: var(--fs-xs);
-}
-.goal-dialog-hint.error {
-  color: var(--color-danger);
-}
-.goal-dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--sp-2);
-  margin-top: var(--sp-3);
-}
-.goal-dialog-btn {
-  padding: 6px var(--sp-4);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background: var(--color-bg-main);
-  color: var(--color-text-primary);
-  font-size: var(--fs-sm);
-  cursor: pointer;
-}
-.goal-dialog-btn:hover:not(:disabled) {
-  background: var(--color-bg-hover);
-}
-.goal-dialog-btn.primary {
-  border-color: transparent;
-  background: var(--color-accent);
-  color: #fff;
-}
-.goal-dialog-btn.primary:hover:not(:disabled) {
-  filter: brightness(1.05);
-}
-.goal-dialog-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
+/* ── 武装态的目标模式胶囊（2026-09-30，docs/frontend/22 §2.6）──────────────
+   点「目标模式」不再弹框要条件（`.goal-dialog*` 已随 `GoalInputDialog.tsx` 下线）：
+   条件取**下一条指令的正文**，在它落地之前胶囊已经亮着，而后端仍是旧模式。
+   虚线描边把"等待指令"与"已生效"区分开 —— 与 `.md-path-link-unknown` 的虚线
+   同族语义（都是"尚未落定"），不额外引入颜色。 */
+.exec-chip.goal.armed {
+  border: 1px dashed rgba(var(--color-accent-rgb), 0.55);
 }
 
 /* ── 计划卡片（消息流末尾固定块）────────────────────────────────────
@@ -2246,9 +2179,6 @@
   border-radius: var(--radius-md);
   background: var(--color-bg-main);
   overflow: hidden;
-}
-.plan-card.approved {
-  border-left-color: var(--color-ok);
 }
 .plan-card-head {
   display: flex;
@@ -2272,42 +2202,199 @@
   font-weight: 500;
   line-height: 18px;
 }
-.plan-card-badge.approved {
-  background: rgba(52, 168, 83, 0.14);
-  color: var(--color-ok);
-}
-/* 正文可滚动：计划文书可能很长，卡片不能把整条消息流顶到天上去 */
-.plan-card-body {
-  max-height: 420px;
-  overflow-y: auto;
-  padding: var(--sp-2) var(--sp-3);
-}
-.plan-card-loading,
-.plan-card-lost {
+/* 锚点行的一句说明 / 读不到时的原因（同一行，只是一个中性、一个琥珀）。
+   2026-09-29 二次改版：正文不再进对话（改由右栏承载），原先的
+   `.plan-card-body`（限高 420px 的 Markdown 容器）与 `.plan-card-loading`
+   随之删除 —— 这里只剩一行文字，不需要滚动容器，也不再需要"正在读取正文"。 */
+.plan-card-line {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-3);
-  color: var(--color-text-secondary);
-  font-size: var(--fs-sm);
-}
-/* 读不到是降级不是错误 —— 但要让用户知道"为什么没有正文"，用琥珀而不是红 */
-.plan-card-lost {
-  color: var(--color-warn);
-}
-.plan-card-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
   gap: var(--sp-2);
   padding: var(--sp-2) var(--sp-3);
   border-top: 1px solid var(--color-border);
-}
-.plan-card-note {
   color: var(--color-text-secondary);
   font-size: var(--fs-sm);
+  line-height: 1.5;
 }
-.plan-card-btn {
+/* 读不到是降级不是错误 —— 但要让用户知道"为什么没有正文"，用琥珀而不是红 */
+.plan-card-line.lost {
+  color: var(--color-warn);
+}
+/* 「打开文档」/「选择操作」：两枚小按钮，卡片与操作栏**共用**同一套外观
+   （语义一样：把用户送到能看到/能操作它的地方）—— 只有一份实现，不会漂移。 */
+.plan-card-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px var(--sp-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.plan-card-open:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+/* 禁用态（2026-09-29 五次改版）：「选择操作」在智能体跑一轮期间不可点 ——
+   灰而不隐（`cursor: default` 与 `.plan-opt:disabled` 同款，不写 not-allowed：
+   它不是"操作错了"，只是"还没轮到"）。 */
+.plan-card-open:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── 计划操作栏（`PlanActionBar`）—— 占的是**输入框的位置** ────────────────
+   2026-09-29 二次改版（docs/frontend/22 §7.3.1）：待批准期间让输入框让位，
+   由这块选择框顶替它 —— "操作与自由输入互斥"是布局事实，不是两处各画一遍。
+   与 `.composer` 共用同一套卡片外观（边框 / 圆角 / 阴影）：它呈现的是
+   "输入框本身换了内容"，左右留白因此由父级 `.composer-wrap` 统一承担。
+   ⚠ 只隐藏 `.composer`（InputBox 根节点），**不是**整个 `.composer-wrap`，
+   否则操作栏自己也会被一起藏掉。 */
+.chat--plan .composer-wrap .composer {
+  display: none;
+}
+.plan-bar {
+  display: block;
+}
+.plan-bar__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid rgba(var(--color-accent-rgb), 0.45);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  box-shadow: var(--shadow-md);
+}
+.plan-bar__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+.plan-bar__icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-accent);
+}
+.plan-bar__title {
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+.plan-bar__hint {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.plan-bar__spacer {
+  flex: 1;
+}
+.plan-bar__lost {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--color-warn);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+/* 选项式选择框：从"两枚按钮"改成**竖排的选项** —— 选项在上、就地输入框在中、
+   确认行在下，读起来是一条自上而下的决策路径。 */
+.plan-opts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+/* 形态刻意对齐 `.ask-option`（同一套"单选圆点 + 标题 + 说明"语言）：两处都是
+   "请用户做个选择"，长得不一样只会让人以为是两种东西。 */
+.plan-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.plan-opt:hover:not(:disabled) {
+  border-color: rgba(var(--color-accent-rgb), 0.5);
+  background: var(--color-bg-active);
+}
+.plan-opt--on {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.plan-opt:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.plan-opt__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  color: #fff;
+}
+.plan-opt--on .plan-opt__mark {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+}
+.plan-opt__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.plan-opt__label {
+  line-height: 1.4;
+}
+.plan-opt__desc {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+/* 就地输入框（「继续修改」/「其他」）：边框用强调色，与上面的选项区分
+   "这是要写字的地方"。 */
+.plan-opt-input {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radii-btn);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  font-family: inherit;
+  outline: none;
+}
+.plan-bar__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.plan-bar__tip {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+/* 确认行按钮。`.primary` = 「确定」；不带 `.primary` 的那枚是 `isSending` 时
+   浮出的「停止」（输入区被让位后停止按钮的落脚点，见 PlanActionBar 注释）。 */
+.plan-bar__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 5px var(--sp-3);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -2316,18 +2403,210 @@
   font-size: var(--fs-sm);
   cursor: pointer;
 }
-.plan-card-btn:hover:not(:disabled) {
+.plan-bar__btn:hover:not(:disabled) {
   background: var(--color-bg-hover);
 }
-.plan-card-btn.primary {
+.plan-bar__btn.primary {
   border-color: transparent;
   background: var(--color-accent);
   color: #fff;
 }
-.plan-card-btn.primary:hover:not(:disabled) {
+.plan-bar__btn.primary:hover:not(:disabled) {
   filter: brightness(1.05);
 }
-.plan-card-btn:disabled {
+.plan-bar__btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
+
+/* ── 目标模式的可见化（2026-09-30，docs/frontend/22 §7.6）───────────────────
+   改造前 goal 模式与 normal 在界面上**零差别**：目标指令消息无标记、每轮裁决结果
+   只 `_print` 到终端。这三个元素分别回答三个"用户看不见"的问题：
+   - `.goal-badge` ：那条被设为目标的指令消息上的徽标（"这条就是目标指令"）
+   - `.goal-check` ：每轮 Stop 裁决的检查卡（"这轮偏在哪 / 成没成"）
+   - `.goal-bar`   ：输入区上方的常驻目标条（"还开着目标模式、目标是啥、第几轮"）
+   配色一律走既有 token（accent / ok / warn / danger），不新增颜色。
+   三者都在无内容时**零占位**（组件 return null 或不渲染 DOM）。 */
+
+/* ── 目标指令徽标（用户气泡头部，2026-09-30）─────────────────────────────
+   与 `.exec-chip.goal` 同色族（主色淡底）—— 同一个语义（"这是一件目标模式的
+   事"）在两个地方出现，长得一致才不会让人当成两种东西。 */
+.goal-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: flex-start;
+  margin-bottom: var(--sp-1);
+  padding: 0 var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: rgba(var(--color-accent-rgb), 0.12);
+  color: var(--color-accent);
+  font-size: var(--fs-xs);
+  line-height: 18px;
+  white-space: nowrap;
+  user-select: none;
+}
+.goal-badge-label {
+  font-weight: 500;
+}
+
+/* ── 目标检查卡（消息流里的一条播报，不是对话气泡）───────────────────────
+   与 `.plan-card` 是**同一族形态**（左侧色条 + 头部行 + 内容行），但刻意分开写：
+   计划卡是"贴在流末尾的锚点"，检查卡是"按时间顺序插进流里的记录"，去掉
+   border-left 之外的差别会让两种东西看起来是一回事。 */
+.goal-check {
+  width: 100%;
+  margin: var(--sp-2) 0;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  overflow: hidden;
+}
+/* 卡片自带上下留白 → 抵掉 `.msg-row` 的默认底部间距，否则连续几轮检查之间
+   会空出一大块（目标跑十几轮时这个间距会被放大成一条"断层"）。 */
+.goal-check-row {
+  margin-bottom: 0;
+}
+/* 结论决定左侧色条 —— 扫一眼就能看出这一轮成没成 */
+.goal-check[data-goal-action='achieved'] { border-left-color: var(--color-ok); }
+.goal-check[data-goal-action='failed'] { border-left-color: var(--color-danger); }
+.goal-check[data-goal-action='error'] { border-left-color: var(--color-danger); }
+.goal-check[data-goal-action='block'] { border-left-color: var(--color-warn); }
+.goal-check[data-goal-action='limit'] { border-left-color: var(--color-warn); }
+.goal-check[data-goal-action='defer'] { border-left-color: var(--color-text-secondary); }
+.goal-check[data-goal-action='set'] { border-left-color: var(--color-accent); }
+
+.goal-check-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--color-bg-sidebar);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.goal-check-title {
+  flex: 1;
+}
+.goal-check-time {
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+}
+.goal-check-badge {
+  padding: 0 var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.goal-check-badge[data-tone='ok'] {
+  background: rgba(52, 168, 83, 0.14);
+  color: var(--color-ok);
+}
+.goal-check-badge[data-tone='warn'] {
+  background: rgba(200, 134, 13, 0.14);
+  color: var(--color-warn);
+}
+.goal-check-badge[data-tone='bad'] {
+  background: rgba(224, 83, 61, 0.14);
+  color: var(--color-danger);
+}
+.goal-check-badge[data-tone='muted'] {
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+
+/* 偏差理由：评估器原文。**不截断、可换行** —— 用户要看的正是这一段 */
+.goal-check-reason {
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+.goal-check-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.goal-check-dot {
+  opacity: 0.6;
+}
+
+/* ── 常驻目标条（输入区上方，2026-09-30）─────────────────────────────────
+   刻意**不用** `.exec-chip` 那套胶囊形态：胶囊在工具栏里、说明"模式是什么"；
+   这里要铺开条件原文与轮次，是"当前在推进的这件事"。 */
+.goal-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+  margin: 0 var(--sp-4) var(--sp-2);
+  padding: 6px var(--sp-3);
+  border: 1px solid rgba(var(--color-accent-rgb), 0.35);
+  border-radius: var(--radius-md);
+  background: rgba(var(--color-accent-rgb), 0.07);
+  color: var(--color-accent);
+  font-size: var(--fs-sm);
+}
+.goal-bar-label {
+  flex: none;
+  font-weight: 600;
+}
+/* 条件原文：单行省略（完整原文在 title 里）。它是这条上最有信息量的部分，
+   所以占据全部剩余宽度。 */
+.goal-bar-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-primary);
+  user-select: text;
+}
+.goal-bar-round {
+  flex: none;
+  color: var(--color-accent);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.goal-bar-dot {
+  opacity: 0.6;
+  margin: 0 2px;
+}
+.goal-bar-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+.goal-bar-close:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.08);
+}
+.goal-bar-close:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+

@@ -109,6 +109,11 @@ class SessionRuntime:
         # 必须同步 cancel_all —— 否则停止后审批线程一直阻塞到超时。
         self._approval = ApprovalBroker(sid, deliver)
         self._pending_overrides: tuple = (None, None)  # (reasoning_effort, max_context)
+        # 「本条消息就是目标指令」的条件文本（2026-09-30 目标可见化）。
+        # 由 ws_bridge 显式传入（它是唯一算得出"这条是目标指令"的地方），
+        # 只在本轮透传给 run_turn，用于给落盘的 user 行打 `goal` 标记。
+        # 非目标消息恒为 None —— agent 侧不做任何反查猜测。
+        self._pending_goal_instruction: Optional[str] = None
         self._bg_watch_task: Optional[asyncio.Task] = None  # 后台任务完成守望
         self._deliver = deliver
         self._reply_sessions = reply_sessions
@@ -390,12 +395,17 @@ class SessionRuntime:
 
     async def start_turn(self, text: str | list,
                          reasoning_effort: Optional[str] = None,
-                         max_context: Optional[str] = None) -> None:
+                         max_context: Optional[str] = None,
+                         goal_instruction: Optional[str] = None) -> None:
         """派发一轮对话：后台线程跑 run_turn，事件循环保持可读。
 
         `text` 为**用户消息的 content**：无附件时是纯字符串（与改造前一致），
         带附件时是 `[文本块 + 附件引用块...]` 的多模态数组（由 ws_bridge 组装）。
         本层只做透传，不解释内容 —— 展开成语义线格式发生在 Agent 的发送边界。
+
+        `goal_instruction`（2026-09-30 目标可见化）：「本条消息就是被设为执行目标
+        的那条指令」时的目标条件文本，透传给 `run_turn` 用于给落盘的 user 行打
+        `goal` 标记（前端据此渲染徽标、回放同样可见）。非目标消息传 None。
 
         先发 running，结束后按终态发**一条**状态：
         - stopped：用户主动停止；
@@ -415,6 +425,7 @@ class SessionRuntime:
         # 下一轮正常结束会被误判成 stopped。
         self.stop_evt.clear()
         self._pending_overrides = (reasoning_effort, max_context)
+        self._pending_goal_instruction = goal_instruction
         self.busy = True
         self._turn_started = time.monotonic()
         self._push_status("running")
@@ -577,7 +588,7 @@ class SessionRuntime:
                     self._resolve_turn_context(max_context))
         except Exception:
             pass
-        agent.run_turn(text)
+        agent.run_turn(text, goal_instruction=self._pending_goal_instruction)
 
 
 class SessionRuntimeRegistry:
