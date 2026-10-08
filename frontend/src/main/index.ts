@@ -866,11 +866,17 @@ function createWindow(): void {
       if (!name && !config) return null
       // 试连要真实起子进程 / 建连接并等握手，最长 MCP_CONNECT_TIMEOUT（默认 15s）
       // → 必须放宽超时，用默认 5s 会稳定误报「超时」（同 llmModelsFetch 的 30s）。
+      //
+      // ⚠️ 45s 而非 30s（2026-10-08）：试连通过后后端会**顺势做一次定点重连**
+      // （`_mcp_reconnect_one_sync`），最坏路径 = 试连 15s + 重连 15s = 30s，
+      // 正好**贴死** 30s 边界 → 偶发 promise 回 null、回执被丢弃，
+      // 用户看到"点测试没反应"。与 mcpServerUpsert 的 30s 同源问题，
+      // 但这里要两次握手，只能再放宽一档。
       return request(
         'mcp_server_test',
         'mcp_test',
         { ...(config ? { config } : {}), ...(name ? { name } : {}) },
-        30000
+        45000
       )
     }
   )

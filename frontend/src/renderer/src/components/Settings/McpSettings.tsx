@@ -528,6 +528,17 @@ export default function McpSettings(): JSX.Element {
                             : '试连失败'}
                         </p>
                         {!test.ok && <p className="mcp-test-error mono">{test.error}</p>}
+                        {/* 试连通过且后端顺势重连过 → 状态点会在同一帧的 mcp_config 里
+                            变成「已连接」。把这行字加上，否则用户会盯着"框是绿的、
+                            状态点是红的"怀疑自己看错了。 */}
+                        {test.ok && test.refreshed && (
+                          <p className="mcp-test-sync">
+                            已同步到运行时
+                            {typeof test.refresh_connected === 'number' && test.refresh_connected > 1
+                              ? `（${test.refresh_connected} 个运行时）`
+                              : ''}
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>

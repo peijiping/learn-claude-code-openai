@@ -1187,8 +1187,13 @@ export interface McpConfigResult {
   pkg_action?: McpPkgActionResult
 }
 
-/** `mcp_server_test` 回执：一次性试连（**不落盘、不登记**）。
- *  会真实起子进程 / 建连接并等握手，最长 MCP_CONNECT_TIMEOUT（默认 15s）。 */
+/** `mcp_server_test` 回执：一次性试连（**不落盘**）。
+ *  会真实起子进程 / 建连接并等握手，最长 MCP_CONNECT_TIMEOUT（默认 15s）。
+ *
+ *  ⚠️ 「不登记」在 2026-10-08 起只对**草稿 / 禁用条目**成立：试连通过且命中
+ *  已保存的启用条目时，后端会**顺势做一次定点重连**并多发一帧 `mcp_config`
+ *  刷新列表状态（详见 ws_bridge 的 `_mcp_reconnect_one_sync`）。状态变
+ *  `connected` 是因为**真的连上了**，不是前端贴标签。 */
 export interface McpTestResult {
   ok: boolean
   /** 失败原因（后端已格式化为一行）；ok=true 时为空串 */
@@ -1197,6 +1202,10 @@ export interface McpTestResult {
   tool_count: number
   resource_count: number
   elapsed_ms: number
+  /** 后端是否顺势做了定点重连。false = 草稿 / 禁用条目 / 试连失败，状态不刷新。 */
+  refreshed?: boolean
+  /** 重连后至少一个 runtime 已连接的个数（仅 refreshed=true 时有意义） */
+  refresh_connected?: number
 }
 
 /** `mcp_server_upsert` 载荷。`original_name ≠ name` 表示重命名（改 JSON key）。 */

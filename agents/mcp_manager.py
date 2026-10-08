@@ -34,6 +34,7 @@ import json
 import os
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -43,7 +44,10 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.sse import sse_client
 
+from logger import get_logger
 from paths import MCP_CONFIG, ROOT_DIR
+
+log = get_logger("mcp")
 
 
 # ── 名称规范化 ───────────────────────────────────────────────────────
@@ -237,20 +241,54 @@ class MCPServerSession:
                     await http_client.aclose()
 
     def stop(self) -> None:
-        """置位退出事件（让 _serve 自然 unwind 清理），join 线程，重置状态。"""
-        if self._loop is not None and self._exit is not None:
+        """置位退出事件（让 _serve 自然 unwind 清理），join 线程，重置状态。
+
+        ⚠️ 这里**必须用 `loop.call_soon_threadsafe(ev.set)`，不能**用
+        `run_coroutine_threadsafe(self._exit.set(), ...)` —— `asyncio.Event.set()`
+        是**普通同步方法**，不是协程，`run_coroutine_threadsafe` 会当场抛
+        `TypeError: A coroutine object is required`。而下面那个 `except Exception:
+        pass` 会把它静默吞掉，于是 `_exit` **永远没被置位** → `_serve` 里的
+        `await self._exit.wait()` 永不返回 → 后台线程与它 spawn 出去的子进程
+        （stdio 传输的真实进程）**全部泄漏**。
+
+        泄漏的实际后果不是"多几个僵尸进程"，而是**下一条同款条目再也连不上**：
+        典型如 codegraphcontext —— 它启动就打开一个 kuzu 嵌入式数据库并持
+        **进程间独占文件锁**，旧进程不退出，新进程启动即
+        `IO exception: Could not set lock on file` → 握手超时 → 设置页显示
+        「连接失败」。2026-10-08 实测：`disable → enable` 一轮之后即永久连不上，
+        且每个失败的连接尝试还会再泄漏一个进程，越点越坏。
+
+        同一根因还解释了 `stop()` 稳定耗时 5s：`join(timeout=5)` 一直等到超时
+        —— 线程本该在毫秒级 unwind 完（实测 `exit.set` + `join` 合计 0.17s）。
+
+        置位后再 join，并如实汇报线程是否真的退了（`stop()` 返回 `bool`），
+        让 `MCPManager.disconnect()` 能在日志/回执里如实体现。
+        """
+        loop, ev, thread = self._loop, self._exit, self._thread
+        if loop is not None and ev is not None:
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self._exit.set(), self._loop).result(timeout=5)
-            except Exception:
+                loop.call_soon_threadsafe(ev.set)
+            except RuntimeError:      # loop 已关闭（线程自行退出过了）
                 pass
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=5)
+        if thread is not None and thread.is_alive():
+            t0 = time.time()
+            thread.join(timeout=5)
+            if thread.is_alive():
+                # 到这里说明 unwind 真的卡住了。**不能静默** —— 泄漏的子进程会
+                # 让同款条目永久连不上（见 docstring），必须在日志里留证据。
+                log.warning("停止超时（>5s）：%s 后台线程仍在运行，可能残留子进程",
+                            self.name)
+                print(f"  \033[31m[mcp] warning: '{self.name}' 停止超时，"
+                      f"后台线程仍在运行（可能残留子进程）\033[0m")
+            else:
+                log.debug("停止完成：%s（%.2fs）", self.name, time.time() - t0)
         self._session = None
         self._thread = None
         self._loop = None
+        self._exit = None
         self._tools = []
         self._resources = []
+        return thread is None or not thread.is_alive()
 
     def restart(self) -> None:
         """stop + start（传输死掉后自愈）。"""
@@ -455,13 +493,39 @@ class MCPManager:
             available = ", ".join(self._config.keys()) or "(none configured)"
             return f"Unknown server '{name}'. Available: {available}"
         session = MCPServerSession(name, cfg)
+        transport = cfg.get("type", "stdio" if "command" in cfg else "streamable-http")
+        # 细粒度日志（2026-10-08）：连接是**最慢也最容易失败**的一步（握手最长
+        # MCP_CONNECT_TIMEOUT=15s），过去只有失败时的 print 且走了 stdout，
+        # 在日志文件里什么都看不到 —— 排查「开关点了没反应」时完全瞎着。
+        # 这里把「打算连什么 / 连了多久 / 成了还是败了」三段都落到日志文件。
+        target = (f"{cfg.get('command')} {' '.join(cfg.get('args') or [])}".strip()
+                  if transport == "stdio" else str(cfg.get("url", "")))
+        log.info("连接中: %s（%s）%s", name, transport, target)
+        t0 = time.time()
         result = session.start()
+        elapsed = time.time() - t0
         if session.ready:
             self._clients[name] = session
             self._last_errors.pop(name, None)
+            log.info("连接成功: %s（%.2fs，%d 工具 / %d 资源）", name, elapsed,
+                     len(session.tools), len(session.resources))
             print(f"  \033[31m[mcp] connected: {name} → {session.tool_names}\033[0m")
             return result
         self._last_errors[name] = result      # 供设置页显示「为什么连不上」
+        log.warning("连接失败: %s（%.2fs）%s", name, elapsed, result)
+        # ⚠️ 失败分支**必须显式 stop()**（2026-10-08 补）。`session` 是局部变量，
+        # 出了这个函数就再没人持有它 —— 而 stdio 传输 spawn 出去的是**真实子进程**。
+        # 不收的话：每次失败的连接尝试泄漏一个子进程；其中持独占资源的那种
+        # （cgc 的 kuzu 文件锁）会**永久毒化**后续所有连接尝试。
+        # 实测：全局 Agent 已连上 cgc 时，会话 runtime 的 manager 再连一次必然
+        # 撞锁超时（kuzu 进程间独占，属先验事实）—— 这条路径的泄漏最容易被误
+        # 读成"偶发"，实际每次开会话都会漏一个。
+        try:
+            if not session.stop():
+                log.warning("连接失败后的清理未完成：%s 可能有残留子进程", name)
+        except Exception as exc:  # noqa: BLE001 - 清理失败不能盖掉原始错因
+            log.warning("连接失败后的清理异常：%s → %s: %s", name,
+                        type(exc).__name__, exc)
         print(f"  \033[31m[mcp] connect failed: {name} → {result}\033[0m")
         return f"MCP error: {result}"
 
@@ -475,11 +539,16 @@ class MCPManager:
 
     def connect_all(self) -> int:
         """启动自动加载：连接全部已配置服务器，返回成功连接数量。"""
+        t0 = time.time()
         count = 0
         for name in list(self._config.keys()):
             result = self.connect(name)
             if not result.startswith("MCP error") and not result.startswith("Unknown"):
                 count += 1
+        # 汇总一条：Agent 构造时这条日志是「MCP 为什么没连上」的第一手证据
+        # （逐条 connect 的日志都在，但"这次启动一个都没连上"需要一眼可见）。
+        log.info("connect_all 完成：%d/%d 成功，耗时 %.2fs", count,
+                 len(self._config), time.time() - t0)
         return count
 
     def disconnect(self, name: str) -> str:
@@ -487,7 +556,14 @@ class MCPManager:
         session = self._clients.pop(name, None)
         if session is None:
             return f"MCP server '{name}' not connected"
-        session.stop()
+        t0 = time.time()
+        clean = session.stop()
+        # stop() 返回 False = 后台线程没在 5s 内退出 → 子进程可能残留。这类残留
+        # 对 stdio 类服务器是致命的（cgc 持 kuzu 独占文件锁，残留一个就再也连不上），
+        # 必须留在日志里，否则只能靠"再点一次开关看能不能连上"来猜。
+        level = log.info if clean else log.warning
+        level("已断开: %s（%.2fs%s）", name, time.time() - t0,
+              "" if clean else "，⚠️ 后台线程未退出，可能有残留子进程")
         return f"Disconnected MCP server '{name}'"
 
     def shutdown(self) -> None:
@@ -514,23 +590,36 @@ class MCPManager:
         self._config = new
         self._config_mtime = new_mtime
         logs: list[str] = []
+        # 细粒度日志（2026-10-08）：**把"为什么动 / 为什么不动"写清楚**。
+        # 静默 return 是这类问题最难查的地方 —— 配置文件明明改了，重连却没发生，
+        # 而日志里一个字都没有（本次 codegraphcontext 关一次就再也连不上，
+        # 表面看像"没触发重载"，实际是重载了但子进程泄漏导致必然失败）。
+        log.info("检测到配置变更，开始 reconcile：%s → %s",
+                 sorted(old.keys()), sorted(new.keys()))
         # 1) 被删除或配置变化的服务器 → 断开
         for name in list(self._clients.keys()):
             if name not in new or new[name] != old.get(name):
+                reason = "条目已移除" if name not in new else "配置有变化"
+                log.info("断开: %s（%s）", name, reason)
                 self.disconnect(name)
-                logs.append(f"  [mcp] disconnected: {name}")
+                logs.append(f"  [mcp] disconnected: {name} ({reason})")
         # 2) 新增或配置变化的服务器 → 连接
         for name, cfg in new.items():
             if name not in self._clients and cfg != old.get(name):
+                log.info("重连: %s", name)
                 result = self.connect(name)
-                logs.append(f"  [mcp] connect {'ok' if not result.startswith('MCP error') else 'failed'}: {name}")
+                ok = not result.startswith("MCP error")
+                logs.append(f"  [mcp] connect {'ok' if ok else 'failed'}: {name}")
         # 3) 清理死会话（调用时自愈之外，周期兜底）
         for name in list(self._clients.keys()):
             if not self._clients[name].is_alive():
+                log.warning("清理死会话: %s（后台线程已退出）", name)
                 self.disconnect(name)
                 logs.append(f"  [mcp] dropped dead session: {name}")
-        for log in logs:
-            print(f"\033[31m{log}\033[0m")
+        if not logs:
+            log.info("配置变更但无需增删改（仅顺序/无关字段变化）")
+        for log_line in logs:
+            print(f"\033[31m{log_line}\033[0m")
         return "\n".join(logs)
 
     # ── 工具池组装（每轮现场组装，非缓存） ──────────────────────────

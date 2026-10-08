@@ -191,6 +191,46 @@ mcp_server_upsert / mcp_server_remove
 
 `maybe_reload` 的 reconcile 是**精确的**：只断开配置变了/被删的、只连接新增/配置变了的条目，其余连接不动。这也是 §1.3「元数据必须旁路」的落实点。
 
+### 6.0 试连通过后的定点重连（2026-10-08 补）
+
+**症状**：开关开着时目标服务没启动 → 真实 `connect()` 失败、`_last_errors` 留下错因、列表显示「连接失败」；用户把服务起好后点「测试」→ 试连成功、列出 N 个工具，但**列表状态仍是「连接失败」**，必须把开关关一下再打开才恢复。
+
+**根因**：`mcp_server_test` 的试连是**刻意无副作用**的 —— `_mcp_test_sync` 起一个临时 `__test__` session、握手列工具、**立刻 stop**，不落盘也不进任何 runtime 的 `_clients`。而列表状态读的是 `_mcp_runtime_snapshot()` → 各 manager 的 `_clients` / `_last_errors`，也就是**上一次真实 connect 的残留结论**。试连与状态刷新在原设计里是两个互不相干的世界。
+
+「关一下再打开」之所以能修好，是因为那一次**真的写了盘** → mtime 变了 → `maybe_reload()` 才不空转（见下）。
+
+**为什么不复用 `_reload_mcp_all_runtimes()`**：`maybe_reload()` 头一件事是比 mtime（`mcp_manager.py:586`），没变就 `return ""`。试连刻意不落盘 → mtime 不变 → **整个热重载是空转**，一个连接都不会重发。所以必须新开一条**按 name 定点重连**的路径（`_mcp_reconnect_one_sync`），自己调 `connect(name)`，不依赖 mtime。
+
+```
+mcp_server_test（{name} 寻址）
+  → _mcp_test_sync：临时 session 握手 → stop → 结论 ok/失败
+  → ok 且【寻址是 {name}】且【磁盘条目 enable=1】
+      → _mcp_reconnect_one_sync(name)：逐个 manager，connected_names() 里就跳过，
+        否则 connect(name)（模块级锁串行化）
+      → 多发一帧 mcp_config（回读全量状态）
+  → 回 mcp_test（含 refreshed）
+```
+
+**三条触发条件缺一即刷新会骗人**：
+
+| 条件 | 缺了会怎样 |
+| --- | --- |
+| 试连 `ok` | 连不上还刷新 = 状态与事实相反 |
+| 寻址是 `{name}` 而非 `{config}` | `{config}` 是**未保存的表单草稿**，重连用的是磁盘旧配置，会显示成「新配置已生效」 |
+| 磁盘条目 `enable=1` | 禁用条目刷成「已连接」是假的（列表状态会按 `enable` 优先判成 `disabled`，两处打架） |
+
+仍然**不落盘**：只调 `connect()`，不碰 `mcp_servers.json`。
+
+**为什么是"真重连"而不是"前端把 status 刷成 connected"**：后者是撒谎 —— `_clients` 里依然没有该条目，模型这一轮真要调它的工具照样失败，而 UI 上看不出任何差别。**状态变 `connected` 必须是因为真的连上了**，这也是回执里 `refreshed` 字段存在的意义：前端据此显示「已同步到运行时」，否则用户会盯着"框是绿的、状态点是红的"怀疑自己看错了。
+
+**前端零改动的关键**：主进程 `onEvent` 是先 `webContents.send` 再 `resolvePending`（`main/index.ts:296-300`），渲染层 `case 'mcp_config'` 本来就是**整份替换** → 多发一帧就能刷新列表，不需要新的信封或增量拼接。
+
+**必须一起改的超时**：`mcpServerTest` 的 IPC 超时从 30s 抬到 **45s**。最坏路径 = 试连 15s + 重连 15s = 30s，**正好贴死** 30s 边界 → 偶发 promise 回 null、回执被丢弃，用户看到"点测试没反应"。与 `mcpServerUpsert` 的 30s 是同源问题，但这里要两次握手，只能再放宽一档。
+
+**并发安全**：`MCPManager` 自身对 `_clients` **没有任何锁**。这里的重连可能与对话轮的 `maybe_reload()`、upsert 触发的热重载同时落在同一个 manager 上 → 两个线程各自 `connect()` 时后写的直接覆盖 `_clients[name]`，先建的那个 session 失去引用 → **stdio 子进程泄漏**；泄漏的子进程若持独占文件锁（cgc 的 kuzu），后续所有连接尝试必然失败。`_mcp_reconnect_lock` 就是为此存在的，粒度取「单条目重连」而非「整个 manager」，锁内只有一次 connect 握手。
+
+**已知不解决的**：cgc 这类持**进程级独占锁**的 stdio 服务器，测试起一个进程、stop、再重连一次，若此刻别的 runtime 还持着锁，重连**仍会**失败 15s。这是先验事实不是 bug（多 manager 并存时必然只有一个连上），状态显示 `error` 是诚实的。
+
 ### 6.1 开关的乐观翻转（2026-09-30 补）
 
 **缺陷**：点启停开关后 UI 无反馈，要关掉设置页重开才能看到新状态。
@@ -263,7 +303,7 @@ CDP 实测（真实组件 + 桩后端，`/tmp/mcp-verify/run2.js`）：
 | `mcp_config_get` | — | `mcp_config` | 读全量：原始条目 + 元数据 + 连接状态 + **本地包列表** |
 | `mcp_server_upsert` | `{name, config, original_name?, meta?}` | `mcp_config` | 新增/编辑/重命名/启停（`original_name ≠ name` = 改名） |
 | `mcp_server_remove` | `{name}` | `mcp_config` | 删条目（含旁路元数据，**不动包**） |
-| `mcp_server_test` | `{config}` **或** `{name}` | `mcp_test` | **一次性试连，不落盘**。`name` = 测已保存条目（取真实密钥） |
+| `mcp_server_test` | `{config}` **或** `{name}` | `mcp_test`（+ 条件性追加一帧 `mcp_config`） | **一次性试连，不落盘**。`name` = 测已保存条目（取真实密钥）。命中「`name` + 已启用」时**额外做一次定点重连并刷新状态**（见 §6.0） |
 | `mcp_market_search` | `{query?, cursor?, limit?}` | `mcp_market` | 代理官方 registry 搜索 |
 | `mcp_market_resolve` | `{item}` | `mcp_market_plan` | **纯翻译，不落盘** —— 供安装确认页展示 |
 | `mcp_pkg_resolve` | `{name, version?}` | `mcp_pkg_plan` | **纯解析，不落盘、不下载** —— 版本/哈希/依赖树/脚本清单 |
@@ -328,7 +368,7 @@ CDP 实测（真实组件 + 桩后端，`/tmp/mcp-verify/run2.js`）：
 }
 ```
 
-`mcp_test` 载荷：`{ok, error, tools[], tool_count, resource_count, elapsed_ms}`。
+`mcp_test` 载荷：`{ok, error, tools[], tool_count, resource_count, elapsed_ms, refreshed?, refresh_connected?}`。后两个字段是 2026-10-08 的定点重连结果（见 §6.0）：`refreshed=true` 表示后端顺势重连过、前端应显示「已同步到运行时」；草稿 / 禁用条目 / 试连失败时为 `false`，状态不刷新。
 `mcp_market` 载荷：`{items[], next_cursor, query, error, cached, elapsed_ms}`。
 `mcp_market_plan` 载荷：`{ok, name, config, env_required[], package_args[], pkg, warnings[], unsupported, error}`。
 其中两个 2026-10-07 新增的字段是给「下载到本地」用的：
@@ -395,7 +435,7 @@ npm 侧的另两个可调项：`MCP_NPM_PATH`（打包后 PATH 可能与开发�
 | `agents/mcp_installer.py` | **新建（2026-10-07）**：本地包安装器 —— 规格白名单、目录命名、`npm view` 解析、dry-run 依赖树、安装（强制安全 flag）、哨兵、装后三重校验、bin 解析、列表 / 卸载 / 复核。**全部子进程调用走可注入 runner**（测试接缝） |
 | `agents/paths.py` | 新增 `MCP_SOURCES = MCP_DIR / "mcp_sources.json"`；2026-10-07 加 `MCP_PKGS_DIR = MCP_DIR / "pkgs"` 并在 `ensure_dirs()` 补建 |
 | `agents/mcp_manager.py` | **5 行**：`connect()` 失败时记 `_last_errors[name]`、成功时清除；新增只读 `last_error(name)` |
-| `agents/ws_bridge.py` | 6 条命令分支 + 6 个辅助函数（`_mcp_store` / `_mcp_managers` / `_mcp_runtime_snapshot` / `_mcp_config_payload*` / `_reload_mcp_all_runtimes` / `_mcp_test_sync`）；2026-10-07 再加 4 条本地包命令，`_mcp_config_payload_sync` 增 `packages` / `pkgs_dir` / `pkg_action` |
+| `agents/ws_bridge.py` | 6 条命令分支 + 6 个辅助函数（`_mcp_store` / `_mcp_managers` / `_mcp_runtime_snapshot` / `_mcp_config_payload*` / `_reload_mcp_all_runtimes` / `_mcp_test_sync`）；2026-10-07 再加 4 条本地包命令，`_mcp_config_payload_sync` 增 `packages` / `pkgs_dir` / `pkg_action`；2026-10-08 加 `_mcp_reconnect_one_sync` + `_mcp_reconnect_lock`（试连后的定点重连，见 §6.0） |
 | `tests/test_mcp_installer.py` | **新建（2026-10-07）**：30 例，假 runner 不真跑 npm |
 | `.env.example` | 补 6 个可调参数（`MCP_MARKET_URL` / `_TIMEOUT` / `_PAGE_SIZE` / `_CACHE_TTL` / `MCP_CONNECT_TIMEOUT` / `MCP_CALL_TIMEOUT`）；2026-10-07 再加 `MCP_NPM_PATH` / `MCP_NPM_REGISTRY` / `MCP_RESOLVE_TIMEOUT` / `MCP_INSTALL_TIMEOUT` |
 
@@ -654,3 +694,87 @@ bin 解析按 POSIX（`node_modules/.bin/<name>` 符号链接）实现。Windows
 代价要说清楚：镜像**能同时篡改元数据与它声明的哈希**，"装后对账"那道防线对镜像攻击无效（它只挡"两次请求之间被重发"）。所以 §8.1 的安全模型在换源后整体降一档 —— 换来的是能装。
 
 > 顺带一条：`mcp-server-time` 已被作者**从 npm 撤下**（元数据里有 `unpublished`），`npm view` 回 404。本模块的处理是给「registry 上没有这个包或版本」而不是崩 —— 这是 404 分支的实测样本。
+
+---
+
+## 九、启停失灵的两个根因（2026-10-08 实测修复）
+
+用户报的现象是两条，看起来无关，实际是**两个独立缺陷叠在一起**：
+
+1. codegraphcontext 启动时是连上的，**关一次再开就再也连不上**（显示「连接失败」）；
+2. 之后**开关按钮点击完全没反应**（前端既不变色也不动）。
+
+日志里的全部证据只有两行 —— `09:26:38` 与 `09:26:52` 各一条「MCP 条目已保存」，之后再无任何命令到达后端。所以第 2 条不是"前端没发请求"，而是**第一条之后链路就堵死了**。
+
+### 9.1 根因一：`stop()` 从未真正停下（引擎层一行错，泄漏子进程）
+
+`MCPServerSession.stop()` 里那句置位退出事件的代码是这样的：
+
+```python
+asyncio.run_coroutine_threadsafe(self._exit.set(), self._loop).result(timeout=5)
+```
+
+`asyncio.Event.set()` 是**普通同步方法，不是协程**（`inspect.iscoroutinefunction(asyncio.Event().set)` → `False`）。于是 `run_coroutine_threadsafe` 当场抛 `TypeError: A coroutine object was required`，而下面紧跟的 `except Exception: pass` **把它静默吞掉了**。
+
+后果是链式的：
+
+- `_exit` 永远没被置位 → `_serve()` 里的 `await self._exit.wait()` 永不返回；
+- 后台线程不退 → 它 spawn 出去的 **stdio 子进程也不退**；
+- `join(timeout=5)` 一直等到超时 → **`stop()` 稳定耗时 5.0s**（这就是"卡住"的直接指纹；正常 unwind 实测只要 **0.17s**）；
+- `stop()` 仍把 `_thread`/`_loop` 置 None 并返回，**调用方以为已经断开干净了**。
+
+对 stdio 类服务器，泄漏的子进程是致命的。codegraphcontext 启动就打开一个 **kuzu 嵌入式数据库并持进程间独占文件锁**：
+
+```
+RuntimeError: IO exception: Could not set lock on file:
+  /Users/peijiping/.codegraphcontext/global/db/kuzudb
+```
+
+旧进程不退出 → 新进程启动即撞锁 → 握手超时（15s）→「连接失败」。而且**每次失败的连接尝试又会再泄漏一个进程**，越点越坏。这解释了"关一次就再也连不上"这个非线性的症状。
+
+**修法**（`mcp_manager.py`）：用 `loop.call_soon_threadsafe(ev.set)`，并在 `join` 后如实汇报线程是否退了（`stop()` 改返回 `bool`）。
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `disable` 耗时 | 5.0s（死等 join 超时） | **0.2s** |
+| `disable → enable` 结果 | 连接失败（kuzu 锁） | **connected** |
+| 残留 cgc 子进程 | 每次失败尝试 +1 | **shutdown 后归零** |
+
+`stop()` 里那个 `except Exception: pass` 是这次排查最大的陷阱：**它把一个必然抛的异常变成了静默失败**。凡是需要"跨线程操作 loop 上的对象"，都要先确认那个对象是不是协程。
+
+### 9.2 根因二：热重载串行 → 撞 30s 超时 → 前端"点了没反应"
+
+`_reload_mcp_all_runtimes()` 原本是**逐个 manager 串行**调 `maybe_reload()`。而 `maybe_reload()` 内部要对每条**启用中**的条目做一次真实的 connect 握手，单条上限 `MCP_CONNECT_TIMEOUT`（默认 15s）。
+
+于是耗时是**各 manager 累加**：全局 Agent + 1 个会话 runtime = 2 个 manager × (cgc 连不上 15s + zotero 0.03s) ≈ **30s+**，而主进程 `mcpServerUpsert` 的超时正好是 **30s**。超时 → promise 回 `null` → 回执被丢弃 → `mcpSaving` 复位但列表状态不更新 → **用户看到"点了没反应"**。
+
+**修法**（`ws_bridge.py`）：`ThreadPoolExecutor` 并发化，耗时 = 最慢的那一个，与 manager 个数无关。
+
+| 场景（2 个 manager） | 串行 | 并发 |
+| --- | --- | --- |
+| `disable` | — | **0.15s** |
+| `enable` | 30s+（**超时**） | **15.01s** ✅ |
+
+注意并发提交时**必须一次性 submit 全部 future 再逐个 `result()`**，逐个 `submit`+`result` 会退化成串行，等于没改。各 manager 读同一份配置文件、只读无写，无共享可变状态，并发安全。
+
+### 9.3 连带修的日志缺口（这类问题本来查不出来）
+
+`mcp_manager.py` 过去**全部用 `print` 打状态**，走 stdout，**不落日志文件**。失败路径有 print 但成功路径没有，重载决策过程一个字都没有。所以当时拿着 `agent_2026-10-08.log` 只能看到"MCP 条目已保存"，看不到"为什么没连上"。
+
+现改为 `get_logger("mcp")` 落 `~/.aigent/logs/agent_日期.log`，并把三段关键信息补齐：
+
+- **打算连什么**：`连接中: <name>（<transport>）<command+args | url>` —— 能区分"命令填错了"和"服务没起来"；
+- **连了多久、成没成**：`连接成功: <name>（<s>，N 工具 / M 资源）` / `连接失败: <name>（<s>）<原因>`；
+- **重载决策**：`检测到配置变更，开始 reconcile：<旧 keys> → <新 keys>`，逐条 `断开:` / `重连:`，无事发生时明确 `配置变更但无需增删改`（**静默 return 是这类问题最难查的地方**）；
+- **重载总耗时**：`MCP 热重载完成：N/M 个 runtime，耗时 X.XXs` —— 这一行是 §9.2 的判据，一旦逼近 30s 就能立刻看出要动哪里；
+- **泄漏取证**：`disconnect` 在线程没退出时打 `warning`，`stop` 超时同样告警 —— 残留子进程从"要靠猜"变成"日志里就有"。
+
+`connect_all()` 另加一条汇总（Agent 构造时的第一手证据）：`connect_all 完成：N/M 成功，耗时 X.XXs`。
+
+### 9.4 验收
+
+- **448 后端测试全绿**（`Ran 448 tests in 8.3s / OK (skipped=4)`，隔离 `HOME` 跑，避免真实 `mcp_servers.json` 里的 cgc 让每个构造 Agent 的用例都等一次 15s 握手）；
+- 前端**零改动**（本次两个根因都在后端），`tsc --noEmit` 通过；
+- 真机复现脚本实测：`disable → enable → disable → enable` 四轮全部符合预期，退出后 `pgrep` 无残留。
+
+> 遗留（**未修，下次遇到同一现象时先查这里**）：日志里那条 `Could not set lock on file` 也可能是**另一个真实 cgc 实例**（另一个进程里跑着、或上次异常退出的僵尸进程）持着锁，而不是本模块泄漏。判据是修复合入后若仍失败，跑 `pgrep -fl "cgc mcp start"` 看有几个 —— 多于一个就是外部占用，需手动清理后再开关。

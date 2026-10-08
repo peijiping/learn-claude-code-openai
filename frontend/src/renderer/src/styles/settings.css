@@ -1855,6 +1855,13 @@
   word-break: break-all;
   white-space: pre-wrap;
 }
+/* 「已同步到运行时」：试连通过且后端顺势重连过 → 状态点同一帧变「已连接」。
+   走 success 色而非 secondary，否则和上面那行"试连成功"标题分不出主次。 */
+.mcp-test-sync {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-success, #34c759);
+}
 
 .mcp-path {
   margin: 0;

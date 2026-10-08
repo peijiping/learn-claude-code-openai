@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Optional
@@ -1051,21 +1052,129 @@ async def _mcp_config_payload(applied: bool | None = None,
         _mcp_config_payload_sync, applied, errors, warnings, msg, pkg_action)
 
 
+def _reload_one_manager(mgr) -> bool:
+    """单个 manager 热重载；返回是否成功（异常已被吞掉记日志）。"""
+    try:
+        mgr.maybe_reload()
+        return True
+    except Exception as exc:  # noqa: BLE001 - 单个 runtime 坏了不影响其余
+        log.warning("MCP 热重载失败：%s: %s", type(exc).__name__, exc)
+        return False
+
+
 def _reload_mcp_all_runtimes() -> int:
     """配置落盘后让所有已构造 runtime 立即 reconcile（mtime 已变 → 精确增删改）。
 
     复用既有 `maybe_reload()`，**不需要新增"重新加载"接口**。未构造的会话不用管：
     `agent_full_v2.py` 构造 Agent 时 `connect_all()` 自然读到新配置。返回触发过的
     runtime 数（仅日志用）；任何异常都不得影响保存回执。
+
+    ⚠️ **必须并发，不能串行**（2026-10-08 修，实测「开关点了没反应」的根因之二）。
+    `maybe_reload()` 内部对每条启用中的条目做 connect 握手，单条上限
+    `MCP_CONNECT_TIMEOUT`（默认 15s）。串行时耗时是**各 manager 累加**：
+    全局 Agent + N 个会话 runtime，2 个 manager × (cgc 连不上 15s + zotero 0.03s)
+    = **30s+，正好撞上主进程 `mcpServerUpsert` 的 30s 超时** → promise 回 null →
+    回执被丢弃、`mcpSaving` 复位但列表状态不更新 → 用户看到"点了没反应"。
+    并发后总耗时 = 最慢的那一个（≈15s），与 manager 个数无关。
+
+    `maybe_reload()` 逐 manager 加锁保护 `_config` 之外的状态，本身无跨 manager
+    共享可变状态，故并发安全（每个 manager 各自读同一份配置文件，只读无写）。
     """
-    n = 0
-    for mgr in _mcp_managers():
-        try:
-            mgr.maybe_reload()
-            n += 1
-        except Exception as exc:  # noqa: BLE001
-            log.warning("MCP 热重载失败：%s: %s", type(exc).__name__, exc)
+    managers = _mcp_managers()
+    if not managers:
+        return 0
+    t0 = time.time()
+    if len(managers) == 1:
+        n = 1 if _reload_one_manager(managers[0]) else 0
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(managers), 8),
+                                 thread_name_prefix="mcp-reload") as pool:
+            # 一次性提交全部 future 再等，避免逐个 submit+result 退化成串行
+            futures = [pool.submit(_reload_one_manager, m) for m in managers]
+            n = sum(1 for f in futures if f.result())
+    # 这次热重载是整条 upsert 回执里最慢的一段（要真做 connect 握手），
+    # 必须单独记耗时：主进程 mcpServerUpsert 的超时是 30s，一旦逼近它，
+    # 前端表现就是"开关点了没反应"（promise 回 null、回执被丢弃）。
+    log.info("MCP 热重载完成：%d/%d 个 runtime，耗时 %.2fs", n, len(managers),
+             time.time() - t0)
     return n
+
+
+# 定点重连的进程级锁。**必须跨 manager 串行化**（2026-10-08 补）。
+# 试连触发的重连与对话轮的 `maybe_reload()`、与 upsert 触发的热重载可能同时落在
+# 同一个 manager 上，而 `MCPManager` 自身对 `_clients` **没有任何锁**：
+# 两个线程各自跑 `connect()` 时，后写的直接覆盖 `_clients[name]`，先建的那个
+# session 失去引用 → **stdio 子进程泄漏**。泄漏的子进程若持独占文件锁
+# （cgc 的 kuzu），后续所有连接尝试必然失败，且看不出与本次改动有关。
+# 粒度取"单条目重连"而非"整个 manager"：锁内只有一次 connect 握手。
+_mcp_reconnect_lock = threading.Lock()
+
+
+def _mcp_reconnect_one_sync(name: str) -> dict:
+    """试连成功后，让**所有**已构造 runtime 真正把这个条目连上。
+
+    为什么**不能**复用 `_reload_mcp_all_runtimes()`（2026-10-08）：
+    `maybe_reload()` 头一件事是比 `mtime`，没变就 `return ""`（mcp_manager.py:586）。
+    试连刻意**不落盘** → 文件 mtime 不变 → 整个热重载是**空转**，一个连接都不会
+    重发。这正是"关一下再打开开关就好了"的机制（那一次真写了盘）。
+    所以这里必须自己调 `connect(name)`，点名重连，不依赖 mtime。
+
+    三个必须守住的边界：
+    1. **已连接的直接跳过** —— `connect()` 虽有 `if name in self._clients: return`
+       的幂等保护，但探测本身不花时间、真正贵的是漏进去那次白跑的 15s 预算。
+    2. **取并集语义** —— 任一 runtime 连上就算成功（与 `_mcp_runtime_snapshot`
+       的状态口径一致）；逐个 manager 的错因只进日志，不回传（回执里的 `error`
+       已经被试连结论占用了）。
+    3. **绝不上抛** —— 调用点在 WS 命令分发链上，抛出去会掀掉整条连接。
+
+    返回 `{refreshed, connected, skipped, total}`：`refreshed` 供回执区分
+    "试连通过但没触发重连"（草稿 / 禁用条目）与"已同步到运行时"。
+    """
+    started = time.time()
+    if not name:
+        return {"refreshed": False, "connected": 0, "skipped": 0, "total": 0}
+    try:
+        managers = _mcp_managers()
+    except Exception as exc:  # noqa: BLE001 - 取列表失败不该让试连结论崩掉
+        log.warning("MCP 定点重连：取运行时列表失败 %s: %s", type(exc).__name__, exc)
+        return {"refreshed": False, "connected": 0, "skipped": 0, "total": 0}
+
+    connected = 0
+    skipped = 0
+    for mgr in managers:
+        try:
+            # 已在连接中：算"已同步"，不重复握手。
+            if name in mgr.connected_names():
+                skipped += 1
+                connected += 1
+                continue
+        except Exception as exc:  # noqa: BLE001 - 兼容没有该方法的旧 manager
+            log.warning("MCP 定点重连：读取连接表失败 %s: %s", type(exc).__name__, exc)
+            continue
+        try:
+            with _mcp_reconnect_lock:
+                result = mgr.connect(name)
+            # ⚠️ 判据必须是「**登记成功**」而不是「没报错」：`connect()` 对未知条目
+            # 返回的是 `Unknown server 'x'. Available: ...`，**不以 `MCP error`
+            # 开头**（mcp_manager.py:493）。只判 `startswith("MCP error")` 会把
+            # "条目根本没进这个 manager 的配置"误计成已连接 → `refresh_connected`
+            # 虚报、前端显示「已同步到运行时（1 个运行时）」而状态其实没变。
+            # 权威判据只有一个：它有没有进 `_clients`。
+            if name in mgr.connected_names():
+                connected += 1
+            else:
+                # 典型场景：cgc 这类持进程级独占锁的 stdio 服务器，别的 runtime
+                # 还持着锁 → 这里必然超时失败。这是**先验事实不是 bug**
+                # （多 manager 并存时只有一个能连上），状态显示 error 是诚实的。
+                log.warning("MCP 定点重连未成功：%s → %s", name, result)
+        except Exception as exc:  # noqa: BLE001 - 单个 manager 坏了不影响其余
+            log.warning("MCP 定点重连异常：%s %s: %s", name, type(exc).__name__, exc)
+    if connected:
+        log.info("MCP 定点重连完成：%s → %d/%d 个 runtime 已连接（%d 个原本就在连接），"
+                 "耗时 %.2fs", name, connected, len(managers), skipped,
+                 time.time() - started)
+    return {"refreshed": True, "connected": connected, "skipped": skipped,
+            "total": len(managers)}
 
 
 def _mcp_test_sync(config: dict) -> dict:
@@ -3326,6 +3435,7 @@ async def handle(ws):
                 probe_cfg = payload.get("config")
                 probe_name = str(payload.get("name") or "").strip()
                 test_error = ""
+                probe_from_name = False
                 if not isinstance(probe_cfg, dict) and probe_name:
                     try:
                         raw = await asyncio.to_thread(_mcp_store().load_raw)
@@ -3334,22 +3444,57 @@ async def handle(ws):
                     else:
                         found = raw.get(probe_name)
                         if isinstance(found, dict):
-                            probe_cfg = found
+                            probe_cfg, probe_from_name = found, True
                         else:
                             test_error = f"没有名为「{probe_name}」的 MCP 服务"
                 if test_error:
                     await safe_send(ws, _envelope("mcp_test", {
                         "ok": False, "error": test_error, "tools": [],
-                        "tool_count": 0, "resource_count": 0, "elapsed_ms": 0}))
+                        "tool_count": 0, "resource_count": 0, "elapsed_ms": 0,
+                        "refreshed": False}))
                 elif not isinstance(probe_cfg, dict):
                     await safe_send(ws, _envelope("mcp_test", {
                         "ok": False, "error": "需要 config 或 name 之一", "tools": [],
-                        "tool_count": 0, "resource_count": 0, "elapsed_ms": 0}))
+                        "tool_count": 0, "resource_count": 0, "elapsed_ms": 0,
+                        "refreshed": False}))
                 else:
                     # 真实起子进程 / 真实建连接并等握手（最长 MCP_CONNECT_TIMEOUT=15s）
                     # → 必须下线程，否则阻塞事件循环会让所有会话的流式事件一起卡住。
-                    await safe_send(ws, _envelope(
-                        "mcp_test", await asyncio.to_thread(_mcp_test_sync, probe_cfg)))
+                    result = await asyncio.to_thread(_mcp_test_sync, probe_cfg)
+                    # 试连通过 → **顺势把状态刷成真的**（2026-10-08）。
+                    # 场景：开关开着时 Zotero 没起 → 真实 connect 失败、`_last_errors`
+                    # 留下错因；用户起好 Zotero 点「测试」→ 临时 session 握手成功却被
+                    # stop 掉，`_clients` 里依然没有它 → 列表仍显示"连接失败"，
+                    # 必须关一下再打开开关才恢复（那一次 mtime 真的变了）。
+                    #
+                    # 触发条件三条全中才做，缺一即刷新会骗人：
+                    #   · `ok`                —— 连不上就别刷
+                    #   · 寻址是 `{name}`      —— `{config}` 是**未保存的表单草稿**，
+                    #     重连用的是磁盘上的旧配置，状态会显示成"新配置已生效"
+                    #   · 磁盘条目 `enable=1`  —— 禁用条目刷成"已连接"是假的
+                    # 仍然**不落盘**：只调 `connect()`，不碰 `mcp_servers.json`。
+                    if result.get("ok") and probe_from_name and probe_name:
+                        try:
+                            raw_entry = (await asyncio.to_thread(
+                                _mcp_store().load_raw)).get(probe_name)
+                        except (ValueError, OSError):
+                            raw_entry = None
+                        if isinstance(raw_entry, dict) and raw_entry.get("enable"):
+                            refresh = await asyncio.to_thread(
+                                _mcp_reconnect_one_sync, probe_name)
+                            result["refreshed"] = bool(refresh.get("refreshed"))
+                            result["refresh_connected"] = refresh.get("connected", 0)
+                    await safe_send(ws, _envelope("mcp_test", result))
+                    # 重连后**多发一帧 `mcp_config`** 让列表状态刷新。
+                    # 前端零改动即可生效：主进程 `onEvent` 是先 `webContents.send`
+                    # 再 `resolvePending`（main/index.ts:296-300），渲染层
+                    # `case 'mcp_config'` 本来就是整份替换。
+                    # ⚠️ 必须在 `mcp_test` **之后**发：主进程按 kind 匹配 pending，
+                    # 先发 `mcp_config` 不会误匹配（本次没有 mcp_config 的 pending），
+                    # 但顺序反过来会让人读日志时误以为状态是试连刷的。
+                    if result.get("refreshed"):
+                        await safe_send(ws, _envelope(
+                            "mcp_config", await _mcp_config_payload()))
 
             elif kind == "mcp_market_search":
                 # 代理官方 registry（前端不直连：跨域、统一缓存、错误文案归口）。
