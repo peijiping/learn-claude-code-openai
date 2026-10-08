@@ -17,7 +17,8 @@
 
 import re
 from pathlib import Path
-import yaml
+# `yaml` 的解析已收口到 `skill_store.parse_frontmatter`（全项目唯一实现），本模块
+# 不再直接依赖它 —— 这样 `skills.py` 只依赖标准库，单独 import 的门槛更低。
 
 
 class SkillLoader:
@@ -46,34 +47,82 @@ class SkillLoader:
 
     # s07: Skill catalog scan (used by build_system below)
     def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
-        """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
-        if not text.startswith("---"):
-            return {}, text
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            return {}, text
-        try:
-            meta = yaml.safe_load(parts[1]) or {}
-        except yaml.YAMLError:
-            meta = {}
-        return meta, parts[2].strip()
+        """Parse YAML frontmatter from SKILL.md. Returns (meta, body).
 
-    
+        **委托给 `skill_store.parse_frontmatter`（全项目唯一实现）**：
+        设置页要显示每个技能的 description，那份解析结果必须与模型看到的**逐字一致**
+        —— 两份实现必然漂移，而这类不一致最难排查。保留本方法只是为了让既有调用方
+        （含教程代码与单测）不用改。
+        """
+        from skill_store import parse_frontmatter
+
+        return parse_frontmatter(text)
+
+    def _iter_manifests(self):
+        """产出 `(技能名, SKILL.md 路径)`：内置技能目录（**只收启用的**）+ 插件贡献的。
+
+        为什么"启停"与"插件贡献"都不在这里自己判定：那是 `skill_store` /
+        `plugin_store` 的职责（它们是设置页的读写门面）。**判据只能有一处** ——
+        两处各判一次必然漂移，漂移的后果是"设置页显示已禁用、模型却照旧能看到"。
+
+        导入放在函数内是刻意的：`skills.py` 要保持"只依赖 yaml 就能 import"
+        （教程代码、部分单测会单独 import 它，那时 `paths`/`config` 未必可加载）。
+        真出问题时降级回"直接扫目录"的老行为 —— 技能全部消失比"启停失效"严重得多。
+        """
+        try:
+            from plugin_store import PluginStore
+            from skill_store import SkillStore
+        except Exception:  # noqa: BLE001 - 导入失败只降级，不能让技能整体消失
+            if self.SKILLS_DIR.exists():
+                for d in sorted(self.SKILLS_DIR.iterdir()):
+                    if d.is_dir() and (d / "SKILL.md").exists():
+                        yield d.name, d / "SKILL.md"
+            return
+
+        for name, manifest in SkillStore(self.SKILLS_DIR).iter_manifests():
+            yield name, manifest
+        try:
+            for name, manifest in PluginStore().iter_skill_manifests():
+                yield name, manifest
+        except Exception:  # noqa: BLE001 - 插件扫描失败不影响内置技能
+            return
 
     def _scan_skills(self):
-        """Scan skills/ dir, populate SKILL_REGISTRY with name/description/content."""
-        if not self.SKILLS_DIR.exists():
-            return
-        for d in sorted(self.SKILLS_DIR.iterdir()):
-            if not d.is_dir():
+        """扫描技能来源，重建 `SKILL_REGISTRY`（name / description / content）。
+
+        ⚠️ **必须整体重建（先清空）**：本方法会被 `list_skills()` 反复调用，而
+        「删除技能 / 禁用技能 / 卸插件」都要**立刻**生效。历史实现是只增不删 ——
+        那时没有删除功能所以看不出来，现在会让被删掉的技能一直留在系统提示里，
+        等于删除按钮是假的。
+
+        插件贡献的技能带 `<插件名>:<技能名>` 前缀（与 Claude Code 的命名规则一致）：
+        插件之间技能重名是常态（各家都爱叫 `code-review`），不加前缀必然互相覆盖。
+        """
+        self.SKILL_REGISTRY = {}
+        for name, manifest in self._iter_manifests():
+            try:
+                raw = manifest.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                # 单个技能读不出来就跳过它，不能让一个坏文件把整张技能表清空
                 continue
-            manifest = d / "SKILL.md"
-            if manifest.exists():
-                raw = manifest.read_text()
-                meta, body = self._parse_frontmatter(raw)
-                name = meta.get("name", d.name)
-                desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
-                self.SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+            meta, _body = self._parse_frontmatter(raw)
+
+            # 内置技能：**键仍是 frontmatter 的 name**（与历史实现逐字一致 —— 换了
+            # 键会让既有会话里模型记住的技能名失效）。插件技能则强制加 `<插件>:` 前缀
+            # （各家插件都爱叫 `code-review`，不加前缀必然互相覆盖）。
+            plugin, sep, local = name.partition(":")
+            base = local if sep else name
+            display = str(meta.get("name") or base).strip() or base
+            key = f"{plugin}:{display}" if sep else display
+            desc = str(meta.get("description") or "").strip() \
+                or (raw.split("\n")[0].lstrip("#").strip())
+            self.SKILL_REGISTRY[key] = {
+                "name": key,
+                "description": desc,
+                "content": raw,
+                "path": str(manifest),
+                "source": "plugin" if sep else "local",
+            }
 
 
     def list_skills(self) -> str:

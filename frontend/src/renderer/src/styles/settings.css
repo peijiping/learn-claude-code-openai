@@ -190,6 +190,20 @@
 .switch.on .switch-knob {
   transform: translateX(14px);
 }
+/* 保存中（乐观位已翻转、回执未到）：呼吸提示，明确"点击已被接收、正在生效"。
+   背景不动（乐观态已经体现开/关），只让旋钮轻微呼吸，避免与禁用态混淆。 */
+.switch.pending .switch-knob {
+  animation: switch-pulse 1s ease-in-out infinite;
+}
+@keyframes switch-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
 
 /* ── 添加 / 编辑模型弹窗 ── */
 .addmodel-mask {
@@ -1597,4 +1611,777 @@
 .sbx-actions {
   display: flex;
   gap: var(--sp-2);
+}
+
+/* ── MCP 服务管理设置页（设置弹窗「MCP」，docs/frontend/23）────────────── */
+.mcp {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+/* 汇总行 + 右侧操作 */
+.mcp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.mcp-summary {
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.mcp-summary b {
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+.mcp-head-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* 常驻风险横幅：MCP 是任意代码执行，这条不该被收进折叠区 */
+.mcp-risk {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: rgba(217, 119, 6, 0.08);
+  border: 1px solid rgba(217, 119, 6, 0.3);
+  color: var(--color-warn, #d97706);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+
+/* 非阻断提醒（如工具前缀撞车）：黄，与红字错误区分开 */
+.mcp-warn {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: rgba(217, 119, 6, 0.06);
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  color: var(--color-warn, #d97706);
+  font-size: var(--fs-sm);
+}
+
+/* ── 条目列表 ── */
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.mcp-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  overflow: hidden;
+}
+.mcp-row:hover {
+  border-color: var(--color-accent);
+}
+.mcp-row.error {
+  border-color: rgba(220, 38, 38, 0.4);
+}
+/* 主体 + 操作**同一行**（操作靠右）。分成两行会让 5 条就把面板撑满，
+   而这页最常见的用法是"扫一眼状态"。展开详情用 flex-basis:100% 另起一行。 */
+.mcp-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+}
+.mcp-row-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3);
+}
+
+/* 状态点五态：绿=已连接 / 红=失败 / 灰=未连接·禁用·待会话 */
+.mcp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--color-text-secondary);
+  opacity: 0.5;
+}
+.mcp-dot.connected {
+  background: var(--color-ok, #34c759);
+  opacity: 1;
+}
+.mcp-dot.error {
+  background: var(--color-danger, #dc2626);
+  opacity: 1;
+}
+
+.mcp-name {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-tag {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-code-bg);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.mcp-tag.src {
+  background: transparent;
+  border: 1px solid var(--color-border);
+}
+.mcp-status-cell {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.mcp-status-cell.ok {
+  color: var(--color-ok, #34c759);
+}
+.mcp-status-cell.warn {
+  color: var(--color-danger, #dc2626);
+}
+.mcp-tools-cell {
+  flex: 1;
+  text-align: right;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.mcp-chevron {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* 行内小按钮 */
+.mcp-act {
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mcp-act:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+.mcp-act:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* 删除：二次确认前是普通灰，arm 后变红（同归档页的 armConfirm 手感） */
+.mcp-act.danger.armed {
+  border-color: var(--color-danger, #dc2626);
+  color: var(--color-danger, #dc2626);
+  font-weight: 600;
+}
+
+/* ── 展开详情 ── */
+.mcp-detail {
+  flex-basis: 100%;
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  border-top: 1px dashed var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mcp-cmd {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.mcp-meta-line {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.mcp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+.mcp-chip {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+
+/* ── 试连结果（不落盘的一次性结论）── */
+.mcp-test-box {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.mcp-test-box.ok {
+  border-color: rgba(52, 199, 89, 0.45);
+  background: rgba(52, 199, 89, 0.07);
+}
+.mcp-test-box.fail {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: rgba(220, 38, 38, 0.06);
+}
+.mcp-test-title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-test-error {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-danger, #dc2626);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.mcp-path {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+/* ── 本地包区块（docs/frontend/23 §本地安装，2026-10-07）────────────────────
+   与上方「条目」并列的第二种资源。`.mcp-subhead` 是它与条目列表之间的分隔标题，
+   刻意不做成可折叠 —— 用户需要一眼看到"我本机到底存了哪些包/占了多少盘"。 */
+.mcp-subhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.mcp-subhead .mcp-hint {
+  font-weight: 400;
+  word-break: break-all;
+}
+/* 本地包行用 `.pkgo` 而不是复用 `.error` —— 正常态的行不该带红边 */
+.mcp-row.pkgo {
+  border-color: var(--color-border);
+}
+
+/* ── 安装方式二选一（下载到本地 / npx 拉取）── */
+.mcp-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mcp-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.mcp-radio:hover {
+  border-color: var(--color-accent);
+}
+.mcp-radio.on {
+  border-color: var(--color-accent);
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.03));
+}
+.mcp-radio input {
+  margin-top: 2px;
+  flex: none;
+}
+.mcp-radio-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mcp-radio-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.mcp-radio-desc {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+/* ── 安装期脚本警示（默认一律跳过；要跑必须显式勾选）── */
+.mcp-scripts-warn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  border-radius: var(--radius-sm);
+  background: rgba(220, 38, 38, 0.06);
+}
+.mcp-scripts-title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-danger, #dc2626);
+}
+.mcp-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+/* ── 表单视图 ── */
+.mcp-form-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.mcp-back {
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mcp-back:hover {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+.mcp-form-title {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+
+.mcp-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-3);
+}
+.mcp-field:last-child {
+  margin-bottom: 0;
+}
+.mcp-label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  font-weight: 400;
+}
+.mcp-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+}
+.mcp-input.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+textarea.mcp-input {
+  resize: vertical;
+  line-height: 1.6;
+}
+.mcp-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+/* 传输类型单选卡（三张并排，选中描边 accent） */
+.mcp-transports {
+  display: flex;
+  gap: var(--sp-2);
+}
+.mcp-transport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.mcp-transport:hover {
+  border-color: var(--color-accent);
+}
+.mcp-transport.active {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.mcp-transport-label {
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+.mcp-transport-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+/* KV 行（env / headers） */
+.mcp-kv-row {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.mcp-kv-row .mcp-input {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-del {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  line-height: 1;
+}
+.mcp-del:hover {
+  border-color: var(--color-danger, #dc2626);
+  color: var(--color-danger, #dc2626);
+}
+.mcp-add {
+  align-self: flex-start;
+  padding: 2px 8px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mcp-add:hover {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+
+.mcp-inline-warn {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-warn, #d97706);
+}
+.mcp-inline-note {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+
+/* ── MCP 市场（设置弹窗「MCP」→ 从市场安装）──────────────────────────── */
+.mcp-market-search {
+  display: flex;
+  gap: var(--sp-2);
+}
+.mcp-market-search .mcp-input {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-market-search .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+.mcp-market-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mcp-market-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+}
+.mcp-market-item:hover {
+  border-color: var(--color-accent);
+}
+.mcp-market-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.mcp-market-title {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-market-id {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  word-break: break-all;
+}
+.mcp-market-desc {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+  /* 描述可能很长：最多两行，超出省略（完整内容在 title 里） */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.mcp-market-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+.mcp-market-repo {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcp-market-actions .btn {
+  flex: none;
+  /* 仓库链接为空时（如只有包没有 repository），按钮要仍靠右 —— 否则它会掉到左边，
+     与其余条目的排版不一致。 */
+  margin-left: auto;
+}
+
+/* 来源徽标三档配色。**刻意都用中性色系** —— 三档都只做命名空间校验、
+   都没有代码审计，用绿色会暗示"更安全"，那是误导。 */
+.mcp-tag.src.official {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.mcp-tag.src.community {
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+.mcp-tag.src.domain {
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+/* ── 安装确认页：将写入的配置原文 ── */
+.mcp-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+}
+.mcp-transcript-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+}
+.mcp-transcript-key {
+  flex: none;
+  width: 64px;
+  text-align: right;
+  font-size: var(--fs-xs);
+  /* 底色是 --color-code-bg（深色），**不能**用 --color-text-secondary
+     （浅色主题下是深灰）—— 深灰压深色等于看不见。 */
+  color: var(--color-code-fg);
+  opacity: 0.72;
+}
+.mcp-transcript-val {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-code-fg);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+/* 声明的环境变量行（名称 + 输入框） */
+.mcp-env-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.mcp-env-name {
+  flex: none;
+  width: 160px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.mcp-env-row .mcp-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   技能 / 插件设置页（设置弹窗「技能」「插件」，2026-09-30，docs/frontend/24、25）
+
+   这两个页面与「MCP」页是**同一套面板语言**：列表行内操作 + 视图切换（不用嵌套
+   模态）+ 错误内联不 toast + 市场分页追加。所以结构类 `.mcp-*` 是**有意复用**的
+   —— 三页共用同一份规则，避免三份几乎相同的 CSS 各自漂移（改一处三处生效）。
+   下面只补 MCP 页没有的三样东西：代码/清单原文块、市场源选择与管理、文件清单。
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* 原文块（SKILL.md 正文 / plugin.json）—— 安装确认页的安全闸门要展示它，
+   必须**可滚动但不塌陷**：限高 320px，内容多时内部滚动，不把确认页撑成长条。 */
+.mcp-code {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 市场源选择行（技能页与插件页共用） */
+.mcp-market-src {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/* 源管理列表 */
+.mcp-src-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-top: var(--sp-2);
+}
+.mcp-src-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  font-size: var(--fs-xs);
+}
+.mcp-src-row.active {
+  border-color: var(--color-accent);
+}
+.mcp-src-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mcp-src-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.mcp-src-meta {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--color-text-secondary);
+  word-break: break-all;
+}
+
+/* 组件徽标：on = 本期真正接入运行时，off = 只入库不执行。
+   ⚠️ 刻意都用中性色（off 用灰、on 用 accent）—— 用绿色会让"未接入"显得像错误，
+   而它只是能力边界（docs/frontend/25 §2.4）。 */
+.mcp-tag.on {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.mcp-tag.off {
+  opacity: 0.6;
+}
+
+/* 文件清单（安装确认页展示"将要写入什么"） */
+.mcp-filelist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow: auto;
+}
+.mcp-file-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+.mcp-file-path {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.mcp-file-size {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+
+/* 组件/源名后面的徽标要留出间距 —— 否则「钩子」与「本期未接入」贴在一起读成一个词 */
+.mcp-src-name .mcp-tag {
+  margin-left: 6px;
+}
+
+/* 技能 / 插件的描述正文：走普通段落而不是 `.mcp-cmd`
+   —— 那是个深色等宽块（给"命令原文"用的），套在散文描述上会被读成代码。 */
+.mcp-desc {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

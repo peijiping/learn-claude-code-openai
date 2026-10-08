@@ -382,6 +382,45 @@ export type UiEvent =
   /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）。**点对点信封**（同上）：
    *  get 与 save 回执同构，整份替换 store。 */
   | { kind: 'sandbox_config'; payload: SandboxConfigResult }
+  /** MCP 服务器配置（设置页「MCP」页，docs/frontend/23）。**点对点信封**（同上）：
+   *  `mcp_config_get` / `mcp_server_upsert` / `mcp_server_remove` 三条共用同形回执，
+   *  每次都回读全量 → 前端整份替换。 */
+  | { kind: 'mcp_config'; payload: McpConfigResult }
+  /** MCP 一次性试连结果（应答 `mcp_server_test`）。**点对点信封**。
+   *  成功时 `tools` 是该 server 暴露的工具原名清单（用于「先验证再保存」）。 */
+  | { kind: 'mcp_test'; payload: McpTestResult }
+  /** 市场搜索结果（应答 `mcp_market_search`）。**点对点信封**。
+   *  `error` 非空时 `items` 为空 —— 那是"搜不到"和"搜失败"的区别，前端必须分开渲染。 */
+  | { kind: 'mcp_market'; payload: McpMarketResult }
+  /** 市场条目 → 配置的翻译结果（应答 `mcp_market_resolve`）。**点对点信封**。
+   *  不落盘：只用于安装确认弹窗展示将写入的 command/args/url 原文。 */
+  | { kind: 'mcp_market_plan'; payload: McpMarketPlan }
+  /** 本地包安装计划（应答 `mcp_pkg_resolve`）。**点对点信封**。
+   *  不落盘、不下载：只用于「下载到本地」确认区展示版本/哈希/依赖规模/脚本清单。
+   *  ⚠️ 与 `mcp_market_plan` 是**两条**命令 —— 前者把 command 写成 `npx`，
+   *  后者写成包内 bin 的绝对路径，混用会装出指向错误路径的条目。 */
+  | { kind: 'mcp_pkg_plan'; payload: McpPkgPlan }
+  /** 技能配置（设置页「技能」页，docs/frontend/24）。**点对点信封**（同 mcp_config）：
+   *  `skill_config_get` / `skill_set_enabled` / `skill_remove` / `skill_install` /
+   *  `skill_market_upsert` / `skill_market_remove` 六条共用同形回执，整份替换。 */
+  | { kind: 'skill_config'; payload: SkillConfigResult }
+  /** 单个技能的 SKILL.md 全文（应答 `skill_read`）。**点对点信封**。 */
+  | { kind: 'skill_content'; payload: SkillContentResult }
+  /** 技能市场搜索结果（应答 `skill_market_search`）。**点对点信封**。
+   *  `error` 非空时 `items` 为空 —— 前端必须把「搜失败」与「搜不到」分开渲染。 */
+  | { kind: 'skill_market'; payload: SkillMarketResult }
+  /** 技能安装计划（应答 `skill_market_resolve`）。**点对点信封**。
+   *  不落盘：只用于安装确认页展示 SKILL.md 全文与文件清单。 */
+  | { kind: 'skill_market_plan'; payload: SkillMarketPlan }
+  /** 插件配置（设置页「插件」页，docs/frontend/25）。**点对点信封**。 */
+  | { kind: 'plugin_config'; payload: PluginConfigResult }
+  /** 插件详情（应答 `plugin_read`）：plugin.json 原文 + 文件清单。**点对点信封**。 */
+  | { kind: 'plugin_content'; payload: PluginContentResult }
+  /** 插件市场搜索结果（应答 `plugin_market_search`）。**点对点信封**。 */
+  | { kind: 'plugin_market'; payload: PluginMarketResult }
+  /** 插件安装计划（应答 `plugin_market_resolve`）。**点对点信封**。
+   *  不落盘：只用于安装确认页列出该插件将贡献的全部组件。 */
+  | { kind: 'plugin_market_plan'; payload: PluginMarketPlan }
   | { kind: 'context_stats'; payload: { session_id: string } & ContextStats }
   /** 任务面板快照（整份替换，不做增量）。
    *  board=null 表示该会话当前没有未完成任务组 → 撤掉面板。
@@ -1072,6 +1111,636 @@ export interface SandboxConfigSavePayload {
   reset?: 'seatbelt' | 'bwrap'
 }
 
+/** MCP 传输类型（与后端 mcp_manager 的三条分派一致）。
+ *  缺 `type` 时后端按「有 command 走 stdio、否则 streamable-http」推断，
+ *  但设置页始终显式给出，避免歧义。 */
+export type McpTransport = 'stdio' | 'sse' | 'streamable-http'
+
+/** MCP 条目状态五态（后端 `_mcp_config_payload_sync` 计算，前端零硬编码推导）。
+ *  - `disabled`     条目 enable=0，不参与连接
+ *  - `connected`    至少一个 MCPManager 已连上（工具清单可用）
+ *  - `error`        有确切失败原因 `last_error`（连接失败 → 内联红字）
+ *  - `idle`         无任何可观测的 MCPManager（理论上仅当全局 Agent 构造失败）
+ *  - `disconnected` 有 manager、没连上、也没留下错因（刚写盘、下一轮才 reconcile） */
+export type McpServerStatus = 'disabled' | 'connected' | 'error' | 'idle' | 'disconnected'
+
+/** 单条 MCP 服务器（设置页「MCP」页，docs/frontend/23）。
+ *
+ *  ⚠️ `env` / `headers` 里的密钥值（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_AUTH` 类键名）
+ *  回传时**已被后端脱敏成 `••••••`**。保存编辑后的表单时**原样回传**该掩码即表示
+ *  「不改这一项」—— 后端会把它换回磁盘上的真值（`McpStore._merge_secret`）。
+ *  千万不要在前端把它当成真实值展示给用户看。 */
+export interface McpServer {
+  name: string
+  enable: boolean
+  transport: McpTransport
+  command?: string | null
+  args: string[]
+  env?: Record<string, string> | null
+  cwd?: string | null
+  url?: string | null
+  headers?: Record<string, string> | null
+  /** 来源：`market` = 从市场安装（带 market_id），`local` = 手填/用户自建 */
+  source: 'local' | 'market'
+  market_id?: string | null
+  market_name?: string | null
+  /** 发布者信任档：official / community / domain-verified（仅市场来源有） */
+  publisher?: string | null
+  installed_at?: string | null
+  status: McpServerStatus
+  /** 已发现的 MCP 工具原名（未加 `mcp__<server>__` 前缀） */
+  tools: string[]
+  tool_count: number
+  last_error?: string | null
+}
+
+/** `mcp_config` 回执 —— `mcp_config_get` / `mcp_server_upsert` / `mcp_server_remove`
+ *  三条命令**共用同一信封**（每次操作都回读全量，前端整份替换，不做出增量拼接）。
+ *  **点对点信封**：只回发起窗口、不广播（同 permission_config / sandbox_config：
+ *  广播会冲掉另一个窗口正在编辑的 draft）→ 不进 isKnownAgentEvent 白名单。 */
+export interface McpConfigResult {
+  /** `~/.aigent/mcp/mcp_servers.json` 绝对路径（页面展示用） */
+  path?: string
+  /** 旁路元数据文件路径（`mcp_sources.json`） */
+  sources_path?: string
+  exists?: boolean
+  servers: McpServer[]
+  /** 本地已安装包（`~/.aigent/mcp/pkgs/` 扫描结果，docs/frontend/23 §本地安装）。
+   *  与 `servers` **放在同一份回执里**：设置页打开时两边都要显示，分两次往返
+   *  会出现"条目已刷新、本地包还是旧的"这种中间态。 */
+  packages?: McpLocalPkg[]
+  /** 本地包根目录的绝对路径（页面展示用） */
+  pkgs_dir?: string
+  /** 可观测的 MCPManager 实例数（全局 Agent + 各会话 runtime）。
+   *  =0 时所有启用条目都会是 `idle`，不要谎报「无法连接」。 */
+  sessions?: number
+  summary?: { total: number; enabled: number; connected: number; packages?: number }
+  /** 操作回执：false = 校验被拒或落盘失败（原因在 `errors`） */
+  applied?: boolean
+  /** 校验/落盘错误（人话，**页面内联展示，不走 toast**） */
+  errors?: string[]
+  /** 非阻断提醒（如两条目归一化后工具前缀撞车），内联展示为黄色提示 */
+  warnings?: string[]
+  msg?: string
+  /** 本地包动作结果（`mcp_pkg_install` / `mcp_pkg_remove` / `mcp_pkg_verify`
+   *  三条命令挂在同一个字段上）。`action` 区分是哪一次动作。 */
+  pkg_action?: McpPkgActionResult
+}
+
+/** `mcp_server_test` 回执：一次性试连（**不落盘、不登记**）。
+ *  会真实起子进程 / 建连接并等握手，最长 MCP_CONNECT_TIMEOUT（默认 15s）。 */
+export interface McpTestResult {
+  ok: boolean
+  /** 失败原因（后端已格式化为一行）；ok=true 时为空串 */
+  error?: string
+  tools: string[]
+  tool_count: number
+  resource_count: number
+  elapsed_ms: number
+}
+
+/** `mcp_server_upsert` 载荷。`original_name ≠ name` 表示重命名（改 JSON key）。 */
+export interface McpUpsertPayload {
+  name: string
+  config: Record<string, unknown>
+  original_name?: string
+  /** 市场来源元数据（写旁路文件；手填/编辑时不带） */
+  meta?: Record<string, unknown>
+}
+
+/** 市场条目的信任档。⚠️ 三档都**只经过命名空间所有权校验**（DNS / GitHub），
+ *  **都没有代码审计** —— 这只是"谁发布"的分级，不是"是否安全"的评级。 */
+export type McpPublisher = 'official' | 'community' | 'domain-verified'
+
+/** 市场条目声明的必填环境变量（安装确认弹窗据此生成表单） */
+export interface McpMarketEnvVar {
+  name: string
+  description: string
+  required: boolean
+  /** 建议用密码框输入（不影响落盘方式 —— 本期仍明文写 0600 的 mcp_servers.json） */
+  secret: boolean
+  default: string
+}
+
+/** 官方 MCP Registry 的一条搜索结果（后端 mcp_market 归一化后的形状）。
+ *
+ *  `packages` / `remotes` **原样带回**：`mcp_market_resolve` 靠它们做翻译，
+ *  把整条发回去就省掉一次网络往返（官方 registry 单次搜索可达十几秒）。
+ *  ⚠️ 别在前端解析这两个字段 —— 翻译规则只应有一处（后端 `mcp_market.resolve`）。
+ */
+export interface McpMarketItem {
+  /** reverse-DNS 全名，如 `io.github.acme/my-server` */
+  id: string
+  name: string
+  /** 最后一段，用作建议条目名 */
+  short_name: string
+  title: string
+  description: string
+  version: string
+  repository: string
+  /** 该条目可用的传输类型 */
+  kinds: string[]
+  /** 能否一键安装（false 时看 `reason`） */
+  installable: boolean
+  /** 不可一键安装的原因（人话，如"需要 Docker 运行时"） */
+  reason: string
+  publisher: McpPublisher
+  published_at: string
+  /** registry 侧状态（active 之外的值值得提醒用户） */
+  status: string
+  packages: Record<string, unknown>[]
+  remotes: Record<string, unknown>[]
+}
+
+/** `mcp_market` 回执（应答 `mcp_market_search`）。**点对点信封**。
+ *  `error` 非空 = 搜索失败（超时 / 断网 / HTTP 错），此时 `items` 为空 ——
+ *  前端要展示错误文案，**不能**渲染成"没搜到结果"（两者含义完全不同）。 */
+export interface McpMarketResult {
+  items: McpMarketItem[]
+  /** 下一页游标；空串 = 没有更多 */
+  next_cursor: string
+  query: string
+  error: string
+  cached: boolean
+  elapsed_ms: number
+}
+
+/** `mcp_market_plan` 回执（应答 `mcp_market_resolve`）：把市场条目翻译成
+ *  `mcpServers` 条目，**纯翻译、不落盘** —— 供安装确认弹窗展示。
+ *
+ *  核心用途：把 `config`（尤其是 `command` / `args` / `url`）**原样**摆给用户看。
+ *  那是"即将在本机执行什么代码"的唯一凭据，必须在点确认之前看到。 */
+export interface McpMarketPlan {
+  ok: boolean
+  /** 建议条目名（后端已避开与现有条目的撞名） */
+  name: string
+  config: Record<string, unknown>
+  env_required: McpMarketEnvVar[]
+  /** **只属于服务本身**的启动参数（不含 runner 与包名，如 `["-y", "pkg@1.0.0"]`
+   *  里的 `-y` 与包名都已剥离）。
+   *
+   *  勾选「下载到本地」时 `command` 会换成包内 bin 的绝对路径，此时 runner（npx）
+   *  与包名都不再适用，但这部分参数必须原样保留。别去切 `config.args` 自己算 ——
+   *  解析规则只应有一处（后端 `mcp_market._config_from_package`）。 */
+  package_args: string[]
+  /** 该条目选中的包的坐标（远程端点条目为 null）。
+   *  「下载到本地」靠它去问 `mcp_pkg_resolve` —— **别在前端解析 `item.packages`**，
+   *  翻译规则只应有一处（后端 `mcp_market.resolve`）。 */
+  pkg: {
+    registry_type: string
+    identifier: string
+    version: string
+    /** 只有 npm 支持本地安装（PyPI 侧要落 uv 工具链，口径未定） */
+    local_installable: boolean
+  } | null
+  warnings: string[]
+  /** ok=false 时的原因（如只有 oci 包、暂不支持） */
+  unsupported: string
+  error: string
+}
+
+/** ══ MCP 本地包安装（2026-10-07，docs/frontend/23 §本地安装）════════════════
+ *
+ *  与市场安装的分歧：市场只把条目翻译成 `npx -y pkg@ver`，包由 npm 在**首次连接时**
+ *  隐式拉取（缓存落在 `~/.npm` 里，看得见摸不着）；本地安装是真的把包装进
+ *  `~/.aigent/mcp/pkgs/<包@版本>/`，再把条目的 `command` 指向包内 bin 的绝对路径。 */
+
+/** 已安装到本地的一个包（`mcp_config.packages[]`）。 */
+export interface McpLocalPkg {
+  /** 目录名，也是卸载 / 复核的寻址标识（如 `scope__pkg@1.2.3`） */
+  slug: string
+  name: string
+  version: string
+  spec: string
+  dir: string
+  command: string
+  bin: string
+  bins: string[]
+  registry: string
+  integrity: string
+  dep_count?: number | null
+  /** 本次安装是否允许执行了安装期脚本（默认 false；true 属高风险操作） */
+  scripts_allowed: boolean
+  installed_at: string
+  size_bytes: number
+  /** `ok` = 可执行文件在；`incomplete` = 上次安装没跑完（有哨兵）；
+   *  `broken` = 元数据在但可执行文件没了 */
+  status: 'ok' | 'incomplete' | 'broken'
+  /** 正在引用这个包的条目名。卸载前必须提醒（删了条目就起不来了） */
+  referenced_by: string[]
+}
+
+/** `mcp_pkg_plan` 回执（应答 `mcp_pkg_resolve`）：本地安装计划，**不落盘、不下载**。
+ *  与 `mcp_market_plan` 同构 —— 确认区展示的必须是"将要执行什么"的原文。 */
+export interface McpPkgPlan {
+  ok: boolean
+  /** 钉死后的规格 `包名@精确版本`（缺版本时会向 registry 问 latest 再钉死） */
+  spec: string
+  name: string
+  version: string
+  slug: string
+  dir: string
+  /** **实际使用的 registry**，必须在确认区明文展示（镜像能篡改元数据与哈希） */
+  registry: string
+  /** tarball 的 sha512（装后与 package-lock 对账；不符即安装失败） */
+  integrity: string
+  shasum: string
+  tarball: string
+  description: string
+  /** 直接依赖数（来自 registry 元数据） */
+  direct_dep_count: number
+  /** 整棵依赖树规模（来自 `npm install --dry-run`）。null = 没取到，**显示"未知"，
+   *  不要编一个数字** —— 传递依赖是供应链攻击的主要载体，报少了会给出虚假的安心感 */
+  dep_count?: number | null
+  /** 该包声明的全部 scripts */
+  scripts: Record<string, string>
+  /** 其中会在**安装期**执行的三个钩子（preinstall / install / postinstall） */
+  install_hooks: Record<string, string>
+  /** install_hooks 非空 → 确认区必须红字列出脚本名 */
+  has_scripts: boolean
+  bins: string[]
+  default_bin: string
+  /** true = 该条目没声明版本，本次由 registry 的 latest 钉死 */
+  pinned_from_latest: boolean
+  /** 本机已装过同样的版本 → 可直接复用（不必再下一次） */
+  already_installed: {
+    slug: string
+    dir: string
+    command: string
+    installed_at: string
+  } | null
+  warnings: string[]
+  error: string
+}
+
+/** `mcp_config.pkg_action`：本地包动作的结果（install / remove / verify 共用）。 */
+export interface McpPkgActionResult {
+  action: 'install' | 'remove' | 'verify'
+  ok: boolean
+  /** 失败原因（人话，**内联展示，不走 toast**） */
+  error?: string
+  slug?: string
+  dir?: string
+  /** install：可写进配置 `command` 的**绝对路径**（已解析符号链接、已做目录包含检查） */
+  command?: string
+  bins?: string[]
+  bin?: string
+  version?: string
+  integrity?: string
+  registry?: string
+  dep_count?: number | null
+  /** install：npm 的输出尾部（截断过），失败时是唯一线索 */
+  log?: string
+  /** install：本次是否直接复用了已装好的目录 */
+  reused?: boolean
+  scripts?: Record<string, string>
+  scripts_allowed?: boolean
+  /** install：跳过安装期脚本的提醒，必须显示给用户 */
+  warnings?: string[]
+  /** remove：释放的字节数 */
+  freed_bytes?: number
+  /** remove：人话结果 */
+  msg?: string
+  /** verify：发现的全部问题（空 = 通过） */
+  errors?: string[]
+  checked?: Record<string, unknown>
+}
+
+/** ══ 技能管理（设置弹窗「技能」页，2026-09-30，docs/frontend/24）══════════
+ *
+ *  ⚠️ 与 MCP 侧同源的两条原则：
+ *  1. **UI 数据源 = 磁盘扫描结果（含被禁用项）**，而不是 `SkillLoader` 的注册表 ——
+ *     后者只收启用的技能，拿它当列表会让"被禁用的技能永远看不见"。
+ *  2. **启停只写旁路元数据**（`~/.aigent/skills_sources.json`），绝不改写 SKILL.md
+ *     正文 —— 技能目录要保持"可直接拷给别的 Agent"的原样。 */
+
+/** 单个技能（`skill_config` 回执里的条目）。 */
+export interface SkillEntry {
+  /** 磁盘目录名（唯一标识；也用于 `skill_read` 寻址） */
+  name: string
+  /** frontmatter 里的 name（缺省时等于 name） */
+  title: string
+  description: string
+  tags: string[]
+  enabled: boolean
+  /** SKILL.md 是否存在。false = 目录在但清单缺失 → 该技能不会被加载 */
+  has_manifest: boolean
+  path: string
+  manifest: string
+  /** 全部文件相对路径（**含 SKILL.md**）。展示"附属文件"时自行过滤掉它 */
+  files: string[]
+  file_count: number
+  size_bytes: number
+  /** `market` = 从市场安装（带 market_id），`local` = 手写 / 用户自建 */
+  source: 'local' | 'market'
+  market_id?: string | null
+  market_name?: string | null
+  publisher?: string | null
+  market_url?: string | null
+  installed_at?: string | null
+  /** 非阻断提醒（缺 description / 缺 SKILL.md 等），内联展示 */
+  warnings: string[]
+}
+
+/** 技能市场源（`skill_config` 回执里的 `markets`）。 */
+export interface SkillMarketEntry {
+  id: string
+  name: string
+  /** `git` = 一个仓库；`api` = 第三方公开 API；`index` = 自建 JSON 索引 */
+  type: 'git' | 'api' | 'index'
+  type_label?: string
+  repo?: string
+  ref?: string
+  provider?: string
+  base_url?: string
+  url?: string
+  /** 信任档：official / community / third-party（**不是安全评级**） */
+  publisher?: string
+  homepage?: string
+  note?: string
+  enabled: boolean
+  /** 内置源：只能启停，不能删除，身份字段也不可改 */
+  builtin?: boolean
+  is_default?: boolean
+}
+
+/** `skill_config` 回执 —— `skill_config_get` / `skill_set_enabled` / `skill_remove` /
+ *  `skill_install` / `skill_market_upsert` / `skill_market_remove` **六条命令共用**，
+ *  每次都回读全量 → 前端整份替换（拼接会留下已删技能的残影）。
+ *  **点对点信封**：只回发起窗口、不广播 → 不进 isKnownAgentEvent 白名单。 */
+export interface SkillConfigResult {
+  /** `~/.aigent/skills` 绝对路径（页面展示用） */
+  dir?: string
+  sources_path?: string
+  markets_path?: string
+  exists?: boolean
+  skills: SkillEntry[]
+  markets: SkillMarketEntry[]
+  default_market?: string
+  /** 已启用插件贡献的技能数 —— 它们**不归本页管理**，但用户需要知道"技能为什么变多了" */
+  plugin_skill_count?: number
+  summary?: { total: number; enabled: number; from_market: number; invalid: number }
+  /** 操作回执：false = 校验被拒或落盘失败（原因在 `errors`） */
+  applied?: boolean
+  /** 校验 / 落盘错误（人话，**页面内联展示，不走 toast**） */
+  errors?: string[]
+  warnings?: string[]
+  msg?: string
+}
+
+/** `skill_read` 回执：单个技能的 SKILL.md 全文（**只读、不落盘**）。 */
+export interface SkillContentResult {
+  name: string
+  text: string
+  path?: string
+  dir?: string
+  description?: string
+  files?: string[]
+  error: string
+}
+
+/** 技能市场的一条搜索结果（后端 `skill_market` 归一化后的形状）。 */
+export interface SkillMarketItem {
+  /** `<源 id>:<仓库内路径>`，全局唯一 */
+  id: string
+  market_id: string
+  market_name: string
+  source_kind: 'git' | 'api' | 'index'
+  name: string
+  dir_name: string
+  /** 仓库内目录（`skills/pdf`）；api 源里是条目 slug */
+  path: string
+  description: string
+  version: string
+  tags: string[]
+  publisher: string
+  installable: boolean
+  /** 不可安装的原因（人话） */
+  reason: string
+  repo: string
+  ref: string
+  url: string
+}
+
+/** `skill_market` 回执（应答 `skill_market_search`）。**点对点信封**。
+ *  `error` 非空 = 搜索失败，此时 `items` 必为空 —— 「搜失败」与「搜不到」必须分开渲染。 */
+export interface SkillMarketResult {
+  items: SkillMarketItem[]
+  next_cursor: string
+  market_id: string
+  market_name?: string
+  query: string
+  /** 该结果集的**总条数**（分页前），用于显示"共 N 条" */
+  total: number
+  error: string
+  cached?: boolean
+  elapsed_ms: number
+}
+
+/** `skill_market_plan` 回执（应答 `skill_market_resolve`）：**纯抓取、不落盘**。
+ *
+ *  `skill_md` 是**整份 SKILL.md 原文**，这是安装确认页的安全闸门 —— 技能正文是
+ *  "模型接下来会照着做什么"的唯一凭据，必须原样展示（不折叠、不摘要）。 */
+export interface SkillMarketPlan {
+  ok: boolean
+  /** 建议落盘目录名（后端已避开撞名） */
+  name: string
+  /** frontmatter 里声明的技能名（可能与 `name` 不同） */
+  skill_name: string
+  description: string
+  /** SKILL.md 全文 */
+  skill_md: string
+  files: { path: string; size: number }[]
+  file_count: number
+  total_bytes: number
+  tags: string[]
+  version: string
+  warnings: string[]
+  /** ok=false 时的原因（人话） */
+  unsupported: string
+  error: string
+  /** 安装时由后端直接复用（前端只需原样回传 item，不必解析它） */
+  meta: Record<string, unknown>
+}
+
+/** ══ 插件管理（设置弹窗「插件」页，2026-09-30，docs/frontend/25）══════════
+ *
+ *  插件采用 **Claude Code 插件规范**：一个目录 + `.claude-plugin/plugin.json`
+ *  清单，可贡献 skills / commands / agents / hooks / MCP 服务器 / 语言服务器。
+ *
+ *  ⚠️ **本期运行时只接「技能」这一路贡献**（`wired` 字段就是它的出处）。
+ *  commands / hooks / MCP 只做清单展示 —— 界面上必须如实标注"本期未接入"，
+ *  不能让人以为装上就等于那些代码开始跑了。 */
+
+/** 单个插件（`plugin_config` 回执里的条目）。 */
+export interface PluginEntry {
+  name: string
+  display_name: string
+  description: string
+  version: string
+  author: string
+  homepage: string
+  /** `.claude-plugin/plugin.json` 是否存在。false = 不能算有效插件 */
+  has_manifest: boolean
+  enabled: boolean
+  path: string
+  manifest_path: string
+  /** 六类组件清单：skills / commands / agents / hooks / mcp_servers / lsp_servers */
+  components: Record<string, string[]>
+  component_counts: Record<string, number>
+  /** 本期**真正接入运行时**的组件类型（目前只有 `skills`） */
+  wired: string[]
+  source: 'local' | 'market'
+  market_id?: string | null
+  market_name?: string | null
+  market_url?: string | null
+  publisher?: string | null
+  repo?: string | null
+  installed_at?: string | null
+  warnings: string[]
+}
+
+/** 插件市场源。 */
+export interface PluginMarketEntry {
+  id: string
+  name: string
+  repo: string
+  ref?: string
+  publisher?: string
+  homepage?: string
+  note?: string
+  enabled: boolean
+  builtin?: boolean
+  is_default?: boolean
+}
+
+/** `plugin_config` 回执（六条命令共用，整份替换）。**点对点信封**。 */
+export interface PluginConfigResult {
+  dir?: string
+  sources_path?: string
+  markets_path?: string
+  exists?: boolean
+  plugins: PluginEntry[]
+  markets: PluginMarketEntry[]
+  default_market?: string
+  /** 后端声明的"本期接入运行时的组件类型"（单一出处，前端别硬编码） */
+  wired_components?: string[]
+  /** 当前实际进入技能表的插件技能数（启用插件 × 有 SKILL.md 的技能） */
+  contributed_skill_count?: number
+  summary?: { total: number; enabled: number; invalid: number; contributing: number }
+  applied?: boolean
+  errors?: string[]
+  warnings?: string[]
+  msg?: string
+}
+
+/** `plugin_read` 回执：plugin.json 原文 + 文件清单。 */
+export interface PluginContentResult {
+  name: string
+  plugin_json: string
+  path?: string
+  manifest_path?: string
+  components?: Record<string, string[]>
+  files: { path: string; size: number }[]
+  error: string
+}
+
+/** 插件市场的一条搜索结果。 */
+export interface PluginMarketItem {
+  id: string
+  market_id: string
+  market_name: string
+  name: string
+  display_name: string
+  description: string
+  version: string
+  author: string
+  category: string
+  tags: string[]
+  homepage: string
+  publisher: string
+  /** source 的形态：relpath / url / git-subdir / github / invalid */
+  source_kind: string
+  source_label: string
+  repo: string
+  ref: string
+  path: string
+  installable: boolean
+  reason: string
+  /** 清单里**声明**的技能名（实际以安装确认页的组件清单为准） */
+  declared_skills: string[]
+  /** 原始市场条目 —— **前端不要解析它**，翻译规则只在后端 `plugin_market` */
+  raw?: Record<string, unknown>
+}
+
+/** `plugin_market` 回执（应答 `plugin_market_search`）。**点对点信封**。 */
+export interface PluginMarketResult {
+  items: PluginMarketItem[]
+  next_cursor: string
+  market_id: string
+  market_name?: string
+  /** `marketplace.json` 里声明的市场名 / 维护者（展示"这是谁的市场"） */
+  catalog_name?: string
+  catalog_owner?: string
+  query: string
+  total: number
+  error: string
+  elapsed_ms: number
+}
+
+/** `plugin_market_plan` 回执（应答 `plugin_market_resolve`）：**纯抓取、不落盘**。
+ *
+ *  安装确认页靠 `components` 列出"这个插件将贡献什么"，靠 `wired` 说明
+ *  "其中哪些本期真正生效"，靠 `plugin_json` 给出"它自称是什么"的原文凭据。 */
+export interface PluginMarketPlan {
+  ok: boolean
+  name: string
+  plugin_name: string
+  display_name: string
+  description: string
+  version: string
+  author: string
+  homepage: string
+  /** `.claude-plugin/plugin.json` 原文 */
+  plugin_json: string
+  components: Record<string, string[]>
+  component_counts: Record<string, number>
+  wired: string[]
+  /** 贡献技能的名字 + 首行描述（让用户在确认页看出"这些技能会教模型做什么"） */
+  skill_previews: { name: string; description: string }[]
+  files: { path: string; size: number }[]
+  file_count: number
+  total_bytes: number
+  source_kind: string
+  repo: string
+  warnings: string[]
+  unsupported: string
+  error: string
+  meta: Record<string, unknown>
+}
+
+/** `skill_install` 载荷。**只回传「哪一条 + 叫什么名」** —— 后端会自己重新解析与
+ *  抓取（结果在后端有内存缓存，几乎不额外花网络），既不依赖前端带回来的 meta，
+ *  也不可能出现"前端传了别的文件却装成别的东西"。 */
+export interface SkillInstallPayload {
+  name: string
+  item: SkillMarketItem
+}
+
+/** `plugin_install` 载荷（同上的最小协议面）。 */
+export interface PluginInstallPayload {
+  name: string
+  item: PluginMarketItem
+}
+
+/** `skill_create` 载荷：手动新建一个技能（后端拼成标准 SKILL.md 落盘）。 */
+export interface SkillCreatePayload {
+  name: string
+  description: string
+  body: string
+  tags?: string[]
+}
+
 /** 会话元数据（来自后端会话元数据 + 会话文件统计） */
 export interface SessionMeta {
   /** 会话 id：短随机串（新会话）/ 存量编号字符串（旧会话）；全链路唯一标识 */
@@ -1199,6 +1868,68 @@ export type ControlKind =
    *  点对点信封。save 是**字段部分更新**载荷，见 SandboxConfigSavePayload） */
   | 'sandbox_config_get'
   | 'sandbox_config_save'
+  /** ── MCP 服务管理（2026-09-30，docs/frontend/23）─────────────────────
+   *  `mcp_config_get`：读原始条目（**含 enable:0**）+ 各 runtime 实时连接状态；
+   *  `mcp_server_upsert`：单条新增/编辑/重命名/启停（**不是整份覆盖** —— MCP 是
+   *    多条目集合，整份覆盖在多窗口下误伤面太大）；
+   *  `mcp_server_remove`：删单条；
+   *  `mcp_server_test`：一次性试连，**不落盘、不登记**（先验证再保存）。
+   *  四条都回点对点信封（mcp_config / mcp_test），只回发起窗口、不广播。
+   *  ⚠ `mcp_server_test` 会真实起子进程并等握手（最长 15s）→ 前端按钮进行中必须
+   *    disabled：主进程 pending 表按 kind FIFO 配对且无 id，同 kind 并发会串台。 */
+  | 'mcp_config_get'
+  | 'mcp_server_upsert'
+  | 'mcp_server_remove'
+  | 'mcp_server_test'
+  /** 市场：搜索官方 MCP Registry → 回执 `mcp_market`。
+   *  ⚠️ 实测单次耗时 0.9s ~ 17s（波动极大）—— 主进程 IPC 超时必须放宽到 30s，
+   *  用默认 5s 会稳定误报超时。 */
+  | 'mcp_market_search'
+  /** 市场：把条目翻译成配置（**不落盘**）→ 回执 `mcp_market_plan`。
+   *  安装确认弹窗靠它拿到"将写入的 command/args 原文"。 */
+  | 'mcp_market_resolve'
+  /** ── 技能管理（2026-09-30，docs/frontend/24）─────────────────────────
+   *  与 MCP 侧完全同构：全部**点对点**（只回发起窗口、不广播）→ 不进
+   *  isKnownAgentEvent 白名单。
+   *  `skill_config_get`：磁盘扫描（**含被禁用项**）+ 源列表；
+   *  `skill_set_enabled`：启停，**只写旁路元数据**，绝不改写 SKILL.md；
+   *  `skill_remove`：删技能目录（+ 元数据）；
+   *  `skill_install`：从市场安装 —— **后端重新解析 + 重新抓取**，前端只回传
+   *    「哪一条 + 叫什么名」（见 SkillInstallPayload 的注释）；
+   *  `skill_read`：读单个技能的 SKILL.md 全文；
+   *  `skill_market_upsert` / `skill_market_remove`：增删技能源（内置源只能停用）；
+   *  `skill_market_search`：在指定源里搜索（git 仓库 / 第三方 API / 自建索引）；
+   *  `skill_market_resolve`：抓取安装计划（**不落盘**），供确认页展示 SKILL.md 全文。
+   *  ⚠ `skill_install` / `skill_market_resolve` / `skill_market_search` 都要打网络
+   *    （scan 一个仓库 + 抓若干 SKILL.md），最长可达十几秒 → 前端按钮进行中必须
+   *    disabled：主进程 pending 表按 kind FIFO 配对且无 id，同 kind 并发会串台。 */
+  | 'skill_config_get'
+  | 'skill_set_enabled'
+  | 'skill_remove'
+  | 'skill_install'
+  /** 手动新建技能（`{name, description, tags?, body}` → 后端拼成标准 SKILL.md 落盘）。
+   *  这是"自己写技能"的最短路径 —— 不必先建仓库再走市场。 */
+  | 'skill_create'
+  | 'skill_read'
+  | 'skill_market_upsert'
+  | 'skill_market_remove'
+  | 'skill_market_search'
+  | 'skill_market_resolve'
+  /** ── 插件管理（2026-09-30，docs/frontend/25）─────────────────────────
+   *  命令集与技能侧一一对应（`plugin_*`）。插件额外多一个 `plugin_read`
+   *  （读 plugin.json 原文 + 文件清单）—— 技能的正文已经由 market plan 带回，
+   *  插件的清单则可能远超一次载荷，单独取更划算。
+   *  `plugin_market_search` 读的是市场仓库里的 `marketplace.json`（raw CDN 直读，
+   *  不受 GitHub API 限额），实测 314 条目录 1~3s。 */
+  | 'plugin_config_get'
+  | 'plugin_set_enabled'
+  | 'plugin_remove'
+  | 'plugin_install'
+  | 'plugin_read'
+  | 'plugin_market_upsert'
+  | 'plugin_market_remove'
+  | 'plugin_market_search'
+  | 'plugin_market_resolve'
   | 'llm_models_fetch'
   /** 结构化提问的作答（ask_user）。**fire-and-forget，无点对点回包** ——
    *  回执走 `ask_resolved` 广播。刻意不走 request()：主进程 pending 表按 kind

@@ -53,6 +53,9 @@ from logger import get_logger, install_excepthooks
 from paths import (
     CHAT_HISTORY_DIR,
     DEFAULT_PROJECT_ID,
+    MCP_PKGS_DIR,
+    PLUGIN_MARKETS,
+    SKILL_MARKETS,
     WorkspacePaths,
     default_scratch_paths,
     plan_display_path,
@@ -75,6 +78,64 @@ from refs import (
 # "当前工作空间根"只由 paths.WorkspacePaths 定义，让 Electron 再推一遍必然分叉。
 from git_changes import diff_file as git_changes_diff
 from git_changes import status as git_changes_status
+# MCP 服务管理（2026-09-30）：设置页「MCP」面板（docs/frontend/23）。
+# 桥层只做「读配置 / 写配置 / 一次性试连 / 转发市场」四件事；客户端、热重载、
+# 破坏性门控全部复用既有 mcp_manager，不在这里重造。
+# `_interpolate_value` 带下划线但是**故意的**：试连必须与运行时走同一套 ${VAR}
+# 展开，否则会出现「测试通过、保存后连不上」这种最难查的偏差。
+# 本地包安装（2026-10-07）：设置页「MCP → 本地包」（docs/frontend/23 §本地安装）。
+#
+# 与市场条目的分歧：市场只**翻译**成一条 `npx -y pkg@ver`，包由 npm 在首次连接时
+# 隐式拉取；本地安装是真的把包装进 `~/.aigent/mcp/pkgs/<包@版本>/`，再把条目的
+# `command` 指向包内 bin 的绝对路径。**下载与写配置刻意分成两步**：
+#   · `mcp_pkg_install` 只下载 + 校验（与 `mcp_market_resolve` 的"纯翻译不落盘"同构），
+#   · 写条目仍走既有的 `mcp_server_upsert`（复用热重载与校验，零重复逻辑）。
+# 这样"装坏了"不会留下一条指向不存在文件的配置。
+from mcp_installer import InstallError as McpInstallError
+from mcp_installer import install as install_mcp_package
+from mcp_installer import install_fail as install_mcp_fail
+from mcp_installer import list_packages as list_mcp_packages
+from mcp_installer import plan as plan_mcp_package
+from mcp_installer import plan_fail as plan_mcp_fail
+from mcp_installer import remove as remove_mcp_package
+from mcp_installer import verify as verify_mcp_package
+from mcp_manager import MCPServerSession
+from mcp_manager import _interpolate_value as interpolate_mcp_config
+from mcp_market import resolve as resolve_market_item
+from mcp_market import search as search_market
+from mcp_store import McpStore
+# 技能 / 插件管理（2026-09-30）：设置页「技能」「插件」两个菜单（docs/frontend/24、25）。
+# 与 MCP 侧完全同构：桥层只做「读配置 / 写配置 / 转发市场」；解析、抓取、落盘的
+# 规则全部在 store / market 两个模块里，这里一行业务规则都不放。
+#
+# ⚠️ 注意 `skill_*` 与既有的 `skills` 命令**不是一回事**：`skills` 是给模型的
+#    "技能清单文本"查询（保留原样，见下文 handle 里的分支），`skill_*` 是设置页的
+#    管理面。两者命名刻意区分，别合并。
+from plugin_market import DEFAULT_MARKET_ID as PLUGIN_DEFAULT_MARKET
+from plugin_market import fetch_files as fetch_plugin_files
+from plugin_market import list_markets as list_plugin_markets
+from plugin_market import plan_fail as plugin_plan_fail
+from plugin_market import remove_market as remove_plugin_market
+from plugin_market import resolve as resolve_plugin_item
+from plugin_market import search as search_plugin_market
+from plugin_market import upsert_market as upsert_plugin_market
+from plugin_store import WIRED_COMPONENTS as WIRED_PLUGIN_COMPONENTS
+from plugin_store import PluginStore, list_files
+from skill_market import DEFAULT_MARKET_ID as SKILL_DEFAULT_MARKET
+from skill_market import fetch_files as fetch_skill_files
+from skill_market import list_markets as list_skill_markets
+from skill_market import plan_fail as skill_plan_fail
+from skill_market import remove_market as remove_skill_market
+from skill_market import resolve as resolve_skill_item
+from skill_market import search as search_skill_market
+from skill_market import upsert_market as upsert_skill_market
+from skill_store import (
+    MANIFEST_NAME as SKILL_MANIFEST_NAME,
+    SkillStore,
+    build_skill_md,
+    load_sources_strict,
+    read_skill_text,
+)
 from permission import PermissionStore, VALID_MODES, builtin_snapshot
 from project_registry import WorkspaceError, get_registry
 from session_manage import SessionManager, set_session_id_guard
@@ -791,6 +852,518 @@ def _refresh_permission_dirs() -> int:
         except Exception as exc:  # noqa: BLE001
             log.warning("额外目录刷新失败 session_%s: %s", rt.sid, exc)
     return n
+
+
+# ── MCP 服务管理（docs/frontend/23，2026-09-30）──────────────────────────
+# 桥层职责：① 读写 ~/.aigent/mcp/mcp_servers.json（写入由 mcp_store 负责）；
+#           ② 把各 runtime 的实时连接状态叠加到原始条目上（**UI 数据源是原始文件，
+#              不是 mcp_manager.load_config 的过滤结果** —— 后者会把 enable:0 的
+#              条目藏起来，于是"被禁用的条目永远看不见、也就无法重新启用"）；
+#           ③ 一次性试连（不落盘、不登记）；④ 转发官方 registry 市场。
+#
+# ⚠️ 本节刻意留在 `_text_of` 定义**之前**（与上方权限/沙盒辅助函数同理）：
+# 从 `_text_of` 到 `handle` 之间的源码会被 tests 切片 exec，落在切片外零维护成本。
+
+def _mcp_store() -> McpStore:
+    """设置页专用 store 实例。
+
+    与 `_permission_store()` 同理：**不要**复用某个 Agent 持有的东西 —— MCPManager
+    是 per-Agent 实例（agent_full_v2.py:423），而设置页可能在任何 Agent 构造之前
+    就被打开。McpStore 无状态门面，多实例指向同一对文件自然一致。
+    """
+    return McpStore()
+
+
+def _mcp_managers() -> list:
+    """所有**可观测**的 mcp_manager：全局 Agent + 每个已构造的会话 runtime。
+
+    为什么必须带上全局 Agent（`agent`）：它在 `Agent.__init__` 里就
+    `connect_all()` 了（agent_full_v2.py:423-430）。只看 `registry.all_runtimes()`
+    会把"用户刚在设置页启用一条、还没开会话"显示成**未连接** —— 而真实连接其实
+    已经建立，用户会以为没生效。按 `id()` 去重，防止将来全局 Agent 进了 registry
+    被算两次。
+    """
+    out: list = []
+    seen: set[int] = set()
+
+    def _add(holder) -> None:
+        mgr = getattr(holder, "mcp_manager", None)
+        if mgr is not None and id(mgr) not in seen:
+            seen.add(id(mgr))
+            out.append(mgr)
+
+    try:
+        _add(agent)
+    except Exception as exc:  # noqa: BLE001 - 构造失败不该掀掉状态汇总
+        log.warning("MCP 状态汇总：全局 Agent 不可用 %s: %s", type(exc).__name__, exc)
+    if registry is None:
+        return out
+    try:
+        runtimes = registry.all_runtimes()
+    except Exception as exc:  # noqa: BLE001 - 取列表失败不该掀掉整条命令
+        log.warning("MCP 状态汇总：取运行时列表失败 %s: %s", type(exc).__name__, exc)
+        return out
+    for rt in runtimes:
+        _add(getattr(rt, "agent", None))
+    return out
+
+
+def _mcp_runtime_snapshot() -> tuple[dict, int]:
+    """汇总各 runtime 的连接状态 → `({name: {connected, tools, error?}}, 会话数)`。
+
+    多实例（每个会话一个 Agent、各持一份 MCPManager）时取**并集**：任一 runtime
+    连上就算已连接，工具清单取最长的那份；错因只在"谁都没连上"时才回传。
+    """
+    agg: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    managers = _mcp_managers()
+    for mgr in managers:
+        try:
+            catalog = mgr.catalog()          # {name: [tool]}，未连接的是空列表
+        except Exception as exc:  # noqa: BLE001 - 单个 manager 坏了不影响其余
+            log.warning("MCP 目录读取失败：%s: %s", type(exc).__name__, exc)
+            continue
+        for name, tools in catalog.items():
+            cur = agg.setdefault(name, {"connected": False, "tools": []})
+            if tools:
+                cur["connected"] = True
+                if len(tools) > len(cur["tools"]):
+                    cur["tools"] = list(tools)
+                errors.pop(name, None)
+                continue
+            try:
+                err = mgr.last_error(name)
+            except Exception:  # noqa: BLE001 - 兼容没有该方法的旧 manager
+                err = None
+            if err and name not in errors:
+                errors[name] = err
+    for name, err in errors.items():
+        cur = agg.setdefault(name, {"connected": False, "tools": []})
+        if not cur["connected"]:
+            cur["error"] = err
+    return agg, len(managers)
+
+
+def _mcp_config_payload_sync(applied: bool | None = None,
+                            errors: list[str] | None = None,
+                            warnings: list[str] | None = None,
+                            msg: str = "",
+                            pkg_action: dict | None = None) -> dict:
+    """MCP 设置页回执载荷（get/save/remove 共用，**逐字段兜底**）。
+
+    为什么逐字段 try：`handle()` 的命令分发链**没有兜底 try/except**，这里抛出去会
+    直接掀掉整条 WS 连接。任何一项探测失败都降级成中性值，回执照发 —— 否则前端
+    会永远停在"读取 MCP 配置…"（权限页与沙盒页都踩过这个"塌成加载态"）。
+
+    `status` 五态（前端据此渲染状态点）：
+      - `disabled`     条目 enable=0，不参与连接
+      - `connected`    至少一个 runtime 已连上
+      - `error`        有确切的失败原因（来自 mcp_manager.last_error）
+      - `idle`         当前没有任何会话（MCPManager 是 per-Agent），还没机会连
+      - `disconnected` 有会话、没连上、也没留下错因（例如刚写盘、下一轮才 reconcile）
+    """
+    store = _mcp_store()
+    collected: list[str] = list(errors or [])
+    try:
+        servers, read_errors = store.list_servers()
+        collected.extend(read_errors)
+    except Exception as exc:  # noqa: BLE001 - 读配置失败不能拦回执
+        log.error("MCP 配置读取失败：%s: %s", type(exc).__name__, exc)
+        servers, collected = [], collected + [f"读取配置失败：{exc}"]
+    try:
+        snapshot, session_count = _mcp_runtime_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        log.error("MCP 状态汇总失败：%s: %s", type(exc).__name__, exc)
+        snapshot, session_count = {}, 0
+        collected.append(f"状态汇总失败：{exc}")
+
+    for item in servers:
+        state = snapshot.get(item["name"]) or {}
+        if not item.get("enable"):
+            item["status"] = "disabled"
+        elif state.get("connected"):
+            item["status"] = "connected"
+        elif state.get("error"):
+            item["status"] = "error"
+        elif session_count == 0:
+            item["status"] = "idle"
+        else:
+            item["status"] = "disconnected"
+        item["tools"] = list(state.get("tools") or [])
+        item["tool_count"] = len(item["tools"])
+        item["last_error"] = state.get("error")
+
+    # 本地已安装包（docs/frontend/23 §本地安装）。**放在同一份回执里**而不是另开
+    # 一条命令：设置页打开时两边都要显示，分两次往返会出现"条目列表已刷新、本地包
+    # 列表还是旧的"这种中间态。扫目录很便宜（通常个位数条目）。
+    try:
+        packages = list_mcp_packages()
+    except Exception as exc:  # noqa: BLE001 - 扫描失败不能拦回执
+        log.error("MCP 本地包列表读取失败：%s: %s", type(exc).__name__, exc)
+        packages = []
+        collected.append(f"本地包列表读取失败：{exc}")
+    # 反向引用：哪些条目正在用这个包（卸载前要提醒用户，否则删完条目就起不来了）
+    used: dict[str, list[str]] = {}
+    for s in servers:
+        pkg = s.get("pkg") if isinstance(s.get("pkg"), dict) else None
+        if pkg and pkg.get("slug"):
+            used.setdefault(str(pkg["slug"]), []).append(s["name"])
+    for p in packages:
+        p["referenced_by"] = used.get(p["slug"], [])
+
+    payload: dict = {
+        "path": str(store.path),
+        "sources_path": str(store.sources_path),
+        "exists": store.path.exists(),
+        "servers": servers,
+        "packages": packages,
+        "pkgs_dir": str(MCP_PKGS_DIR),
+        "sessions": session_count,
+        "summary": {
+            "total": len(servers),
+            "enabled": sum(1 for s in servers if s.get("enable")),
+            "connected": sum(1 for s in servers if s.get("status") == "connected"),
+            "packages": len(packages),
+        },
+    }
+    if applied is not None:
+        payload["applied"] = applied
+        payload["warnings"] = list(warnings or [])
+    if collected:
+        payload["errors"] = collected
+    if msg:
+        payload["msg"] = msg
+    # 本地包动作（install / remove / verify）的结果挂在这一个字段上 —— 让回执保持
+    # **一条**（`mcp_config` 是"整份替换"语义，前端只认这一种形状），而不是为每个
+    # 动作新开一个信封再各写一遍 store 替换逻辑。
+    if pkg_action is not None:
+        payload["pkg_action"] = pkg_action
+    return payload
+
+
+async def _mcp_config_payload(applied: bool | None = None,
+                             errors: list[str] | None = None,
+                             warnings: list[str] | None = None,
+                             msg: str = "",
+                             pkg_action: dict | None = None) -> dict:
+    """`_mcp_config_payload_sync` 的异步外壳（读文件 + 汇总状态都要下线程）。"""
+    return await asyncio.to_thread(
+        _mcp_config_payload_sync, applied, errors, warnings, msg, pkg_action)
+
+
+def _reload_mcp_all_runtimes() -> int:
+    """配置落盘后让所有已构造 runtime 立即 reconcile（mtime 已变 → 精确增删改）。
+
+    复用既有 `maybe_reload()`，**不需要新增"重新加载"接口**。未构造的会话不用管：
+    `agent_full_v2.py` 构造 Agent 时 `connect_all()` 自然读到新配置。返回触发过的
+    runtime 数（仅日志用）；任何异常都不得影响保存回执。
+    """
+    n = 0
+    for mgr in _mcp_managers():
+        try:
+            mgr.maybe_reload()
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("MCP 热重载失败：%s: %s", type(exc).__name__, exc)
+    return n
+
+
+def _mcp_test_sync(config: dict) -> dict:
+    """一次性试连：起临时 session，握手 + 列工具，然后**立刻拆掉**。
+
+    三条硬约束（改之前先读）：
+    1. **不落盘、不登记** —— 只在临时对象上试，绝不碰 `mcp_servers.json`，
+       也不进任何 runtime 的 `_clients`（否则会污染模型工具池）。
+    2. **必须在 `asyncio.to_thread` 里跑** —— `start()` 要等握手完成，最长
+       `MCP_CONNECT_TIMEOUT`（默认 15s）；在事件循环里同步等会让所有会话的
+       流式事件一起卡住。
+    3. **绝不上抛** —— `handle()` 无兜底 try，抛出去会掀掉整条 WS 连接。
+
+    注意取值顺序：`stop()` 会把 `_session`/`_tools` 重置为空，所以 `ready`、
+    `tools`、`resources` **必须在 stop() 之前**读出来。
+    """
+    started = time.time()
+    try:
+        errors = _mcp_store().validate_config(config)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"校验失败：{exc}", "tools": [],
+                "tool_count": 0, "resource_count": 0, "elapsed_ms": 0}
+    if errors:
+        return {"ok": False, "error": "；".join(errors), "tools": [],
+                "tool_count": 0, "resource_count": 0, "elapsed_ms": 0}
+
+    session = MCPServerSession("__test__", interpolate_mcp_config(dict(config)))
+    summary = ""
+    ok = False
+    tools: list[str] = []
+    resource_count = 0
+    try:
+        summary = session.start()
+        ok = session.ready
+        if ok:
+            tools = list(session.tool_names)
+            resource_count = len(session.resources)
+    except Exception as exc:  # noqa: BLE001
+        summary = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            session.stop()
+        except Exception as exc:  # noqa: BLE001 - 清理失败不该盖掉试连结论
+            log.warning("MCP 试连清理失败：%s: %s", type(exc).__name__, exc)
+    return {
+        "ok": ok,
+        "error": "" if ok else (summary or "连接失败（未返回原因）"),
+        "tools": tools,
+        "tool_count": len(tools),
+        "resource_count": resource_count,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+# ── 技能 / 插件管理（docs/frontend/24、25，2026-09-30）────────────────────
+# 与 MCP 一节完全同构（见上）：UI 数据源是**磁盘扫描结果**（含被禁用项），
+# 而不是 `SkillLoader.SKILL_REGISTRY` —— 后者只收启用的技能，拿它当列表数据源
+# 会让"被禁用的技能永远看不见、也就无法重新启用"（同 mcp_store 的坑，23 篇 §1.4）。
+#
+# ⚠️ 本节同样必须留在 `_text_of` **之前**（理由见上一节的注释）。
+
+def _skill_store() -> SkillStore:
+    """设置页专用技能 store（无状态门面，多实例指向同一份磁盘自然一致）。"""
+    return SkillStore()
+
+
+def _plugin_store() -> PluginStore:
+    return PluginStore()
+
+
+def _skill_config_payload_sync(applied: bool | None = None,
+                               errors: list[str] | None = None,
+                               warnings: list[str] | None = None,
+                               msg: str = "") -> dict:
+    """技能设置页回执载荷（**逐字段兜底**）。
+
+    ⚠️ 为什么逐字段 try：`handle()` 的命令分发链**没有兜底 try/except**，这里抛出去
+    会直接掀掉整条 WS 连接。任何一项探测失败都降级成中性值、回执照发 —— 否则前端
+    会永远停在"读取技能配置…"。
+
+    「读失败 ≠ 没有技能」这条必须能区分：`skills: [] + errors` 时前端渲染的是
+    "配置读取失败"，而不是"还没有任何技能"（后者会诱导用户去市场重装，反而把磁盘上
+    还在的技能覆盖掉，同 23 篇 §4.2-3）。
+    """
+    store = _skill_store()
+    plugin_store = _plugin_store()
+    collected = list(errors or [])
+
+    skills: list[dict] = []
+    try:
+        skills = store.scan()
+    except Exception as exc:  # noqa: BLE001
+        log.error("技能目录扫描失败：%s: %s", type(exc).__name__, exc)
+        collected.append(f"读取技能目录失败：{exc}")
+    try:
+        # 旁路元数据损坏 → 启停状态全丢。必须让用户看见，不能静默当作"全部启用"。
+        load_sources_strict(store.sources_path)
+    except Exception as exc:  # noqa: BLE001
+        collected.append(f"技能元数据文件损坏（启停状态可能不准）：{exc}")
+    try:
+        if store.skills_dir.exists() and not os.access(store.skills_dir, os.R_OK):
+            collected.append(f"技能目录不可读：{store.skills_dir}")
+    except Exception as exc:  # noqa: BLE001
+        collected.append(f"技能目录探测失败：{exc}")
+
+    try:
+        markets = list_skill_markets()
+    except Exception as exc:  # noqa: BLE001
+        log.error("技能源列表读取失败：%s: %s", type(exc).__name__, exc)
+        markets = []
+        collected.append(f"读取技能源失败：{exc}")
+
+    contributed = 0
+    try:
+        contributed = len(plugin_store.iter_skill_manifests())
+    except Exception as exc:  # noqa: BLE001 - 插件侧坏掉不该让技能页整体失败
+        log.warning("插件技能统计失败：%s: %s", type(exc).__name__, exc)
+
+    payload: dict = {
+        "dir": str(store.skills_dir),
+        "sources_path": str(store.sources_path),
+        # 源注册表的落点**从常量取**（不写死文件名 —— 写死就与 paths 里那份重复了，
+        # 改常量时这里会静默指向另一个文件）
+        "markets_path": str(SKILL_MARKETS),
+        "exists": store.skills_dir.exists(),
+        "skills": skills,
+        "markets": markets,
+        "default_market": SKILL_DEFAULT_MARKET,
+        "plugin_skill_count": contributed,
+        "summary": {
+            "total": len(skills),
+            "enabled": sum(1 for s in skills if s.get("enabled")),
+            "from_market": sum(1 for s in skills if s.get("source") == "market"),
+            "invalid": sum(1 for s in skills if not s.get("has_manifest")),
+        },
+    }
+    if applied is not None:
+        payload["applied"] = applied
+        payload["warnings"] = list(warnings or [])
+    if collected:
+        payload["errors"] = collected
+    if msg:
+        payload["msg"] = msg
+    return payload
+
+
+async def _skill_config_payload(applied: bool | None = None,
+                                errors: list[str] | None = None,
+                                warnings: list[str] | None = None,
+                                msg: str = "") -> dict:
+    """`_skill_config_payload_sync` 的异步外壳（扫目录 + 读元数据都要下线程）。"""
+    return await asyncio.to_thread(
+        _skill_config_payload_sync, applied, errors, warnings, msg)
+
+
+def _plugin_config_payload_sync(applied: bool | None = None,
+                                errors: list[str] | None = None,
+                                warnings: list[str] | None = None,
+                                msg: str = "") -> dict:
+    """插件设置页回执载荷（逐字段兜底，理由同上）。"""
+    store = _plugin_store()
+    collected = list(errors or [])
+    plugins: list[dict] = []
+    try:
+        plugins = store.scan()
+    except Exception as exc:  # noqa: BLE001
+        log.error("插件目录扫描失败：%s: %s", type(exc).__name__, exc)
+        collected.append(f"读取插件目录失败：{exc}")
+    try:
+        load_sources_strict(store.sources_path)
+    except Exception as exc:  # noqa: BLE001
+        collected.append(f"插件元数据文件损坏（启停状态可能不准）：{exc}")
+
+    try:
+        markets = list_plugin_markets()
+    except Exception as exc:  # noqa: BLE001
+        log.error("插件市场列表读取失败：%s: %s", type(exc).__name__, exc)
+        markets = []
+        collected.append(f"读取插件市场失败：{exc}")
+
+    wired = 0
+    try:
+        wired = len(store.iter_skill_manifests())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("插件技能统计失败：%s: %s", type(exc).__name__, exc)
+
+    payload: dict = {
+        "dir": str(store.plugins_dir),
+        "sources_path": str(store.sources_path),
+        "markets_path": str(PLUGIN_MARKETS),
+        "exists": store.plugins_dir.exists(),
+        "plugins": plugins,
+        "markets": markets,
+        "default_market": PLUGIN_DEFAULT_MARKET,
+        "wired_components": list(WIRED_PLUGIN_COMPONENTS),
+        "contributed_skill_count": wired,
+        "summary": {
+            "total": len(plugins),
+            "enabled": sum(1 for p in plugins if p.get("enabled")),
+            "invalid": sum(1 for p in plugins if not p.get("has_manifest")),
+            "contributing": sum(1 for p in plugins
+                                if p.get("enabled") and p.get("components", {}).get("skills")),
+        },
+    }
+    if applied is not None:
+        payload["applied"] = applied
+        payload["warnings"] = list(warnings or [])
+    if collected:
+        payload["errors"] = collected
+    if msg:
+        payload["msg"] = msg
+    return payload
+
+
+async def _plugin_config_payload(applied: bool | None = None,
+                                 errors: list[str] | None = None,
+                                 warnings: list[str] | None = None,
+                                 msg: str = "") -> dict:
+    return await asyncio.to_thread(
+        _plugin_config_payload_sync, applied, errors, warnings, msg)
+
+
+def _reload_skills_all_runtimes() -> int:
+    """技能/插件变更后，重建所有**已构造** runtime 的 system prompt。
+
+    为什么必须做这一步：`Agent._refresh_system_prompt()` 只在**会话入口**（init /
+    switch / new）被调用，不是每轮都跑 —— 也就是说"装了新技能，当前会话看不到"
+    是个真实存在过的坑（agent_full_v2.py:1930 的注释就是为它写的）。刚在设置页装完
+    技能，用户切回对话就期望它生效，所以这里主动触发一次重建。
+
+    代价是**整段前缀缓存失效一次**（同该方法的 docstring 所述）—— 但这只在技能列表
+    真的变过时才发生，而"改了技能表"本来就必须让模型看到新内容。未构造的会话不用管：
+    首次构造时自然读到新状态。
+
+    全程 try/except：刷新失败绝不能影响保存回执（同 `_reload_mcp_all_runtimes`）。
+    返回触发重建的 runtime 数（仅日志用）。
+    """
+    holders: list = []
+    try:
+        holders.append(agent)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("技能热刷新：全局 Agent 不可用 %s: %s", type(exc).__name__, exc)
+    if registry is not None:
+        try:
+            holders.extend(getattr(rt, "agent", None) for rt in registry.all_runtimes())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("技能热刷新：取运行时列表失败 %s: %s", type(exc).__name__, exc)
+    n = 0
+    seen: set[int] = set()
+    for holder in holders:
+        if holder is None or id(holder) in seen:
+            continue
+        seen.add(id(holder))
+        refresh = getattr(holder, "_refresh_system_prompt", None)
+        if not callable(refresh):
+            continue
+        try:
+            refresh()
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("技能热刷新失败：%s: %s", type(exc).__name__, exc)
+    return n
+
+
+def _skill_read_sync(name: str) -> dict:
+    """读单个技能的 SKILL.md 全文（设置页「查看正文」，**不落盘**）。"""
+    store = _skill_store()
+    item = store.get(name)
+    if item is None:
+        return {"name": name, "text": "", "error": f"没有名为「{name}」的技能"}
+    return {
+        "name": item["name"],
+        "text": read_skill_text(item["manifest"]),
+        "path": item["manifest"],
+        "dir": item["path"],
+        "description": item["description"],
+        "files": item["files"],
+        "error": "",
+    }
+
+
+def _plugin_read_sync(name: str) -> dict:
+    """读单个插件的 plugin.json 原文 + 文件清单（设置页「查看详情」）。"""
+    store = _plugin_store()
+    item = store.get(name)
+    if item is None:
+        return {"name": name, "plugin_json": "", "files": [], "error":
+                f"没有名为「{name}」的插件"}
+    text = read_skill_text(item["manifest_path"])
+    return {
+        "name": item["name"],
+        "plugin_json": text,
+        "path": item["path"],
+        "manifest_path": item["manifest_path"],
+        "components": item["components"],
+        "files": list_files(item["path"]),
+        "error": "",
+    }
 
 
 # ── 右侧面板（docs/frontend/19，2026-09-23）──────────────────────────────
@@ -2685,6 +3258,599 @@ async def handle(ws):
                 await safe_send(ws, _envelope(
                     "sandbox_config",
                     await _sandbox_payload(applied=not errors, errors=errors)))
+
+            elif kind == "mcp_config_get":
+                # 设置页读：原始条目（**含 enable:0**）+ 旁路元数据 + 各 runtime 连接状态。
+                # 逐字段兜底见 _mcp_config_payload_sync：探测失败也要回执，否则前端
+                # 会永远停在"读取 MCP 配置…"。
+                await safe_send(ws, _envelope(
+                    "mcp_config", await _mcp_config_payload()))
+
+            elif kind == "mcp_server_upsert":
+                # 新增 / 编辑 / 重命名 / 启停（`config.enable` 变化即启停）。
+                # **单条 upsert，不是整份覆盖** —— MCP 是"多条目集合"，整份覆盖在
+                # 多窗口场景下误伤面太大（对比 permission_config_save 的整份语义）。
+                name = str(payload.get("name") or "").strip()
+                raw_cfg = payload.get("config")
+                original = payload.get("original_name")
+                original = str(original).strip() if isinstance(original, str) else None
+                meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else None
+                try:
+                    if not isinstance(raw_cfg, dict):
+                        raise ValueError("配置必须是 JSON 对象")
+                    _, warnings = await asyncio.to_thread(
+                        _mcp_store().upsert, name, raw_cfg, original, meta)
+                    refreshed = await asyncio.to_thread(_reload_mcp_all_runtimes)
+                    log.info("MCP 条目已保存: %s（已触发 %d 个会话热重载）", name, refreshed)
+                    await safe_send(ws, _envelope("mcp_config", await _mcp_config_payload(
+                        applied=True, warnings=warnings, msg=f"已保存「{name}」")))
+                except ValueError as exc:
+                    # 校验失败**只走回执 errors[]，不额外发 error 信封** —— 那一封会被
+                    # 前端当全局 toast（agentStore `case 'error'`），而设置页的约定是
+                    # "错误内联展示、不 toast"（要对着文本改，toast 一闪而过等于没提示）。
+                    log.warning("MCP 条目保存被拒: %s → %s", name, exc)
+                    await safe_send(ws, _envelope("mcp_config", await _mcp_config_payload(
+                        applied=False, errors=[str(exc)], msg="保存被拒")))
+                except OSError as exc:
+                    log.error("MCP 配置落盘失败: %s", exc)
+                    await safe_send(ws, _envelope("mcp_config", await _mcp_config_payload(
+                        applied=False, errors=[f"落盘失败：{exc}"], msg="保存失败")))
+
+            elif kind == "mcp_server_remove":
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    await safe_send(ws, _envelope("mcp_config", await _mcp_config_payload(
+                        applied=False, errors=["名称不能为空"], msg="删除被拒")))
+                else:
+                    try:
+                        await asyncio.to_thread(_mcp_store().remove, name)
+                        refreshed = await asyncio.to_thread(_reload_mcp_all_runtimes)
+                        log.info("MCP 条目已删除: %s（已触发 %d 个会话热重载）", name, refreshed)
+                        await safe_send(ws, _envelope("mcp_config", await _mcp_config_payload(
+                            applied=True, msg=f"已删除「{name}」")))
+                    except (ValueError, OSError) as exc:
+                        log.error("MCP 条目删除失败: %s → %s", name, exc)
+                        await safe_send(ws, _envelope("mcp_config", await _mcp_config_payload(
+                            applied=False, errors=[str(exc)], msg="删除失败")))
+
+            elif kind == "mcp_server_test":
+                # 一次性试连：**不落盘、不登记**（不碰 mcp_servers.json，也不进任何
+                # runtime 的 _clients，否则会污染模型工具池）。
+                #
+                # 两种寻址方式二选一（**为什么必须有两种**）：
+                #   · `{name}`   —— 测**已保存**的条目：从磁盘读真实配置。
+                #     设置页回执里的 `env`/`headers` 是**脱敏过的掩码**（••••••），
+                #     拿掩码去测会把 •••••• 当成真密钥发给 server —— 对需要鉴权的
+                #     条目必然假失败，用户会以为配置写错了。
+                #   · `{config}` —— 测**表单里还没保存**的草稿（用户刚手填的真值）。
+                probe_cfg = payload.get("config")
+                probe_name = str(payload.get("name") or "").strip()
+                test_error = ""
+                if not isinstance(probe_cfg, dict) and probe_name:
+                    try:
+                        raw = await asyncio.to_thread(_mcp_store().load_raw)
+                    except (ValueError, OSError) as exc:
+                        probe_cfg, test_error = None, f"读取配置失败：{exc}"
+                    else:
+                        found = raw.get(probe_name)
+                        if isinstance(found, dict):
+                            probe_cfg = found
+                        else:
+                            test_error = f"没有名为「{probe_name}」的 MCP 服务"
+                if test_error:
+                    await safe_send(ws, _envelope("mcp_test", {
+                        "ok": False, "error": test_error, "tools": [],
+                        "tool_count": 0, "resource_count": 0, "elapsed_ms": 0}))
+                elif not isinstance(probe_cfg, dict):
+                    await safe_send(ws, _envelope("mcp_test", {
+                        "ok": False, "error": "需要 config 或 name 之一", "tools": [],
+                        "tool_count": 0, "resource_count": 0, "elapsed_ms": 0}))
+                else:
+                    # 真实起子进程 / 真实建连接并等握手（最长 MCP_CONNECT_TIMEOUT=15s）
+                    # → 必须下线程，否则阻塞事件循环会让所有会话的流式事件一起卡住。
+                    await safe_send(ws, _envelope(
+                        "mcp_test", await asyncio.to_thread(_mcp_test_sync, probe_cfg)))
+
+            elif kind == "mcp_market_search":
+                # 代理官方 registry（前端不直连：跨域、统一缓存、错误文案归口）。
+                # 实测单次 0.9s~17s → 这里 20s 请求超时，前端 IPC 超时放到 30s。
+                res = await asyncio.to_thread(
+                    search_market,
+                    str(payload.get("query") or ""),
+                    str(payload.get("cursor") or ""),
+                    payload.get("limit"),
+                )
+                await safe_send(ws, _envelope("mcp_market", res))
+
+            elif kind == "mcp_market_resolve":
+                # **纯翻译、不落盘** —— 供安装确认弹窗展示将要写入的 command/args 原文。
+                # 那是"即将执行什么代码"的唯一凭据，必须在用户点确认之前看到。
+                item = payload.get("item")
+                if not isinstance(item, dict):
+                    await safe_send(ws, _envelope("mcp_market_plan", {
+                        "ok": False, "name": "", "config": {}, "env_required": [],
+                        "package_args": [], "pkg": None, "warnings": [],
+                        "unsupported": "条目格式非法", "error": ""}))
+                else:
+                    try:
+                        current = await asyncio.to_thread(
+                            lambda: list(_mcp_store().load_raw().keys()))
+                    except (ValueError, OSError) as exc:
+                        # 撞名检测读不到现有条目 → 降级成"不查重"，不值得拦下这次翻译
+                        log.warning("市场翻译：读取现有 MCP 名称失败 %s: %s",
+                                    type(exc).__name__, exc)
+                        current = []
+                    try:
+                        plan = await asyncio.to_thread(resolve_market_item, item, current)
+                    except Exception as exc:  # noqa: BLE001 - 分发链无兜底 try，这里必须兜住
+                        log.error("市场条目翻译失败：%s: %s", type(exc).__name__, exc)
+                        plan = {"ok": False, "name": "", "config": {}, "env_required": [],
+                                "package_args": [], "pkg": None, "warnings": [],
+                                "unsupported": f"翻译失败：{exc}", "error": ""}
+                    await safe_send(ws, _envelope("mcp_market_plan", plan))
+
+            # ── 本地包安装（设置弹窗「MCP → 本地包」，docs/frontend/23 §本地安装）──
+            # 四条命令全部**点对点**且都要下线程（`npm view` / `npm install` 是
+            # 秒级到分钟级的阻塞调用，留在事件循环里会卡住所有会话的流式事件）。
+            # 约定：resolve 回 `mcp_pkg_plan`（新信封）；其余三条回 `mcp_config`
+            # 并在 `pkg_action` 字段里带上动作结果 —— 前端只认一种列表形状。
+            elif kind == "mcp_pkg_resolve":
+                # **纯解析、不落盘、不下载** —— 供"下载到本地"确认区展示
+                # 版本 / 哈希 / 依赖树规模 / 安装期脚本清单。
+                try:
+                    pkg_plan = await asyncio.to_thread(
+                        plan_mcp_package,
+                        str(payload.get("name") or ""),
+                        str(payload.get("version") or ""))
+                except Exception as exc:  # noqa: BLE001 - 分发链无兜底 try，这里必须兜住
+                    log.error("本地包解析失败：%s: %s", type(exc).__name__, exc)
+                    pkg_plan = plan_mcp_fail(f"解析失败：{exc}")
+                await safe_send(ws, _envelope("mcp_pkg_plan", pkg_plan))
+
+            elif kind == "mcp_pkg_install":
+                # **只下载 + 校验，不写配置**（与 mcp_market_resolve 的"纯翻译"同构）。
+                # 写条目仍走既有的 mcp_server_upsert：复用热重载、校验与掩码回填，
+                # 而且"装到一半失败"不会留下一条指向不存在文件的配置。
+                if not isinstance(payload, dict):
+                    action = install_mcp_fail("载荷格式非法")
+                else:
+                    try:
+                        action = await asyncio.to_thread(
+                            install_mcp_package,
+                            str(payload.get("name") or ""),
+                            str(payload.get("version") or ""),
+                            bin_name=str(payload.get("bin") or ""),
+                            allow_scripts=bool(payload.get("allow_scripts")))
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("本地包安装异常：%s: %s", type(exc).__name__, exc)
+                        action = install_mcp_fail(f"安装失败：{exc}")
+                action["action"] = "install"
+                if action.get("ok"):
+                    log.info("本地包已就绪：%s（%s）", action.get("slug"), action.get("dir"))
+                await safe_send(ws, _envelope(
+                    "mcp_config",
+                    await _mcp_config_payload(
+                        msg="已下载到本地" if action.get("ok") else "下载失败",
+                        pkg_action=action)))
+
+            elif kind == "mcp_pkg_remove":
+                slug = str((payload or {}).get("slug") or "").strip()
+                try:
+                    action = await asyncio.to_thread(remove_mcp_package, slug)
+                except McpInstallError as exc:
+                    action = {"ok": False, "slug": slug, "freed_bytes": 0,
+                              "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    log.error("本地包卸载异常：%s: %s", type(exc).__name__, exc)
+                    action = {"ok": False, "slug": slug, "freed_bytes": 0,
+                              "error": f"卸载失败：{exc}"}
+                action["action"] = "remove"
+                if action.get("ok"):
+                    log.info("本地包已卸载：%s", slug)
+                await safe_send(ws, _envelope(
+                    "mcp_config",
+                    await _mcp_config_payload(
+                        msg=action.get("msg") or "已卸载",
+                        pkg_action=action)))
+
+            elif kind == "mcp_pkg_verify":
+                slug = str((payload or {}).get("slug") or "").strip()
+                try:
+                    action = await asyncio.to_thread(verify_mcp_package, slug)
+                except McpInstallError as exc:
+                    action = {"ok": False, "slug": slug, "errors": [str(exc)],
+                              "checked": {}}
+                except Exception as exc:  # noqa: BLE001
+                    log.error("本地包复核异常：%s: %s", type(exc).__name__, exc)
+                    action = {"ok": False, "slug": slug,
+                              "errors": [f"复核失败：{exc}"], "checked": {}}
+                action["action"] = "verify"
+                await safe_send(ws, _envelope(
+                    "mcp_config",
+                    await _mcp_config_payload(
+                        msg="校验通过" if action.get("ok") else "校验未通过",
+                        pkg_action=action)))
+
+            # ── 技能管理（设置弹窗「技能」页，docs/frontend/24）────────────────
+            # 全部**点对点**：只回发起窗口、不广播（与 permission/sandbox/mcp 同约定
+            # —— 广播会冲掉另一个窗口正在编辑的草稿）→ 都不进 isKnownAgentEvent 白名单。
+            elif kind == "skill_config_get":
+                await safe_send(ws, _envelope("skill_config", await _skill_config_payload()))
+
+            elif kind == "skill_set_enabled":
+                # 启停 = **只写旁路元数据**，绝不碰 SKILL.md（docs/frontend/24 §1.1）。
+                # 落盘后必须触发一次 system prompt 重建，否则"切回对话看不到生效"。
+                name = str(payload.get("name") or "").strip()
+                enabled = bool(payload.get("enabled"))
+                try:
+                    await asyncio.to_thread(_skill_store().set_enabled, name, enabled)
+                    refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                    log.info("技能「%s」已%s（触发 %d 个 runtime 重建提示）",
+                             name, "启用" if enabled else "禁用", refreshed)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=True,
+                        msg=f"已{'启用' if enabled else '禁用'}「{name}」")))
+                except ValueError as exc:
+                    # 校验失败**只走回执 errors[]，不额外发 error 信封**（那一封会被前端
+                    # 当全局 toast，而设置页的约定是错误内联展示，同 23 篇 §3.3-2）。
+                    log.warning("技能启停被拒: %s → %s", name, exc)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=[str(exc)], msg="操作被拒")))
+                except OSError as exc:
+                    log.error("技能启停落盘失败: %s", exc)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=[f"落盘失败：{exc}"], msg="操作失败")))
+
+            elif kind == "skill_install":
+                # 从市场安装：**后端自己重新解析 + 重新抓取**，绝不信前端带回来的
+                # meta 或文件内容。两条理由：
+                #   ① `resolve` 与 `fetch_files` 的结果在后端有内存 TTL 缓存，确认页刚
+                #      抓过、这里几乎不额外花网络，代价可忽略；
+                #   ② 前端只需回传「哪一条（item）+ 叫什么名」，协议面小得多，
+                #      也不可能出现"前端传了别的文件却装成别的东西"。
+                item = payload.get("item")
+                want = str(payload.get("name") or "").strip()
+                if not isinstance(item, dict):
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=["缺少要安装的市场条目"], msg="安装被拒")))
+                else:
+                    mid = str(item.get("market_id") or "")
+                    try:
+                        existing = await asyncio.to_thread(
+                            lambda: [s["name"] for s in _skill_store().scan()])
+                        plan = await asyncio.to_thread(
+                            resolve_skill_item, mid, item, existing)
+                        if not plan.get("ok"):
+                            raise ValueError(plan.get("unsupported") or plan.get("error")
+                                             or "无法生成安装计划")
+                        name = want or str(plan.get("name") or "")
+                        files = await asyncio.to_thread(fetch_skill_files, mid, item)
+                        if isinstance(files, dict) and files.get("__error__"):
+                            raise ValueError(str(files["__error__"]))
+                        await asyncio.to_thread(
+                            _skill_store().install, name, files, plan.get("meta"))
+                        refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                        log.info("技能已安装: %s ← %s（触发 %d 个 runtime 重建提示）",
+                                 name, mid, refreshed)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=True, warnings=list(plan.get("warnings") or []),
+                            msg=f"已安装技能「{name}」")))
+                    except ValueError as exc:
+                        log.warning("技能安装被拒: %s → %s", item.get("id"), exc)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=False, errors=[str(exc)], msg="安装被拒")))
+                    except OSError as exc:
+                        log.error("技能安装落盘失败: %s", exc)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=False, errors=[f"落盘失败：{exc}"], msg="安装失败")))
+                    except Exception as exc:  # noqa: BLE001 - 分发链无兜底 try，这里必须兜住
+                        log.error("技能安装异常: %s: %s", type(exc).__name__, exc)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=False, errors=[f"安装失败：{type(exc).__name__}: {exc}"],
+                            msg="安装失败")))
+
+            elif kind == "skill_create":
+                # 手动新建（对齐 MCP 页的「+ 手动添加」）：只有 name / description /
+                # tags / body 四个字段，后端拼成一份标准 SKILL.md 落盘。
+                # 这也是"自己写技能"的最短路径 —— 不必先建仓库再走市场。
+                name = str(payload.get("name") or "").strip()
+                description = str(payload.get("description") or "").strip()
+                body = str(payload.get("body") or "")
+                tags = payload.get("tags")
+                if not description:
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False,
+                        errors=["description 不能为空 —— 技能列表与系统提示都靠它"],
+                        msg="新建被拒")))
+                elif not body.strip():
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=["技能正文不能为空"], msg="新建被拒")))
+                else:
+                    try:
+                        content = build_skill_md(
+                            name, description,
+                            tags if isinstance(tags, list) else [],
+                            body)
+                        await asyncio.to_thread(
+                            _skill_store().install, name, {SKILL_MANIFEST_NAME: content},
+                            {"source": "local", "origin": "manual"})
+                        refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                        log.info("技能已新建: %s（触发 %d 个 runtime 重建提示）", name, refreshed)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=True, msg=f"已新建技能「{name}」")))
+                    except ValueError as exc:
+                        log.warning("技能新建被拒: %s → %s", name, exc)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=False, errors=[str(exc)], msg="新建被拒")))
+                    except OSError as exc:
+                        log.error("技能新建落盘失败: %s", exc)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=False, errors=[f"落盘失败：{exc}"], msg="新建失败")))
+
+            elif kind == "skill_remove":
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=["名称不能为空"], msg="删除被拒")))
+                else:
+                    try:
+                        _, warns = await asyncio.to_thread(lambda: _skill_store().remove(name))
+                        refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                        log.info("技能已删除: %s（触发 %d 个 runtime 重建提示）", name, refreshed)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=True, warnings=list(warns or []), msg=f"已删除「{name}」")))
+                    except (ValueError, OSError) as exc:
+                        log.error("技能删除失败: %s → %s", name, exc)
+                        await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                            applied=False, errors=[str(exc)], msg="删除失败")))
+
+            elif kind == "skill_read":
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    res = {"name": "", "text": "", "error": "名称不能为空"}
+                else:
+                    try:
+                        res = await asyncio.to_thread(_skill_read_sync, name)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("技能正文读取失败: %s: %s", type(exc).__name__, exc)
+                        res = {"name": name, "text": "",
+                               "error": f"读取失败：{type(exc).__name__}: {exc}"}
+                await safe_send(ws, _envelope("skill_content", res))
+
+            elif kind == "skill_market_upsert":
+                # 新增/更新一个技能源。**内置源只能改 enabled**，身份字段以代码为准
+                # （否则改一次默认源地址就要求用户去编辑 JSON）。
+                entry = payload.get("entry")
+                try:
+                    if not isinstance(entry, dict):
+                        raise ValueError("源配置必须是 JSON 对象")
+                    await asyncio.to_thread(upsert_skill_market, entry)
+                    label = entry.get("name") or entry.get("id")
+                    log.info("技能源已保存: %s", label)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=True, msg=f"已保存技能源「{label}」")))
+                except ValueError as exc:
+                    log.warning("技能源保存被拒: %s", exc)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=[str(exc)], msg="保存被拒")))
+                except OSError as exc:
+                    log.error("技能源落盘失败: %s", exc)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=[f"落盘失败：{exc}"], msg="保存失败")))
+
+            elif kind == "skill_market_remove":
+                market_id = str(payload.get("market_id") or "").strip()
+                try:
+                    _, warns = await asyncio.to_thread(remove_skill_market, market_id)
+                    log.info("技能源已删除: %s", market_id)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=not warns, errors=list(warns or []) or None,
+                        msg=f"已删除技能源「{market_id}」" if not warns else "删除被拒")))
+                except (ValueError, OSError) as exc:
+                    log.error("技能源删除失败: %s → %s", market_id, exc)
+                    await safe_send(ws, _envelope("skill_config", await _skill_config_payload(
+                        applied=False, errors=[str(exc)], msg="删除失败")))
+
+            elif kind == "skill_market_search":
+                # 代理各技能源（前端不直连：跨域、统一缓存、错误文案归口）。
+                # 实测 git 源 1~3s、第三方 API 0.5~17s → 后端 20s，前端 IPC 放到 30s。
+                res = await asyncio.to_thread(
+                    search_skill_market,
+                    str(payload.get("market_id") or SKILL_DEFAULT_MARKET),
+                    str(payload.get("query") or ""),
+                    str(payload.get("cursor") or ""),
+                    payload.get("limit"),
+                )
+                await safe_send(ws, _envelope("skill_market", res))
+
+            elif kind == "skill_market_resolve":
+                # **纯抓取、不落盘** —— 供安装确认页展示 SKILL.md 全文与文件清单。
+                item = payload.get("item")
+                if not isinstance(item, dict):
+                    await safe_send(ws, _envelope("skill_market_plan",
+                                                  skill_plan_fail("条目格式非法")))
+                else:
+                    mid = str(payload.get("market_id")
+                              or item.get("market_id") or SKILL_DEFAULT_MARKET)
+                    try:
+                        current = await asyncio.to_thread(
+                            lambda: [s["name"] for s in _skill_store().scan()])
+                    except Exception as exc:  # noqa: BLE001 - 撞名检测读不到就降级成不查重
+                        log.warning("技能安装计划：读取现有名称失败 %s: %s",
+                                    type(exc).__name__, exc)
+                        current = []
+                    try:
+                        plan = await asyncio.to_thread(
+                            resolve_skill_item, mid, item, current)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("技能条目解析失败：%s: %s", type(exc).__name__, exc)
+                        plan = skill_plan_fail(f"解析失败：{type(exc).__name__}: {exc}")
+                    await safe_send(ws, _envelope("skill_market_plan", plan))
+
+            # ── 插件管理（设置弹窗「插件」页，docs/frontend/25）────────────────
+            elif kind == "plugin_config_get":
+                await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload()))
+
+            elif kind == "plugin_set_enabled":
+                name = str(payload.get("name") or "").strip()
+                enabled = bool(payload.get("enabled"))
+                try:
+                    await asyncio.to_thread(_plugin_store().set_enabled, name, enabled)
+                    refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                    log.info("插件「%s」已%s（触发 %d 个 runtime 重建提示）",
+                             name, "启用" if enabled else "禁用", refreshed)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=True, msg=f"已{'启用' if enabled else '禁用'}「{name}」")))
+                except ValueError as exc:
+                    log.warning("插件启停被拒: %s → %s", name, exc)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=[str(exc)], msg="操作被拒")))
+                except OSError as exc:
+                    log.error("插件启停落盘失败: %s", exc)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=[f"落盘失败：{exc}"], msg="操作失败")))
+
+            elif kind == "plugin_install":
+                # 与技能安装同一条思路：**后端重新解析 + 重新抓取**，前端只回传
+                # 「哪一条 + 叫什么名」。插件的 source 三种形态（相对路径 / 独立仓库 /
+                # 仓库子目录）由 `plugin_market` 统一翻译，这里一行业务规则都不放。
+                item = payload.get("item")
+                want = str(payload.get("name") or "").strip()
+                if not isinstance(item, dict):
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=["缺少要安装的市场条目"], msg="安装被拒")))
+                else:
+                    mid = str(item.get("market_id") or "")
+                    try:
+                        existing = await asyncio.to_thread(
+                            lambda: [p["name"] for p in _plugin_store().scan()])
+                        plan = await asyncio.to_thread(
+                            resolve_plugin_item, mid, item, existing)
+                        if not plan.get("ok"):
+                            raise ValueError(plan.get("unsupported") or plan.get("error")
+                                             or "无法生成安装计划")
+                        name = want or str(plan.get("name") or "")
+                        files = await asyncio.to_thread(fetch_plugin_files, mid, item)
+                        if isinstance(files, dict) and files.get("__error__"):
+                            raise ValueError(str(files["__error__"]))
+                        await asyncio.to_thread(
+                            _plugin_store().install, name, files, plan.get("meta"))
+                        refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                        log.info("插件已安装: %s ← %s（触发 %d 个 runtime 重建提示）",
+                                 name, mid, refreshed)
+                        await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                            applied=True, warnings=list(plan.get("warnings") or []),
+                            msg=f"已安装插件「{name}」")))
+                    except ValueError as exc:
+                        log.warning("插件安装被拒: %s → %s", item.get("id"), exc)
+                        await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                            applied=False, errors=[str(exc)], msg="安装被拒")))
+                    except OSError as exc:
+                        log.error("插件安装落盘失败: %s", exc)
+                        await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                            applied=False, errors=[f"落盘失败：{exc}"], msg="安装失败")))
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("插件安装异常: %s: %s", type(exc).__name__, exc)
+                        await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                            applied=False, errors=[f"安装失败：{type(exc).__name__}: {exc}"],
+                            msg="安装失败")))
+
+            elif kind == "plugin_remove":
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=["名称不能为空"], msg="删除被拒")))
+                else:
+                    try:
+                        _, warns = await asyncio.to_thread(lambda: _plugin_store().remove(name))
+                        refreshed = await asyncio.to_thread(_reload_skills_all_runtimes)
+                        log.info("插件已删除: %s（触发 %d 个 runtime 重建提示）", name, refreshed)
+                        await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                            applied=True, warnings=list(warns or []), msg=f"已删除「{name}」")))
+                    except (ValueError, OSError) as exc:
+                        log.error("插件删除失败: %s → %s", name, exc)
+                        await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                            applied=False, errors=[str(exc)], msg="删除失败")))
+
+            elif kind == "plugin_read":
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    res = {"name": "", "plugin_json": "", "files": [], "error": "名称不能为空"}
+                else:
+                    try:
+                        res = await asyncio.to_thread(_plugin_read_sync, name)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("插件详情读取失败: %s: %s", type(exc).__name__, exc)
+                        res = {"name": name, "plugin_json": "", "files": [],
+                               "error": f"读取失败：{type(exc).__name__}: {exc}"}
+                await safe_send(ws, _envelope("plugin_content", res))
+
+            elif kind == "plugin_market_upsert":
+                entry = payload.get("entry")
+                try:
+                    if not isinstance(entry, dict):
+                        raise ValueError("市场配置必须是 JSON 对象")
+                    await asyncio.to_thread(upsert_plugin_market, entry)
+                    label = entry.get("name") or entry.get("id")
+                    log.info("插件市场已保存: %s", label)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=True, msg=f"已保存插件市场「{label}」")))
+                except ValueError as exc:
+                    log.warning("插件市场保存被拒: %s", exc)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=[str(exc)], msg="保存被拒")))
+                except OSError as exc:
+                    log.error("插件市场落盘失败: %s", exc)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=[f"落盘失败：{exc}"], msg="保存失败")))
+
+            elif kind == "plugin_market_remove":
+                market_id = str(payload.get("market_id") or "").strip()
+                try:
+                    _, warns = await asyncio.to_thread(remove_plugin_market, market_id)
+                    log.info("插件市场已删除: %s", market_id)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=not warns, errors=list(warns or []) or None,
+                        msg=f"已删除插件市场「{market_id}」" if not warns else "删除被拒")))
+                except (ValueError, OSError) as exc:
+                    log.error("插件市场删除失败: %s → %s", market_id, exc)
+                    await safe_send(ws, _envelope("plugin_config", await _plugin_config_payload(
+                        applied=False, errors=[str(exc)], msg="删除失败")))
+
+            elif kind == "plugin_market_search":
+                # 实测官方市场目录（314 条）单次 1~3s；读的是 raw CDN，不受 API 限额。
+                res = await asyncio.to_thread(
+                    search_plugin_market,
+                    str(payload.get("market_id") or PLUGIN_DEFAULT_MARKET),
+                    str(payload.get("query") or ""),
+                    str(payload.get("cursor") or ""),
+                    payload.get("limit"),
+                )
+                await safe_send(ws, _envelope("plugin_market", res))
+
+            elif kind == "plugin_market_resolve":
+                # **纯抓取、不落盘** —— 供安装确认页列出插件将贡献的全部组件。
+                item = payload.get("item")
+                if not isinstance(item, dict):
+                    await safe_send(ws, _envelope("plugin_market_plan",
+                                                  plugin_plan_fail("条目格式非法")))
+                else:
+                    mid = str(payload.get("market_id")
+                              or item.get("market_id") or PLUGIN_DEFAULT_MARKET)
+                    try:
+                        current = await asyncio.to_thread(
+                            lambda: [p["name"] for p in _plugin_store().scan()])
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("插件安装计划：读取现有名称失败 %s: %s",
+                                    type(exc).__name__, exc)
+                        current = []
+                    try:
+                        plan = await asyncio.to_thread(
+                            resolve_plugin_item, mid, item, current)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("插件条目解析失败：%s: %s", type(exc).__name__, exc)
+                        plan = plugin_plan_fail(f"解析失败：{type(exc).__name__}: {exc}")
+                    await safe_send(ws, _envelope("plugin_market_plan", plan))
 
             elif kind == "llm_models_fetch":
                 # 「刷新」按钮：调 GET {base_url}/models 拉取该连接可用的模型 id 列表。

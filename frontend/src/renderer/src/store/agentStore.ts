@@ -4,7 +4,7 @@ import { create } from 'zustand'
 // 这里只用到三件事：接收 `session_history` 里的 right_panel、切会话时收尾、
 // 删会话/断线重连时清缓存。
 import { flushRightPanelPending, useRightPanelStore } from './rightPanelStore'
-import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, ExecutionMode, ExecutionModeChangedPayload, GoalAction, GoalMarker, HistoryAskUser, HistoryMessage, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, PlanContentPayload, PlanStatus, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, ExecutionMode, ExecutionModeChangedPayload, GoalAction, GoalMarker, HistoryAskUser, HistoryMessage, McpConfigResult, McpMarketItem, McpMarketPlan, McpMarketResult, McpPkgActionResult, McpPkgPlan, McpTestResult, McpUpsertPayload, PluginConfigResult, PluginContentResult, PluginInstallPayload, PluginMarketEntry, PluginMarketItem, PluginMarketPlan, PluginMarketResult, SkillConfigResult, SkillContentResult, SkillCreatePayload, SkillInstallPayload, SkillMarketEntry, SkillMarketItem, SkillMarketPlan, SkillMarketResult, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, PlanContentPayload, PlanStatus, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -342,7 +342,22 @@ export function openPlanDocInPanel(sid: string, path: string, name = ''): void {
 
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
-export type SettingsTab = 'general' | 'model' | 'permission' | 'sandbox' | 'trash' | 'about'
+export type SettingsTab =
+  | 'general'
+  | 'model'
+  | 'permission'
+  | 'sandbox'
+  /** MCP 服务管理（2026-09-30，docs/frontend/23）—— 排在「沙盒」之后，
+   *  与权限/沙盒同属"配置型"设置页（进页懒加载 + 回执整份替换）。 */
+  | 'mcp'
+  /** 技能管理（2026-09-30，docs/frontend/24）—— 排在「MCP」之后，与它同属
+   *  "配置型 + 市场可安装"的设置页（进页懒加载 + 回执整份替换）。 */
+  | 'skill'
+  /** 插件管理（2026-09-30，docs/frontend/25）—— Claude Code 插件规范：
+   *  一个插件可贡献 skills / commands / agents / hooks / MCP 服务器。 */
+  | 'plugin'
+  | 'trash'
+  | 'about'
 
 /** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
@@ -775,6 +790,55 @@ interface AgentState {
    *  （平台状态 + 开关 + 两个模板文件内容）。只由设置页消费 —— 点对点回执。 */
   sandboxConfig: SandboxConfigResult | null
   sandboxSaving: boolean
+  /** MCP 服务管理（设置页「MCP」页，docs/frontend/23）：`mcp_config` 回执整份结果
+   *  （原始条目 + 连接状态 + 路径 + errors/warnings）。
+   *  只由设置页消费 —— 点对点回执，不参与全局广播状态。 */
+  mcpConfig: McpConfigResult | null
+  mcpSaving: boolean
+  /** 「测试连接」的一次性结果（`mcp_test` 回执）。null = 尚未测过 / 已切换条目。
+   *  它**不属于 mcpConfig** —— 试连不落盘，不改变条目状态。 */
+  mcpTest: McpTestResult | null
+  mcpTesting: boolean
+  /** 市场搜索结果（**已按页累加**，docs/frontend/23）。
+   *  ⚠️ 它**不走事件分支** —— 与 mcpConfig 刻意不同：分页要累加，而事件分支只会
+   *  把已累加的多页覆盖成最后一页。与 `refs` / `file_content` 这些"点对点回执由
+   *  调用方后处理"的先例一致，这里由 `searchMcpMarket` 的 promise 路径负责。 */
+  mcpMarket: McpMarketResult | null
+  mcpMarketLoading: boolean
+  /** 安装确认所需的翻译结果（`mcp_market_plan` 回执）。**不落盘**。
+   *  同样由 promise 路径填充（一次性、无累加语义，无需事件分支）。 */
+  mcpMarketPlan: McpMarketPlan | null
+  mcpResolving: boolean
+  /** 本地包安装计划（`mcp_pkg_plan`）。**不落盘、不下载** —— 只用于
+   *  「下载到本地」确认区展示版本/哈希/依赖规模/脚本清单。 */
+  mcpPkgPlan: McpPkgPlan | null
+  /** 本地包在途操作。**必须区分是哪一种** —— 安装要等分钟级，
+   *  把 resolve 的转圈文案用在 install 上会让用户以为卡死。 */
+  mcpPkgBusy: 'resolve' | 'install' | 'remove' | 'verify' | null
+  /** 最近一次本地包动作的结果（install / remove / verify）。
+   *  与 `mcpConfig.pkg_action` **同源**：事件分支与 promise 分支都会写，
+   *  谁先到都不影响（内容相同）。页面用它内联展示结论，**不走 toast**。 */
+  mcpPkgAction: McpPkgActionResult | null
+  /** 技能管理（设置页「技能」页，docs/frontend/24）：`skill_config` 回执整份结果
+   *  （磁盘扫描的技能 + 市场源列表 + 路径 + errors/warnings）。
+   *  只由设置页消费 —— 点对点回执，不参与全局广播状态。 */
+  skillConfig: SkillConfigResult | null
+  skillSaving: boolean
+  /** 技能市场搜索结果（**已按页累加**）。
+   *  ⚠️ 与 skillConfig 不同，它**不走事件分支** —— 分页要累加，而事件分支只会把已
+   *  累加的多页覆盖成最后一页（同 mcpMarket 的坑）。由 promise 路径负责。 */
+  skillMarket: SkillMarketResult | null
+  skillMarketLoading: boolean
+  /** 安装确认所需的抓取结果（`skill_market_plan`）。**不落盘**。 */
+  skillMarketPlan: SkillMarketPlan | null
+  skillResolving: boolean
+  /** 插件管理（设置页「插件」页，docs/frontend/25）。结构同上。 */
+  pluginConfig: PluginConfigResult | null
+  pluginSaving: boolean
+  pluginMarket: PluginMarketResult | null
+  pluginMarketLoading: boolean
+  pluginMarketPlan: PluginMarketPlan | null
+  pluginResolving: boolean
   /** 当前激活会话的上下文统计（每轮 turn_end / 切会话时后端下发） */
   currentContextStats: ContextStats | null
   /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
@@ -956,6 +1020,91 @@ interface AgentState {
   /** 保存沙盒设置（**字段部分更新**：开关 / 模板内容 / 恢复默认）。
    *  权威值由 `sandboxConfig` 回执回写；返回 applied（false = 有字段校验失败）。 */
   saveSandboxConfig: (payload: SandboxConfigSavePayload) => Promise<boolean>
+  /** 拉取 MCP 条目列表（进「MCP」页时懒加载；后端未就绪静默忽略） */
+  loadMcpConfig: () => Promise<void>
+  /** 新增 / 编辑 / 重命名 / 启停一条 MCP 条目（`original_name` 不同 = 改名）。
+   *  返回 applied；权威值由 `mcpConfig` 回写，errors/warnings 由页面内联展示。 */
+  upsertMcpServer: (payload: McpUpsertPayload) => Promise<boolean>
+  /** 删除一条 MCP 条目（含旁路元数据）。 */
+  removeMcpServer: (name: string) => Promise<boolean>
+  /** 一次性试连（**不落盘**）：结果写 `mcpTest`，供列表行 / 表单「先验证再保存」。
+   *  `name` → 测磁盘上已保存的条目（取真实密钥）；`config` → 测表单草稿。
+   *  失败也返回结果对象（`ok=false` + error 文案），只有链路级异常才返回合成结果。 */
+  testMcpServer: (target: {
+    config?: Record<string, unknown>
+    name?: string
+  }) => Promise<McpTestResult | null>
+  /** 清掉上一次试连结果（表单弹窗打开/切换条目时调用，避免显示陈旧结论）。 */
+  clearMcpTest: () => void
+  /** 搜索市场（官方 registry）。`cursor` 非空 = 翻下一页，结果**追加**；
+   *  空 = 换关键词/重新搜，结果**整份替换**。失败也写 `mcpMarket`（带 `error`），
+   *  页面据此区分「搜失败」与「搜不到」—— 两者含义完全不同。 */
+  searchMcpMarket: (query: string, cursor?: string) => Promise<void>
+  /** 把市场条目翻译成将写入的配置（**不落盘**），结果写 `mcpMarketPlan`，
+   *  供安装确认弹窗展示 command/args 原文。 */
+  resolveMcpInstall: (item: McpMarketItem) => Promise<McpMarketPlan | null>
+  /** 关掉安装确认页时清掉翻译结果（避免下次打开显示上一条目的配置）。 */
+  clearMcpMarketPlan: () => void
+  /** MCP 本地包（docs/frontend/23 §本地安装）：问 registry 要版本/哈希/依赖树/脚本
+   *  清单（**不落盘、不下载**），结果写 `mcpPkgPlan`。
+   *  ⚠️ `version` 为空时后端会问一次 latest **并钉死** —— 返回值里的 `version`
+   *  才是真正要装的那个，UI 必须以它为准。 */
+  resolveMcpPkg: (name: string, version?: string) => Promise<McpPkgPlan | null>
+  /** 关掉确认区 / 切换包时清掉解析结果。 */
+  clearMcpPkgPlan: () => void
+  /** 下载并校验一个包到 `~/.aigent/mcp/pkgs/`。**不写配置** —— 拿到 `command`
+   *  后再走 `upsertMcpServer`（复用热重载与校验，装坏了也不会留下死条目）。 */
+  installMcpPkg: (payload: {
+    name: string
+    version: string
+    bin?: string
+    allow_scripts?: boolean
+  }) => Promise<McpPkgActionResult | null>
+  /** 卸载一个本地包（只删 `pkgs/` 下的那个目录，**不动引用它的条目**）。 */
+  removeMcpPkg: (slug: string) => Promise<McpPkgActionResult | null>
+  /** 复核一个本地包（哈希对账 + 可执行文件是否还在目录内）。 */
+  verifyMcpPkg: (slug: string) => Promise<McpPkgActionResult | null>
+  /** 拉取技能列表（进「技能」页时懒加载；后端未就绪静默忽略） */
+  loadSkillConfig: () => Promise<void>
+  /** 启用 / 禁用技能。**只写旁路元数据**（不改 SKILL.md 正文），后端会顺带刷新
+   *  各会话的 system prompt，所以切回对话立刻生效。 */
+  setSkillEnabled: (name: string, enabled: boolean) => Promise<boolean>
+  /** 删除技能（目录 + 元数据）。 */
+  removeSkill: (name: string) => Promise<boolean>
+  /** 从市场安装：只回传「哪一条 + 叫什么名」，文件由后端自己抓。
+   *  返回 applied；失败原因由 `skillConfig.errors` 内联展示。 */
+  installSkill: (payload: SkillInstallPayload) => Promise<boolean>
+  /** 手动新建技能（`{name, description, tags?, body}`）。返回 applied。 */
+  createSkill: (payload: SkillCreatePayload) => Promise<boolean>
+  /** 读单个技能的 SKILL.md 全文（一次性读取，只写返回值、不进全局状态）。 */
+  readSkill: (name: string) => Promise<SkillContentResult | null>
+  /** 新增 / 更新技能源（内置源只能改启用状态）。 */
+  upsertSkillMarket: (entry: Record<string, unknown>) => Promise<boolean>
+  /** 删除自定义技能源（内置源会被拒，原因走 `errors` 内联展示）。 */
+  removeSkillMarket: (marketId: string) => Promise<boolean>
+  /** 在指定源里搜索技能。`cursor` 非空 = 翻下一页（结果**追加**）；空 = 整份替换。 */
+  searchSkillMarket: (marketId: string, query: string, cursor?: string) => Promise<void>
+  /** 抓取安装计划（**不落盘**）→ 安装确认页展示 SKILL.md 全文。 */
+  resolveSkillInstall: (
+    marketId: string,
+    item: SkillMarketItem
+  ) => Promise<SkillMarketPlan | null>
+  clearSkillMarketPlan: () => void
+  /** 插件管理（docs/frontend/25）：与技能侧一一对应。 */
+  loadPluginConfig: () => Promise<void>
+  setPluginEnabled: (name: string, enabled: boolean) => Promise<boolean>
+  removePlugin: (name: string) => Promise<boolean>
+  installPlugin: (payload: PluginInstallPayload) => Promise<boolean>
+  /** 读单个插件的 plugin.json 原文 + 文件清单（一次性读取）。 */
+  readPlugin: (name: string) => Promise<PluginContentResult | null>
+  upsertPluginMarket: (entry: Record<string, unknown>) => Promise<boolean>
+  removePluginMarket: (marketId: string) => Promise<boolean>
+  searchPluginMarket: (marketId: string, query: string, cursor?: string) => Promise<void>
+  resolvePluginInstall: (
+    marketId: string,
+    item: PluginMarketItem
+  ) => Promise<PluginMarketPlan | null>
+  clearPluginMarketPlan: () => void
   /** 刷新某连接可用模型列表（GET {base_url}{models_path}），返回模型 id 列表（失败返回空） */
   fetchModels: (payload: {
     base_url?: string
@@ -1684,6 +1833,29 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   permissionSaving: false,
   sandboxConfig: null,
   sandboxSaving: false,
+  mcpConfig: null,
+  mcpSaving: false,
+  mcpTest: null,
+  mcpTesting: false,
+  mcpMarket: null,
+  mcpMarketLoading: false,
+  mcpMarketPlan: null,
+  mcpResolving: false,
+  mcpPkgPlan: null,
+  mcpPkgBusy: null,
+  mcpPkgAction: null,
+  skillConfig: null,
+  skillSaving: false,
+  skillMarket: null,
+  skillMarketLoading: false,
+  skillMarketPlan: null,
+  skillResolving: false,
+  pluginConfig: null,
+  pluginSaving: false,
+  pluginMarket: null,
+  pluginMarketLoading: false,
+  pluginMarketPlan: null,
+  pluginResolving: false,
   currentContextStats: null,
   sessionUsageBySession: {},
   taskBoardBySession: {},
@@ -2471,6 +2643,46 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (payload?.platform) set({ sandboxConfig: payload })
         break
       }
+      case 'mcp_config': {
+        // 点对点回执（同 permission_config / sandbox_config）：get / upsert / remove
+        // 三条**共用同一信封**，每次都回读全量 → 整份替换，不做增量拼接。
+        // 刻意不 toast：errors / warnings 要由 MCP 页内联展示，用户得对着它们改配置。
+        const payload = ev.payload as McpConfigResult
+        if (payload && Array.isArray(payload.servers)) set({ mcpConfig: payload })
+        // 本地包动作（install / remove / verify）也挂在这封回执上 —— 顺手存一份给
+        // 页面内联展示。**只写不 toast**（同上）。
+        if (payload?.pkg_action) set({ mcpPkgAction: payload.pkg_action })
+        break
+      }
+      case 'mcp_pkg_plan': {
+        // 本地安装计划（点对点，**不落盘、不下载**）。与 mcp_market 同理：
+        // 它不走 promise 归属，事件分支与 promise 分支写的是同一份内容。
+        const payload = ev.payload as McpPkgPlan
+        if (payload) set({ mcpPkgPlan: payload })
+        break
+      }
+      case 'mcp_test': {
+        // 试连结果（点对点）：只写 mcpTest，**不动 mcpConfig** —— 试连不落盘，
+        // 条目状态不因此改变（避免"测了一下就显示已连接"的假象）。
+        const payload = ev.payload as McpTestResult
+        if (payload) set({ mcpTest: payload })
+        break
+      }
+      case 'skill_config': {
+        // 点对点回执（同 mcp_config）：get / set_enabled / remove / install /
+        // market_upsert / market_remove **六条共用同一信封**，每次都回读全量
+        // → 整份替换，不做增量拼接（拼接会留下已删技能的残影）。
+        // 刻意不 toast：errors / warnings 要由技能页内联展示，用户得对着它们改。
+        const payload = ev.payload as SkillConfigResult
+        if (payload && Array.isArray(payload.skills)) set({ skillConfig: payload })
+        break
+      }
+      case 'plugin_config': {
+        // 同 skill_config：六条命令共用，整份替换。
+        const payload = ev.payload as PluginConfigResult
+        if (payload && Array.isArray(payload.plugins)) set({ pluginConfig: payload })
+        break
+      }
       case 'context_stats': {
         const p = ev.payload as { session_id: string } & ContextStats
         // 仅当是本会话（当前显示会话）时更新，避免后台会话统计串台
@@ -3131,10 +3343,31 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     if (tab === 'model' && !get().llmConfig) void get().loadLlConfig()
     if (tab === 'permission' && !get().permissionConfig) void get().loadPermissionConfig()
     if (tab === 'sandbox' && !get().sandboxConfig) void get().loadSandboxConfig()
+    if (tab === 'mcp' && !get().mcpConfig) void get().loadMcpConfig()
+    if (tab === 'skill' && !get().skillConfig) void get().loadSkillConfig()
+    if (tab === 'plugin' && !get().pluginConfig) void get().loadPluginConfig()
   },
-  // 关闭时清掉权限/沙盒配置缓存：配置可能被另一个窗口改过，重进必须重新拉取
-  // （未保存的 draft 在组件内 state，随组件卸载自然丢弃）
-  closeSettings: () => set({ settingsOpen: false, permissionConfig: null, sandboxConfig: null }),
+  // 关闭时清掉权限/沙盒/MCP/技能/插件配置缓存：配置可能被另一个窗口改过，重进必须
+  // 重新拉取（未保存的 draft 在组件内 state，随组件卸载自然丢弃）
+  closeSettings: () =>
+    set({
+      settingsOpen: false,
+      permissionConfig: null,
+      sandboxConfig: null,
+      mcpConfig: null,
+      mcpTest: null,
+      // 市场结果也一起清：市场内容随时间变化，重进必须重新搜（缓存 TTL 在后端）
+      mcpMarket: null,
+      mcpMarketPlan: null,
+      mcpPkgPlan: null,
+      mcpPkgAction: null,
+      skillConfig: null,
+      skillMarket: null,
+      skillMarketPlan: null,
+      pluginConfig: null,
+      pluginMarket: null,
+      pluginMarketPlan: null
+    }),
   loadLlConfig: async () => {
     try {
       const res = (await window.agent.llmConfigGet()) as { config?: LlmConfig } | null
@@ -3216,6 +3449,660 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set({ sandboxSaving: false })
     }
   },
+  loadMcpConfig: async () => {
+    try {
+      const res = (await window.agent.mcpConfigGet()) as McpConfigResult | null
+      // `servers` 必须是数组才算有效回执 —— 读配置失败时后端回的是 `servers: [] + errors`，
+      // 空数组是合法值，不能当"没拿到"处理（否则页面会一直停在加载态）。
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  upsertMcpServer: async (payload) => {
+    set({ mcpSaving: true })
+    try {
+      const res = (await window.agent.mcpServerUpsert({
+        name: payload.name,
+        config: payload.config,
+        // 只在真有值时才带字段：后端把"字段存在"当语义（original_name 存在 = 要改名），
+        // 传 undefined/空串会把「新增」误判成「改名」。
+        ...(payload.original_name ? { original_name: payload.original_name } : {}),
+        ...(payload.meta ? { meta: payload.meta } : {})
+      })) as McpConfigResult | null
+      // 权威值以回执为准：**校验失败（applied=false）也回全量** —— 页面据此重绘，
+      // 并从 res.errors / res.warnings 内联展示（不 toast，见 23 篇 §前端约束）。
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存 MCP 服务失败', 'error', 4000)
+      return false
+    } finally {
+      set({ mcpSaving: false })
+    }
+  },
+  removeMcpServer: async (name) => {
+    set({ mcpSaving: true })
+    try {
+      const res = (await window.agent.mcpServerRemove({ name })) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除 MCP 服务失败', 'error', 4000)
+      return false
+    } finally {
+      set({ mcpSaving: false })
+    }
+  },
+  testMcpServer: async (target) => {
+    // 先清上一次结果：留着会让新开的表单弹窗 / 另一行显示无关的试连结论。
+    set({ mcpTesting: true, mcpTest: null })
+    try {
+      const res = (await window.agent.mcpServerTest(
+        // 只带有值的那一路：`name` 走磁盘真实配置（含未脱敏密钥），
+        // `config` 走表单草稿。两个都带时后端优先用 config。
+        target.name && !target.config
+          ? { name: target.name }
+          : { config: target.config ?? {} }
+      )) as McpTestResult | null
+      if (res) set({ mcpTest: res })
+      return res
+    } catch {
+      // 链路级异常（后端未就绪 / IPC 失败）：**不 toast**，合成一个失败结果走同一条
+      // 内联展示路径 —— 与后端校验失败同款式，用户看到的位置与措辞一致。
+      const fallback: McpTestResult = {
+        ok: false,
+        error: '请求失败：后端未连接或已超时',
+        tools: [],
+        tool_count: 0,
+        resource_count: 0,
+        elapsed_ms: 0
+      }
+      set({ mcpTest: fallback })
+      return fallback
+    } finally {
+      set({ mcpTesting: false })
+    }
+  },
+  clearMcpTest: () => set({ mcpTest: null }),
+  searchMcpMarket: async (query, cursor) => {
+    set({ mcpMarketLoading: true })
+    try {
+      const res = (await window.agent.mcpMarketSearch({
+        query,
+        ...(cursor ? { cursor } : {})
+      })) as McpMarketResult | null
+      if (!res) {
+        // IPC 超时（25s 未回）：官方 registry 慢起来能到 17s，别谎报"没有结果"
+        set({
+          mcpMarket: {
+            items: [], next_cursor: '', query, cached: false, elapsed_ms: 0,
+            error: '请求超时：市场响应过慢，请重试或改用「手动添加」'
+          }
+        })
+        return
+      }
+      const prev = get().mcpMarket
+      if (cursor && prev && !res.error) {
+        // 翻页**追加**；按 id 去重 —— registry 的游标分页在同一 server 有多版本时
+        // 可能重复返回，重复的 React key 会引发渲染异常。
+        const seen = new Set(prev.items.map((i) => i.id))
+        set({
+          mcpMarket: {
+            ...res,
+            items: [...prev.items, ...res.items.filter((i) => !seen.has(i.id))]
+          }
+        })
+      } else {
+        set({ mcpMarket: res })
+      }
+    } catch {
+      set({
+        mcpMarket: {
+          items: [], next_cursor: '', query, cached: false, elapsed_ms: 0,
+          error: '搜索失败：后端未连接'
+        }
+      })
+    } finally {
+      set({ mcpMarketLoading: false })
+    }
+  },
+  resolveMcpInstall: async (item) => {
+    set({ mcpResolving: true, mcpMarketPlan: null })
+    try {
+      const res = (await window.agent.mcpMarketResolve({ item })) as McpMarketPlan | null
+      if (res) {
+        set({ mcpMarketPlan: res })
+        return res
+      }
+      // null（IPC 超时）必须合成失败计划，理由同 resolveSkillInstall
+      const fallback: McpMarketPlan = {
+        ok: false, name: '', config: {}, env_required: [], package_args: [], pkg: null,
+        warnings: [], unsupported: '翻译超时：请返回市场重试', error: ''
+      }
+      set({ mcpMarketPlan: fallback })
+      return fallback
+    } catch {
+      const fallback: McpMarketPlan = {
+        ok: false, name: '', config: {}, env_required: [], package_args: [], pkg: null,
+        warnings: [], unsupported: '翻译失败：后端未连接或已超时', error: ''
+      }
+      set({ mcpMarketPlan: fallback })
+      return fallback
+    } finally {
+      set({ mcpResolving: false })
+    }
+  },
+  clearMcpMarketPlan: () => set({ mcpMarketPlan: null }),
+  resolveMcpPkg: async (name, version) => {
+    set({ mcpPkgBusy: 'resolve', mcpPkgPlan: null, mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgResolve({
+        name,
+        ...(version ? { version } : {})
+      })) as McpPkgPlan | null
+      if (res) {
+        set({ mcpPkgPlan: res })
+        return res
+      }
+      // null（IPC 超时）**必须合成失败计划** —— `if (res)` 跳过会让确认区掉进
+      // "解析结果为空"的死端（同 resolveSkillInstall / resolveMcpInstall 的坑）。
+      const fallback: McpPkgPlan = {
+        ok: false, spec: '', name, version: version ?? '', slug: '', dir: '',
+        registry: '', integrity: '', shasum: '', tarball: '', description: '',
+        direct_dep_count: 0, dep_count: null, scripts: {}, install_hooks: {},
+        has_scripts: false, bins: [], default_bin: '', pinned_from_latest: false,
+        already_installed: null, warnings: [],
+        error: '解析超时：registry 可能不可达，请重试或改用 npx 方式'
+      }
+      set({ mcpPkgPlan: fallback })
+      return fallback
+    } catch {
+      const fallback: McpPkgPlan = {
+        ok: false, spec: '', name, version: version ?? '', slug: '', dir: '',
+        registry: '', integrity: '', shasum: '', tarball: '', description: '',
+        direct_dep_count: 0, dep_count: null, scripts: {}, install_hooks: {},
+        has_scripts: false, bins: [], default_bin: '', pinned_from_latest: false,
+        already_installed: null, warnings: [],
+        error: '解析失败：后端未连接'
+      }
+      set({ mcpPkgPlan: fallback })
+      return fallback
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  clearMcpPkgPlan: () => set({ mcpPkgPlan: null, mcpPkgAction: null }),
+  installMcpPkg: async (payload) => {
+    set({ mcpPkgBusy: 'install', mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgInstall(payload)) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      const action = res?.pkg_action ?? null
+      if (action) set({ mcpPkgAction: action })
+      return action
+    } catch {
+      // 异常（多半是 IPC 180s 超时）：**先重拉一次配置** —— 后端可能其实装完了，
+      // 只是回执没赶上；不重拉的话用户会看到"失败"却在本地包列表里发现它。
+      const action: McpPkgActionResult = {
+        action: 'install', ok: false,
+        error: '安装请求超时或后端未连接。请查看下方「本地包」列表确认是否已装好'
+      }
+      set({ mcpPkgAction: action })
+      void get().loadMcpConfig()
+      return action
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  removeMcpPkg: async (slug) => {
+    set({ mcpPkgBusy: 'remove', mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgRemove({ slug })) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      const action = res?.pkg_action ?? null
+      if (action) set({ mcpPkgAction: action })
+      return action
+    } catch {
+      const action: McpPkgActionResult = {
+        action: 'remove', ok: false, slug, error: '卸载失败：后端未连接或已超时'
+      }
+      set({ mcpPkgAction: action })
+      return action
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  verifyMcpPkg: async (slug) => {
+    set({ mcpPkgBusy: 'verify', mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgVerify({ slug })) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      const action = res?.pkg_action ?? null
+      if (action) set({ mcpPkgAction: action })
+      return action
+    } catch {
+      const action: McpPkgActionResult = {
+        action: 'verify', ok: false, slug, errors: ['复核失败：后端未连接或已超时']
+      }
+      set({ mcpPkgAction: action })
+      return action
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  loadSkillConfig: async () => {
+    try {
+      const res = (await window.agent.skillConfigGet()) as SkillConfigResult | null
+      // `skills` 必须是数组才算有效回执 —— 读失败时后端回的是 `skills: [] + errors`，
+      // 空数组是合法值，不能当"没拿到"处理（否则页面会一直停在加载态）。
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  setSkillEnabled: async (name, enabled) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillSetEnabled({ name, enabled })) as
+        | SkillConfigResult
+        | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('切换技能状态失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  removeSkill: async (name) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillRemove({ name })) as SkillConfigResult | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除技能失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  installSkill: async (payload) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillInstall({
+        name: payload.name,
+        item: payload.item as unknown as object
+      })) as SkillConfigResult | null
+      // 权威值以回执为准：**校验失败（applied=false）也回全量** —— 页面据此重绘，
+      // 并从 res.errors / res.warnings 内联展示（不 toast）。
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      // 链路级异常（后端未就绪 / IPC 超时）：**不 toast**，合成一条 applied=false 的
+      // 回执走同一条内联展示路径 —— 与后端校验失败同款式，用户看到的位置与措辞一致。
+      const prev = get().skillConfig
+      if (prev) {
+        set({
+          skillConfig: {
+            ...prev,
+            applied: false,
+            errors: ['安装失败：后端未连接或已超时'],
+            msg: '安装失败'
+          }
+        })
+      }
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  createSkill: async (payload) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillCreate({
+        name: payload.name,
+        description: payload.description,
+        body: payload.body,
+        ...(payload.tags?.length ? { tags: payload.tags } : {})
+      })) as SkillConfigResult | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('新建技能失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  readSkill: async (name) => {    try {
+      return (await window.agent.skillRead({ name })) as SkillContentResult | null
+    } catch {
+      return { name, text: '', error: '请求失败：后端未连接或已超时' }
+    }
+  },
+  upsertSkillMarket: async (entry) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillMarketUpsert({ entry })) as SkillConfigResult | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存技能源失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  removeSkillMarket: async (marketId) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillMarketRemove({ market_id: marketId })) as
+        | SkillConfigResult
+        | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除技能源失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  searchSkillMarket: async (marketId, query, cursor) => {
+    set({ skillMarketLoading: true })
+    try {
+      const res = (await window.agent.skillMarketSearch({
+        market_id: marketId,
+        query,
+        ...(cursor ? { cursor } : {})
+      })) as SkillMarketResult | null
+      if (!res) {
+        // IPC 超时（30s 未回）：git 源要扫仓库树、第三方 API 实测能到 17s，
+        // 别谎报"没有结果"。
+        set({
+          skillMarket: {
+            items: [],
+            next_cursor: '',
+            market_id: marketId,
+            query,
+            total: 0,
+            cached: false,
+            elapsed_ms: 0,
+            error: '请求超时：市场响应过慢，请重试或换一个源'
+          }
+        })
+        return
+      }
+      const prev = get().skillMarket
+      if (cursor && prev && !res.error && prev.market_id === res.market_id) {
+        // 翻页**追加**；按 id 去重 —— 重复的 React key 会引发渲染异常。
+        const seen = new Set(prev.items.map((i) => i.id))
+        set({
+          skillMarket: {
+            ...res,
+            items: [...prev.items, ...res.items.filter((i) => !seen.has(i.id))]
+          }
+        })
+      } else {
+        set({ skillMarket: res })
+      }
+    } catch {
+      set({
+        skillMarket: {
+          items: [],
+          next_cursor: '',
+          market_id: marketId,
+          query,
+          total: 0,
+          cached: false,
+          elapsed_ms: 0,
+          error: '搜索失败：后端未连接'
+        }
+      })
+    } finally {
+      set({ skillMarketLoading: false })
+    }
+  },
+  resolveSkillInstall: async (marketId, item) => {
+    set({ skillResolving: true, skillMarketPlan: null })
+    // null（IPC 60s 超时）与异常（后端未连接）都**必须**合成失败计划：
+    // 把 null 落成"无结果"会让确认页掉进"安装信息已失效"死端 —— 用户看起来
+    // 就是永久坏了，而真实原因（源慢 / 网络抖动）重试就能过。
+    const failPlan = (msg: string): SkillMarketPlan => ({
+      ok: false,
+      name: '',
+      skill_name: '',
+      description: '',
+      skill_md: '',
+      files: [],
+      file_count: 0,
+      total_bytes: 0,
+      tags: [],
+      version: '',
+      warnings: [],
+      unsupported: msg,
+      error: '',
+      meta: {}
+    })
+    try {
+      const res = (await window.agent.skillMarketResolve({
+        market_id: marketId,
+        item: item as unknown as object
+      })) as SkillMarketPlan | null
+      if (res) {
+        set({ skillMarketPlan: res })
+        return res
+      }
+      const fallback = failPlan('抓取超时：市场源响应过慢或网络不稳，请返回市场重试')
+      set({ skillMarketPlan: fallback })
+      return fallback
+    } catch {
+      const fallback = failPlan('抓取失败：后端未连接或已超时')
+      set({ skillMarketPlan: fallback })
+      return fallback
+    } finally {
+      set({ skillResolving: false })
+    }
+  },
+  clearSkillMarketPlan: () => set({ skillMarketPlan: null }),
+  loadPluginConfig: async () => {
+    try {
+      const res = (await window.agent.pluginConfigGet()) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  setPluginEnabled: async (name, enabled) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginSetEnabled({ name, enabled })) as
+        | PluginConfigResult
+        | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('切换插件状态失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  removePlugin: async (name) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginRemove({ name })) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除插件失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  installPlugin: async (payload) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginInstall({
+        name: payload.name,
+        item: payload.item as unknown as object
+      })) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      const prev = get().pluginConfig
+      if (prev) {
+        set({
+          pluginConfig: {
+            ...prev,
+            applied: false,
+            errors: ['安装失败：后端未连接或已超时'],
+            msg: '安装失败'
+          }
+        })
+      }
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  readPlugin: async (name) => {
+    try {
+      return (await window.agent.pluginRead({ name })) as PluginContentResult | null
+    } catch {
+      return { name, plugin_json: '', files: [], error: '请求失败：后端未连接或已超时' }
+    }
+  },
+  upsertPluginMarket: async (entry) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginMarketUpsert({ entry })) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存插件市场失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  removePluginMarket: async (marketId) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginMarketRemove({ market_id: marketId })) as
+        | PluginConfigResult
+        | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除插件市场失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  searchPluginMarket: async (marketId, query, cursor) => {
+    set({ pluginMarketLoading: true })
+    try {
+      const res = (await window.agent.pluginMarketSearch({
+        market_id: marketId,
+        query,
+        ...(cursor ? { cursor } : {})
+      })) as PluginMarketResult | null
+      if (!res) {
+        set({
+          pluginMarket: {
+            items: [],
+            next_cursor: '',
+            market_id: marketId,
+            query,
+            total: 0,
+            elapsed_ms: 0,
+            error: '请求超时：市场响应过慢，请重试'
+          }
+        })
+        return
+      }
+      const prev = get().pluginMarket
+      if (cursor && prev && !res.error && prev.market_id === res.market_id) {
+        const seen = new Set(prev.items.map((i) => i.id))
+        set({
+          pluginMarket: {
+            ...res,
+            items: [...prev.items, ...res.items.filter((i) => !seen.has(i.id))]
+          }
+        })
+      } else {
+        set({ pluginMarket: res })
+      }
+    } catch {
+      set({
+        pluginMarket: {
+          items: [],
+          next_cursor: '',
+          market_id: marketId,
+          query,
+          total: 0,
+          elapsed_ms: 0,
+          error: '搜索失败：后端未连接'
+        }
+      })
+    } finally {
+      set({ pluginMarketLoading: false })
+    }
+  },
+  resolvePluginInstall: async (marketId, item) => {
+    set({ pluginResolving: true, pluginMarketPlan: null })
+    // null（IPC 超时）与异常都必须合成失败计划，理由同 resolveSkillInstall
+    const failPlan = (msg: string): PluginMarketPlan => ({
+      ok: false,
+      name: '',
+      plugin_name: '',
+      display_name: '',
+      description: '',
+      version: '',
+      author: '',
+      homepage: '',
+      plugin_json: '',
+      components: {},
+      component_counts: {},
+      wired: [],
+      skill_previews: [],
+      files: [],
+      file_count: 0,
+      total_bytes: 0,
+      source_kind: '',
+      repo: '',
+      warnings: [],
+      unsupported: msg,
+      error: '',
+      meta: {}
+    })
+    try {
+      const res = (await window.agent.pluginMarketResolve({
+        market_id: marketId,
+        item: item as unknown as object
+      })) as PluginMarketPlan | null
+      if (res) {
+        set({ pluginMarketPlan: res })
+        return res
+      }
+      const fallback = failPlan('抓取超时：市场源响应过慢或网络不稳，请返回市场重试')
+      set({ pluginMarketPlan: fallback })
+      return fallback
+    } catch {
+      const fallback = failPlan('抓取失败：后端未连接或已超时')
+      set({ pluginMarketPlan: fallback })
+      return fallback
+    } finally {
+      set({ pluginResolving: false })
+    }
+  },
+  clearPluginMarketPlan: () => set({ pluginMarketPlan: null }),
   fetchModels: async (payload) => {
     try {
       const res = (await window.agent.llmModelsFetch(payload)) as LlmModelsResult | null

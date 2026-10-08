@@ -3,6 +3,9 @@ import { Icon } from '@components/common/Icon'
 import ModelSettings from './Settings/ModelSettings'
 import PermissionSettings from './Settings/PermissionSettings'
 import SandboxSettings from './Settings/SandboxSettings'
+import McpSettings from './Settings/McpSettings'
+import SkillSettings from './Settings/SkillSettings'
+import PluginSettings from './Settings/PluginSettings'
 import TrashSettings from './Settings/TrashSettings'
 
 const NAV: { key: SettingsTab; label: string }[] = [
@@ -10,14 +13,23 @@ const NAV: { key: SettingsTab; label: string }[] = [
   { key: 'model', label: '模型' },
   { key: 'permission', label: '权限' },
   { key: 'sandbox', label: '沙盒' },
+  { key: 'mcp', label: 'MCP' },
+  { key: 'skill', label: '技能' },
+  { key: 'plugin', label: '插件' },
   { key: 'trash', label: '归档' },
   { key: 'about', label: '关于' }
 ]
 
-/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/权限/沙盒/归档/关于）。
+/** 设置弹窗：应用窗口正中央弹出，左侧菜单栏（通用/模型/权限/沙盒/MCP/技能/插件/归档/关于）。
  *  「归档」（key 仍为 trash）= 原回收站：软删除会话在此还原 / 彻底删除。
  *  「权限」= 权限管控全局配置（~/.aigent/config/permissions.json，docs/frontend/18）。
- *  「沙盒」= 执行隔离开关与双平台模板编辑（docs/frontend/20）。 */
+ *  「沙盒」= 执行隔离开关与双平台模板编辑（docs/frontend/20）。
+ *  「MCP」= MCP 服务管理：本地增删改启停 + 一次性试连（docs/frontend/23）。
+ *  「技能」= 技能管理：列表 / 市场安装 / 手动新建（docs/frontend/24）。
+ *  「插件」= 插件管理：Claude Code 插件规范，含市场与组件清单（docs/frontend/25）。
+ *
+ *  顺序刻意是「MCP → 技能 → 插件」：三者都是"给智能体加外部能力"，且**都由同一套
+ *  面板语言构成**（列表行内操作 + 市场 + 安装确认），放一起才读得出它们的关系。 */
 export default function SettingsModal(): JSX.Element {
   const tab = useAgentStore((s) => s.settingsTab)
   const openSettings = useAgentStore((s) => s.openSettings)
@@ -57,6 +69,9 @@ export default function SettingsModal(): JSX.Element {
             {tab === 'model' && <ModelSettings />}
             {tab === 'permission' && <PermissionSettings />}
             {tab === 'sandbox' && <SandboxSettings />}
+            {tab === 'mcp' && <McpSettings />}
+            {tab === 'skill' && <SkillSettings />}
+            {tab === 'plugin' && <PluginSettings />}
             {tab === 'trash' && <TrashSettings />}
             {tab === 'general' && <GeneralSettings />}
             {tab === 'about' && <AboutSettings />}

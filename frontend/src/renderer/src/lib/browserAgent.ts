@@ -468,6 +468,137 @@ class BrowserAgentBridge implements AgentApi {
   sandboxConfigSave(payload: object): Promise<unknown> {
     return this.request('sandbox_config_save', 'sandbox_config', payload as Record<string, unknown>)
   }
+  /** MCP 服务管理（设置页「MCP」页，docs/frontend/23）：读 / 单条增改 / 删除 / 试连 */
+  async mcpConfigGet(): Promise<unknown> {
+    return this.request('mcp_config_get', 'mcp_config')
+  }
+  mcpServerUpsert(payload: {
+    name: string
+    config: object
+    original_name?: string
+    meta?: object
+  }): Promise<unknown> {
+    return this.request('mcp_server_upsert', 'mcp_config', payload as Record<string, unknown>)
+  }
+  mcpServerRemove(payload: { name: string }): Promise<unknown> {
+    return this.request('mcp_server_remove', 'mcp_config', payload as Record<string, unknown>)
+  }
+  mcpServerTest(payload: { config?: object; name?: string }): Promise<unknown> {
+    // 试连要真实起子进程 / 建连接并等握手（最长 15s）→ 超时放宽到 30s，
+    // 否则默认超时会稳定误报「超时」（同 llmModelsFetch 的处理）。
+    return this.request('mcp_server_test', 'mcp_test', payload as Record<string, unknown>, 30000)
+  }
+  /** MCP 市场：搜索官方 registry（实测 0.9~17s → 同样放宽到 30s） */
+  mcpMarketSearch(payload: { query?: string; cursor?: string; limit?: number }): Promise<unknown> {
+    return this.request('mcp_market_search', 'mcp_market', payload as Record<string, unknown>, 30000)
+  }
+  /** MCP 市场：把条目翻译成将写入的配置（纯翻译、不落盘） */
+  mcpMarketResolve(payload: { item: object }): Promise<unknown> {
+    return this.request('mcp_market_resolve', 'mcp_market_plan', payload as Record<string, unknown>)
+  }
+  /** MCP 本地包（设置页「MCP → 本地包」，docs/frontend/23 §本地安装）。
+   *  ⚠️ 只有 install 需要**分钟级**超时（真实下载整棵依赖树）—— 与主进程 IPC
+   *  的 180s 对齐，否则浏览器调试通道会先超时、而后端其实已经装成功了。 */
+  mcpPkgResolve(payload: { name: string; version?: string }): Promise<unknown> {
+    return this.request('mcp_pkg_resolve', 'mcp_pkg_plan', payload as Record<string, unknown>, 30000)
+  }
+  mcpPkgInstall(payload: {
+    name: string
+    version: string
+    bin?: string
+    allow_scripts?: boolean
+  }): Promise<unknown> {
+    return this.request('mcp_pkg_install', 'mcp_config', payload as Record<string, unknown>, 180000)
+  }
+  mcpPkgRemove(payload: { slug: string }): Promise<unknown> {
+    return this.request('mcp_pkg_remove', 'mcp_config', payload as Record<string, unknown>, 30000)
+  }
+  mcpPkgVerify(payload: { slug: string }): Promise<unknown> {
+    return this.request('mcp_pkg_verify', 'mcp_config', payload as Record<string, unknown>, 30000)
+  }
+  /** 技能管理（设置页「技能」页，docs/frontend/24）。六条状态命令共用 `skill_config`
+   *  回执（整份替换）；`skill_read` 另走 `skill_content`。 */
+  async skillConfigGet(): Promise<unknown> {
+    return this.request('skill_config_get', 'skill_config')
+  }
+  skillSetEnabled(payload: { name: string; enabled: boolean }): Promise<unknown> {
+    return this.request('skill_set_enabled', 'skill_config', payload as Record<string, unknown>)
+  }
+  skillRemove(payload: { name: string }): Promise<unknown> {
+    return this.request('skill_remove', 'skill_config', payload as Record<string, unknown>)
+  }
+  /** 从市场安装：只回传「哪一条 + 叫什么名」，文件内容由后端自己抓。 */
+  skillInstall(payload: { name: string; item: object }): Promise<unknown> {
+    return this.request('skill_install', 'skill_config', payload as Record<string, unknown>, 60000)
+  }
+  skillRead(payload: { name: string }): Promise<unknown> {
+    return this.request('skill_read', 'skill_content', payload as Record<string, unknown>)
+  }
+  /** 手动新建技能（只传 name / description / tags / body，SKILL.md 由后端拼） */
+  skillCreate(payload: {
+    name: string
+    description: string
+    body: string
+    tags?: string[]
+  }): Promise<unknown> {
+    return this.request('skill_create', 'skill_config', payload as Record<string, unknown>)
+  }
+  /** 技能源增删：两者都回 `skill_config`（源列表就在那份载荷里，不必单开信封）。 */
+  skillMarketUpsert(payload: { entry: object }): Promise<unknown> {
+    return this.request('skill_market_upsert', 'skill_config', payload as Record<string, unknown>)
+  }
+  skillMarketRemove(payload: { market_id: string }): Promise<unknown> {
+    return this.request('skill_market_remove', 'skill_config', payload as Record<string, unknown>)
+  }
+  /** 技能市场搜索：git 源要扫一次仓库树 + 抓若干 SKILL.md，第三方 API 实测最慢十几秒
+   *  → 超时放宽到 30s（默认 5s 会稳定误报超时）。 */
+  skillMarketSearch(payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }): Promise<unknown> {
+    return this.request('skill_market_search', 'skill_market', payload as Record<string, unknown>, 30000)
+  }
+  /** 抓取安装计划（**不落盘**）：要把该技能的全部文件拉下来 → 同样 30s。 */
+  skillMarketResolve(payload: { market_id?: string; item: object }): Promise<unknown> {
+    return this.request('skill_market_resolve', 'skill_market_plan', payload as Record<string, unknown>, 60000)
+  }
+  /** 插件管理（设置页「插件」页，docs/frontend/25）：命令集与技能侧一一对应。 */
+  async pluginConfigGet(): Promise<unknown> {
+    return this.request('plugin_config_get', 'plugin_config')
+  }
+  pluginSetEnabled(payload: { name: string; enabled: boolean }): Promise<unknown> {
+    return this.request('plugin_set_enabled', 'plugin_config', payload as Record<string, unknown>)
+  }
+  pluginRemove(payload: { name: string }): Promise<unknown> {
+    return this.request('plugin_remove', 'plugin_config', payload as Record<string, unknown>)
+  }
+  pluginInstall(payload: { name: string; item: object }): Promise<unknown> {
+    return this.request('plugin_install', 'plugin_config', payload as Record<string, unknown>, 60000)
+  }
+  pluginRead(payload: { name: string }): Promise<unknown> {
+    return this.request('plugin_read', 'plugin_content', payload as Record<string, unknown>)
+  }
+  pluginMarketUpsert(payload: { entry: object }): Promise<unknown> {
+    return this.request('plugin_market_upsert', 'plugin_config', payload as Record<string, unknown>)
+  }
+  pluginMarketRemove(payload: { market_id: string }): Promise<unknown> {
+    return this.request('plugin_market_remove', 'plugin_config', payload as Record<string, unknown>)
+  }
+  /** 读市场目录（`marketplace.json`，raw CDN 直读；官方市场 314 条实测 1~3s） */
+  pluginMarketSearch(payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }): Promise<unknown> {
+    return this.request('plugin_market_search', 'plugin_market', payload as Record<string, unknown>, 30000)
+  }
+  /** 抓取插件安装计划（**不落盘**）：要拉下整个插件目录 → 同样放宽。 */
+  pluginMarketResolve(payload: { market_id?: string; item: object }): Promise<unknown> {
+    return this.request('plugin_market_resolve', 'plugin_market_plan', payload as Record<string, unknown>, 60000)
+  }
   /** 刷新远端模型列表：GET /models 可能较慢，超时放宽到 30s */
   llmModelsFetch(payload: {
     base_url?: string

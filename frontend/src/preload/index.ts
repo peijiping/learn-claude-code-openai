@@ -212,6 +212,99 @@ const agent = {
   sandboxConfigSave: (payload: object): Promise<unknown> =>
     ipcRenderer.invoke('agent:sandboxConfigSave', payload),
 
+  /** MCP 服务管理（设置页「MCP」页，docs/frontend/23）：
+   *  读全量 / 单条增改（含重命名、启停）/ 删除单条 / 一次性试连（不落盘）。 */
+  mcpConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:mcpConfigGet'),
+  mcpServerUpsert: (payload: {
+    name: string
+    config: object
+    original_name?: string
+    meta?: object
+  }): Promise<unknown> => ipcRenderer.invoke('agent:mcpServerUpsert', payload),
+  mcpServerRemove: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpServerRemove', payload),
+  /** 试连：传 `config`（表单草稿真值）或 `name`（从磁盘读真实配置，含未脱敏密钥） */
+  mcpServerTest: (payload: { config?: object; name?: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpServerTest', payload),
+
+  /** MCP 市场（官方 registry 代理）：搜索 / 把条目翻译成将写入的配置（不落盘） */
+  mcpMarketSearch: (payload: { query?: string; cursor?: string; limit?: number }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpMarketSearch', payload),
+  mcpMarketResolve: (payload: { item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpMarketResolve', payload),
+
+  /** MCP 本地包（设置页「MCP → 本地包」，docs/frontend/23 §本地安装）。 */
+  mcpPkgResolve: (payload: { name: string; version?: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpPkgResolve', payload),
+  mcpPkgInstall: (payload: {
+    name: string
+    version: string
+    bin?: string
+    allow_scripts?: boolean
+  }): Promise<unknown> => ipcRenderer.invoke('agent:mcpPkgInstall', payload),
+  mcpPkgRemove: (payload: { slug: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpPkgRemove', payload),
+  mcpPkgVerify: (payload: { slug: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpPkgVerify', payload),
+
+  /** 技能管理（设置页「技能」页，docs/frontend/24）：
+   *  读全量 / 启停（只写旁路元数据）/ 删除 / 从市场安装 / 读 SKILL.md 全文 / 增删源。
+   *  六条状态命令共用 `skill_config` 回执（整份替换）；`skillRead` 另走 `skill_content`。 */
+  skillConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:skillConfigGet'),
+  skillSetEnabled: (payload: { name: string; enabled: boolean }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillSetEnabled', payload),
+  skillRemove: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillRemove', payload),
+  /** 安装：只回传「哪一条 + 叫什么名」，文件内容由后端自己抓（协议面最小） */
+  skillInstall: (payload: { name: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillInstall', payload),
+  skillRead: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillRead', payload),
+  /** 手动新建技能（SKILL.md 由后端拼装，前端不拼 YAML） */
+  skillCreate: (payload: {
+    name: string
+    description: string
+    body: string
+    tags?: string[]
+  }): Promise<unknown> => ipcRenderer.invoke('agent:skillCreate', payload),
+
+  /** 技能市场：搜索（指定源）/ 抓取安装计划（不落盘）/ 增删源 */
+  skillMarketSearch: (payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }): Promise<unknown> => ipcRenderer.invoke('agent:skillMarketSearch', payload),
+  skillMarketResolve: (payload: { market_id?: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillMarketResolve', payload),
+  skillMarketUpsert: (payload: { entry: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillMarketUpsert', payload),
+  skillMarketRemove: (payload: { market_id: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillMarketRemove', payload),
+
+  /** 插件管理（设置页「插件」页，docs/frontend/25）：命令集与技能侧一一对应。 */
+  pluginConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:pluginConfigGet'),
+  pluginSetEnabled: (payload: { name: string; enabled: boolean }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginSetEnabled', payload),
+  pluginRemove: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginRemove', payload),
+  pluginInstall: (payload: { name: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginInstall', payload),
+  pluginRead: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginRead', payload),
+  pluginMarketSearch: (payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }): Promise<unknown> => ipcRenderer.invoke('agent:pluginMarketSearch', payload),
+  pluginMarketResolve: (payload: { market_id?: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginMarketResolve', payload),
+  pluginMarketUpsert: (payload: { entry: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginMarketUpsert', payload),
+  pluginMarketRemove: (payload: { market_id: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginMarketRemove', payload),
+
   /** 刷新某连接的可用模型列表（GET {base_url}/models）；api_key 留空时后端回退已保存密钥 */
   llmModelsFetch: (payload: {
     base_url?: string

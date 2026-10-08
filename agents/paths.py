@@ -26,8 +26,28 @@ ROOT_DIR = Path.cwd()
 # 散落的配置文件（config.json / credentials.json / llmconfig.json / providers.json /
 # permissions.json）自 2026-09-22 起统一收在 `~/.aigent/config/`（CONFIG_DIR）下。
 
-# 技能目录
+# 技能目录（每个技能一个子目录，内含 SKILL.md）
 SKILLS_DIR = AIGENT_HOME / "skills"
+# 技能旁路元数据（设置页用：source / market_id / market_name / publisher /
+# installed_at / enabled）。**刻意与技能本体分离**（docs/frontend/24），三条理由：
+#   1. 技能目录必须保持**可直接拷给别的 Agent 用**的原样（SKILL.md + 附属文件）；
+#      往里塞一个 .aigent-meta.json 会污染这份"可移植性"；
+#   2. 启用/禁用状态若写进 SKILL.md 的 frontmatter，等于每次启停都要**改写用户
+#      手写的技能正文**（还会过期、还会与上游更新冲突）；
+#   3. 市场来源信息（从哪装的）与技能内容无关，混在一起会让"更新技能"变成
+#      "合并两份不同来源的数据"。
+SKILL_SOURCES = AIGENT_HOME / "skills_sources.json"
+# 已注册的技能市场源（用户添加的 git 仓库 / 索引地址），设置页可增删。
+SKILL_MARKETS = AIGENT_HOME / "skill_markets.json"
+
+# 插件目录（每个插件一个子目录，内含 .claude-plugin/plugin.json 清单）。
+# 采用 Claude Code 插件规范 —— 插件是"可分发的能力包"，可贡献 skills /
+# commands / hooks / MCP 服务器等组件（docs/frontend/25）。
+PLUGINS_DIR = AIGENT_HOME / "plugins"
+# 插件旁路元数据（与 SKILL_SOURCES 同理：不污染插件目录本体）。
+PLUGIN_SOURCES = AIGENT_HOME / "plugins_sources.json"
+# 已注册的插件市场源（`marketplace.json` 所在的 git 仓库）。默认预置官方市场。
+PLUGIN_MARKETS = AIGENT_HOME / "plugin_markets.json"
 
 # worktree 目录（git worktree 实验分支挂载点）
 WORKTREE_DIR = AIGENT_HOME / "worktrees"
@@ -36,6 +56,21 @@ WORKTREE_DIR = AIGENT_HOME / "worktrees"
 MCP_DIR = AIGENT_HOME / "mcp"
 # MCP 服务器配置文件（mcpServers 格式，多服务器）
 MCP_CONFIG = MCP_DIR / "mcp_servers.json"
+# MCP 条目旁路元数据（设置页用：source / market_id / installed_at / publisher）。
+# **刻意与 MCP_CONFIG 分离**（docs/frontend/23）：
+#   1. mcp_servers.json 保持标准 mcpServers 格式，可直接拷给别的 MCP 客户端用；
+#   2. mcp_manager.maybe_reload() 靠 `new[name] != old.get(name)` 判配置变化，
+#      元数据若内嵌进条目，改个 installed_at 就会触发整条断连重连。
+MCP_SOURCES = MCP_DIR / "mcp_sources.json"
+# MCP **本地包**安装根（2026-10-07，docs/frontend/23 §本地安装）。
+# `~/.aigent/mcp/pkgs/<包@版本>/` —— 一个包一个专属目录（内含 node_modules 与
+# 我们写的 `aigent-meta.json`）。要点：
+#   1. 落在 `MCP_DIR` 之下是刻意的：与既有的"应用自身产物只在 `~/.aigent` 下"
+#      收口习惯一致（同 sandbox/），不往用户的全局 npm 前缀里塞东西；
+#   2. 目录名带版本 → 同包不同版本可并存，同名同版天然幂等；
+#   3. 卸载 = 删这个目录，没有任何跨目录的副作用（故 `mcp_installer.remove` 只
+#      允许删本目录的直接子目录）。
+MCP_PKGS_DIR = MCP_DIR / "pkgs"
 
 # 工作目录（所有工具操作的沙盒根；项目选择阶段改为用户可选）
 WORKDIR = ROOT_DIR / "WorkSpace/task1"
@@ -336,6 +371,13 @@ def ensure_dirs() -> None:
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     DURABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
     MCP_DIR.mkdir(parents=True, exist_ok=True)
+    # MCP 本地包安装根（2026-10-07）：预先建好，让"批量安装"与"首次打开本地包
+    # 列表"都不必各自 mkdir（与 SKILLS_DIR / PLUGINS_DIR 同策略）。
+    MCP_PKGS_DIR.mkdir(parents=True, exist_ok=True)
+    # 技能 / 插件的运行时落点（docs/frontend/24、25）。技能目录此前由
+    # migrate_legacy 顺带搬过来，不保证存在 → 这里统一补建（幂等）。
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
     WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
 
 

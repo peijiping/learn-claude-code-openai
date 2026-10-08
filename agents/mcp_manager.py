@@ -24,7 +24,7 @@ mcp_manager.py - MCPManager（真实 MCP 客户端接入）
 对外 API（与旧 mock 版保持兼容，tools.py / agent_full_v2.py 依赖）：
   available_servers / connected_names / catalog / catalog_text / connect /
   connect_all / assemble_tools / assemble_handlers
-新增：disconnect / maybe_reload / shutdown / is_destructive
+新增：disconnect / maybe_reload / shutdown / is_destructive / last_error
 
 MCP 是 Lead（主智能体）级动态能力：子智能体不暴露 connect_mcp 与 mcp__* 工具。
 """
@@ -401,6 +401,9 @@ class MCPManager:
         self._config: dict[str, dict] = {}          # 当前生效配置（{name: cfg}）
         self._config_mtime: float | None = None
         self._clients: dict[str, MCPServerSession] = {}  # 已连接：name → 会话
+        # 上次连接失败的原因（设置页展示用；`connect()` 成功即清除）。
+        # 只增不改任何判定逻辑 —— 见 docs/frontend/23「引擎层最小改动」。
+        self._last_errors: dict[str, str] = {}
         self._reload_config()
 
     # ── 配置 ────────────────────────────────────────────────────────
@@ -455,10 +458,20 @@ class MCPManager:
         result = session.start()
         if session.ready:
             self._clients[name] = session
+            self._last_errors.pop(name, None)
             print(f"  \033[31m[mcp] connected: {name} → {session.tool_names}\033[0m")
             return result
+        self._last_errors[name] = result      # 供设置页显示「为什么连不上」
         print(f"  \033[31m[mcp] connect failed: {name} → {result}\033[0m")
         return f"MCP error: {result}"
+
+    def last_error(self, name: str) -> str | None:
+        """上次连接失败的原因（成功连接后清除）；从未失败过返回 None。
+
+        仅用于设置页展示，**不参与任何判定**（不要拿它当连接状态的判据 ——
+        状态的唯一权威是 `connected_names()`）。
+        """
+        return self._last_errors.get(name)
 
     def connect_all(self) -> int:
         """启动自动加载：连接全部已配置服务器，返回成功连接数量。"""
