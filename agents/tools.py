@@ -45,6 +45,10 @@ import sandbox as sandbox_mod
 # 文档转换走 doc_convert（叶子模块）：PDF 的「文本层 + 页图」与 Office 的文本抽取
 # 都由它提供，附件通道与工具通道共用同一段代码。
 import doc_convert
+# 联网工具（2026-10-17）：DeepSeek 的 Search / Fetch 两个 HTTP 接口封装在叶子模块
+# web_tools（只依赖标准库 + httpx + logger，不 import config/paths），本模块只负责
+# 注册 schema 与转调。Key/基址/超时走配置（见 .env.example 与 docs/frontend/26）。
+import web_tools
 from attachments import (
     IMAGE_EXTS,
     build_tool_image_result,
@@ -773,6 +777,16 @@ class ToolRegistry:
             "run_write":   lambda **kw: self.run_write(kw["path"], kw["content"]),
             "run_edit":    lambda **kw: self.run_edit(kw["path"], kw["old_text"], kw["new_text"]),
             "run_glob":    lambda **kw: self.run_glob(kw["pattern"]),
+            # ── 联网工具（2026-10-17）─────────────────────────────────────
+            # 转调 web_tools 的两个函数（DeepSeek Search / Fetch）。
+            # 两者都**永远返回字符串**（不含图片块），且网络/鉴权/限流等
+            # 失败都收敛成 "Error: ..." 文案；`parallel` 由分桶逻辑消费，
+            # 不进 handler（lambda 只取需要的关键字）。Key 未配置时函数内部
+            # 返回明确指引，不会抛异常打死整轮。
+            "web_search":  lambda **kw: web_tools.search(
+                kw["query"], kw.get("count"), kw.get("need_content", False),
+                kw.get("ori_question")),
+            "web_fetch":   lambda **kw: web_tools.fetch(kw["url"]),
             # ── todo 已下线（2026-09-16）────────────────────────────────
             # 原 TodoWrite：单列表、整表替换语义 update(items, fresh_start)。
             # 下线原因：与 task 看板功能高度重合；且「每轮整表覆盖写」会冲掉
@@ -1047,6 +1061,62 @@ class ToolRegistry:
                             "parallel": {"type": "boolean", "default": False,
                                 "description": "True 时与同次响应中其他独立 glob 搜索并行执行。多个互不依赖的 pattern 一起发可提速。"}
                         }, "required": ["pattern"]}
+                    }
+                },
+                # ── 联网工具（2026-10-17）─────────────────────────────────────
+                # 放在 base_tools：主智能体与**子智能体**都可用（子智能体读代码/
+                # 查资料时常需联网）。后端是 DeepSeek 的 Search / Fetch API，Key
+                # 独立配置（DEEPSEEK_SEARCH_API_KEY），与主模型供应商解耦。
+                # 两者是只读网络请求：权限链按"非文件工具"直接放行；互不依赖的
+                # 多条查询可设 parallel=true 并发。详细设计见 docs/frontend/26。
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": (
+                            "联网搜索网页，返回结构化结果（标题 / 链接 / 摘要 / 日期 / 权威性 / 相关度）。"
+                            "当需要**最新信息**、库/框架/API 的当前用法、版本发布、报错排查、"
+                            "或工作空间里找不到的外部事实时使用。\n"
+                            "query 支持搜索语法（会原样传给搜索引擎，可组合）："
+                            "`site:github.com`（限定站点，多个用空格+OR）、`-site:example.com`（排除站点）、"
+                            "`-\"短语\"`（排除短语）、`\"精确短语\"`（精确匹配）、`lang:zh,en`（限定语言）、"
+                            "`after:2025` / `before:2026-06-01`（按发布时间）。\n"
+                            "默认只回**摘要**（适合阅读、省上下文）；确需网页正文时才传 need_content=true"
+                            "（正文很长，会明显占用上下文，且仅在读取某条结果的细节时才值得）。\n"
+                            "多条**互不依赖**的搜索可在同一条回复里一起发起并设 parallel=true 提速。"
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "query": {"type": "string",
+                                "description": "搜索词（1~128 字符，不能全为空白），支持上述搜索语法"},
+                            "count": {"type": "integer",
+                                "description": "返回条数 1~50，默认 10；只要几条时传小值更省上下文"},
+                            "need_content": {"type": "boolean", "default": False,
+                                "description": "是否在结果里附网页正文（content）。默认 False 只给摘要；"
+                                               "正文很长，仅当需要细读具体内容时才设 True"},
+                            "ori_question": {"type": "string",
+                                "description": "可选：触发本次搜索的用户原始问题，有助于理解搜索意图"},
+                            "parallel": {"type": "boolean", "default": False,
+                                "description": "True 时与同次响应中其他独立工具调用并行执行。多个互不依赖的搜索一起发可提速。"}
+                        }, "required": ["query"]}
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "description": (
+                            "抓取单个网页，返回**标题 + Markdown 正文**。"
+                            "通常在 web_search 拿到 URL 后，需要读全篇内容时用它。\n"
+                            "只接受 http/https URL，且页面需能正常访问；"
+                            "被站点安全策略拦截、内容类型不支持或页面无可提取正文时会返回错误。\n"
+                            "**不要**用它读取工作空间里的本地文件 —— 那用 run_read。"
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "url": {"type": "string",
+                                "description": "要抓取的网页地址（含 host 的 http/https URL）"},
+                            "parallel": {"type": "boolean", "default": False,
+                                "description": "True 时与同次响应中其他独立工具调用并行执行。"}
+                        }, "required": ["url"]}
                     }
                 },
                 # 原「view_image」工具定义已下线（2026-09-21）：读图片并入 run_read

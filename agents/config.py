@@ -112,7 +112,11 @@ def _merge_json_into_env(path: Path) -> None:
         return
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as e:
+        # 整份文件解析失败时**必须出声**：静默 return 会让「配置写坏了」表现成
+        # 「配置没生效」（如 credentials.json 少一个逗号 → 该文件所有键全部丢失
+        # → 工具报「未配置 API Key」），症状与原因相隔太远，极难排查。
+        print(f"[config] ⚠️ 配置文件解析失败，整份已忽略：{path}（{type(e).__name__}: {e}）")
         return
     for key, value in data.items():
         if isinstance(value, (str, int, float, bool)):
