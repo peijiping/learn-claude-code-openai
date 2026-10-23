@@ -3,6 +3,10 @@
 > 从一个「从 0 到 1 学习 Coding Agent Harness」的个人仓库，**转变为一个功能完整的桌面智能体工具**。
 > 前端做壳，Python 后端做脑：所有 Agent 逻辑、工具执行、流式生成都在后端，前端只负责「渲染 + 交互 + 转发」。
 
+![智能体桌面端界面](docs/assets/agent-desktop.png)
+
+<sub>桌面端实机截图（Electron + React 前端，Python Agent 后端）。</sub>
+
 ---
 
 ## 这个项目是什么
@@ -14,7 +18,7 @@
 
 > Agency（感知—推理—行动）来自模型训练，我们构建的是 **Harness** —— 让模型在特定领域里干活的脚手架。
 
-**当前状态**：桌面壳 + 流式打字机 + 工具调用可视化已打通，同时具备 **多工作空间（多项目）隔离、模型管理/热切换、会话管理（含回收站/归档）、token 统计与上下文指示、子智能体执行回放、会话内任务面板、统一日志** 等能力，可直接对话使用。
+**当前状态**：桌面壳 + 流式打字机 + 工具调用可视化已打通，并已具备 **多工作空间隔离、模型管理/热切换、会话管理（含回收站/归档）、token 统计与上下文指示、子智能体回放、任务面板、计划/目标执行模式、权限审批与沙盒隔离、附件/@引用/读图/多格式预览、右栏文件与变更面板、MCP/技能/插件管理、联网工具、统一日志**，可直接对话使用。
 
 ---
 
@@ -26,6 +30,33 @@
 - **并发会话**：每个会话独立 Agent 运行时（`SessionRuntime`），可同时后台执行；任务树切换会话**不断流**，事件按 `session_id` 路由 + 连接无关广播
 - **停止请求**：会话级 `stop`，只停下当前正在执行的那一轮
 - **断线自愈**：Python 子进程拉起监控 + WebSocket 指数退避重连 + 连接 Hub 广播（断线重连不丢运行中事件）+ 父进程孤儿看护
+
+### 任务执行模式
+- **计划模式（Plan）**：先产出可审阅的计划文书并写入工作空间，用户确认后再按计划执行；计划模式与目标模式在前端互斥切换，工作空间下拉框出现带关闭 × 的模式 tag
+- **目标模式（Goal）**：设定目标后由独立评估器逐轮判定是否达成，未达成自动续跑，连续多轮未达成触发 limit 分支
+- **用户确认选项（`ask_user`）**：模型在对话中抛出选项卡片，输入区让位、选择结果回填为工具结果继续执行
+
+### 权限与安全
+- **两档权限模式**：默认（逐项审批）/ 完全访问，对齐 WorkBuddy；会话 chip 与工作空间默认权限可分别设置
+- **审批流**：范式 C 审批弹窗，静态分析工具参数（写文件/执行命令/删改等）后决定放行或询问，支持「本会话允许」记忆
+- **权限管理设置页**：八分区规则配置，按命令/路径/工具粒度定制
+- **沙盒隔离**：`run_bash` 经 `agents/sandbox.py` 执行隔离（macOS Seatbelt / Linux bwrap，其他平台降级裸跑），策略模板用户可编辑，配置热生效
+
+### 文件与多模态
+- **附件输入**：添加文件/图片，统一转换层（`doc_convert.py`）把 PDF / Office 转成模型可读内容
+- **@ 引用**：输入框引用工作空间内文件与文件夹，气泡中渲染为胶囊 token，随消息回放
+- **工具读图 / 统一读文件**：`run_read` 按类型分派，图片、复合文档（带图表/扫描页的 PDF、Office）都能按需进入上下文
+- **多格式预览**：对话中出现的文件路径、`file://` 链接、@ 胶囊点开即在右栏独立 tab 只读预览（图片 / PDF / Word / Excel / PPT），目录则定位到右栏文件视图
+
+### 右侧面板
+- **文件 + 变更双视图**：文件树浏览与打开、git 变更列表；每个会话私有一份面板实例（开没开、标签、激活项、滚动位置随会话走）
+- 终端 / 浏览器两项已预留契约与状态模型（第二期实现）
+
+### 扩展生态
+- **MCP 服务**：市场浏览与一键安装（默认本地包安装，钉版本 + 记录哈希）、手动添加、引用本机已启动服务、启停 / 测试 / 删除 / 工具清单；stdio / sse / streamable-http 三传输，配置按 mtime 热重载
+- **技能**：多源市场聚合 + 手动新建，启停即时生效
+- **插件**：兼容 Claude Code 插件规范（`marketplace.json` 即市场），市场安装、组件清单确认、启停 / 详情 / 删除；当前技能类组件已接入运行时
+- **联网工具**：`web_search` + `web_fetch`，模型可主动检索与抓取网页正文
 
 ### 工作空间 / 多项目
 - **多工作空间（多项目）**：选定目录 = 工具沙箱根 + 一份同构元数据目录（`~/.aigent/projects/<id>/`）；`projects.json` 索引 + `ws` 短码
@@ -76,12 +107,15 @@
 └──────────────┬──────────────────────────────────────────────────────┘
                │ 启动 ws_bridge.py（127.0.0.1:8765）
 ┌──────────────▼──────────────────────────────────────────────────────┐
-│  Python 后端（OpenAI SDK，零业务改动）                                  │
+│  Python 后端（OpenAI SDK）                                            │
 │    agents/ws_bridge.py          桥：命令进 → Agent 方法调用，事件出 → 广播 │
 │    agents/session_runtime.py    ⭐ 并发会话运行时（每会话独立 Agent）      │
 │    agents/llm_config.py         模型配置（连接→模型两级 + 热切换）         │
 │    agents/project_registry.py   多工作空间索引与隔离                     │
 │    agents/session_manage.py     会话元数据 / 归档 / 回收站 / 子智能体记录  │
+│    agents/permission.py        权限判定链 + 审批（approval.py）           │
+│    agents/sandbox.py           沙盒执行隔离                             │
+│    agents/execution_mode.py     计划 / 目标执行模式                      │
 │    agents/streaming_client.py   StreamEvent / EventSink / WSSink       │
 │    agents/agent_full_v2.py      Agent 引擎（run_turn / 会话 / 目标…）    │
 └──────────────────────────────────────────────────────────────────────┘
@@ -118,12 +152,19 @@ learn-claude-code-main/
 │   ├── project_registry.py       # 多工作空间索引与隔离
 │   ├── session_manage.py         # 会话元数据 / 回收站 / 子智能体记录
 │   ├── subagent_store.py         # 子智能体旁路记录存储
+│   ├── permission.py / approval.py  # 权限判定链 + 审批流
+│   ├── sandbox.py                # 沙盒执行隔离（Seatbelt / bwrap）
+│   ├── execution_mode.py         # 计划模式 / 目标模式
+│   ├── attachments.py / doc_convert.py / refs.py  # 附件、文档转换、@ 引用
+│   ├── mcp_manager.py / mcp_store.py / mcp_market.py / mcp_installer.py
+│   ├── skills.py / skill_store.py / skill_market.py
+│   ├── plugin_store.py / plugin_market.py
+│   ├── web_tools.py              # 联网工具（web_search / web_fetch）
 │   ├── tools.py                  # ToolRegistry（统一工具注册）
 │   ├── task_manager.py           # 会话内任务面板
 │   ├── cron_scheduler.py         # 定时任务
 │   ├── teammate_manager.py       # 队友协作
-│   ├── mcp_manager.py            # MCP 客户端管理
-│   ├── memories.py / context_compact.py / goal.py / workflow.py / skills.py
+│   ├── memories.py / context_compact.py / goal.py / workflow.py
 │   ├── logger.py / config.py / paths.py / utils.py
 │   └── ...
 │
@@ -131,7 +172,7 @@ learn-claude-code-main/
 │   ├── src/main/                 #   主进程：pythonManager / agentWS / IPC / 目录选择
 │   ├── src/preload/              #   contextBridge 白名单
 │   ├── src/renderer/src/
-│   │   ├── components/           #   Sidebar(工作空间树) / Chat / SettingsModal / common
+│   │   ├── components/           #   Sidebar / Chat / RightPanel / Settings / TitleBar / common
 │   │   ├── store/                #   Zustand：agentStore / sidebarStore / settingsStore
 │   │   ├── hooks/                #   useAgentStream
 │   │   ├── protocols/            #   事件线协议类型 / 解析
@@ -218,12 +259,15 @@ REPL 命令：直接输入对话；`/tasks` 任务看板 · `/compact` 压缩 ·
 
 同一条 WebSocket 上用 `kind` 区分消息：
 - **事件（后端→前端）**：`{kind:'event', payload:{type:'content_delta', text:'…'}}`，类型与后端 `StreamEvent` 一一对应
-- **命令（前端→后端），按 4 组**：
+- **命令（前端→后端），按组**：
   - 会话：`chat` / `stop` / `status_query` / `session_switch` / `session_set_unread` / `session_model` / `session_clear` / `session_rename` / `session_trash` / `session_restore` / `session_delete` / `sessions_list` / `trash_list`
-  - 工作空间：`projects_list` / `project_add` / `project_open` / `project_rename` / `project_remove`
+  - 工作空间：`projects_list` / `project_add` / `project_open` / `project_rename` / `project_remove` / `project_permission`
   - 模型：`llm_config_get` / `llm_config_save` / `llm_models_fetch`
-  - 查询：`goal_status` / `tasks` / `skills`
-- **广播信封**：`sessions` / `projects` / `session_status` / `task_board` / `context_stats` 等
+  - 执行与交互：`session_exec_mode` / `goal_status` / `plan_approve` / `plan_read` / `ask_answer` / `ask_cancel` / `approval_answer` / `session_permission`
+  - 文件与右栏：`attachment_stage` / `refs_list` / `file_read` / `git_status` / `git_diff`
+  - 安全与扩展：`permission_config_get/save` / `sandbox_config_get/save` / `mcp_*` / `skill_*` / `plugin_*`
+  - 查询：`tasks` / `skills`
+- **广播信封**：`sessions` / `projects` / `session_status` / `task_board` / `context_stats` / `permission_changed` 等
 
 完整协议见 [docs/frontend/03-前后端通信协议.md](docs/frontend/03-前后端通信协议.md)。
 
@@ -245,6 +289,21 @@ REPL 命令：直接输入对话；`/tasks` 任务看板 · `/compact` 压缩 ·
 | [09-日志系统.md](docs/frontend/09-日志系统.md) | `~/.aigent/logs` 统一日志 / 全量埋点 |
 | [10-Task任务系统.md](docs/frontend/10-Task任务系统改造方案.md) | 会话内任务面板 / 存储布局 / 中断续跑 |
 | [11-工作空间管理.md](docs/frontend/11-工作空间管理.md) | 多工作空间隔离 / 空间树 / `projects` 协议 |
+| [12-附件与文件输入.md](docs/frontend/12-附件与文件输入.md) | 附件通道 / 统一文档转换 / 下载与回放 |
+| [13-引用文件与文件夹（@-mention）.md](docs/frontend/13-引用文件与文件夹（@-mention）.md) | @ 引用 / 胶囊 token / 引用协议 |
+| [14-工具读图（view_image）.md](docs/frontend/14-工具读图（view_image）.md) | 模型按需读图（入口已并入 `run_read`） |
+| [15-统一文件读取（run_read 按类型分派）.md](docs/frontend/15-统一文件读取（run_read 按类型分派）.md) | 读文件工具收敛 / 复合文档读取 |
+| [16-对话中的用户确认选项（ask_user）.md](docs/frontend/16-对话中的用户确认选项（ask_user）.md) | `ask_user` 工具 / 选项卡片 / 输入区让位 |
+| [17-权限管控（两档模式与审批流）.md](docs/frontend/17-权限管控（两档模式与审批流）.md) | 两档权限 / 判定链 / 审批弹窗 |
+| [18-权限管理设置页开发方案.md](docs/frontend/18-权限管理设置页开发方案.md) | 设置页八分区 / 读写与生效 |
+| [19-右侧面板（文件与变更）.md](docs/frontend/19-右侧面板（文件与变更）.md) | 会话私有右栏 / 文件树 / git 变更 |
+| [20-沙盒（执行隔离）.md](docs/frontend/20-沙盒（执行隔离）.md) | Seatbelt / bwrap / 策略模板 |
+| [21-多格式文件预览.md](docs/frontend/21-多格式文件预览.md) | 图片 / PDF / Office 预览 / 路径点击 |
+| [22-任务执行模式（计划与目标）.md](docs/frontend/22-任务执行模式（计划与目标）.md) | Plan / Goal 模式与互斥切换 |
+| [23-MCP服务管理.md](docs/frontend/23-MCP服务管理.md) | MCP 市场 / 本地包安装 / 热重载 |
+| [24-技能管理.md](docs/frontend/24-技能管理.md) | 多源市场 / 启停语义 |
+| [25-插件管理.md](docs/frontend/25-插件管理.md) | Claude Code 插件规范兼容 / 组件清单 |
+| [26-联网工具（web_search 与 web_fetch）.md](docs/frontend/26-联网工具（web_search 与 web_fetch）.md) | 联网检索与网页抓取 |
 
 ---
 
@@ -264,7 +323,16 @@ REPL 命令：直接输入对话；`/tasks` 任务看板 · `/compact` 压缩 ·
 | 增量 · 任务面板 | 会话内 TaskBoard 实时推流与重放 | ✅ |
 | 增量 · 子智能体回放 | 旁路记录 + 卡片回放 | ✅ |
 | 增量 · 日志系统 | `~/.aigent/logs` 统一留痕 | ✅ |
-| 后续 | 附件多模态 / 账号 / 自动化深化 / 权限细化 | 🚩 增量 |
+| 增量 · 附件与引用 | 附件通道 / @ 引用 / 读图 / 统一 `run_read` | ✅ |
+| 增量 · ask_user | 对话内选项卡片 | ✅ |
+| 增量 · 权限管控 | 两档模式 / 审批流 / 设置页 | ✅ |
+| 增量 · 沙盒 | Seatbelt / bwrap 执行隔离 | ✅ |
+| 增量 · 右侧面板 | 文件 + 变更双视图 / 会话私有 | ✅ |
+| 增量 · 多格式预览 | 图片 / PDF / Office 独立 tab 预览 | ✅ |
+| 增量 · 任务执行模式 | 计划模式 / 目标模式 | ✅ |
+| 增量 · 扩展生态 | MCP / 技能 / 插件管理与安装 | ✅ |
+| 增量 · 联网工具 | `web_search` / `web_fetch` | ✅ |
+| 后续 | 右栏终端与浏览器 / 账号 / 权限细化 | 🚩 增量 |
 
 ---
 
