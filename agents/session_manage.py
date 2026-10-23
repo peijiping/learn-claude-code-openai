@@ -25,7 +25,8 @@ from typing import Callable, Optional
 
 from context_compact import ContextCompact, DEFAULT_MAX_CONTEXT_TOKENS
 import paths  # 运行期读 paths.TASKS_DIR（测试/CLI 会临时改写模块级值，不能静态捕获）
-from paths import DEFAULT_PROJECT_SLUG, task_files_for_session
+from paths import (DEFAULT_PROJECT_SLUG, plan_display_path,
+                   plan_file_for_session, task_files_for_session)
 from logger import get_logger
 
 # 统一日志（~/.aigent/logs/agent_日期.log）
@@ -41,6 +42,142 @@ SESSION_ID_LEN = 10
 
 # token 消耗统计的四字段（与 LLM usage 投影结构一致，会话级累计/轮级明细共用）
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "cached_tokens", "total_tokens")
+
+# 「不修改该项」哨兵（2026-09-25，任务执行模式）。
+# 与 None 严格区分：`set_session_execution(..., goal_condition=None)` 表示
+# **显式把目标条件清空**（goal 达成/清除时必须能落盘 None），而省略参数
+# 才表示"本项不改"。若用 None 兼任"不改"，清空就永远写不进去。
+_UNSET: object = object()
+
+# ── 右侧面板（2026-09-23，docs/frontend/19）────────────────────────────
+# 会话级 UI 状态，与 unread / permission_mode / usage_totals 同源，随
+# session_history 回传恢复。**只有这四项视图**：摘要是刻意不做的一项（任务面板
+# 留在聊天区下方），加回来必须先改这张白名单，否则读写两侧口径会打架。
+RIGHTPANEL_VIEWS = ("files", "changes", "terminal", "browser")
+# 视图标签每类至多一枚；常驻文件标签上限 12（超出丢最旧的非激活项）。
+RIGHTPANEL_MAX_FILE_TABS = 12
+# 标签总数上限 = 视图上限 + 常驻上限 + 1 个预览位。视图标签**永不**因超限被丢。
+RIGHTPANEL_MAX_TABS = len(RIGHTPANEL_VIEWS) + RIGHTPANEL_MAX_FILE_TABS + 1
+
+
+def right_panel_tab_key(tab: dict) -> str:
+    """标签的稳定键：视图标签 `view:<view>`，文件标签 `file:<绝对路径>`。
+
+    前端 `lib/rpanelTabs.ts::tabKey` 必须与此**逐字一致** —— `active` 字段存的
+    就是它，两边算法一旦漂移，切会话恢复时激活项会对不上（表现为"标签都在但
+    一个都没选中"）。
+    """
+    if not isinstance(tab, dict):
+        return ""
+    if tab.get("kind") == "view":
+        return f"view:{tab.get('view')}"
+    if tab.get("kind") == "file":
+        return f"file:{tab.get('path')}"
+    return ""
+
+
+def normalize_right_panel(ui) -> Optional[dict]:
+    """归一化右栏状态；整份不可用返回 None（= 当作没设置）。
+
+    存在的理由是**防线而不是清洗**：这份数据来自前端、落在磁盘上、会被手改、
+    会跨版本漂移。任何一处畸形都不许把前端打崩，所以规则是**逐项丢弃**而不是
+    整份拒绝 —— 丢掉一枚坏标签，比让整条会话恢复失败划算得多。
+
+    规则（与前端 `normalizeTabs` 逐条对齐）：
+    - 入参非 dict → None；`tabs` 非 list → 空列表
+    - `kind` 非 view/file、`view` 不在白名单、`path` 非非空 str → 丢弃该项
+    - 同 view / 同 path 重复 → 只留首个
+    - `name` 缺失/非 str/空 → 用 basename 兜底
+    - `pinned` 非 bool → 视为 True（**默认常驻**：手改 meta 不该凭空造出
+      "无人打开的预览位"，那种标签会被下一次会话点击无声顶掉，很难理解）
+    - 预览位（pinned=False）多于一枚 → 只留最后一枚
+    - 常驻文件标签 > 12 → 丢最旧的非激活项；总标签 > 16 → 再丢文件标签
+    - `active` 不命中任何 tab key → None
+    """
+    if not isinstance(ui, dict):
+        return None
+
+    raw_tabs = ui.get("tabs")
+    if not isinstance(raw_tabs, list):
+        raw_tabs = []
+
+    tabs: list[dict] = []
+    seen_views: set[str] = set()
+    seen_paths: set[str] = set()
+    for raw in raw_tabs:
+        if not isinstance(raw, dict):
+            continue
+        kind = raw.get("kind")
+        if kind == "view":
+            view = raw.get("view")
+            if view not in RIGHTPANEL_VIEWS or view in seen_views:
+                continue
+            seen_views.add(view)
+            tabs.append({"kind": "view", "view": view})
+        elif kind == "file":
+            path = raw.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            path = path.strip()
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            name = raw.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = os.path.basename(path.rstrip("/")) or path
+            pinned = raw.get("pinned")
+            if not isinstance(pinned, bool):
+                pinned = True
+            tabs.append({
+                "kind": "file",
+                "path": path,
+                "name": name.strip(),
+                "pinned": pinned,
+            })
+
+    # 预览位全场唯一：只留最后一枚（"最近一次会话点击"才是用户心智里的预览位）
+    preview_idx = [i for i, t in enumerate(tabs)
+                   if t["kind"] == "file" and not t["pinned"]]
+    if len(preview_idx) > 1:
+        drop = set(preview_idx[:-1])
+        tabs = [t for i, t in enumerate(tabs) if i not in drop]
+
+    active = ui.get("active")
+    if not isinstance(active, str) or not active:
+        active = None
+
+    # 超限淘汰：先常驻文件标签（丢最旧的非激活），再文件标签总数。
+    # 视图标签与预览位（最近一次交互的结果）永远保留 —— 淘汰它们是"点了没反应"。
+    # 计数含激活项（上限就是"常驻标签有几枚"），但**只丢非激活的**。
+    def pinned_count(items: list[dict]) -> int:
+        return sum(1 for t in items if t["kind"] == "file" and t["pinned"])
+
+    def droppable_indexes(items: list[dict]) -> list[int]:
+        return [i for i, t in enumerate(items)
+                if t["kind"] == "file" and t["pinned"]
+                and right_panel_tab_key(t) != active]
+
+    while pinned_count(tabs) > RIGHTPANEL_MAX_FILE_TABS:
+        candidates = droppable_indexes(tabs)
+        if not candidates:
+            break
+        tabs.pop(candidates[0])
+    while len(tabs) > RIGHTPANEL_MAX_TABS:
+        candidates = droppable_indexes(tabs)
+        if not candidates:
+            # 只剩视图标签与预览位时无从淘汰：宁可略微超限，也不静默丢视图标签
+            break
+        tabs.pop(candidates[0])
+
+    keys = {right_panel_tab_key(t) for t in tabs}
+    if active is not None and active not in keys:
+        active = None
+
+    return {
+        "open": bool(ui.get("open")),
+        "tabs": tabs,
+        "active": active,
+    }
 
 
 def new_session_id() -> str:
@@ -158,7 +295,7 @@ class SessionManager:
         """设置会话级上下文窗口覆盖（如 "1M" / "128k"）。
 
         空串/None 时恢复默认窗口（DEFAULT_MAX_CONTEXT_TOKENS 兜底）。
-        LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+        LLM 模型/窗口配置统一由 ~/.aigent/config/llmconfig.json 按模型元数据解析
         （SessionRuntime 每轮把解析结果传入），不再读全局 env
         MAX_CONTEXT_TOKENS（历史 bug：该值与所选模型真实窗口不符导致统计误用 1M）。
         同步影响 ContextCompact 的压缩阈值与前端展示的上下文上限。
@@ -349,6 +486,11 @@ class SessionManager:
                 # 消息记录时间（UI 展示元数据，不进模型上下文），老行缺省
                 if msg_data.get("created_at"):
                     norm["created_at"] = msg_data["created_at"]
+                # 目标模式可见化（2026-09-30）：`goal` 标记与上面的
+                # created_at/usage/approval 同族 —— 读取保留、不进模型上下文
+                #（Agent 侧 MODEL_MSG_FIELDS 白名单在发送边界剔除）。
+                if msg_data.get("goal"):
+                    norm["goal"] = msg_data["goal"]
                 normalized.append(norm)
             elif msg_role == "assistant":
                 norm = {
@@ -374,11 +516,18 @@ class SessionManager:
                     norm["usage_session"] = msg_data["usage_session"]
                 normalized.append(norm)
             elif msg_role == "tool":
-                normalized.append({
+                norm = {
                     "role": "tool",
                     "content": content,
                     "tool_call_id": msg_data.get("tool_call_id", ""),
-                })
+                }
+                # 审批结算元数据（2026-09-22 权限管控，docs/frontend/17 §4.4）：
+                # 回放渲染「已拒绝/超时/停止」徽标的数据源。与 assistant 行的
+                # usage/model_info 同模式 —— **读取保留**，模型上下文由 Agent 侧
+                # 发送前的 MODEL_MSG_FIELDS 白名单投影剔除（approval 不在白名单）。
+                if msg_data.get("approval"):
+                    norm["approval"] = msg_data["approval"]
+                normalized.append(norm)
             elif msg_role == "subagent":
                 # 子智能体执行记录：原样保留（只服务回放展示，不进模型上下文；
                 # Agent 侧加载后统一过滤）。同时进缓存，供重写后回写。
@@ -614,6 +763,13 @@ class SessionManager:
             # 消息记录时间（前端右下角展示）：新消息落盘时打点，
             # 重写（compact/自愈）时保留行内已有值，避免老行被误改时间
             row["created_at"] = message.get("created_at") or _now_iso()
+            # 目标模式可见化（2026-09-30，docs/frontend/22 §6.6）：把「这条是
+            # 目标指令 / 目标设定 / 本轮检查结果」的结构化标记随行落盘。
+            # 纯 UI 元数据 —— 加载时由 load_session_history 保留，模型上下文由
+            # Agent 侧 MODEL_MSG_FIELDS 白名单投影剔除（与 usage/approval 同模式）。
+            # 存量行没有该字段，读侧一律 `.get()`，零迁移。
+            if message.get("goal"):
+                row["goal"] = message["goal"]
             return row
         elif role == "assistant":
             row = {
@@ -634,11 +790,19 @@ class SessionManager:
                 row["usage_session"] = message["usage_session"]
             return row
         elif role == "tool":
-            return {
+            row = {
                 "role": "tool",
                 "content": message.get("content", ""),
                 "tool_call_id": message.get("tool_call_id", ""),
             }
+            # 审批结算元数据（2026-09-22 权限管控，docs/frontend/17 §4.4）：拒绝/
+            # 超时/停止的 tool 行旁挂 approval 字段，前端回放渲染「已拒绝」徽标。
+            # 纯 UI 元数据 —— 加载时由 load_session_history 保留，模型上下文由
+            # Agent 侧 MODEL_MSG_FIELDS 白名单投影剔除（与 usage/model_info 同模式）；
+            # 允许执行的工具行不写。
+            if message.get("approval"):
+                row["approval"] = message["approval"]
+            return row
         elif role == "subagent":
             # 子智能体执行记录：独立行，只服务回放展示，不进模型上下文
             row = {
@@ -1167,7 +1331,76 @@ class SessionManager:
             "model_id": None,
             "overrides": None,
             "unread": False,
+            # ── 权限管控（2026-09-22，docs/frontend/17 §2.2/§7.2）─────────
+            # 当前模式：default | full_access。None = 未记录（继承链兜底：
+            # 工作空间最后更改值 → permissions.json 默认值），不写死 "default"
+            # 是为了让继承链在会话创建后、模式首次显式更改前仍可生效。
+            "permission_mode": None,
+            # 模式最后变更时间（审计/展示用）
+            "permission_updated_at": None,
+            # 「会话内允许」记忆：[{type, value, at, source}]，type ∈
+            # bash_prefix/pattern/path/mcp_tool，source ∈ approval/user。
+            # 重启会话后保留生效（「会话内」以会话为界，不以进程为界）。
+            "session_allows": [],
+            # ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────
+            # 会话级 UI 状态：开着的标签 + 当前激活 + 右栏开合。
+            # None = 从未用过右栏（前端回落"关闭"）。形状见 normalize_right_panel()。
+            # 写在这里只为**可发现性**（一份 meta 摆在眼前能看出有哪些字段）；
+            # 读路径一律 `.get()`，存量 meta 缺该字段与 None 同义。
+            "right_panel": None,
+            # ── 任务执行模式（2026-09-25，docs/frontend/22）──────────────
+            # 独立于权限档位的一条正交轴：normal（默认）/ plan / goal。
+            # None = 未记录 = normal（零迁移；前端按 "normal" 兜底渲染）。
+            # ⚠ 语义边界：`execution_mode == "goal"` **不是** goal 的真相 ——
+            # 真相恒为 `GoalController.active`，本字段只是 UI 投影（去重推送用）。
+            "execution_mode": None,
+            # 计划文书状态：None（未产出）/ "ready"（待批准）/ "approved"。
+            # 这是 plan 的**真源**（execution_mode 只是它的投影）。
+            "plan_status": None,
+            # 计划文书**文件名**（`<name>.md`，2026-09-29 起由模型命名）。
+            # 落 meta 的理由：文书现在写在 `<工作空间>/.aiagent/plan/` 下且名字由
+            # 模型给 —— 路径再也无法由 sid 推出，不存这一份，切会话/重启后就
+            # **读不到自己刚写的文书**（卡片会显示"已丢失"）。
+            # 存的是文件名而不是绝对路径：工作空间整体搬家后仍然有效。
+            # ⚠ 存量会话（升级前产出）该字段为 None → 读路径回退旧口径
+            #   `<data_root>/plans/session_<sid>.md`（见 `_plans_file_for`）。
+            "plan_name": None,
+            # 目标完成条件：**只作 GoalController.restore 的喂料**（最小落盘投影），
+            # active=True 时记 condition，clear/achieved/failed 时置 None。
+            # 它不是"第二个目标存储"—— 不要拿它当 goal 状态的读源。
+            "goal_condition": None,
+            # ── 目标运行期指标（2026-09-30，docs/frontend/22 §6.4/§7.6）─────
+            # 常驻目标条与检查记录要展示"第 N 轮 / 已运行多久"，这两个值
+            # **必须随 `sessions` 列表下发** —— 否则断线重连 / 整页重载后
+            # 目标条会带着错误的轮次复活（`session_history` 只在切换会话时发）。
+            # 语义与 goal_condition 一样：**只是投影**，真相恒为
+            # `GoalController.active.iterations / .set_at`；active 为空时置 None。
+            "goal_round": None,
+            "goal_started_at": None,
+            # 目标期间的 token 起点（算"目标期间消耗"用；非展示字段）
+            "goal_tokens_at_start": None,
         }
+
+    def _plans_file_for(self, session_id: str) -> Path:
+        """本会话的**旧口径**计划文书路径（2026-09-25 版落点）。
+
+        ⚠️ 2026-09-29 起写入已不走这里（改为工作空间内、模型命名）。本方法只剩
+        两个用途：① 存量会话（meta 无 `plan_name`）的读取回退；② 切会话时给出
+        一个"路径存在但不会被写"的展示值。
+        口径唯一在 `paths.plan_file_for_session`，不要自拼。
+        """
+        return plan_file_for_session(
+            session_id, self.session_prefix,
+            self.chat_history_dir.parent / paths.PLANS_DIRNAME,
+        )
+
+    def plan_file_for(self, session_id: str) -> Path:
+        """本会话计划文书的绝对路径（**公开入口**，供桥层 / 回执组装调用）。
+
+        口径唯一在 `_plans_file_for` → `paths.plan_file_for_session`；本方法只是
+        去掉下划线的对外别名，避免 `ws_bridge` 触碰私有成员造成第二处拼接。
+        """
+        return self._plans_file_for(session_id)
 
     def _meta_entry_for(self, session_file: Path) -> dict:
         """取某会话的元数据条目：优先独立 meta 文件，回退 index.jsonl（存量会话）。"""
@@ -1409,6 +1642,98 @@ class SessionManager:
         # 选模型/调参数是 UI 操作，不是对话内容变化 → 不刷新 updated_at。
         return self._update_entry(session_id, mutate, touch=False)
 
+    def set_session_permission(self, session_id: str, mode: str) -> dict:
+        """记录会话当前权限模式（2026-09-22 权限管控，docs/frontend/17 §2.2）。
+
+        mode ∈ {"default", "full_access"}；非法值原样落盘不在此校验语义
+        （调用方 Agent.persist_permission_mode 负责校验）。写 permission_mode +
+        permission_updated_at 两个字段。模式切换是 UI 操作，不是对话内容变化
+        → touch=False（不把会话顶到列表最前）。
+        """
+        return self._update_entry(
+            session_id,
+            lambda e: e.update({
+                "permission_mode": mode,
+                "permission_updated_at": _now_iso(),
+            }),
+            touch=False,
+        )
+
+    def set_session_execution(self, session_id: str, *,
+                              execution_mode: object = _UNSET,
+                              plan_status: object = _UNSET,
+                              plan_name: object = _UNSET,
+                              goal_condition: object = _UNSET,
+                              goal_round: object = _UNSET,
+                              goal_started_at: object = _UNSET,
+                              goal_tokens_at_start: object = _UNSET) -> dict:
+        """记录会话的任务执行模式状态（docs/frontend/22）。
+
+        **部分更新**语义：参数省略（`_UNSET`）= 本项不改；显式传值（含 `None`）
+        = 写入。`None` 与省略必须区分开 —— 否则"goal 达成后把 goal_condition
+        清空"这条落盘永远写不进去。
+
+        字段语义（详见 `_new_entry` 的注释）：
+        - `execution_mode`：`None | "normal" | "plan" | "goal"`，**仅 UI 投影**；
+        - `plan_status`：`None | "ready" | "approved"`，plan 的真源；
+        - `plan_name`：模型给的文件名（2026-09-29），路径口径的唯一来源；
+        - `goal_condition`：`GoalController.restore` 的喂料，active 时记条件；
+        - `goal_round` / `goal_started_at` / `goal_tokens_at_start`：目标运行期
+          指标的投影（2026-09-30 目标可见化）。前两个随 `sessions` 列表下发，
+          供常驻目标条在重连后恢复"第 N 轮"；第三个只在会话内算消耗用。
+
+        模式/状态切换是 UI 操作，不是对话内容变化 → touch=False（不把会话顶到
+        列表最前）。
+        """
+        def mutate(e):
+            if execution_mode is not _UNSET:
+                e["execution_mode"] = execution_mode
+            if plan_status is not _UNSET:
+                e["plan_status"] = plan_status
+            if plan_name is not _UNSET:
+                e["plan_name"] = plan_name
+            if goal_condition is not _UNSET:
+                e["goal_condition"] = goal_condition
+            if goal_round is not _UNSET:
+                e["goal_round"] = goal_round
+            if goal_started_at is not _UNSET:
+                e["goal_started_at"] = goal_started_at
+            if goal_tokens_at_start is not _UNSET:
+                e["goal_tokens_at_start"] = goal_tokens_at_start
+        return self._update_entry(session_id, mutate, touch=False)
+
+    def set_session_ui(self, session_id: str, ui: dict | None) -> dict:
+        """记录会话的右侧面板状态（2026-09-23，docs/frontend/19）。
+
+        形状 `{open, tabs[], active}`，见 `normalize_right_panel()`。落盘前
+        **一律归一化**：这份数据来自前端、会被手改、会跨版本漂移，坏值必须在
+        写入口就被挡掉，否则前端每次恢复都要自己防一遍。
+
+        切标签/开关面板是 UI 操作，不是对话内容变化 → touch=False（不把会话
+        顶到列表最前）。
+
+        Raises:
+            FileNotFoundError: 会话 jsonl 不存在
+        """
+        payload = normalize_right_panel(ui)
+        return self._update_entry(
+            session_id, lambda e: e.update({"right_panel": payload}), touch=False,
+        )
+
+    def set_session_allows(self, session_id: str, allows: list) -> dict:
+        """整表覆写「会话内允许」记忆（审批 allow_session 时由 gate 回调写入）。
+
+        gate.record_session_allow 在内存去重后生成**全量快照**传进来 —— 这里
+        只做落盘，不做合并，避免内存与磁盘两份状态漂移。touch=False 同上。
+        """
+        clean = [
+            dict(a) for a in (allows if isinstance(allows, list) else [])
+            if isinstance(a, dict) and a.get("type") and a.get("value")
+        ]
+        return self._update_entry(
+            session_id, lambda e: e.update({"session_allows": clean}), touch=False,
+        )
+
     def add_usage_totals(self, session_id: str, delta: dict,
                          count_turn: bool = True) -> None:
         """把一轮 token 消耗增量累进会话元数据 usage_totals（O(1) 原子写）。
@@ -1471,6 +1796,13 @@ class SessionManager:
                 task_file.unlink()
             except OSError as e:
                 log.error("删除任务文件失败 %s: %s", task_file.name, e)
+        # ── 计划文书：**刻意不删**（2026-09-29 起）───────────────────────
+        # 2026-09-25 版计划文书落在元数据目录（`<data_root>/plans/`），与会话
+        # jsonl 同源，所以删会话/清会话时一并 unlink（旧的两处级联清理）。
+        # 2026-09-29 起文书改落 `<工作空间>/.aiagent/plan/` —— 它此时是**工作区里
+        # 的项目文件**（用户看得见、可编辑、可进版本库），不再是会话的临时产物。
+        # 删一个会话顺手删掉工作区里的文档是"越权删用户文件"，所以这里不再清。
+        # 旧版本的元数据目录文书是**其它路径**，也不受影响（回退读取仍需要它们）。
         with self._index_lock:
             if self.meta_file(session_id).exists():
                 try:
@@ -1493,7 +1825,8 @@ class SessionManager:
 
         Returns:
             [{id, title, title_source, status, created_at, updated_at,
-              trashed_at, file, model_id, project, usage_totals, unread}, ...]
+              trashed_at, file, model_id, project, usage_totals, unread,
+              permission_mode, execution_mode, plan_status}, ...]
             按「最后修改时间」（元数据 updated_at，mtime 兜底）降序 —— 最近使用的在前
         """
         self.backfill_index()
@@ -1520,6 +1853,34 @@ class SessionManager:
                 "project": meta.get("project", self.project_id),
                 "usage_totals": meta.get("usage_totals"),
                 "unread": bool(meta.get("unread", False)),
+                # 当前权限模式（2026-09-22 权限管控）：前端盾牌 chip 的数据源。
+                # meta 无记录（存量会话）时前端按 "default" 兜底渲染；真实判定
+                # 以后端 gate 继承链为准，此字段只服务展示。
+                "permission_mode": meta.get("permission_mode") or "default",
+                # 任务执行模式（2026-09-25，docs/frontend/22）：**断线重连 / 整页
+                # 重载后恢复胶囊 tag 的唯一通道**。为什么不挂 session_history：
+                # 连接建立时的重放序列不含 session_history，而它只在收到
+                # session_switch 之后才发出；前端重连只做 resetTransient() +
+                # listSessions()。与 permission_mode / unread 同通道即天然覆盖。
+                "execution_mode": meta.get("execution_mode") or "normal",
+                "plan_status": meta.get("plan_status"),
+                # 计划文书路径（2026-09-29 改口径）：判据在 `paths.plan_display_path`
+                # （**三个出口共用**）—— 新口径给相对工作空间的
+                # `.aiagent/plan/<name>.md`；存量会话（meta 无 `plan_name`）回退旧的
+                # 元数据目录绝对路径（卡片照样能显示与读正文，只是不进右栏）。
+                # 为什么不落绝对路径：工作空间整体搬家后绝对路径即失效，而相对路径
+                # 对右栏标签 / `file_read` 都是天然可用的口径。
+                "plan_path": plan_display_path(
+                    meta.get("plan_status"), meta.get("plan_name"),
+                    str(self._plans_file_for(sid))),
+                # 目标条件（goal 模式胶囊 tag 的文案）。仅 mode=goal 时非空。
+                "goal_condition": meta.get("goal_condition"),
+                # 目标运行期指标（2026-09-30 目标可见化）：常驻目标条要显示
+                # 「第 N 轮」，而 session_history 只在 session_switch 后才发 ——
+                # 重连/整页重载只有这条通道，故必须随列表下发，否则目标条会带
+                # 着错误的轮次复活（与上面 execution_mode 同一条纪律）。
+                "goal_round": meta.get("goal_round"),
+                "goal_started_at": meta.get("goal_started_at"),
             })
         sessions = [s for s in sessions if s.get("status") == status]
         # 排序键与会话列表展示解耦：list_sessions 内单独算 key（含 mtime 兜底），
@@ -1579,6 +1940,24 @@ class SessionManager:
             if sid:
                 try:
                     self._update_entry(sid, lambda e: e.pop("usage_totals", None))
+                except FileNotFoundError:
+                    pass
+
+            # 执行模式状态随会话内容归零，但**文书文件不动**（2026-09-29 改）：
+            # 文书现在落在 `<工作空间>/.aiagent/plan/`，是工作区里的项目文件，
+            # 清会话不该删用户的文件（旧版落在元数据目录、与会话同源，才需要清）。
+            # 状态必须归零 —— 否则会留下"plan_status=approved 但会话已空"的僵尸壳，
+            # 前端切回来会渲染一张没有上下文的卡片。
+            if sid:
+                try:
+                    self._update_entry(sid, lambda e: e.update({
+                        "execution_mode": None, "plan_status": None,
+                        "plan_name": None, "goal_condition": None,
+                        # 目标运行期指标一并归零（2026-09-30）：漏清会让清空后的
+                        # 会话带着"第 7 轮"的幽灵目标条复活。
+                        "goal_round": None, "goal_started_at": None,
+                        "goal_tokens_at_start": None,
+                    }), touch=False)
                 except FileNotFoundError:
                     pass
 

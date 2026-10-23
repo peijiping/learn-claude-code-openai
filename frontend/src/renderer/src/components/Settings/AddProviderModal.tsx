@@ -279,7 +279,7 @@ export default function AddProviderModal({
                     <Icon name={showKey ? 'eyeSlash' : 'eye'} size={14} />
                   </button>
                 </div>
-                <p className="form-hint">密钥仅保存在本地 ~/.aigent/llmconfig.json。</p>
+                <p className="form-hint">密钥仅保存在本地 ~/.aigent/config/llmconfig.json。</p>
               </div>
 
               <ModelListEditor

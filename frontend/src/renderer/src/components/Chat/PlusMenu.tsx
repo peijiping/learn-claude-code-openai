@@ -53,14 +53,18 @@ export const PLUS_MENU_LABELS: Record<PlusMenuKey, string> = Object.fromEntries(
 interface PlusMenuProps {
   /**
    * 当前激活的「执行方式」条目（计划模式 / 目标模式），null = 都未开启。
-   * 「执行方式」二选一属于会话级状态，本期未接线，恒传 null；结构先留好，
-   * 后续接后端时只需把会话当前模式传进来即可显示勾选。
+   * 「执行方式」二选一属于**会话级状态**（后端持有唯一真相），调用方把会话当前的
+   * `execution_mode` 映射进来即可显示勾选；**新建任务（无会话）时映射的是
+   * `pendingExecMode` 草稿**（2026-09-27）—— 两项在无会话态同样可选、勾选态照常显示。
    */
   activeKey?: PlusMenuKey | null
-  /** 置灰的条目（**先于操作的反馈**：比"点了再弹错误"好）。典型场景是
-   *  默认工作空间下「引用文件或文件夹」不可用（草稿目录没有可引用的文件）。 */
+  /** 置灰的条目（**先于操作的反馈**：比"点了再弹错误"好）。
+   *  2026-09-27 起只剩**一类**场景：默认工作空间下「引用文件或文件夹」不可用
+   *  （草稿目录没有可引用的文件）。「执行方式」两项**任何情况下都不再置灰** ——
+   *  无会话时点选记为 `pendingExecMode` 草稿，随首条消息落地（原"无会话置灰 +
+   *  「请先发送一条消息创建会话」提示"已删除）。 */
   disabledKeys?: PlusMenuKey[]
-  /** 置灰原因（作为 title 提示；只传一个，因为当前只有一类置灰场景）。 */
+  /** 置灰原因（作为 title 提示） */
   disabledReason?: string
   onPick: (key: PlusMenuKey) => void
   onClose: () => void
@@ -108,7 +112,7 @@ export default function PlusMenu({
                   role="menuitem"
                   aria-disabled={disabled}
                   className={`plus-menu-item ${activeKey === it.key ? 'active' : ''} ${disabled ? 'disabled' : ''}`}
-                  title={disabled ? disabledReason || '当前不可用' : undefined}
+                  title={disabled ? (disabledReason || '当前不可用') : undefined}
                   onClick={() => {
                     if (disabled) return
                     onPick(it.key)

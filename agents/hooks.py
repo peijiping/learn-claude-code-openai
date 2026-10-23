@@ -38,11 +38,18 @@ s04 将其重构为钩子,带来以下好处:
   • 解耦:主循环不再关心具体的安全策略;
   • 可扩展:新增横切逻辑只需注册新钩子,无需修改主循环;
   • 可测试:每个钩子可独立单元测试;
-  • 可配置:不同实例可拥有不同的 deny_list / destructive 策略。
+  • 可配置:不同实例可注入各自的 PermissionGate（策略本体在 permission.py）。
+
+权限管控改造（2026-09-22，见 docs/frontend/17）
+─────────────────────────────────────────────
+permission_hook 已改为**纯委托**：全部判定逻辑（两档模式、内置/自定义清单、
+命令分段与 token 边界匹配、敏感路径、额外目录、MCP 破坏性门控、会话内允许
+记忆、审批编排）收敛到 `permission.py` 的 `PermissionGate` 八步判定链。
+本模块只保留钩子骨架与 `set_permission_gate()` 注入点 —— 钩子是横切关注点的
+插座，不该再长策略。
 """
 
 import json
-import os
 
 from paths import WORKDIR
 
@@ -67,25 +74,6 @@ class HookSystem:
     POST_TOOL_USE      = "PostToolUse"
     STOP               = "Stop"
 
-    # ── 安全策略默认值(类级别,实例可覆盖) ──────────────────────────────
-    # 硬性黑名单:匹配到其中任一模式即直接阻断,无需用户确认。
-    # 之所以"硬阻断",是因为这些命令一旦执行,后果不可逆或风险极高。
-    DEFAULT_DENY_LIST = [
-        "rm -rf /",   # 递归删除根目录 —— 经典灾难命令
-        "sudo",       # 提权执行 —— 越权风险
-        "shutdown",   # 关闭系统
-        "reboot",     # 重启系统
-        "mkfs",       # 格式化文件系统
-        "dd if=",     # 低级磁盘写入
-    ]
-
-    # 软性危险清单:匹配到则弹窗提示用户二次确认,默认拒绝 (大写 N)。
-    DEFAULT_DESTRUCTIVE = [
-        "rm ",        # 普通删除 (注意末尾空格,避免误匹配 rmdir/rmt 等)
-        "> /etc/",    # 重定向写入系统配置目录
-        "chmod 777",  # 权限过度开放
-    ]
-
     def __init__(self, silent: bool = False, workdir=None):
         # silent 模式：抑制所有钩子打印（cron 定时任务用，避免输出混淆主终端）
         self.silent = silent
@@ -100,15 +88,35 @@ class HookSystem:
             self.POST_TOOL_USE:      [],
             self.STOP:               [],
         }
-        # 策略列表复制为实例属性,允许不同实例拥有不同策略(测试/多租户场景)。
-        self.deny_list: list[str] = list(self.DEFAULT_DENY_LIST)
-        self.destructive: list[str] = list(self.DEFAULT_DESTRUCTIVE)
+        # 权限门（策略本体，2026-09-22 迁入 permission.py）：由 Agent 构造后经
+        # set_permission_gate() 注入。主智能体与子智能体共用同一实例 ——
+        # 子智能体的审批卡片因此能落在同一会话的 broker 上（文档 §6）。
+        self.permission_gate = None
+        # 执行模式门（2026-09-25，docs/frontend/22 任务执行模式）：同款注入点，
+        # 策略本体在 execution_mode.py 的 ExecutionGate。与权限门**各自独立** ——
+        # 两条轴不合并判定链，只是同一事件上按固定顺序各判一次（见
+        # register_default_hooks 的顺序说明）。
+        self.execution_gate = None
+        self._no_gate_warned = False   # 无门告警只打一次，避免子智能体循环刷屏
         # MCP 破坏性工具查询回调（由外部注入 MCPManager.is_destructive，s19 真实 MCP）
         self.mcp_destructive_lookup = None
 
     def set_mcp_destructive_lookup(self, fn) -> None:
         """注入 MCP 破坏性工具查询函数：接收 mcp__{server}__{tool} 全名，返回 bool。"""
         self.mcp_destructive_lookup = fn
+
+    def set_permission_gate(self, gate) -> None:
+        """注入权限门（PermissionGate 实例）。注入后 permission_hook 纯委托判定。"""
+        self.permission_gate = gate
+
+    def set_execution_gate(self, gate) -> None:
+        """注入执行模式门（`execution_mode.ExecutionGate` 实例）。
+
+        与 `set_permission_gate` **并列**（不是二选一）：两条轴各持一份状态、
+        各判一次。未注入时 `plan_guard_hook` 直接放行 —— 独立 HookSystem
+        （子智能体兜底构造、单测直连）因此行为与改造前一致。
+        """
+        self.execution_gate = gate
 
     # ── 注册与触发 ────────────────────────────────────────────────────────
     def register(self, event: str, callback):
@@ -150,88 +158,96 @@ class HookSystem:
     # ═════════════════════════════════════════════════════════════════════
     # 下面 5 个方法都被设计为 bound method:既能被 `register(self.X)` 注入
     # 到注册表(此时 `self` 自动绑定,签名对外只暴露事件参数),又能在内部
-    # 访问 `self.deny_list` / `self.destructive` 等策略,便于按实例定制。
+    # 访问 `self.permission_gate` / `self.mcp_destructive_lookup` 等注入策略。
 
     def permission_hook(self, tool_call: dict):
         """
-        PreToolUse 钩子 —— 权限校验器。
+        PreToolUse 钩子 —— 权限校验器（纯委托，2026-09-22 起）。
 
-        本函数是 s03 `check_permission()` 的直接迁移,但被重新挂载到
-        PreToolUse 事件上,从而与主循环解耦。校验规则如下:
-
-          ① 若工具是 bash:
-              a) 命令匹配 self.deny_list 任一项 → 硬阻断 (返回拒绝原因)
-              b) 命令匹配 self.destructive 任一项 → 弹窗询问用户,默认拒绝
-          ② 若工具是 write_file / edit_file:
-              目标路径解析后必须位于工作根（`self.workdir`，默认 WORKDIR）之内,
-              否则弹窗询问用户。
+        本函数是 s03 `check_permission()` 的迁移（该文件已于 2026-09-25 删除，原文存
+        `history/anthropic_v2/s03_permission/`），经历 s04（钩子化）与本次权限管控
+        改造（策略迁出）两个阶段后，职责收敛为**一行委托**：把 OpenAI SDK 的
+        tool_call 交给 `permission.py` 的 `PermissionGate.check_tool_call()`
+        八步判定链（模式判定 → 硬拒绝 → 预授权目录 → 自定义规则 → 会话内允许
+        → 类别规则 → 审批编排），本钩子不再持有任何策略。
 
         参数:
-            tool_call — LangChain 风格的工具调用字典,结构为
-                        {"name": 工具名(str), "args": 参数字典(dict), "id": 调用id(str)}
-                        例如 {"name": "bash", "args": {"command": "rm foo"}, "id": "toolu_01"}
-                        调用方约定参见 agent_full_v2.py 第 271 行
-                        `hook_system.trigger("PreToolUse", tool_call)`。
+            tool_call — OpenAI SDK 的 tool_call 对象（`.function.name` /
+                        `.function.arguments`，arguments 为 JSON 字符串或 dict）。
 
-        返回:
+        返回（与 HookSystem.trigger 的阻断约定一致）:
             None — 放行;
-            字符串 — 拒绝原因,将阻断该工具调用并回传给 Agent。
+            字符串 — 阻断原因,作为 tool_result 回填给模型。
+
+        无 gate 时的行为：独立 HookSystem（subagent 兜底构造、单测直连）没有
+        注入权限门 → 无法判定，放行并告警一次。生产路径恒接 gate
+        （`Agent.__init__` 构造 PermissionGate 后立即注入，主/子智能体共用）。
         """
-        # 把字典里的关键字段拆出来,避免后面反复用 tool_call["name"] / tool_call["args"] 的写法,
-        # 风格与 check_permission.py 的 LangChain 改造保持一致。
-        tool_name = tool_call.function.name
-        # OpenAI SDK 返回的 function.arguments 是 JSON 字符串,需解析为 dict 才能按 key 取值
-        raw_args = tool_call.function.arguments
-        tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        gate = self.permission_gate
+        if gate is None:
+            if not self._no_gate_warned:
+                self._no_gate_warned = True
+                print("\033[2;33m[HOOK] ⚠ HookSystem 未注入权限门（set_permission_gate），"
+                      "权限判定被跳过\033[0m")
+            return None
+        try:
+            return gate.check_tool_call(
+                tool_call, mcp_lookup=self.mcp_destructive_lookup
+            )
+        except Exception as e:  # noqa: BLE001 - fail-closed：门自身故障宁可错杀
+            print(f"\033[2;31m[HOOK] ⚠ 权限门异常，已按拒绝处理: "
+                  f"{type(e).__name__}: {e}\033[0m")
+            return f"Error: Permission gate failure: {type(e).__name__}: {e}"
 
-               # ── 规则 1:bash 命令的硬黑名单 + 软危险检查 ──────────────────────
-        if tool_name == "bash":
-            # 1a) 硬黑名单:出现即拒绝,无需交互
-            for pattern in self.deny_list:
-                if pattern in tool_args.get("command", ""):
-                    print(f"\n\033[2;95m⛔ Blocked: '{pattern}'\033[0m")
-                    return "Permission denied by deny list"
-            # 1b) 软危险:弹窗让用户决定,默认 N 即拒绝
-            for kw in self.destructive:
-                if kw in tool_args.get("command", ""):
-                    print(f"\n\033[2;95m⚠  Potentially destructive command\033[0m")
-                    print(f"\033[2;95m   Tool: {tool_name}({tool_args})\033[0m")
-                    choice = input("   Allow? [y/N] ").strip().lower()
-                    if choice not in ("y", "yes"):
-                        return "Permission denied by user"
+    def plan_guard_hook(self, tool_call: dict):
+        """PreToolUse 钩子 —— 计划模式守卫（模式级，注册在权限校验**之前**）。
 
-        # ── 规则 2:文件写入必须在工作目录之内 (防越权写入) ───────────────
-        # ⚠️ 已知失效点（2026-09-18 记录，未在本轮修改）：工具名是 run_write /
-        # run_edit，而这里是 write_file / edit_file（s03 遗留命名）→ 本规则实际
-        # **永不命中**。要修得先确认产品上是否希望"越界写弹窗确认"。
-        if tool_name in ("write_file", "edit_file"):
-            # 把相对路径与工作根拼接,再 resolve() 消除 ../ 之类的逃逸,
-            # 最后用 is_relative_to 校验解析后的绝对路径是否仍在工作根内。
-            # 工作根来自本实例注入的 workdir（多工作空间：每个 Agent 传自己的空间根）。
-            root = self.workdir
-            path = tool_args.get("path", "")
-            if not (root / path).resolve().is_relative_to(root):
-                print(f"\n\033[2;95m⚠  Writing outside workspace\033[0m")
-                print(f"\033[2;95m   Tool: {tool_name}({tool_args})\033[0m")
-                choice = input("   Allow? [y/N] ").strip().lower()
-                if choice not in ("y", "yes"):
-                    return "Permission denied by user"
+        契约与 `permission_hook` **完全同款**（同一个 `HookSystem.trigger` 约定）：
 
-        # ── 规则 3:MCP 破坏性工具 (destructiveHint) 二次确认 ─────────────
-        # 与 bash 软危险审批同机制、同 UX;MCP_ALLOW_DESTRUCTIVE=true 时直接放行,
-        # silent 模式( cron/非交互 )直接拒绝,避免 input() 挂死。
-        if tool_name.startswith("mcp__") and self.mcp_destructive_lookup is not None:
-            if self.mcp_destructive_lookup(tool_name):
-                if os.environ.get("MCP_ALLOW_DESTRUCTIVE", "false").lower() == "true":
-                    return None  # 显式放行
-                if self.silent:
-                    return "Permission denied (destructive MCP tool)"
-                print(f"\n\033[2;95m⚠  Potentially destructive MCP tool\033[0m")
-                print(f"\033[2;95m   Tool: {tool_name}({tool_args})\033[0m")
-                choice = input("   Allow? [y/N] ").strip().lower()
-                if choice not in ("y", "yes"):
-                    return "Permission denied by user"
-        return None
+            返回 None   → 放行；
+            返回字符串  → 阻断，该字符串作为 tool_result 回填给模型。
+
+        为什么排在 `permission_hook` 之前（顺序即语义，勿回退）：
+          • 模式级限制问的是"这一轮整体以什么方式干"，比单条规则的拒绝理由
+            更可行动 —— 模型看到的是"改用 plan_write 提交计划"，而不是一句
+            "命令不在白名单内"；
+          • plan 模式下被拦下的集合**本就是权限链 allow 集合的真子集**
+            （非只读命令在权限链里也过不去），故不会掩盖任何硬拒绝语义。
+
+        未注入执行模式门时直接放行（独立 HookSystem / 子智能体兜底构造 /
+        单测直连的路径因此与改造前逐字节一致）。**非 plan 模式也直接放行**
+        —— 零开销，且工具参数解析失败不会误伤 normal / goal 路径。
+        """
+        gate = self.execution_gate
+        if gate is None:
+            return None
+        try:
+            if not gate.plan_blocks_writes():
+                return None
+        except Exception:  # noqa: BLE001 - 状态读取失败 → 不猜，放行
+            return None
+        # 只有 plan 生效时才解析参数：解析失败按 fail-closed 阻断（与权限链同款）
+        try:
+            tool_name = tool_call.function.name
+            raw_args = tool_call.function.arguments
+            tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except Exception:
+            return "Error: Plan mode guard: 工具参数解析失败"
+        # store 从权限门取（同一份 permissions.json 热加载缓存）—— plan 的只读
+        # 判定要叠加用户的 deny_patterns / dangerous_patterns，否则会破坏
+        # "plan 放行集合 ⊂ 权限链 allow 集合"这条不变量。
+        store = None
+        if self.permission_gate is not None:
+            try:
+                store = self.permission_gate.store.load()
+            except Exception:  # noqa: BLE001 - store 不可用则只用内置清单
+                store = None
+        try:
+            return gate.blocked_reason(tool_name, tool_args, store)
+        except Exception as e:  # noqa: BLE001 - fail-closed：守卫自身故障宁可错杀
+            print(f"\033[2;31m[HOOK] ⚠ 计划模式守卫异常，已按拒绝处理: "
+                  f"{type(e).__name__}: {e}\033[0m")
+            return f"Error: Plan mode guard failure: {type(e).__name__}: {e}"
 
     def log_hook(self, tool_call: dict):
         """
@@ -339,14 +355,18 @@ class HookSystem:
         """
         一键注册全部内置钩子。
 
-        注册顺序很重要:
-          • permission_hook 必须先于 log_hook —— 这样一旦权限被阻断,
+        注册顺序很重要（PreToolUse 内**次序即语义**）：
+          • plan_guard_hook 必须在 permission_hook 之前 —— 模式级限制更可行动，
+            且 plan 拦下的集合是权限链 allow 集合的子集，不会掩盖硬拒绝语义
+            （2026-09-25 任务执行模式，docs/frontend/22）；
+          • permission_hook 必须先于 log_hook —— 这样一旦权限被阻断，
             日志会反映"被阻断"的事实 (而不是显示一条最终未执行的成功日志);
           • 其余钩子顺序对功能无影响,按可读性排列。
         """
         self.register(self.USER_PROMPT_SUBMIT, self.context_inject_hook)  # 用户输入观察
-        self.register(self.PRE_TOOL_USE,       self.permission_hook)      # ① 权限校验 (先)
-        self.register(self.PRE_TOOL_USE,       self.log_hook)             # ② 调用日志  (后)
+        self.register(self.PRE_TOOL_USE,       self.plan_guard_hook)      # ① 执行模式 (最严)
+        self.register(self.PRE_TOOL_USE,       self.permission_hook)      # ② 权限校验
+        self.register(self.PRE_TOOL_USE,       self.log_hook)             # ③ 调用日志
         self.register(self.POST_TOOL_USE,      self.large_output_hook)    # 大输出告警
         self.register(self.STOP,               self.summary_hook)         # 会话结束摘要
 

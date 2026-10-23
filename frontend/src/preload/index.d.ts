@@ -17,15 +17,43 @@ export interface RefInput {
   is_dir?: boolean
 }
 
+/** chat 携带的**预选执行模式**（结构与 renderer 侧 ExecutionMode 一致）。 */
+export interface ExecModeInput {
+  mode: 'normal' | 'plan' | 'goal'
+  condition?: string
+}
+
 export interface AgentApi {
   /** 发起一次对话。
    *  attachments=本轮附件（`attachment_stage` 登记得到的 att_id 列表）；
    *  **只有附件没有正文时 text 传空串**（后端据此只插附件块，不插空文本块）。
    *  refs=本轮引用的工作空间路径（**零复制**，只传路径）；**只有引用没正文也是
-   *  合法发送**。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null) => Promise<void>
+   *  合法发送**。execMode=随本条消息落地的执行模式（2026-09-30 起两种含义）：
+   *  无会话 = 新建任务的**预选**（plan/goal，后端在建会话时落盘，首轮即生效）；
+   *  **已有会话 + goal** = 目标模式的**武装位**（条件就是本条消息的正文，后端在
+   *  派发 turn 之前落地 —— 见 docs/frontend/22 §2.6）。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null, execMode?: ExecModeInput | null) => Promise<void>
   setSessionModel: (payload: { session_id?: string | null; model_id?: string | null; overrides?: { [modelId: string]: { thinking_strength?: string; max_context_option?: 'standard' | 'extended' } } | null }) => Promise<void>
   stop: (sessionId: string) => Promise<void>
+  /** 结构化提问作答 / 取消（ask_user）。fire-and-forget：回执走 `ask_resolved` 广播。 */
+  answerAsk: (sessionId: string, requestId: string, answers: unknown[]) => Promise<void>
+  cancelAsk: (sessionId: string, requestId: string) => Promise<void>
+  /** ── 权限管控（2026-09-22，docs/frontend/17）────────────────────────
+   * 审批作答（allow_once / allow_session / deny）与切换会话权限档位
+   * （default / full_access）。同 ask_answer 的 fire-and-forget 模式：
+   * 回执分别走 `approval_resolved` / `permission_changed` 广播。 */
+  approvalAnswer: (sessionId: string, requestId: string, decision: string) => Promise<void>
+  sessionPermission: (sessionId: string, mode: string) => Promise<void>
+  /** 新建任务（无会话）态切换目标工作空间权限档位；回执走 projects 广播 */
+  projectPermission: (projectId: string, mode: string) => Promise<void>
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）────────────────────
+   * 与权限档位正交的另一条轴（normal / plan / goal）。
+   * `sessionExecMode` / `approvePlan` 同 sessionPermission 的 fire-and-forget
+   * （回执走 `execution_mode_changed` 广播 / `error` 信封）；`planRead` 有真回执
+   * （点对点 `plan_content`，形状与 file_content 同族，`reason` 非空 = 读不到）。 */
+  sessionExecMode: (sessionId: string, mode: string, condition?: string) => Promise<void>
+  approvePlan: (sessionId: string) => Promise<void>
+  planRead: (sessionId: string) => Promise<unknown>
   switchSession: (sessionId: string) => Promise<{ session_id: string; message_count: number }>
   clearSession: () => Promise<{ deleted: number }>
   listSessions: () => Promise<unknown[]>
@@ -59,6 +87,32 @@ export interface AgentApi {
    *  与附件 **完全独立**：不复制、不存储，只给模型一份路径清单。
    *  拉取当前工作空间的可引用条目（扁平、一次全量）；超时返回 null。 */
   listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }) => Promise<unknown>
+  /** ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────────────
+   *  右栏状态记在**会话元数据**里（不是 localStorage），随 session_history 回传。
+   *  形状与 renderer 侧 `RPanelPersist` 一致（此处用 unknown，两套 tsconfig 不互访）。 */
+  /** 上报右栏状态（fire-and-forget：后端无点对点回包，同 ask_answer） */
+  sessionUi: (payload: { session_id: string; ui: unknown }) => Promise<void>
+  /** 读工作空间内单个文件 → `file_content` 信封 */
+  readFile: (payload: {
+    path: string
+    sessionId?: string | null
+    projectId?: string | null
+  }) => Promise<unknown>
+  /** 把要经 `aigent-file://` 展示的路径报备进主进程白名单（多格式预览，
+   *  docs/frontend/21）。fire-and-forget：主进程无回包。 */
+  allowFileStream: (paths: string[]) => Promise<void>
+  /** 读取 git 状态 → `git_status` 信封 */
+  gitStatus: (payload?: {
+    sessionId?: string | null
+    projectId?: string | null
+  }) => Promise<unknown>
+  /** 读单个文件的 diff（`path` 为仓库相对路径）→ `git_diff` 信封 */
+  gitDiff: (payload: {
+    path: string
+    staged?: boolean
+    sessionId?: string | null
+    projectId?: string | null
+  }) => Promise<unknown>
   /** 工作空间列表（主要数据源是 `projects` 广播信封，这里是主动拉取的兜底） */
   listProjects: () => Promise<unknown>
   /** 把选定目录登记为工作空间（已登记则复用；后端同时置为活动空间） */
@@ -76,6 +130,74 @@ export interface AgentApi {
   queryStatus: () => Promise<{ ok: boolean }>
   llmConfigGet: () => Promise<unknown>
   llmConfigSave: (config: unknown) => Promise<unknown>
+  /** 权限配置（~/.aigent/config/permissions.json）读 / 保存 */
+  permissionConfigGet: () => Promise<unknown>
+  permissionConfigSave: (config: unknown) => Promise<unknown>
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）读 / 保存（字段部分更新） */
+  sandboxConfigGet: () => Promise<unknown>
+  sandboxConfigSave: (payload: object) => Promise<unknown>
+  /** MCP 服务管理（设置页「MCP」页，docs/frontend/23）：读 / 单条增改 / 删除 / 试连 */
+  mcpConfigGet: () => Promise<unknown>
+  mcpServerUpsert: (payload: {
+    name: string
+    config: object
+    original_name?: string
+    meta?: object
+  }) => Promise<unknown>
+  mcpServerRemove: (payload: { name: string }) => Promise<unknown>
+  /** 试连：传 `config`（表单草稿真值）或 `name`（磁盘真实配置，含未脱敏密钥） */
+  mcpServerTest: (payload: { config?: object; name?: string }) => Promise<unknown>
+  /** MCP 市场（官方 registry 代理）：搜索 / 条目→配置翻译（不落盘） */
+  mcpMarketSearch: (payload: { query?: string; cursor?: string; limit?: number }) => Promise<unknown>
+  mcpMarketResolve: (payload: { item: object }) => Promise<unknown>
+  /** MCP 本地包（设置页「MCP → 本地包」，docs/frontend/23 §本地安装）：
+   *  解析（不落盘）/ 下载 / 卸载 / 复核。写条目仍走 mcpServerUpsert。 */
+  mcpPkgResolve: (payload: { name: string; version?: string }) => Promise<unknown>
+  mcpPkgInstall: (payload: {
+    name: string
+    version: string
+    bin?: string
+    allow_scripts?: boolean
+  }) => Promise<unknown>
+  mcpPkgRemove: (payload: { slug: string }) => Promise<unknown>
+  mcpPkgVerify: (payload: { slug: string }) => Promise<unknown>
+  /** 技能管理（设置页「技能」页，docs/frontend/24）：读 / 启停 / 删除 / 安装 / 读正文 */
+  skillConfigGet: () => Promise<unknown>
+  skillSetEnabled: (payload: { name: string; enabled: boolean }) => Promise<unknown>
+  skillRemove: (payload: { name: string }) => Promise<unknown>
+  skillInstall: (payload: { name: string; item: object }) => Promise<unknown>
+  skillRead: (payload: { name: string }) => Promise<unknown>
+  skillCreate: (payload: {
+    name: string
+    description: string
+    body: string
+    tags?: string[]
+  }) => Promise<unknown>
+  /** 技能市场：搜索 / 抓取安装计划（不落盘）/ 增删源 */
+  skillMarketSearch: (payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }) => Promise<unknown>
+  skillMarketResolve: (payload: { market_id?: string; item: object }) => Promise<unknown>
+  skillMarketUpsert: (payload: { entry: object }) => Promise<unknown>
+  skillMarketRemove: (payload: { market_id: string }) => Promise<unknown>
+  /** 插件管理（设置页「插件」页，docs/frontend/25）：命令集与技能侧一一对应 */
+  pluginConfigGet: () => Promise<unknown>
+  pluginSetEnabled: (payload: { name: string; enabled: boolean }) => Promise<unknown>
+  pluginRemove: (payload: { name: string }) => Promise<unknown>
+  pluginInstall: (payload: { name: string; item: object }) => Promise<unknown>
+  pluginRead: (payload: { name: string }) => Promise<unknown>
+  pluginMarketSearch: (payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }) => Promise<unknown>
+  pluginMarketResolve: (payload: { market_id?: string; item: object }) => Promise<unknown>
+  pluginMarketUpsert: (payload: { entry: object }) => Promise<unknown>
+  pluginMarketRemove: (payload: { market_id: string }) => Promise<unknown>
   /** 刷新某连接可用模型列表（GET {base_url}/models；api_key 留空回退已保存密钥） */
   llmModelsFetch: (payload: {
     base_url?: string

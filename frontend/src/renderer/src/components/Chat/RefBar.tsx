@@ -17,8 +17,9 @@ import type { MessageRef } from '@protocols/agentProtocol'
  */
 interface RefBarProps {
   refs?: MessageRef[]
-  /** 点击 chip：在系统文件管理器中定位（可缺省） */
-  onOpen?: (path: string) => void
+  /** 点击 chip。`isDir` 一并给出：目录与文件在右栏走不同的落点
+   *  （目录去系统文件管理器，文件去右栏预览位）。 */
+  onOpen?: (path: string, isDir: boolean) => void
 }
 
 export default function RefBar({ refs, onOpen }: RefBarProps): JSX.Element | null {
@@ -31,7 +32,7 @@ export default function RefBar({ refs, onOpen }: RefBarProps): JSX.Element | nul
           className="ref-chip"
           title={r.path}
           data-ref-path={r.path}
-          onClick={onOpen ? () => onOpen(r.path) : undefined}
+          onClick={onOpen ? () => onOpen(r.path, r.is_dir) : undefined}
         >
           <Icon name={r.is_dir ? 'folder' : 'fileText'} size={12} />
           <span className="ref-chip-name">{capsuleLabel({ name: r.name, isDir: r.is_dir })}</span>

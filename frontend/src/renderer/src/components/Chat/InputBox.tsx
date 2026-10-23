@@ -9,6 +9,7 @@ import History from '@tiptap/extension-history'
 import Placeholder from '@tiptap/extension-placeholder'
 import { Icon } from '@components/common/Icon'
 import { hasImageInput } from '@components/Settings/llmShared'
+import type { ExecutionMode, PermissionMode } from '@protocols/agentProtocol'
 import {
   attachmentUrl,
   hasSendableContent,
@@ -21,6 +22,7 @@ import {
 } from '@store/agentStore'
 import { useWorkspaceRefs } from '@hooks/useWorkspaceRefs'
 import PlusMenu, { PLUS_MENU_LABELS, type PlusMenuKey } from './PlusMenu'
+import ExecutionModeTag from './ExecutionModeTag'
 import AttachmentBar, { type AttachmentView } from './AttachmentBar'
 import DropOverlay from './DropOverlay'
 import RefPicker from './RefPicker'
@@ -49,6 +51,13 @@ interface InputBoxProps {
   onRemoveAttachment: (key: string) => void
   /** 在系统文件管理器中定位附件原文件 */
   onOpenAttachment: (sourcePath: string) => void
+  /** 输入区被临时"让位"（本会话有在途的 ask_user 提问）时为 true。
+   *
+   *  隐藏由父级的 CSS 承担（`.chat--asking`），这里只做一件事：**把焦点收回来**。
+   *  否则用户盲打的内容会进到一个看不见的编辑器里 —— 敲 Enter 时虽然被
+   *  store 的 isSending / 父级的发送守卫拦下，但"字打进去了却看不见"本身就是事故。
+   *  编辑器**不卸载**：它是非受控的（内容只在内部），卸载即丢草稿。 */
+  suspended?: boolean
 }
 
 /** 草稿附件 → 统一视图（图片走自定义协议显示缩略图） */
@@ -95,7 +104,8 @@ export default function InputBox({
   attachments,
   onStagePaths,
   onRemoveAttachment,
-  onOpenAttachment
+  onOpenAttachment,
+  suspended = false
 }: InputBoxProps): JSX.Element {
   const isSending = useAgentStore((s) => s.isSending)
   const stop = useAgentStore((s) => s.stop)
@@ -114,11 +124,67 @@ export default function InputBox({
   const newSession = useAgentStore((s) => s.newSession)
   const openProject = useAgentStore((s) => s.openProject)
   const addProjectFromPicker = useAgentStore((s) => s.addProjectFromPicker)
+  const switchPermission = useAgentStore((s) => s.switchPermission)
+  const switchProjectPermission = useAgentStore((s) => s.switchProjectPermission)
+  /** 权限档位（2026-09-22 权限管控，docs/frontend/17）：盾牌 chip 的选中态。
+   *  fallback 链：permissionModeBySession（permission_changed 广播 /
+   *  session_history 恢复）→ sessions 列表该会话的 permission_mode →
+   *  所属工作空间 permission_mode → 'default'。无会话（新建任务）时展示
+   *  目标空间的档位作预告（新会话默认档位取所属空间的最后更改值）。 */
+  const permMode: PermissionMode = useAgentStore((s) => {
+    const sid = s.activeSession
+    if (sid) {
+      return (
+        s.permissionModeBySession[sid] ??
+        s.sessions.find((x) => x.id === sid)?.permission_mode ??
+        'default'
+      )
+    }
+    const pid = s.pendingProjectId ?? s.activeProject
+    return s.projects.find((p) => p.id === pid)?.permission_mode ?? 'default'
+  })
+  const switchExecMode = useAgentStore((s) => s.switchExecMode)
+  /** 目标模式**武装态**（2026-09-30，docs/frontend/22 §2.6）：已有会话点了「目标模式」
+   *  、条件还没定 —— 下一条指令的正文即目标条件。仅用于给胶囊加提示 + 兜住
+   *  "点了没反馈"的空窗（真值随后由 `execution_mode_changed` / `sessions` 校准）。 */
+  const goalArmed = useAgentStore((s) =>
+    s.activeSession ? !!s.goalArmBySession[s.activeSession] : false
+  )
+  /** 执行模式（2026-09-25，docs/frontend/22）：胶囊 tag 的选中态。fallback 链与
+   *  权限 chip 同款：`executionModeBySession`（广播 / session_history / sessions
+   *  列表）→ `sessions` 列表该会话的 `execution_mode` → `'normal'`（**零占位**）。
+   *  **无会话（新建任务）读 `pendingExecMode` 草稿**（2026-09-27）：执行模式确实
+   *  是会话级状态、此刻没有归属，但"选不了"比"选了待落地"差得多 —— 草稿随首条
+   *  消息经 `chat.exec_mode` 落进新会话元数据，首轮即生效。
+   *  **已有会话的武装态优先于 fallback 链**（2026-09-30）：后端此刻还是旧模式，
+   *  但用户已明确要进目标模式 —— 胶囊必须当场亮（否则点菜单毫无反馈）。 */
+  const execMode: ExecutionMode = useAgentStore((s) => {
+    const sid = s.activeSession
+    if (!sid) return s.pendingExecMode
+    if (s.goalArmBySession[sid]) return 'goal'
+    return s.executionModeBySession[sid] ?? s.sessions.find((x) => x.id === sid)?.execution_mode ?? 'normal'
+  })
+  const execPlanStatus = useAgentStore((s) =>
+    s.activeSession ? (s.planBySession[s.activeSession]?.status ?? null) : null
+  )
+  const execGoalCondition = useAgentStore((s) =>
+    s.activeSession
+      ? (s.sessions.find((x) => x.id === s.activeSession)?.goal_condition ?? null)
+      : (s.pendingExecGoalCondition || null)
+  )
+  /** 本会话是否有在途审批（PreToolUse 判定 ask）：有 → 发送按钮禁用
+   *  （title=「等待权限审批」）。与 ask 的整块让位（chat--asking）刻意不同：
+   *  审批挂起时**输入框可打字、停止可用** —— 停止按钮就在输入区。 */
+  const approvalPending = useAgentStore((s) =>
+    s.activeSession ? Object.keys(s.approvalBySession[s.activeSession] ?? {}).length > 0 : false
+  )
   const [modelOpen, setModelOpen] = useState(false)
   // 加号「添加内容」菜单：条目按 key 分发，见 handlePlusPick
   const [plusOpen, setPlusOpen] = useState(false)
   // 工作空间下拉（chip 点开）：上部分 = 已打开过的空间，末尾固定项 = 选择文件夹
   const [wsOpen, setWsOpen] = useState(false)
+  // 权限档位下拉（盾牌 chip 点开）：两档（默认 / 完全访问），仿 ws-picker
+  const [permOpen, setPermOpen] = useState(false)
   const [hoveredPanel, setHoveredPanel] = useState<{ id: string; x: number; y: number } | null>(null)
   const [ctxTooltip, setCtxTooltip] = useState(false)
   // 面板以 Portal 渲染在 body 顶层，离开菜单项会先触发 onMouseLeave，
@@ -169,6 +235,10 @@ export default function InputBox({
   useEffect(() => {
     if (hasSession) setWsOpen(false)
   }, [hasSession])
+  // 切换会话时收起权限菜单（选中项随会话变化，避免半开状态指错对象）
+  useEffect(() => {
+    setPermOpen(false)
+  }, [activeSession])
 
   // ── 引用候选（@-mention）────────────────────────────────────────
   // 一次拉全量 + 前端本地过滤；沙箱根由 (空间, 会话) 共同决定，换空间自动重拉。
@@ -351,6 +421,12 @@ export default function InputBox({
   )
   editorRef.current = editor
 
+  // 让位期间把手上的焦点收回（见 props.suspended）：编辑器仍挂在 DOM 里，
+  // 只是被父级 CSS 藏起来 —— 留着焦点的结果是"盲打"。
+  useEffect(() => {
+    if (suspended && editor?.isFocused) editor.commands.blur()
+  }, [suspended, editor])
+
   // 发送完成 → 清空正文与胶囊并聚焦。**不用 setContent 做同步**（见 props 注释）
   useEffect(() => {
     if (clearSignal <= 0) return
@@ -384,12 +460,14 @@ export default function InputBox({
   const imageUnsupported = hasImageDraft && !hasImageInput(active?.capabilities)
   // 发送可用：正文 / 就绪附件 / 引用**任一非空**即可（判据只有一处：
   // store 里的 `hasSendableContent`，InputBox 的按钮与 ChatPanel 构造 payload 共用）；
-  // 且不能有"正在读取"的附件（避免半成品发出去）
+  // 且不能有"正在读取"的附件（避免半成品发出去）；
+  // 且本会话没有在途审批（等待权限审批期间只禁发送，输入/停止不受影响）
   const stagingCount = attachments.filter((a) => a.status === 'staging').length
   const canSend =
     hasSendableContent(value.text, attachments, value.refs) &&
     stagingCount === 0 &&
-    !imageUnsupported
+    !imageUnsupported &&
+    !approvalPending
   liveRef.current.canSend = canSend
 
   // 引用在当前空间不可用（默认草稿空间，或后端已明确 disabled）
@@ -411,6 +489,27 @@ export default function InputBox({
       // ⚠️ 绝不能改成 pickFiles：那会走附件的复制链路，把"引用"变成"上传"。
       if (refPathDisabled) return
       editorRef.current?.chain().focus().insertContent('@').run()
+      return
+    }
+    if (key === 'planMode') {
+      // 执行模式（2026-09-25，docs/frontend/22）：会话级开关，切换是 fire-and-forget，
+      // 胶囊只认 `execution_mode_changed` 广播（**不做乐观更新**）。
+      // 无会话（2026-09-27 起）不再置灰、也不再 toast 让用户"先发消息"：切到的是
+      // `pendingExecMode` 草稿态（store 里判），随首条消息交给后端落地。
+      // 跨模式（goal → plan）**直接切换**（2026-09-27 起）：不再弹"请先关闭目标模式"，
+      // 被让位的目标由后端一并清理 —— 与 `agentStore.switchExecMode` 同一口径。
+      if (execMode === 'plan') return
+      switchExecMode('plan')
+      return
+    }
+    if (key === 'goalMode') {
+      if (execMode === 'goal') return
+      // 目标模式**不再弹框要条件**（2026-09-30，docs/frontend/22 §2.6）：点选即进
+      // 目标模式，**下一条指令的正文就是目标条件**。已有会话记的是 store 里的
+      // 武装位（本地草稿，后端毫不知情）；无会话记 `pendingExecMode` 草稿 —— 两者
+      // 都在 `send()` 里随 `chat.exec_mode/exec_condition` 交给后端落地。
+      // 从 plan 切进来同样直接：跨模式清场由后端 `set_execution_mode` 一并做。
+      switchExecMode('goal')
       return
     }
     showToast(`「${PLUS_MENU_LABELS[key]}」功能待开发`, 'info', 2000)
@@ -499,7 +598,12 @@ export default function InputBox({
               <PlusMenu
                 onPick={handlePlusPick}
                 onClose={() => setPlusOpen(false)}
-                disabledKeys={refPathDisabled ? ['refPath'] : []}
+                // 「执行方式」二选一的勾选态：由会话当前 execution_mode（无会话时 =
+                // `pendingExecMode` 草稿）映射而来 —— 无会话也已可选，见 execMode 注释。
+                activeKey={execMode === 'plan' ? 'planMode' : execMode === 'goal' ? 'goalMode' : null}
+                // 唯一置灰场景：默认工作空间不可引用（草稿目录没有可引用的文件）。
+                // 「执行方式」两项**任何情况下都不置灰**（2026-09-27 改）。
+                disabledKeys={refPathDisabled ? (['refPath'] as PlusMenuKey[]) : []}
                 disabledReason={
                   currentProjectId === DEFAULT_PROJECT
                     ? '默认工作空间是临时草稿目录，没有可引用的文件；请先切换到自定义工作空间'
@@ -508,9 +612,71 @@ export default function InputBox({
               />
             )}
           </span>
-          <button className="tool-btn access">
-            完全访问 <Icon name="chevronDown" size={12} />
-          </button>
+          {/* 权限档位盾牌 chip（2026-09-22 权限管控，docs/frontend/17）：两档
+              （默认 = 敏感操作逐次审批 / 完全访问 = 跳过审批）。切换是
+              fire-and-forget —— 会话态 chip 选中态只认 permission_changed 广播；
+              无会话（新建任务）时也可切换，写的是**目标工作空间**的最后更改值
+              （projects.json，该空间新会话的默认档位），chip 由 projects 广播驱动。 */}
+          <span className="perm-select">
+            <button
+              className={`tool-btn access perm-chip${permMode === 'full_access' ? ' full' : ''}`}
+              title={
+                hasSession
+                  ? permMode === 'full_access'
+                    ? '完全访问：跳过审批（硬拒绝仍生效）。点击切换'
+                    : '默认：敏感操作逐次审批。点击切换'
+                  : permMode === 'full_access'
+                    ? '完全访问：跳过审批（硬拒绝仍生效）。点击切换本工作空间新会话的默认档位'
+                    : '默认：敏感操作逐次审批。点击切换本工作空间新会话的默认档位'
+              }
+              aria-haspopup="menu"
+              aria-expanded={permOpen}
+              onClick={() => setPermOpen((v) => !v)}
+            >
+              <Icon name="shieldCheck" size={13} />
+              {permMode === 'full_access' ? '完全访问' : '默认'}
+              <Icon name="chevronDown" size={11} />
+            </button>
+            {permOpen && (
+              <>
+                <div className="perm-menu-mask" onClick={() => setPermOpen(false)} />
+                <div className="perm-menu">
+                  <div
+                    role="menuitem"
+                    className={`perm-menu-item ${permMode === 'default' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPermOpen(false)
+                      if (permMode !== 'default') {
+                        if (hasSession) switchPermission('default')
+                        else switchProjectPermission('default')
+                      }
+                    }}
+                  >
+                    <Icon name="shieldCheck" size={13} />
+                    <span className="perm-menu-name">默认</span>
+                    <span className="perm-menu-desc">敏感操作逐次审批</span>
+                    {permMode === 'default' && <Icon name="check" size={13} />}
+                  </div>
+                  <div
+                    role="menuitem"
+                    className={`perm-menu-item full ${permMode === 'full_access' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPermOpen(false)
+                      if (permMode !== 'full_access') {
+                        if (hasSession) switchPermission('full_access')
+                        else switchProjectPermission('full_access')
+                      }
+                    }}
+                  >
+                    <Icon name="shieldCheck" size={13} />
+                    <span className="perm-menu-name">完全访问</span>
+                    <span className="perm-menu-desc">跳过审批（硬拒绝仍生效）</span>
+                    {permMode === 'full_access' && <Icon name="check" size={13} />}
+                  </div>
+                </div>
+              </>
+            )}
+          </span>
           <span className="ws-select">
             <span
               className={`ctx-chip ${!hasSession && wsOpen ? 'open' : ''} ${hasSession ? '' : 'clickable'}`}
@@ -571,6 +737,16 @@ export default function InputBox({
               </>
             )}
           </span>
+          {/* 执行模式胶囊（2026-09-25，docs/frontend/22 §6.1）：紧贴工作空间 chip 右侧
+              （`.toolbar-left` 末位）。normal 时组件自身 return null → **零占位**，
+              工具栏尺寸不变。与权限盾牌 chip 是两条独立的轴，不共用状态。 */}
+          <ExecutionModeTag
+            mode={execMode}
+            planStatus={execPlanStatus}
+            goalCondition={execGoalCondition}
+            goalArmed={goalArmed}
+            onClose={() => switchExecMode('normal')}
+          />
         </div>
 
         <div className="toolbar-right">
@@ -707,9 +883,11 @@ export default function InputBox({
               title={
                 stagingCount > 0
                   ? '附件正在读取…'
-                  : imageUnsupported
-                    ? '当前模型不支持图片输入'
-                    : '发送'
+                  : approvalPending
+                    ? '等待权限审批'
+                    : imageUnsupported
+                      ? '当前模型不支持图片输入'
+                      : '发送'
               }
             >
               <Icon name="send" size={15} />

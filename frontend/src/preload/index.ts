@@ -18,6 +18,13 @@ interface RefInput {
   is_dir?: boolean
 }
 
+/** chat 携带的**预选执行模式**（与 renderer 侧 ExecutionMode 同构；preload 属 node
+ *  侧 tsconfig，不跨到 renderer 取类型）。 */
+interface ExecModeInput {
+  mode: 'normal' | 'plan' | 'goal'
+  condition?: string
+}
+
 /**
  * preload - 渲染进程与主进程之间唯一的"合规通道"。
  * 只暴露白名单 API（不透出原始 ipcRenderer），contextIsolation 开启下安全。
@@ -29,9 +36,11 @@ const agent = {
    * projectId=新建任务的归属工作空间 id（缺省 = 后端当前活动空间）。
    * attachments=本轮附件（附件登记得到的 att_id 列表）；**只有附件无正文时 text 传空串**。
    * refs=本轮引用的工作空间路径（**零复制**：只传路径，后端校验越界后挂中性引用块）；
-   * **只有引用无正文同样是合法发送**。 */
-  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null): Promise<void> =>
-    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}), ...(refs?.length ? { refs } : {}) }),
+   * **只有引用无正文同样是合法发送**。
+   * execMode=新建任务的**预选执行模式**（无会话时选好的 plan/goal，随首条消息交给后端
+   * 在建会话时落盘，首轮即生效）；缺省/null = 不设置（见 docs/frontend/22 §2.5）。 */
+  send: (text: string, sessionId?: string | null, overrides?: { thinking_strength?: string; max_context?: string } | null, modelId?: string | null, projectId?: string | null, attachments?: ChatAttachmentInput[] | null, refs?: RefInput[] | null, execMode?: ExecModeInput | null): Promise<void> =>
+    ipcRenderer.invoke('agent:send', { text, session_id: sessionId, project_id: projectId, ...(overrides ? { overrides } : {}), ...(modelId ? { model_id: modelId } : {}), ...(attachments?.length ? { attachments } : {}), ...(refs?.length ? { refs } : {}), ...(execMode ? { exec_mode: execMode.mode, ...(execMode.condition ? { exec_condition: execMode.condition } : {}) } : {}) }),
 
   /** 记录/更新某会话选择的模型与参数到后端元数据（无需等待下一条消息）。
    * overrides 为按模型 id 的 UI 档位 map：{ [modelId]: { thinking_strength?, max_context_option? } } */
@@ -40,6 +49,44 @@ const agent = {
 
   /** 停止指定会话正在执行的那一轮（其它后台会话不受影响） */
   stop: (sessionId: string): Promise<void> => ipcRenderer.invoke('agent:stop', { session_id: sessionId }),
+
+  /** ── 结构化提问作答（ask_user，2026-09-21）─────────────────────────
+   * 模型用 `ask_user` 工具提问并阻塞等待；这里提交答案 / 取消。
+   * **fire-and-forget**：回执走 `ask_resolved` 广播（渲染层从 onEvent 收），
+   * 这两个 invoke 的返回值无意义、也不该等 —— 别改成 request()。 */
+  answerAsk: (sessionId: string, requestId: string, answers: unknown[]): Promise<void> =>
+    ipcRenderer.invoke('agent:answerAsk', { session_id: sessionId, request_id: requestId, answers }),
+  cancelAsk: (sessionId: string, requestId: string): Promise<void> =>
+    ipcRenderer.invoke('agent:cancelAsk', { session_id: sessionId, request_id: requestId }),
+
+  /** ── 权限管控（2026-09-22，docs/frontend/17）────────────────────────
+   * 审批作答 / 切换会话权限档位。与 ask_answer 同款 **fire-and-forget**：
+   * 回执分别走 `approval_resolved` / `permission_changed` 广播，
+   * 这两个 invoke 的返回值无意义、也不该等 —— 别改成 request()。 */
+  approvalAnswer: (sessionId: string, requestId: string, decision: string): Promise<void> =>
+    ipcRenderer.invoke('agent:approvalAnswer', { session_id: sessionId, request_id: requestId, decision }),
+  sessionPermission: (sessionId: string, mode: string): Promise<void> =>
+    ipcRenderer.invoke('agent:sessionPermission', { session_id: sessionId, mode }),
+  projectPermission: (projectId: string, mode: string): Promise<void> =>
+    ipcRenderer.invoke('agent:projectPermission', { project_id: projectId, mode }),
+
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）────────────────────
+   * 与权限档位**正交**的另一条轴（normal / plan / goal）。三条命令：
+   * - `sessionExecMode` / `approvePlan`：同 sessionPermission 的 **fire-and-forget**
+   *   —— 回执分别走 `execution_mode_changed` 广播与既有 `error` 信封，别改成 request()。
+   * - `planRead`：**有真回执**（点对点 `plan_content`），需 await；形状与 file_content
+   *   同族（`reason` 非空 = 读不到，属常规降级而非异常）。
+   * ⚠ 计划文书在**元数据目录**里，读不到时不能用 readFile 兜底（越界）。 */
+  sessionExecMode: (sessionId: string, mode: string, condition?: string): Promise<void> =>
+    ipcRenderer.invoke('agent:sessionExecMode', {
+      session_id: sessionId,
+      mode,
+      ...(condition !== undefined ? { condition } : {})
+    }),
+  approvePlan: (sessionId: string): Promise<void> =>
+    ipcRenderer.invoke('agent:planApprove', { session_id: sessionId }),
+  planRead: (sessionId: string): Promise<unknown> =>
+    ipcRenderer.invoke('agent:planRead', { session_id: sessionId }),
 
   /** 会话操作（新建任务是纯前端行为：store 清空消息并把 activeSession 置 null，不走 IPC） */
   switchSession: (sessionId: string): Promise<{ session_id: string; message_count: number }> =>
@@ -105,6 +152,29 @@ const agent = {
    *  之后按键在前端本地过滤）。返回 `RefsPayload`；主进程等待超时返回 null。 */
   listRefs: (payload?: { projectId?: string | null; sessionId?: string | null }): Promise<unknown> =>
     ipcRenderer.invoke('agent:listRefs', payload ?? {}),
+
+  /** ── 右侧面板（2026-09-23，docs/frontend/19）─────────────────────────
+   * 右栏状态记在**会话元数据**里（不是 localStorage），随 session_history 回传。
+   * 设计见 docs/frontend/19-右侧面板（文件与变更）.md。 */
+  /** 上报右栏状态（开着的标签 + 当前激活 + 开合）。**fire-and-forget** ——
+   *  同 ask_answer：主进程 pending 表按 kind FIFO 配对且无 id，同 kind 并发会
+   *  串台。调用方做 400ms 防抖合并上报，故这里直发不回执。 */
+  sessionUi: (payload: { session_id: string; ui: unknown }): Promise<void> =>
+    ipcRenderer.invoke('agent:sessionUi', payload),
+  /** 读工作空间内单个文件（右栏「文件」预览）→ `file_content` 信封 */
+  readFile: (payload: { path: string; sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:readFile', payload),
+  /** 把要经 `aigent-file://` 展示的路径报备进主进程白名单（多格式预览，
+   *  docs/frontend/21）。收到 file_content 且 kind 为 image/pdf（或 office 转换
+   *  成功）后调用。**fire-and-forget**：主进程无回包。 */
+  allowFileStream: (paths: string[]): Promise<void> =>
+    ipcRenderer.invoke('agent:allowFileStream', { paths }),
+  /** 读取 git 状态（右栏「变更」）→ `git_status` 信封 */
+  gitStatus: (payload?: { sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:gitStatus', payload ?? {}),
+  /** 读单个文件的 diff（仓库相对路径）→ `git_diff` 信封 */
+  gitDiff: (payload: { path: string; staged?: boolean; sessionId?: string | null; projectId?: string | null }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:gitDiff', payload),
   /** 工作空间列表（`projects` 信封为主要数据源，这里是主动拉取的兜底） */
   listProjects: (): Promise<unknown> => ipcRenderer.invoke('agent:listProjects'),
   /** 把选定目录登记为工作空间（已登记过则复用；后端同时把它设为活动空间） */
@@ -130,6 +200,110 @@ const agent = {
   llmConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:llmConfigGet'),
   llmConfigSave: (config: unknown): Promise<unknown> =>
     ipcRenderer.invoke('agent:llmConfigSave', { config }),
+
+  /** 权限配置（~/.aigent/config/permissions.json）：读 / 保存。
+   *  保存后判定侧即时生效（无需重启后端），额外目录会推给在途会话。 */
+  permissionConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:permissionConfigGet'),
+  permissionConfigSave: (config: unknown): Promise<unknown> =>
+    ipcRenderer.invoke('agent:permissionConfigSave', { config }),
+
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）：读 / 保存（字段部分更新） */
+  sandboxConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:sandboxConfigGet'),
+  sandboxConfigSave: (payload: object): Promise<unknown> =>
+    ipcRenderer.invoke('agent:sandboxConfigSave', payload),
+
+  /** MCP 服务管理（设置页「MCP」页，docs/frontend/23）：
+   *  读全量 / 单条增改（含重命名、启停）/ 删除单条 / 一次性试连（不落盘）。 */
+  mcpConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:mcpConfigGet'),
+  mcpServerUpsert: (payload: {
+    name: string
+    config: object
+    original_name?: string
+    meta?: object
+  }): Promise<unknown> => ipcRenderer.invoke('agent:mcpServerUpsert', payload),
+  mcpServerRemove: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpServerRemove', payload),
+  /** 试连：传 `config`（表单草稿真值）或 `name`（从磁盘读真实配置，含未脱敏密钥） */
+  mcpServerTest: (payload: { config?: object; name?: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpServerTest', payload),
+
+  /** MCP 市场（官方 registry 代理）：搜索 / 把条目翻译成将写入的配置（不落盘） */
+  mcpMarketSearch: (payload: { query?: string; cursor?: string; limit?: number }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpMarketSearch', payload),
+  mcpMarketResolve: (payload: { item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpMarketResolve', payload),
+
+  /** MCP 本地包（设置页「MCP → 本地包」，docs/frontend/23 §本地安装）。 */
+  mcpPkgResolve: (payload: { name: string; version?: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpPkgResolve', payload),
+  mcpPkgInstall: (payload: {
+    name: string
+    version: string
+    bin?: string
+    allow_scripts?: boolean
+  }): Promise<unknown> => ipcRenderer.invoke('agent:mcpPkgInstall', payload),
+  mcpPkgRemove: (payload: { slug: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpPkgRemove', payload),
+  mcpPkgVerify: (payload: { slug: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:mcpPkgVerify', payload),
+
+  /** 技能管理（设置页「技能」页，docs/frontend/24）：
+   *  读全量 / 启停（只写旁路元数据）/ 删除 / 从市场安装 / 读 SKILL.md 全文 / 增删源。
+   *  六条状态命令共用 `skill_config` 回执（整份替换）；`skillRead` 另走 `skill_content`。 */
+  skillConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:skillConfigGet'),
+  skillSetEnabled: (payload: { name: string; enabled: boolean }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillSetEnabled', payload),
+  skillRemove: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillRemove', payload),
+  /** 安装：只回传「哪一条 + 叫什么名」，文件内容由后端自己抓（协议面最小） */
+  skillInstall: (payload: { name: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillInstall', payload),
+  skillRead: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillRead', payload),
+  /** 手动新建技能（SKILL.md 由后端拼装，前端不拼 YAML） */
+  skillCreate: (payload: {
+    name: string
+    description: string
+    body: string
+    tags?: string[]
+  }): Promise<unknown> => ipcRenderer.invoke('agent:skillCreate', payload),
+
+  /** 技能市场：搜索（指定源）/ 抓取安装计划（不落盘）/ 增删源 */
+  skillMarketSearch: (payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }): Promise<unknown> => ipcRenderer.invoke('agent:skillMarketSearch', payload),
+  skillMarketResolve: (payload: { market_id?: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillMarketResolve', payload),
+  skillMarketUpsert: (payload: { entry: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillMarketUpsert', payload),
+  skillMarketRemove: (payload: { market_id: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:skillMarketRemove', payload),
+
+  /** 插件管理（设置页「插件」页，docs/frontend/25）：命令集与技能侧一一对应。 */
+  pluginConfigGet: (): Promise<unknown> => ipcRenderer.invoke('agent:pluginConfigGet'),
+  pluginSetEnabled: (payload: { name: string; enabled: boolean }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginSetEnabled', payload),
+  pluginRemove: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginRemove', payload),
+  pluginInstall: (payload: { name: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginInstall', payload),
+  pluginRead: (payload: { name: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginRead', payload),
+  pluginMarketSearch: (payload: {
+    market_id?: string
+    query?: string
+    cursor?: string
+    limit?: number
+  }): Promise<unknown> => ipcRenderer.invoke('agent:pluginMarketSearch', payload),
+  pluginMarketResolve: (payload: { market_id?: string; item: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginMarketResolve', payload),
+  pluginMarketUpsert: (payload: { entry: object }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginMarketUpsert', payload),
+  pluginMarketRemove: (payload: { market_id: string }): Promise<unknown> =>
+    ipcRenderer.invoke('agent:pluginMarketRemove', payload),
 
   /** 刷新某连接的可用模型列表（GET {base_url}/models）；api_key 留空时后端回退已保存密钥 */
   llmModelsFetch: (payload: {

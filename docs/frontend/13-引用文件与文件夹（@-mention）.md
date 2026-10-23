@@ -188,7 +188,7 @@ run_glob 或 bash（工作目录即工作空间根）。
 | `components/Chat/editor/serializeDoc.ts` | `serializeEditor()` / `collectRefs()` —— 序列化**唯一出处**，纯函数（只有类型导入） |
 | `components/Chat/RefPicker.tsx` | 候选面板（向上弹出、封顶 280px、键盘/鼠标交互、空态/加载态/disabled 原因/截断提示） |
 | `components/Chat/RefCapsule.tsx` | 胶囊 NodeView（图标 ⇄ 悬浮变删除、tooltip 绝对路径） |
-| `components/Chat/RefText.tsx` | 气泡正文的**内联**胶囊渲染（只读；点击在文件管理器中定位） |
+| `components/Chat/RefText.tsx` | 气泡正文的**内联**胶囊渲染（只读；点击行为见 §2.10） |
 | `components/Chat/RefBar.tsx` | 气泡里的只读引用 chip **兜底行**（只列正文没能内联渲染的引用） |
 | `lib/refFilter.ts` | 本地过滤打分 + `toCandidates` + `capsuleLabel`（纯函数） |
 | `lib/refTokens.ts` | 正文 `@相对路径` token → 「文本 / 胶囊」片段（纯函数，见 §2.9） |
@@ -295,6 +295,24 @@ user 消息 {content, refs}
 > 形态一致）。路径本身含空格的文件引用后 token 会被切断 —— 这是 v1 既有取舍，
 > 不是本次引入的。
 
+### 2.10 点击胶囊的行为改道（2026-09-23，随右栏落地）
+
+此前点胶囊一律 `openInFinder`（在系统文件管理器中定位）。右栏（Doc19）落地后改为**按引用类型分流**：
+
+| 引用类型 | 行为 | 理由 |
+| --- | --- | --- |
+| 文件（`is_dir: false`） | 在右栏**预览位**打开 | 引用本来就是"指一条路"，点开的意图是**看内容**，不是找文件在哪。去 Finder 等于让用户再手动双击一次 |
+| 目录（`is_dir: true`） | `openInFinder` 定位 | 目录没有"预览"这回事；给它开一个标签只会得到一个永远打不开的空壳 |
+| 附件 chip | `openInFinder`（不变） | 附件是**搬进上下文的副本**，用户点它是想找到**原件** |
+| 无激活会话 | 回退 `openInFinder` | 右栏跟着会话走，没有会话就没有落点 |
+
+**契约变化**：`RefText` / `RefBar` 的 `onOpen` 签名从 `(path: string) => void`
+改为 `(path: string, isDir: boolean) => void`；分流逻辑收在 `MessageItem.tsx` 的
+`openRef(path, isDir)` 一处，两个组件都只负责把 `isDir` 透传上来。
+
+> 注意这里**不产生任何新标签**给目录 —— "点目录不新增标签"是一条实测断言
+> （Doc19 §7.3 的 S14c），它防的是"用户点了个目录，栏里多出一个打不开的标签"。
+
 ***
 
 ## 三、落地
@@ -335,6 +353,17 @@ user 消息 {content, refs}
 
 **后端零改动**（本次纯渲染层），`chat.payload.text`、`refs[]`、账本块全部不变。
 
+**前端 · 点击行为改道（2026-09-23，随右栏落地，§2.10）**（修改 3 个）：
+
+| 文件 | 类型 | 改动 |
+| --- | --- | --- |
+| `components/Chat/RefText.tsx` | 修改 | `onOpen` 签名 `(path)` → `(path, isDir)`，透传 `is_dir` |
+| `components/Chat/RefBar.tsx` | 修改 | 同上 |
+| `components/Chat/MessageItem.tsx` | 修改 | 新增 `openRef(path, isDir)` 分流：文件 → 右栏预览位 / 目录 → `openInFinder` / 无激活会话 → `openInFinder` |
+
+**后端仍零改动**，`refs` 信封与账本块一字未动 —— 本次只是把"点下去发生什么"从
+"一律 Finder"改成"按类型分流"。
+
 ### 3.2 勿回退要点
 
 1. `chat.payload.text` 恒为字符串；引用只走 `refs` 兄弟字段。
@@ -355,6 +384,10 @@ user 消息 {content, refs}
     （邮箱、手打 `@nope` 都靠这条），绝不做"看到 `@` 就替换"。
 15. 两组胶囊（输入区 `.ref-capsule` / 气泡 `.ref-chip`）**共用 `--color-ref-*` 变量**，
     改配色改变量、不要在某一处写死颜色。
+16. **点胶囊的分流不许合回一刀切**（2026-09-23）：文件 → 右栏预览位、目录 → 文件管理器、
+    附件 → 文件管理器。把文件也丢给 Finder，等于让用户点一下再手动双击一次；
+    把目录也开成标签，等于往栏里塞一个永远打不开的空壳。签名是 `(path, isDir)`，
+    分流只在 `MessageItem.openRef` 一处 —— 别在 `RefText`/`RefBar` 里各判一次。
 
 ### 3.3 可调参数
 
@@ -412,7 +445,7 @@ user 消息 {content, refs}
 | 无分隔紧贴 | `@README.md这个图片` → 胶囊 + `这个图片` | 前缀回退生效 |
 | 未匹配 `@` | `@nope/zzz 无关内容`、`me@example.com 是邮箱` 逐字原样，内联胶囊 **0** 颗 | 不误吃正文 |
 | 回放路径 | `session_history` 注入 3 条：单文件内联 / 目录渲染成 `src/`（尾斜杠）/ 一条消息两颗胶囊 | 回放与实时同源 |
-| 点击胶囊 | `openInFinder` 收到 `/Users/pei/proj/data/attachments/full.png` | 定位可用 |
+| 点击胶囊 | `openInFinder` 收到 `/Users/pei/proj/data/attachments/full.png` | 定位可用（**2026-09-23 起文件引用改走右栏预览位，附件仍走此处**，见 §2.10） |
 | 发送载荷 | `text = "@data/attachments/full.png  这个图片里的内容是什么?"`，`refs[0] = {path,name,is_dir}` | 协议零变化 |
 | 控制台 | 0 报错、0 CSP violation | — |
 

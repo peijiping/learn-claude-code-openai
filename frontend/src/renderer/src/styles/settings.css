@@ -190,6 +190,20 @@
 .switch.on .switch-knob {
   transform: translateX(14px);
 }
+/* 保存中（乐观位已翻转、回执未到）：呼吸提示，明确"点击已被接收、正在生效"。
+   背景不动（乐观态已经体现开/关），只让旋钮轻微呼吸，避免与禁用态混淆。 */
+.switch.pending .switch-knob {
+  animation: switch-pulse 1s ease-in-out infinite;
+}
+@keyframes switch-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
 
 /* ── 添加 / 编辑模型弹窗 ── */
 .addmodel-mask {
@@ -1110,4 +1124,1271 @@
 }
 .addprovider-foot .addmodel-foot-hint {
   flex: 1;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   权限管理页（docs/frontend/18，2026-09-22）
+   独立 `.perm-*` 前缀：**不复用**附件 / 引用 / 审批卡的 chip 类名 ——
+   那些有自己的语义（引用胶囊表示"这条消息引用了什么"），混用会让两处
+   样式互相牵制（13 篇记录的教训）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+.perm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.perm-loading,
+.perm-empty {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+
+/* 顶部说明条 */
+.perm-intro {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-sidebar);
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.perm-intro p {
+  margin: 0;
+  line-height: 1.7;
+}
+.perm-intro code {
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+}
+.perm-intro-note {
+  margin-top: var(--sp-2) !important;
+  color: var(--color-warn);
+}
+
+/* 分区 */
+.perm-sec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+}
+.perm-sec-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0;
+  font-size: var(--fs-md);
+  color: var(--color-text-primary);
+}
+.perm-sec-desc {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+.perm-sub {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+
+/* 单选卡片（模式 / MCP） */
+.perm-cards {
+  display: flex;
+  gap: var(--sp-3);
+}
+.perm-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  text-align: left;
+  padding: var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-main);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.perm-card:hover {
+  border-color: var(--color-accent);
+}
+.perm-card.active {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.perm-card-label {
+  font-size: var(--fs-md);
+  color: var(--color-text-primary);
+}
+.perm-card-desc {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+/* 行内输入行 */
+.perm-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.perm-inline .input {
+  flex: 1;
+  min-width: 180px;
+}
+.perm-input-num {
+  flex: none;
+  max-width: 110px;
+  text-align: right;
+}
+.perm-input-num.invalid {
+  border-color: var(--color-danger);
+}
+.perm-unit,
+.perm-invalid {
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.perm-invalid {
+  font-size: var(--fs-xs);
+  color: var(--color-danger);
+}
+
+/* 路径列表（额外目录 / 敏感路径） */
+.perm-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.perm-list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+}
+.perm-path {
+  flex: 1;
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.perm-del {
+  flex: none;
+}
+
+/* 模式 chip 列表 */
+.perm-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.perm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+.perm-chip.builtin {
+  background: var(--color-bg-sidebar);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+.perm-chip.custom {
+  background: var(--color-bg-active);
+  border-color: rgba(var(--color-accent-rgb), 0.35);
+  color: var(--color-accent);
+}
+.perm-chip.warn {
+  background: rgba(200, 134, 13, 0.1);
+  border-color: rgba(200, 134, 13, 0.35);
+  color: var(--color-warn);
+}
+.perm-chip.deny {
+  background: rgba(224, 83, 61, 0.08);
+  border-color: rgba(224, 83, 61, 0.35);
+  color: var(--color-danger);
+}
+.perm-chip-del {
+  padding: 0 0 0 2px;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+}
+.perm-chip-del:hover {
+  opacity: 1;
+}
+
+/* 硬拒绝警示块 */
+.perm-danger-note {
+  padding: var(--sp-3);
+  border: 1px solid rgba(224, 83, 61, 0.28);
+  border-radius: var(--radius-sm);
+  background: rgba(224, 83, 61, 0.07);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: var(--color-danger);
+}
+
+/* 判定顺序（数据来自后端 builtin.order，与 evaluate 的实现次序同源）。
+   左侧色条编码"严格程度"：红=拒绝 / 琥珀=必问 / 绿=免问 / 灰=兜底。 */
+.perm-order {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-sidebar);
+}
+.perm-order-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-md);
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+.perm-order-sub {
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+.perm-order-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.perm-order-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--color-border);
+  background: var(--color-bg-main);
+}
+.perm-order-item.order-deny {
+  border-left-color: var(--color-danger);
+}
+.perm-order-item.order-dangerous {
+  border-left-color: var(--color-warn);
+}
+.perm-order-item.order-safe {
+  border-left-color: var(--color-ok);
+}
+.perm-order-rank {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-hover);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.perm-order-body {
+  flex: 1;
+  min-width: 0;
+}
+.perm-order-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.perm-order-label {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+.perm-order-effect {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.perm-order-pos {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  opacity: 0.85;
+}
+.perm-order-note {
+  margin: 2px 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+.perm-order-tail {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+.perm-add {
+  align-self: flex-start;
+}
+
+/* 保存结果提示（后端归一化 warnings） */
+.perm-warns {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid rgba(200, 134, 13, 0.3);
+  border-radius: var(--radius-sm);
+  background: rgba(200, 134, 13, 0.08);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.perm-warns-title {
+  margin-bottom: var(--sp-1);
+  color: var(--color-warn);
+}
+.perm-warns ul {
+  margin: 0;
+  padding-left: var(--sp-4);
+  line-height: 1.7;
+}
+
+/* 底部保存栏：sticky 贴住滚动区底边（负 margin 抵消 .settings-body 的 24px padding） */
+.perm-foot {
+  position: sticky;
+  bottom: calc(var(--sp-5) * -1);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) calc(var(--sp-5) * -1) calc(var(--sp-5) * -1);
+  padding: var(--sp-3) var(--sp-5);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+}
+.perm-foot-status {
+  flex: 1;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.perm-foot-status.dirty {
+  color: var(--color-accent);
+}
+
+/* ── 沙盒设置页（设置弹窗「沙盒」，docs/frontend/20）──────────────────── */
+.sbx {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* 总开关行：左文案右开关 */
+.sbx-switch-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+}
+.sbx-switch-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.sbx-switch-row .perm-sec-desc {
+  margin: 0;
+}
+
+/* 平台状态行：ok = 后端可用（绿点前缀）/ warn = 不可用（黄） */
+.sbx-status {
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+.sbx-status.ok {
+  color: var(--color-text-secondary);
+}
+.sbx-status.ok::before {
+  content: '● ';
+  color: var(--color-success, #34c759);
+}
+.sbx-status.warn {
+  color: var(--color-warning, #d97706);
+}
+.sbx-status.warn::before {
+  content: '▲ ';
+}
+/* off = 总开关已关闭（中性灰、空心点）：避免"关着开关、状态行还亮绿/亮黄"的误导 */
+.sbx-status.off {
+  color: var(--color-text-secondary);
+  opacity: 0.75;
+}
+.sbx-status.off::before {
+  content: '○ ';
+}
+
+/* 保存校验错误（后端回执 errors，内联展示不 toast） */
+.sbx-error {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  color: #dc2626;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+/* 当前平台分区高亮 + 标签 */
+.sbx-section {
+  border-radius: var(--radius-md);
+}
+.sbx-section.current {
+  padding: var(--sp-3);
+  margin: 0 calc(var(--sp-3) * -1);
+  border: 1px solid rgba(var(--color-accent-rgb), 0.35);
+  background: var(--color-bg-sidebar);
+}
+.sbx-current-tag {
+  padding: 1px var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: rgba(var(--color-accent-rgb), 0.15);
+  color: var(--color-accent);
+  font-size: var(--fs-xs);
+  font-weight: normal;
+}
+
+/* 占位符说明行 */
+.sbx-placeholders {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.8;
+}
+.sbx-placeholders code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--color-bg-sidebar);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+
+/* 模板编辑器 */
+.sbx-editor {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  resize: vertical;
+}
+.sbx-editor:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+/* 编辑器操作行 */
+.sbx-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* ── MCP 服务管理设置页（设置弹窗「MCP」，docs/frontend/23）────────────── */
+.mcp {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+/* 汇总行 + 右侧操作 */
+.mcp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.mcp-summary {
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+}
+.mcp-summary b {
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+.mcp-head-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* 常驻风险横幅：MCP 是任意代码执行，这条不该被收进折叠区 */
+.mcp-risk {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: rgba(217, 119, 6, 0.08);
+  border: 1px solid rgba(217, 119, 6, 0.3);
+  color: var(--color-warn, #d97706);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+
+/* 非阻断提醒（如工具前缀撞车）：黄，与红字错误区分开 */
+.mcp-warn {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: rgba(217, 119, 6, 0.06);
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  color: var(--color-warn, #d97706);
+  font-size: var(--fs-sm);
+}
+
+/* ── 条目列表 ── */
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.mcp-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  overflow: hidden;
+}
+.mcp-row:hover {
+  border-color: var(--color-accent);
+}
+.mcp-row.error {
+  border-color: rgba(220, 38, 38, 0.4);
+}
+/* 主体 + 操作**同一行**（操作靠右）。分成两行会让 5 条就把面板撑满，
+   而这页最常见的用法是"扫一眼状态"。展开详情用 flex-basis:100% 另起一行。 */
+.mcp-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+}
+.mcp-row-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3);
+}
+
+/* 状态点五态：绿=已连接 / 红=失败 / 灰=未连接·禁用·待会话 */
+.mcp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--color-text-secondary);
+  opacity: 0.5;
+}
+.mcp-dot.connected {
+  background: var(--color-ok, #34c759);
+  opacity: 1;
+}
+.mcp-dot.error {
+  background: var(--color-danger, #dc2626);
+  opacity: 1;
+}
+
+.mcp-name {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-tag {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-code-bg);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+.mcp-tag.src {
+  background: transparent;
+  border: 1px solid var(--color-border);
+}
+.mcp-status-cell {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.mcp-status-cell.ok {
+  color: var(--color-ok, #34c759);
+}
+.mcp-status-cell.warn {
+  color: var(--color-danger, #dc2626);
+}
+.mcp-tools-cell {
+  flex: 1;
+  text-align: right;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.mcp-chevron {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+/* 行内小按钮 */
+.mcp-act {
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mcp-act:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+.mcp-act:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* 删除：二次确认前是普通灰，arm 后变红（同归档页的 armConfirm 手感） */
+.mcp-act.danger.armed {
+  border-color: var(--color-danger, #dc2626);
+  color: var(--color-danger, #dc2626);
+  font-weight: 600;
+}
+
+/* ── 展开详情 ── */
+.mcp-detail {
+  flex-basis: 100%;
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  border-top: 1px dashed var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mcp-cmd {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.mcp-meta-line {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+.mcp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+.mcp-chip {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+
+/* ── 试连结果（不落盘的一次性结论）── */
+.mcp-test-box {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.mcp-test-box.ok {
+  border-color: rgba(52, 199, 89, 0.45);
+  background: rgba(52, 199, 89, 0.07);
+}
+.mcp-test-box.fail {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: rgba(220, 38, 38, 0.06);
+}
+.mcp-test-title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-test-error {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-danger, #dc2626);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+/* 「已同步到运行时」：试连通过且后端顺势重连过 → 状态点同一帧变「已连接」。
+   走 success 色而非 secondary，否则和上面那行"试连成功"标题分不出主次。 */
+.mcp-test-sync {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-success, #34c759);
+}
+
+.mcp-path {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+/* ── 本地包区块（docs/frontend/23 §本地安装，2026-10-07）────────────────────
+   与上方「条目」并列的第二种资源。`.mcp-subhead` 是它与条目列表之间的分隔标题，
+   刻意不做成可折叠 —— 用户需要一眼看到"我本机到底存了哪些包/占了多少盘"。 */
+.mcp-subhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.mcp-subhead .mcp-hint {
+  font-weight: 400;
+  word-break: break-all;
+}
+/* 本地包行用 `.pkgo` 而不是复用 `.error` —— 正常态的行不该带红边 */
+.mcp-row.pkgo {
+  border-color: var(--color-border);
+}
+
+/* ── 安装方式二选一（下载到本地 / npx 拉取）── */
+.mcp-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mcp-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.mcp-radio:hover {
+  border-color: var(--color-accent);
+}
+.mcp-radio.on {
+  border-color: var(--color-accent);
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.03));
+}
+.mcp-radio input {
+  margin-top: 2px;
+  flex: none;
+}
+.mcp-radio-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mcp-radio-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.mcp-radio-desc {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+/* ── 安装期脚本警示（默认一律跳过；要跑必须显式勾选）── */
+.mcp-scripts-warn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  border-radius: var(--radius-sm);
+  background: rgba(220, 38, 38, 0.06);
+}
+.mcp-scripts-title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-danger, #dc2626);
+}
+.mcp-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+/* ── 表单视图 ── */
+.mcp-form-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.mcp-back {
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mcp-back:hover {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+.mcp-form-title {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+
+.mcp-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-3);
+}
+.mcp-field:last-child {
+  margin-bottom: 0;
+}
+.mcp-label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  font-weight: 400;
+}
+.mcp-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  color: var(--color-text-primary);
+  font-size: var(--fs-sm);
+}
+.mcp-input.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+textarea.mcp-input {
+  resize: vertical;
+  line-height: 1.6;
+}
+.mcp-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+/* 传输类型单选卡（三张并排，选中描边 accent） */
+.mcp-transports {
+  display: flex;
+  gap: var(--sp-2);
+}
+.mcp-transport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.mcp-transport:hover {
+  border-color: var(--color-accent);
+}
+.mcp-transport.active {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+}
+.mcp-transport-label {
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+.mcp-transport-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+/* KV 行（env / headers） */
+.mcp-kv-row {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.mcp-kv-row .mcp-input {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-del {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  line-height: 1;
+}
+.mcp-del:hover {
+  border-color: var(--color-danger, #dc2626);
+  color: var(--color-danger, #dc2626);
+}
+.mcp-add {
+  align-self: flex-start;
+  padding: 2px 8px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mcp-add:hover {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+
+.mcp-inline-warn {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-warn, #d97706);
+}
+.mcp-inline-note {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+
+/* ── MCP 市场（设置弹窗「MCP」→ 从市场安装）──────────────────────────── */
+.mcp-market-search {
+  display: flex;
+  gap: var(--sp-2);
+}
+.mcp-market-search .mcp-input {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-market-search .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+.mcp-market-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mcp-market-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+}
+.mcp-market-item:hover {
+  border-color: var(--color-accent);
+}
+.mcp-market-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.mcp-market-title {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  color: var(--color-text-primary);
+}
+.mcp-market-id {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  word-break: break-all;
+}
+.mcp-market-desc {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+  /* 描述可能很长：最多两行，超出省略（完整内容在 title 里） */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.mcp-market-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+.mcp-market-repo {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcp-market-actions .btn {
+  flex: none;
+  /* 仓库链接为空时（如只有包没有 repository），按钮要仍靠右 —— 否则它会掉到左边，
+     与其余条目的排版不一致。 */
+  margin-left: auto;
+}
+
+/* 来源徽标三档配色。**刻意都用中性色系** —— 三档都只做命名空间校验、
+   都没有代码审计，用绿色会暗示"更安全"，那是误导。 */
+.mcp-tag.src.official {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.mcp-tag.src.community {
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+.mcp-tag.src.domain {
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+/* ── 安装确认页：将写入的配置原文 ── */
+.mcp-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+}
+.mcp-transcript-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+}
+.mcp-transcript-key {
+  flex: none;
+  width: 64px;
+  text-align: right;
+  font-size: var(--fs-xs);
+  /* 底色是 --color-code-bg（深色），**不能**用 --color-text-secondary
+     （浅色主题下是深灰）—— 深灰压深色等于看不见。 */
+  color: var(--color-code-fg);
+  opacity: 0.72;
+}
+.mcp-transcript-val {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-code-fg);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+/* 声明的环境变量行（名称 + 输入框） */
+.mcp-env-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.mcp-env-name {
+  flex: none;
+  width: 160px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.mcp-env-row .mcp-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   技能 / 插件设置页（设置弹窗「技能」「插件」，2026-09-30，docs/frontend/24、25）
+
+   这两个页面与「MCP」页是**同一套面板语言**：列表行内操作 + 视图切换（不用嵌套
+   模态）+ 错误内联不 toast + 市场分页追加。所以结构类 `.mcp-*` 是**有意复用**的
+   —— 三页共用同一份规则，避免三份几乎相同的 CSS 各自漂移（改一处三处生效）。
+   下面只补 MCP 页没有的三样东西：代码/清单原文块、市场源选择与管理、文件清单。
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* 原文块（SKILL.md 正文 / plugin.json）—— 安装确认页的安全闸门要展示它，
+   必须**可滚动但不塌陷**：限高 320px，内容多时内部滚动，不把确认页撑成长条。 */
+.mcp-code {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 市场源选择行（技能页与插件页共用） */
+.mcp-market-src {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/* 源管理列表 */
+.mcp-src-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-top: var(--sp-2);
+}
+.mcp-src-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-main);
+  font-size: var(--fs-xs);
+}
+.mcp-src-row.active {
+  border-color: var(--color-accent);
+}
+.mcp-src-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mcp-src-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.mcp-src-meta {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--color-text-secondary);
+  word-break: break-all;
+}
+
+/* 组件徽标：on = 本期真正接入运行时，off = 只入库不执行。
+   ⚠️ 刻意都用中性色（off 用灰、on 用 accent）—— 用绿色会让"未接入"显得像错误，
+   而它只是能力边界（docs/frontend/25 §2.4）。 */
+.mcp-tag.on {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.mcp-tag.off {
+  opacity: 0.6;
+}
+
+/* 文件清单（安装确认页展示"将要写入什么"） */
+.mcp-filelist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow: auto;
+}
+.mcp-file-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs);
+}
+.mcp-file-path {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.mcp-file-size {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+
+/* 组件/源名后面的徽标要留出间距 —— 否则「钩子」与「本期未接入」贴在一起读成一个词 */
+.mcp-src-name .mcp-tag {
+  margin-left: 6px;
+}
+
+/* 技能 / 插件的描述正文：走普通段落而不是 `.mcp-cmd`
+   —— 那是个深色等宽块（给"命令原文"用的），套在散文描述上会被读成代码。 */
+.mcp-desc {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

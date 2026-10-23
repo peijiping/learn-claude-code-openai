@@ -4,10 +4,15 @@
     <meta charset="UTF-8" />
     <!-- 安全：不加载远程资源。
          aigent-att: = 本机会话附件目录（用户选中的图片缩略图），仅由主进程
-         的协议处理器放行 .attachments 目录内的真实文件，见 12-附件与文件输入.md -->
+         的协议处理器放行 .attachments 目录内的真实文件，见 12-附件与文件输入.md
+         aigent-file: = 工作空间文件流（图片 / PDF 预览），仅放行后端 file_read
+         回执报备过的路径，见 21-多格式文件预览.md。
+         ⚠️ object-src 必须显式列出：PDF 的 <embed> 走插件数据加载，漏写时
+         object-src 回落 default-src 'self'，aigent-file 会被静默拦掉 —— 症状是
+         PDF 区域全灰转圈、控制台只有一条 CSP 告警（真机探针实测，勿删）。 -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: aigent-att:; font-src 'self'"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: aigent-att: aigent-file:; object-src 'self' aigent-file:; font-src 'self'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />

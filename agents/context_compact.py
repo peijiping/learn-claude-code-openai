@@ -44,7 +44,7 @@ log = get_logger("compact")
 
 
 # 上下文窗口默认 token 上限（最后兜底）：模型元数据缺失且无显式覆盖时使用。
-# LLM 模型/窗口配置统一由 ~/.aigent/llmconfig.json 按模型元数据解析
+# LLM 模型/窗口配置统一由 ~/.aigent/config/llmconfig.json 按模型元数据解析
 # （llm_config.resolve_model_window / SessionRuntime 每轮传入），不再读全局 env
 # （历史 bug：全局 MAX_CONTEXT_TOKENS 与所选模型真实窗口不符导致统计误用 1M）。
 DEFAULT_MAX_CONTEXT_TOKENS = 1_000_000

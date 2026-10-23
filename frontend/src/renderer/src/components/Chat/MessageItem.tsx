@@ -3,12 +3,26 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Icon } from '@components/common/Icon'
 import { renderRefText } from '@lib/refTokens'
+import { buildPathIndex, localTargetOf, parseRefUrl, remarkPathLinks, safeUrlTransform, type PathIndex } from '@lib/pathLinks'
 import type { TurnModelInfo, UsageStats } from '@protocols/agentProtocol'
-import { attachmentUrl, useAgentStore, type Message, type SubAgentMsg, type ToolCallMsg } from '@store/agentStore'
+import {
+  attachmentUrl,
+  useAgentStore,
+  type ApprovalInteraction,
+  type AskUserMsg,
+  type Message,
+  type SubAgentMsg,
+  type ToolCallMsg
+} from '@store/agentStore'
 import MessageMenu from './MessageMenu'
 import AttachmentBar, { isDegraded } from './AttachmentBar'
+import AskUserBlock from './AskUserBlock'
+import ApprovalCard from './ApprovalCard'
+import GoalBadge from './GoalBadge'
+import GoalCheckCard from './GoalCheckCard'
 import RefBar from './RefBar'
 import RefText from './RefText'
+import { useRightPanelStore } from '@store/rightPanelStore'
 
 /** token 数字格式化：≥10000 用 k 缩写（如 45.6k），否则千位逗号 */
 function fmtTokens(n: number): string {
@@ -44,7 +58,19 @@ function modelInfoText(mi: TurnModelInfo): string | null {
   return parts.length ? parts.join(' · ') : null
 }
 
+/** 审批结算徽标（2026-09-22 权限管控）：approval_resolved 后旁挂在工具行上。
+ *  allowed_* → 绿「已允许」、denied/timeout → 红「已拒绝」、stopped → 灰「已停止」。
+ *  回放路径只有拒绝系（后端不落盘允许结局，见 docs/frontend/17 §4.4）。 */
+const APPROVAL_BADGE: Record<string, { cls: string; text: string }> = {
+  allowed_once: { cls: 'ok', text: '已允许' },
+  allowed_session: { cls: 'ok', text: '已允许' },
+  denied: { cls: 'deny', text: '已拒绝' },
+  timeout: { cls: 'deny', text: '已拒绝' },
+  stopped: { cls: 'stop', text: '已停止' }
+}
+
 function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
+  const badge = tool.approval ? APPROVAL_BADGE[tool.approval.decision] : undefined
   return (
     <div className={`toolbar-call ${tool.status}`}>
       <span className="toolbar-icon">
@@ -52,6 +78,11 @@ function ToolCallBar({ tool }: { tool: ToolCallMsg }): JSX.Element {
       </span>
       <span className="toolbar-name">{tool.name || '(工具)'}</span>
       <span className="toolbar-args">({tool.args.slice(0, 120)}{tool.args.length > 120 ? '…' : ''})</span>
+      {badge && (
+        <span className={`approval-badge ${badge.cls}`} title={tool.approval?.trigger || undefined}>
+          {badge.text}
+        </span>
+      )}
       {tool.status === 'running' ? (
         <span className="toolbar-status spinner" />
       ) : (
@@ -150,6 +181,108 @@ function SubAgentBlock({ block }: { block: SubAgentMsg }): JSX.Element {
   )
 }
 
+/** 正文段（Markdown 渲染）。提问块把正文切成前后两段时各渲染一段，
+ *  样式与改造前的单块完全一致（同一个 `.markdown-body` 容器 + 同一条表格包裹规则）。
+ *  `cursor` = 流式光标，只在**最后一段**上出现，位置与改造前相同（正文末尾）。
+ *
+ *  `pathIndex`（可选）= 工作空间路径白名单（`lib/pathLinks.ts`）：助手正文里的
+ *  裸路径文本 / `file://` 链接命中即渲染成可点链接（多格式预览，2026-09-23，
+ *  docs/frontend/21）。用户消息不传（正文走 RefText 胶囊，不走 markdown）。
+ *  `onOpenPath` = 点击后的动作（复用 openRef：文件 → 右栏常驻 tab，目录 → 定位）。 */
+function MarkdownBody({
+  text,
+  cursor,
+  pathIndex,
+  onOpenPath
+}: {
+  text: string
+  cursor?: boolean
+  pathIndex?: PathIndex
+  onOpenPath?: (abs: string, isDir: boolean) => void
+}): JSX.Element {
+  // 插件数组按 index 是否为空构建：空树（未加载/不可引用）零开销直通
+  const remarkPlugins = useMemo(() => {
+    if (!pathIndex || pathIndex.size === 0) return [remarkGfm]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- remark 的 [plugin, ...args] 元组形态
+    return [remarkGfm, [remarkPathLinks, pathIndex] as any]
+  }, [pathIndex])
+  return (
+    <div className="markdown-body">
+      {text ? (
+        // 表格外包一层横向滚动框（.table-scroll）：列多时表格自身横向滚动，
+        // 不把整块对话区撑宽（外层 .msgscroll 为 overflow-x: hidden）。
+        // urlTransform 必须自定义：默认清洗会把内部链接 aigent-ref: 清成空串；
+        // safeUrlTransform 镜像默认白名单、只多放行内部协议（javascript:/data: 仍拦）。
+        <ReactMarkdown
+          remarkPlugins={remarkPlugins}
+          urlTransform={safeUrlTransform}
+          components={{
+            table: ({ children }) => (
+              <div className="table-scroll">
+                <table>{children}</table>
+              </div>
+            ),
+            a: ({ href, children }) => {
+              const url = String(href ?? '')
+              const ref = url ? parseRefUrl(url) : null
+              if (ref) {
+                return (
+                  <button
+                    type="button"
+                    className="md-path-link"
+                    title={ref.abs}
+                    onClick={() => onOpenPath?.(ref.abs, ref.isDir)}
+                    disabled={!onOpenPath}
+                  >
+                    {children}
+                  </button>
+                )
+              }
+              // ── 本地路径兜底（2026-09-23 事故修复）─────────────────────
+              // `file://` 链接只在"逐字命中已加载的文件列表"时被 remark 插件改写成
+              // 内部链接；**文件列表没加载**（用户从没开过右栏「文件」视图 —— 最常见的
+              // 情形）时它是裸 `file:`，会被 urlTransform 清成空串 → `<a href="">`
+              // 点一下就"导航到当前页"= 整页重载 = 会话态全丢、回到新建任务态。
+              // 所以这里把本地路径一律转成按钮送右栏；路径不在工作空间内时由后端
+              // 沙箱拒绝并在预览区说明原因 —— 看得懂的失败 ≫ 整页重载。
+              const local = localTargetOf(url)
+              if (local) {
+                return (
+                  <button
+                    type="button"
+                    className="md-path-link md-path-link-unknown"
+                    title={local.path}
+                    onClick={() => onOpenPath?.(local.path, local.isDir)}
+                    disabled={!onOpenPath}
+                  >
+                    {children}
+                  </button>
+                )
+              }
+              // 外链：`target=_blank` 交给主进程 `setWindowOpenHandler` → shell.openExternal。
+              // **绝不能在本窗口导航** —— 渲染层一导航，整个应用就没了。
+              if (/^(https?:)?\/\//i.test(url) || /^mailto:/i.test(url)) {
+                return (
+                  <a href={url} target="_blank" rel="noreferrer noopener">
+                    {children}
+                  </a>
+                )
+              }
+              // 其余（`javascript:` / `data:` 已被 urlTransform 清成空串、纯锚点）：
+              // 锚点保留（只改 hash，不离开应用），其它不渲染成可导航元素。
+              if (url.startsWith('#')) return <a href={url}>{children}</a>
+              return <span>{children}</span>
+            }
+          }}
+        >
+          {text}
+        </ReactMarkdown>
+      ) : null}
+      {cursor && <span className="cursor" />}
+    </div>
+  )
+}
+
 /** 消息时间展示：jsonl 秒级 ISO（2026-09-18T10:30:00）→ 年月日时分秒（2026-09-18 10:30:00）；
  *  空值（老会话行无 created_at）不渲染 */
 function fmtMsgTime(iso?: string): string {
@@ -167,6 +300,61 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     return s.sessions.find((x) => x.id === sid)?.project ?? s.activeProject
   })
 
+  /** 会话内点引用（正文里的 `@文件` 胶囊 / RefBar 兜底行）该落到哪里
+   *  （2026-09-23 改版，docs/frontend/19 §6 / 21 篇）：
+   *  - **文件** → 右栏**常驻位**（独立 tab 页，互不顶替，用户拍板的新语义）；
+   *  - **目录** → 定位右栏「文件」视图（标签没开就自动添加并激活），
+   *    并在树里展开到该目录 —— 不再弹系统文件管理器；
+   *  - **附件**不在此列：附件是会话副本、不在工作区树里，保持 `openInFinder` 不变。
+   *
+   *  这里读 `activeSession` 而不是走 props：MessageItem 只会渲染**当前会话**的消息
+   *  （`messages` 就是按 activeSession 做的投影），不存"渲染着 A 的消息、
+   *  当前会话却是 B"的中间态。 */
+  const activeSession = useAgentStore((s) => s.activeSession)
+  const revealFile = useRightPanelStore((s) => s.revealFile)
+  const revealDir = useRightPanelStore((s) => s.revealDir)
+  const openRef = (path: string, isDir: boolean): void => {
+    if (!activeSession) {
+      void window.agent.openInFinder(path)
+      return
+    }
+    if (isDir) revealDir(activeSession, path)
+    else revealFile(activeSession, path)
+  }
+
+  /** 工作空间路径白名单（裸路径识别的数据源）：与右栏树同源（refs_list 回执）。
+   *  selector 只取 tree 引用（稳定），索引构建在 useMemo 里，每条消息仅建一次。 */
+  const rpTree = useRightPanelStore((s) =>
+    activeSession ? s.liveBySession[activeSession]?.tree : undefined
+  )
+  const pathIndex = useMemo(() => buildPathIndex(rpTree), [rpTree])
+
+  /** 本条消息上需要锚定的在途审批卡片（2026-09-22 权限管控）：按 toolCallId
+   *  匹配到本消息的工具行。主工具条匹配的渲染在工具条后；子智能体工具匹配的
+   *  渲染在子智能体块**外**（块默认折叠，审批是"必须现在做决定"的交互，
+   *  藏在折叠块里等于没问）。未被任何工具条配对的由 MessageList 末尾兜底。
+   *  zustand v5 的 selector 返回值即 getSnapshot，不能在这里新建对象/数组
+   *  （会触发 "Maximum update depth exceeded" 死循环）—— 只取 store 里的
+   *  审批表引用（缺条目时 undefined），配对计算放 useMemo。 */
+  const approvalTable = useAgentStore((s) =>
+    s.activeSession ? s.approvalBySession[s.activeSession] : undefined
+  )
+  const { mainApprovals, subApprovals } = useMemo(() => {
+    if (msg.role !== 'assistant' || !approvalTable) {
+      return { mainApprovals: [] as ApprovalInteraction[], subApprovals: [] as ApprovalInteraction[] }
+    }
+    const mainIds = new Set(msg.toolCalls.map((t) => t.id))
+    const subIds = new Set(msg.subagents.flatMap((x) => x.toolCalls.map((t) => t.id)))
+    const main: ApprovalInteraction[] = []
+    const sub: ApprovalInteraction[] = []
+    for (const a of Object.values(approvalTable)) {
+      if (!a.toolCallId) continue
+      if (mainIds.has(a.toolCallId)) main.push(a)
+      else if (subIds.has(a.toolCallId)) sub.push(a)
+    }
+    return { mainApprovals: main, subApprovals: sub }
+  }, [msg, approvalTable])
+
   /** 正文里的 `@相对路径` token → 内联胶囊（与输入区同款视觉，见 lib/refTokens）。
    *
    *  `segments` 给正文用；`leftover` 是"没能内联渲染"的引用（正文里找不到对应 token，
@@ -177,6 +365,35 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     const inline = new Set(r.inlinePaths)
     return { segments: r.segments, leftover: (msg.refs ?? []).filter((x) => x?.path && !inline.has(x.path)) }
   }, [msg.content, msg.refs])
+
+  /** 正文 × 提问小结块的**交错序列**（2026-09-22）。
+   *
+   *  模型的话总在提问之前（"先跟你确认几个关键项"，然后才问），所以卡片必须插在
+   *  正文里**发起提问那一刻**的位置：之前的正文在卡片上方，之后的留在下方。
+   *  切点取自 `AskUserMsg.contentOffset`（实时在 `tool_call_start` 记录）；
+   *  回放缺省 → 视作全量正文在卡片上方（jsonl 每次 LLM 调用一行，正文必在提问之前）。
+   *
+   *  只在有**已结算**的提问块时才切（`pending` 不渲染，见下面的过滤规则）。 */
+  const parts = useMemo(() => {
+    const content = msg.content ?? ''
+    const asks = (msg.askUsers ?? []).filter((a) => a.status !== 'pending')
+    const out: Array<{ kind: 'text'; text: string } | { kind: 'ask'; block: AskUserMsg }> = []
+    let cursor = 0
+    for (const block of asks) {
+      // 偏移可能越界（老数据 / 回放缺省）：夹到 [cursor, 正文长度]，保证单调不减
+      const off =
+        typeof block.contentOffset === 'number'
+          ? Math.min(Math.max(block.contentOffset, cursor), content.length)
+          : content.length
+      if (off > cursor) out.push({ kind: 'text', text: content.slice(cursor, off) })
+      out.push({ kind: 'ask', block })
+      cursor = off
+    }
+    if (cursor < content.length) out.push({ kind: 'text', text: content.slice(cursor) })
+    return out
+  }, [msg.content, msg.askUsers])
+  // 光标只挂在最后一段正文上（正文段为空的纯文字流：单独渲染一段空正文兜住光标）
+  const lastText = parts.length > 0 && parts[parts.length - 1].kind === 'text'
 
   /** 右键打开消息菜单 */
   const openMenu = (e: ReactMouseEvent): void => {
@@ -189,11 +406,29 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
     void navigator.clipboard.writeText(msg.content || '')
   }
 
+  // ── 目标卡片（2026-09-30 目标可见化，docs/frontend/22 §7.6）────────────
+  // 单独一条分支：它不是对话的一轮（没有气泡、没有 thinking / 工具条 / footer），
+  // 也没有"用户还是助手"的归属 —— 是系统对目标状态的播报。实时（`goal_check`
+  // 信封）与回放（jsonl 的 `goal` 标记）产出**同一个消息对象**，故只有这一处。
+  // 必须放在 user/assistant 两个分支**之前**：它既不是 user 也不是 assistant。
+  if (msg.role === 'goal_check') {
+    return (
+      <div className="msg-row goal-check-row">
+        <GoalCheckCard marker={msg.goal} />
+      </div>
+    )
+  }
+
   if (msg.role === 'user') {
     return (
       <>
         <div className="msg-row user" onContextMenu={openMenu}>
           <div className="msg-bubble user">
+            {/* 目标指令徽标（2026-09-30 目标可见化）：这条消息就是**被设为执行目标**
+                的那条指令 —— 用户的原话诉求「用户被设为目标的指令消息要标出来，
+                已设为执行目标」。目标设定的完整交代由紧随其后的「目标已设定」卡片
+                承担，这里只标"就是这条"。 */}
+            {msg.goal?.kind === 'instruction' && <GoalBadge marker={msg.goal} />}
             {/* 附件（2026-09-20）：实时消息来自草稿项、回放消息来自后端 harvest，
                 形状一致 → 图片显示缩略图、其它显示文件 chip；点击在 Finder 中定位原文件 */}
             {msg.attachments && msg.attachments.length > 0 && (
@@ -229,17 +464,11 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
               />
             )}
             {/* 正文：`@相对路径` token 就地渲染成胶囊（只显示文件名，与输入区一致） */}
-            <RefText
-              segments={refRender.segments}
-              onOpen={(p) => void window.agent.openInFinder(p)}
-            />
+            <RefText segments={refRender.segments} onOpen={openRef} />
             {/* 引用（@-mention）兜底行：只列"正文里没能内联渲染"的引用（正常为空）。
                 引用与附件是**两条独立通道**（形状与语义都不同）—— 引用零复制、
                 只指向工作空间里的路径，故用独立组件与独立样式渲染 */}
-            <RefBar
-              refs={refRender.leftover}
-              onOpen={(p) => void window.agent.openInFinder(p)}
-            />
+            <RefBar refs={refRender.leftover} onOpen={openRef} />
             <div className="msg-meta">
               {msg.created_at && <span className="msg-time">{fmtMsgTime(msg.created_at)}</span>}
               <button
@@ -289,33 +518,47 @@ export default function MessageItem({ msg }: { msg: Message }): JSX.Element {
       <div className="msg-row assistant" onContextMenu={openMenu}>
         <div className="assistant-body">
           <ThinkingBox text={msg.thinking} open={false} active={msg.thinkingActive} />
+          {/* ── 正文（2026-09-29 改版：上移到工具条之前）──────────────────────
+              模型的话总在动作之前（"我先读一下这个文件，再给结论"），所以正文
+              排在工具调用**之上**才符合时间顺序 —— 改造前正文挂在工具条 / 子智能体
+              块**下方**，读起来像"先干活后说话"（用户反馈，见 02 篇消息结构）。
+              正文与结构化提问小结块（ask_user）仍按**当时的先后**交错渲染：
+              提问之前说的话在卡片上方，提问之后续写的正文（实时路径整轮合并进
+              一条消息）留在卡片下方 —— 见上面 `parts` 的切分规则。
+              `pending` 的那条**不渲染**：此刻输入区上方的面板正承载交互，
+              这里再挂一条空小结就是重复表达。结算后（answered/cancelled/stopped）
+              与回放路径都走到这里，展示的是后端生成的同一份 result_text
+              （前端不解析、只原样展示）。 */}
+          {parts.map((p, i) =>
+            p.kind === 'ask' ? (
+              <AskUserBlock key={`ask-${p.block.toolCallId || i}`} block={p.block} />
+            ) : (
+              <MarkdownBody
+                key={`md-${i}`}
+                text={p.text}
+                cursor={msg.streaming && i === parts.length - 1}
+                pathIndex={pathIndex}
+                onOpenPath={openRef}
+              />
+            )
+          )}
+          {/* 全文都是提问、没有正文（或正文还没开吐）时，光标单独兜一块空正文：
+              与改造前的 `content` 为空时的渲染一致 */}
+          {msg.streaming && !lastText && <MarkdownBody text="" cursor />}
           {msg.toolCalls.map((t) => (
             <ToolCallBar key={t.id} tool={t} />
+          ))}
+          {/* 在途审批卡片（主工具）：锚定到触发的工具条下方 */}
+          {mainApprovals.map((a) => (
+            <ApprovalCard key={a.requestId} approval={a} />
           ))}
           {msg.subagents.map((s) => (
             <SubAgentBlock key={s.id} block={s} />
           ))}
-          <div className="markdown-body">
-            {msg.content ? (
-              // 表格外包一层横向滚动框（.table-scroll）：列多时表格自身横向滚动，
-              // 不把整块对话区撑宽（外层 .msgscroll 为 overflow-x: hidden）。
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={{
-                  table: ({ children }) => (
-                    <div className="table-scroll">
-                      <table>{children}</table>
-                    </div>
-                  )
-                }}
-              >
-                {msg.content}
-              </ReactMarkdown>
-            ) : (
-              msg.streaming && <span className="cursor" />
-            )}
-            {msg.streaming && msg.content && <span className="cursor" />}
-          </div>
+          {/* 在途审批卡片（子智能体工具）：渲染在折叠块外，保证可见 */}
+          {subApprovals.map((a) => (
+            <ApprovalCard key={a.requestId} approval={a} />
+          ))}
           {!msg.streaming && usage}
           {!msg.streaming && switchText && (
             <div className="model-switch-notice" title="已切换模型">

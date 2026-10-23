@@ -38,12 +38,17 @@ from task_manager import TaskManager
 from message_bus import MessageBus, VALID_MSG_TYPES
 from memories import MemoryStore
 from logger import get_logger
+import sandbox as sandbox_mod
 # 工具读图与读文档（2026-09-21）：中性图片块的构造在 attachments 里定义（展开侧
 # 也在那），本模块只负责"读盘 + 判类型 + 造块"。**不引入循环依赖**：attachments
 # 只依赖标准库 + paths/config/doc_convert + logger，不 import tools。
 # 文档转换走 doc_convert（叶子模块）：PDF 的「文本层 + 页图」与 Office 的文本抽取
 # 都由它提供，附件通道与工具通道共用同一段代码。
 import doc_convert
+# 联网工具（2026-10-17）：DeepSeek 的 Search / Fetch 两个 HTTP 接口封装在叶子模块
+# web_tools（只依赖标准库 + httpx + logger，不 import config/paths），本模块只负责
+# 注册 schema 与转调。Key/基址/超时走配置（见 .env.example 与 docs/frontend/26）。
+import web_tools
 from attachments import (
     IMAGE_EXTS,
     build_tool_image_result,
@@ -121,6 +126,20 @@ class ToolRegistry:
         self._worktree_manager = None  # worktree 管理器（holder，s18）
         self._mcp_manager = None  # MCP 管理器（holder，s19）
         self._workflow_manager = None  # 工作流运行时管理器（holder，s16）
+        # 交互提问 broker（holder，2026-09-21）：由 SessionRuntime 在 build_agent 时
+        # 按会话注入（InteractionBroker 需要 session_id 与 deliver，属会话级状态）。
+        # 未注入时 ask_user 返回明确的 Error 文本（绝不做阻塞式 input() 兜底）。
+        self._interaction_broker = None
+        # 额外目录集（holder，2026-09-22 权限管控）：与 PermissionGate 共享同一
+        # set 对象（见 set_extra_dirs），safe_path 兜底层用它放行工作根之外的
+        # 预授权目录。gate 接线前为空集，行为与改造前一致。
+        self._extra_dirs: set = set()
+        # 计划文书写入回调（holder，2026-09-25 任务执行模式）：由 `Agent` 在构造时
+        # 经 `set_plan_sink` 注入一个**已经算好落点**的闭包（见
+        # agent_full_v2.Agent._bind_plan_sink）。为什么是闭包而不是路径：
+        # `ToolRegistry` 只有 workdir / bash_cwd，**拿不到 workspace、session_id、
+        # data_root** —— 计划文书落在元数据目录，registry 侧推断必然推错。
+        self._plan_sink = None
 
         # ── 懒加载缓存 ──
         self._handlers_cache = None
@@ -199,6 +218,52 @@ class ToolRegistry:
                 "WorkflowManager 未初始化。请先调用 set_workflow_manager(...)。"
             )
         return mgr
+
+    def set_interaction_broker(self, broker) -> None:
+        """由 SessionRuntime.build_agent 调用一次，挂上本会话的 InteractionBroker。
+
+        holder 而非构造参数：ToolRegistry 是 Agent 级对象，而交互提问是**会话级**
+        能力（需要 session_id 与事件投递出口），且要在 Agent 构造之后才拿得到。
+        """
+        self._interaction_broker = broker
+
+    def set_extra_dirs(self, dirs: set) -> None:
+        """注入额外目录集（PermissionGate 共享对象，2026-09-22 权限管控）。
+
+        ⚠️ **共享同一个 set 对象**（非拷贝）：gate 在会话恢复 / 审批「会话内允许」/
+        「允许一次」时动态增删，safe_path 的兜底判定即时同步，无二次同步代码。
+
+        内容 = WORKTREE_DIR（应用自管沙箱）∪ 全局 additional_dirs（permissions.json）
+        ∪ 会话批准目录（session_allows 的 path 类记忆，见 permission.py §3.3）。
+        gate 未接线时为空集 —— safe_path 行为与改造前一致（只认 workdir）。
+        """
+        if isinstance(dirs, set):
+            self._extra_dirs = dirs
+
+    def set_plan_sink(self, cb) -> None:
+        """注入「计划文书写入」回调（holder，2026-09-25 任务执行模式）。
+
+        `cb(content: str) -> str`：**已经绑定本会话落点**的闭包，内部完成
+        "算路径 → 原子写 → 标 ready → 落 meta → 推 execution_mode_changed /
+        plan_ready"，返回给模型的 tool_result 文本。
+
+        ⚠️ 只能传"已经算好路径"的回调：`ToolRegistry.__init__` 没有 workspace /
+        session_id / data_root（见 `_plan_sink` 的定义处注释），registry 侧
+        **不做任何路径推断**。未注入时 `plan_write` 返回可读的 Error 文本
+        （工具层铁律：永远返回字符串、绝不向上抛），与 cron / teammate 的
+        holder 缺省语义一致。
+        """
+        self._plan_sink = cb
+
+    def get_interaction_broker(self):
+        """获取 InteractionBroker；未注入返回 None（**不抛错**）。
+
+        与 background/teammate 的 holder 不同，这里刻意不抛 RuntimeError：
+        `ask_user` 在无前端场景（子智能体、cron、headless）属于"能力不可用"，
+        应当由 handler 返回一句可读的 Error 文本给模型，而不是炸掉整轮。
+        getattr 兜底是为了兼容测试里 `ToolRegistry.__new__()` 手搭的桩。
+        """
+        return getattr(self, "_interaction_broker", None)
 
     def set_todo_manager(self, session_id: str) -> "TodoManager":
         """
@@ -284,6 +349,13 @@ class ToolRegistry:
             原为 `@staticmethod` + 模块级 `WORKDIR`。多工作空间下每个 Agent 的沙箱根
             不同（= 该空间选定的真实目录），故改为实例方法读 `self.workdir`。
             `base` 覆盖语义不变（worktree / 子智能体 scoped workdir 仍走它）。
+        兜底层扩展（2026-09-22 权限管控，见 docs/frontend/17 §3.3）：
+            判定层（PreToolUse 的 PermissionGate）先跑 —— 目标路径不在有效目录集内
+            会触发审批，批准后把父目录写入 `_extra_dirs`（与 gate 共享的 set）。
+            这里是**第二道兜底**：路径逃逸 base 后再查 `_extra_dirs`（全局
+            additional_dirs ∪ 会话批准目录 ∪ WORKTREE_DIR），命中则放行 ——
+            保证审批放行的单次执行不会在工具层被二次拦下；仍不在任何有效目录
+            才抛 ValueError（防绕过 hook 的调用路径）。
         """
         # 拼接工作根和输入路径，并解析为绝对路径
         # .resolve() 会解析符号链接并返回绝对路径
@@ -291,19 +363,38 @@ class ToolRegistry:
         path = (base / p).resolve()
 
         # is_relative_to() 检查 path 是否在 base 的子目录中
-        # 如果 path 是 "/etc/passwd" 或 "../other_dir" 等外部路径，则拒绝
         if not path.is_relative_to(base):
-            raise ValueError(f"Path escapes workspace: {p}")
+            # 逃逸 base → 查共享额外目录集（gate 维护；未接线时为空集 = 改造前行为）
+            if not self._in_extra_dirs(path):
+                raise ValueError(f"Path escapes workspace: {p}")
 
         return path
+
+    def _in_extra_dirs(self, path: Path) -> bool:
+        """路径是否落在额外目录集内（safe_path 兜底；逐目录 is_relative_to）。"""
+        for d in self._extra_dirs:
+            try:
+                if path.is_relative_to(d):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
 
     def run_bash(self, command: str, base: Path | None = None) -> str:
         """
         执行shell命令并返回结果
         安全特性：
-        - 危险命令黑名单检查：禁止 rm -rf /, sudo, shutdown, reboot 等高危操作
+        - 危险命令门控已上收到 PermissionGate（PreToolUse 先于本方法执行，
+          2026-09-22 权限管控，见 docs/frontend/17）：内置硬拒绝/危险清单、
+          自定义规则、会话内允许记忆、审批流均在判定层完成 —— 工具层不再
+          保留重复黑名单，避免两处清单漂移。
         - 超时保护：命令执行超过120秒会自动终止
         - 输出截断：结果最多返回50000字符，防止内存溢出
+        - 沙盒隔离（2026-09-22，见 sandbox.py / docs/frontend/20）：开关开启且
+          平台后端可用时，命令经 sandbox-exec（macOS）/ bwrap（Linux）执行 ——
+          写被限制在工作区∪额外目录∪临时目录内、网络默认断开、敏感目录不可读。
+          这是执行层的"绝对墙"，与判定层（PermissionGate）互补；full_access
+          模式下同样生效。后端不可用则裸跑 + 一次性 warning（诚实降级）。
         参数：
             command: 要执行的shell命令字符串
             base: 可选，命令的工作目录（worktree / 子智能体 scoped 场景传入）；
@@ -312,16 +403,16 @@ class ToolRegistry:
             命令成功：返回标准输出+标准错误的合并内容（最多50000字符）
             命令失败：返回格式 "Error: command failed with return code X\\n错误信息"
             超时：返回 "Error: Timeout (120s)"
-            危险命令：返回 "Error: Dangerous command blocked"
+            危险命令：在判定层被拦截（回填 "Error: Permission denied ..."），
+            不会执行到这里
         """
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-        if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
-        try:
-            r = subprocess.run(
+        cwd = base or self.bash_cwd or os.getcwd()
+
+        def _bare_run():
+            return subprocess.run(
                 command,
                 shell=True,
-                cwd=base or self.bash_cwd or os.getcwd(),
+                cwd=cwd,
                 capture_output=True,
                 text=True,
                 # 显式 utf-8 + errors="replace"：**绝不能**用默认的严格解码。
@@ -333,11 +424,39 @@ class ToolRegistry:
                 errors="replace",
                 timeout=120
             )
+
+        try:
+            # 后端探测也放进 try：工具层的契约是"返回字符串、绝不向上抛"，
+            # 探测里的 which/subprocess 一旦抛异常也不能穿透（2026-09-24 修）。
+            backend = sandbox_mod.get_backend()
+            if backend is not None:
+                # 可写集 = workdir ∪ 有效 cwd（bash_cwd / worktree base 可能不在
+                # workdir 内，不加入会误拦工作目录内的写入）∪ 会话批准额外目录
+                try:
+                    r = backend.run(
+                        command,
+                        cwd=Path(cwd),
+                        workdir=self.workdir,
+                        extra_writable=[Path(cwd), *self._extra_dirs],
+                        timeout=120,
+                    )
+                except RuntimeError as e:
+                    # 模板被改坏（缺必需占位符）：降级裸跑 + error log，
+                    # 提示用户在设置页恢复默认模板。绝不因模板问题打死本轮。
+                    log.error("沙盒模板损坏，降级裸跑: %s", e)
+                    r = _bare_run()
+            else:
+                r = _bare_run()
             out = (r.stdout + r.stderr).strip()
             if self._is_binary_content(out):
                 return "Error: 输出包含大量二进制数据，请使用专用工具（如 pymupdf 读取 PDF）而非 strings/cat/hexdump 等原始命令。"
             if r.returncode != 0:
-                return f"Error: 命令执行失败，返回码 {r.returncode}\n{self._smart_truncate(out, 50000)}"
+                msg = self._smart_truncate(out, 50000)
+                # 沙盒拦截特征：给模型一条可行动的提示（走配置/模板调整，而非反复重试）
+                if sandbox_mod.looks_blocked_by_sandbox(r.stderr or ""):
+                    msg += ("\n（沙盒拦截：命令可能尝试写工作区外文件、访问网络或读取"
+                            "受保护目录；如确有需要，请让用户在设置→沙盒中调整沙盒配置）")
+                return f"Error: 命令执行失败，返回码 {r.returncode}\n{msg}"
             return self._smart_truncate(out, 50000) if out else "(command executed successfully, no output)"
         except subprocess.TimeoutExpired:
             # 命令执行超时（超过120秒）
@@ -658,6 +777,16 @@ class ToolRegistry:
             "run_write":   lambda **kw: self.run_write(kw["path"], kw["content"]),
             "run_edit":    lambda **kw: self.run_edit(kw["path"], kw["old_text"], kw["new_text"]),
             "run_glob":    lambda **kw: self.run_glob(kw["pattern"]),
+            # ── 联网工具（2026-10-17）─────────────────────────────────────
+            # 转调 web_tools 的两个函数（DeepSeek Search / Fetch）。
+            # 两者都**永远返回字符串**（不含图片块），且网络/鉴权/限流等
+            # 失败都收敛成 "Error: ..." 文案；`parallel` 由分桶逻辑消费，
+            # 不进 handler（lambda 只取需要的关键字）。Key 未配置时函数内部
+            # 返回明确指引，不会抛异常打死整轮。
+            "web_search":  lambda **kw: web_tools.search(
+                kw["query"], kw.get("count"), kw.get("need_content", False),
+                kw.get("ori_question")),
+            "web_fetch":   lambda **kw: web_tools.fetch(kw["url"]),
             # ── todo 已下线（2026-09-16）────────────────────────────────
             # 原 TodoWrite：单列表、整表替换语义 update(items, fresh_start)。
             # 下线原因：与 task 看板功能高度重合；且「每轮整表覆盖写」会冲掉
@@ -666,6 +795,9 @@ class ToolRegistry:
             # 回滚方式：取消下一行注释，并恢复 _tools_cache 里的 "todo" 定义。
             # "todo":      lambda **kw: self.get_todo_manager().update(kw["items"], kw.get("fresh_start", False)),
             "load_skill":  lambda **kw: self.skills.load_skill(kw["name"]),
+            # 计划文书（2026-09-25 任务执行模式）：真正的落盘在 Agent 注入的
+            # _plan_sink 闭包里（registry 拿不到 session_id / data_root）。
+            "plan_write":  lambda **kw: self._run_plan_write(kw),
             "list_skills": lambda **kw: self.skills.list_skills(),
             "write_memory":   lambda **kw: self.memory.write(kw["name"], kw["type"], kw["description"], kw["body"]),
             "forget_memory":  lambda **kw: self.memory.forget(kw["name"]),
@@ -763,7 +895,65 @@ class ToolRegistry:
                 self.get_workflow_manager().run_sync(
                     kw["name"], kw.get("args"), kw.get("resume_from_run_id"))
             ),
+            # ── 交互提问（2026-09-21）──
+            # `_tool_call_id` / `_stop_event` 由 agent_full_v2 的 `_make_executor`
+            # 注入（只有这一个工具需要它们：前者给前端锚定小结块，后者让等待
+            # 可被停止唤醒）。模型侧 schema 里**没有**这两个字段。
+            "ask_user": lambda **kw: self._run_ask_user(kw),
         }
+
+    def _run_plan_write(self, kw: dict) -> str:
+        """plan_write 处理器：把正文（+ 模型取的名字）交给 Agent 注入的闭包落盘。
+
+        工具层铁律：**永远返回字符串、绝不向上抛异常**（见模块头与
+        `execute` 的注释）。未注入 sink（子智能体 / CLI 之外的独立构造 /
+        单测直连）时返回明确 Error 文本，而不是抛异常打死整轮。
+
+        `name` 只做**类型兜底**：真清洗（去掉目录分隔符 / 保留字符 / 空名回退）
+        在 `paths.plan_filename` —— 那里是名字口径的唯一出处，此处再写一遍
+        就是第二份规则。空 / 缺省 / 非字符串一律交给下游回退。
+        """
+        content = kw.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return "Error: plan_write 需要非空的 content（计划正文 Markdown）。"
+        raw_name = kw.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        sink = self._plan_sink
+        if sink is None:
+            return (
+                "Error: plan_write 当前不可用（本会话未接入任务执行模式）。"
+                "请改用普通回复说明你的计划。"
+            )
+        try:
+            return sink(content, name)
+        except Exception as e:  # noqa: BLE001 - 工具层绝不向上抛
+            log.error("plan_write 处理器异常: %s: %s", type(e).__name__, e, exc_info=True)
+            return f"Error: plan_write 执行失败: {type(e).__name__}: {e}"
+
+    # ── ask_user：向用户提出结构化选择题并阻塞等待作答 ──────────────
+    def _run_ask_user(self, kw: dict) -> str:
+        """ask_user 处理器：透传给本会话的 InteractionBroker。
+
+        工具层铁律：**永远返回字符串、绝不向上抛异常**。
+        broker 未注入（子智能体 / cron / headless / 后端未接线）时返回明确
+        Error 文本，让模型改为"在回复里直接提问并结束回合"，而不是挂死。
+        """
+        broker = self.get_interaction_broker()
+        if broker is None:
+            return (
+                "Error: ask_user 当前不可用（没有可交互的前端会话；"
+                "子智能体/后台任务不支持向用户提问）。"
+                "请改为在回复中直接向用户提问，并结束本回合。"
+            )
+        try:
+            return broker.ask(
+                questions=kw.get("questions") or [],
+                tool_call_id=str(kw.get("_tool_call_id") or ""),
+                stop_event=kw.get("_stop_event"),
+            )
+        except Exception as e:  # noqa: BLE001 - 工具层绝不向上抛
+            log.error("ask_user 处理器异常: %s: %s", type(e).__name__, e, exc_info=True)
+            return f"Error: ask_user 执行失败: {type(e).__name__}: {e}"
 
     @property
     def handlers(self) -> dict:
@@ -873,6 +1063,62 @@ class ToolRegistry:
                         }, "required": ["pattern"]}
                     }
                 },
+                # ── 联网工具（2026-10-17）─────────────────────────────────────
+                # 放在 base_tools：主智能体与**子智能体**都可用（子智能体读代码/
+                # 查资料时常需联网）。后端是 DeepSeek 的 Search / Fetch API，Key
+                # 独立配置（DEEPSEEK_SEARCH_API_KEY），与主模型供应商解耦。
+                # 两者是只读网络请求：权限链按"非文件工具"直接放行；互不依赖的
+                # 多条查询可设 parallel=true 并发。详细设计见 docs/frontend/26。
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": (
+                            "联网搜索网页，返回结构化结果（标题 / 链接 / 摘要 / 日期 / 权威性 / 相关度）。"
+                            "当需要**最新信息**、库/框架/API 的当前用法、版本发布、报错排查、"
+                            "或工作空间里找不到的外部事实时使用。\n"
+                            "query 支持搜索语法（会原样传给搜索引擎，可组合）："
+                            "`site:github.com`（限定站点，多个用空格+OR）、`-site:example.com`（排除站点）、"
+                            "`-\"短语\"`（排除短语）、`\"精确短语\"`（精确匹配）、`lang:zh,en`（限定语言）、"
+                            "`after:2025` / `before:2026-06-01`（按发布时间）。\n"
+                            "默认只回**摘要**（适合阅读、省上下文）；确需网页正文时才传 need_content=true"
+                            "（正文很长，会明显占用上下文，且仅在读取某条结果的细节时才值得）。\n"
+                            "多条**互不依赖**的搜索可在同一条回复里一起发起并设 parallel=true 提速。"
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "query": {"type": "string",
+                                "description": "搜索词（1~128 字符，不能全为空白），支持上述搜索语法"},
+                            "count": {"type": "integer",
+                                "description": "返回条数 1~50，默认 10；只要几条时传小值更省上下文"},
+                            "need_content": {"type": "boolean", "default": False,
+                                "description": "是否在结果里附网页正文（content）。默认 False 只给摘要；"
+                                               "正文很长，仅当需要细读具体内容时才设 True"},
+                            "ori_question": {"type": "string",
+                                "description": "可选：触发本次搜索的用户原始问题，有助于理解搜索意图"},
+                            "parallel": {"type": "boolean", "default": False,
+                                "description": "True 时与同次响应中其他独立工具调用并行执行。多个互不依赖的搜索一起发可提速。"}
+                        }, "required": ["query"]}
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "description": (
+                            "抓取单个网页，返回**标题 + Markdown 正文**。"
+                            "通常在 web_search 拿到 URL 后，需要读全篇内容时用它。\n"
+                            "只接受 http/https URL，且页面需能正常访问；"
+                            "被站点安全策略拦截、内容类型不支持或页面无可提取正文时会返回错误。\n"
+                            "**不要**用它读取工作空间里的本地文件 —— 那用 run_read。"
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "url": {"type": "string",
+                                "description": "要抓取的网页地址（含 host 的 http/https URL）"},
+                            "parallel": {"type": "boolean", "default": False,
+                                "description": "True 时与同次响应中其他独立工具调用并行执行。"}
+                        }, "required": ["url"]}
+                    }
+                },
                 # 原「view_image」工具定义已下线（2026-09-21）：读图片并入 run_read
                 # —— 模型不会再"该用 A 却用了 B"。图片依旧是**像素本身**进上下文
                 # （通道没变，见 docs/frontend/14 与 15），只是入口不再单独暴露。
@@ -899,11 +1145,38 @@ class ToolRegistry:
                 #         "fresh_start": {"type": "boolean", "default": False, "description": "True 时表示开始新计划——先清掉当前列表里所有已完成的任务，再用 items 替换整个列表。"},
                 #     }, "required": ["items"]}
                 # }},
+                # ── 计划文书（任务执行模式，docs/frontend/22）──────────────────
+                # 落点（2026-09-29 改版）：`<工作空间>/.aiagent/plan/<name>.md`。
+                # **目录由后端强制**（模型定不了；`name` 里的任何目录分隔符都会被
+                # 清洗掉），模型只定**文件名** —— 比"给 path 但忽略中间段"干净，
+                # 又保住了"每份计划有个一眼看得懂的名字"这件事。
+                # 工具**常驻**工具列表（不做按模式动态裁剪：那会牵动
+                # tools / base_tools / main_agent_tools / default_agent_tools 多处
+                # 传参点）；非 plan 模式下调用会被 plan 守卫拦下。
+                {"type": "function", "function": {
+                    "name": "plan_write",
+                    "description": (
+                        "写入/覆盖本会话的计划文书（仅在计划模式下可用）。"
+                        "在计划模式下完成只读探索后，用本工具提交实施计划：目标、"
+                        "步骤分解、涉及文件、风险与验证方式。用户批准后才会开始执行。"
+                        "文书会写到工作空间的 .aiagent/plan/ 下，用户会在右侧面板里看到它。"
+                        "不要用它保存代码、笔记或任何交付文档。"
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "name": {"type": "string",
+                                 "description": (
+                                     "计划文书的文件名（不要带目录、可带或不带 .md）。"
+                                     "用简短、一眼看懂主题的名字，例如「nav-tree 接口实现计划」"
+                                     "「沙盒改造方案」。留空则自动取一个。"
+                                 )},
+                        "content": {"type": "string",
+                                    "description": "计划正文（Markdown 格式）"},
+                    }, "required": ["content"]}
+                }},
                 {"type": "function", "function": {
                     "name": "load_skill", "description": "加载指定名称的专业技能（skill）知识。",
                     "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "要加载的专业技能（skill）名称"}}, "required": ["name"]}
-                }},
-                {"type": "function", "function": {
+                }},                {"type": "function", "function": {
                     "name": "list_skills", "description": "获取当前所有可用技能（skill）的名称和简短描述列表，用于了解当前会话支持哪些技能。",
                     "parameters": {"type": "object", "properties": {
                         "parallel": {"type": "boolean", "default": False,
@@ -1111,6 +1384,11 @@ class ToolRegistry:
                                                           "传入后续跑：未变化的步骤直接命中缓存重放。"}},
                                    "required": ["name"]}
                 }},
+                # ── 交互提问（2026-09-21）──────────────────────────────
+                # 只进主智能体工具集（tools），**绝不进 base_tools**：
+                # 子智能体只有单向事件上行、没有下行应答通道，常跑在后台 daemon
+                # 线程里 —— 拿到它就会调用到一个永远无人应答的接口并挂住线程。
+                self._ask_user_tool_def(),
             ]
         return self._tools_cache
 
@@ -1375,6 +1653,106 @@ class ToolRegistry:
                 },
                 "required": ["prompt"]
             }
+        }}
+
+    # ── ask_user 工具定义 ────────────────────────────────────────
+    def _ask_user_tool_def(self) -> dict:
+        """ask_user 工具定义（向用户提出结构化选择题并等待作答）。
+
+        ⚠️ 三条硬约束（改动前必读）：
+        1. **本定义只进 `tools`（主智能体），绝不进 `base_tools`**。子智能体只有
+           单向事件上行、没有下行应答通道，且常跑在后台 daemon 线程里 ——
+           拿到它就会调用到一个永远无人应答的接口，把线程挂死。
+        2. **schema 里不得出现 `parallel` / `run_in_background`**。`_execute_tool_call`
+           与分桶逻辑都硬编码"ask_user 永远串行且独占"，若 schema 里给了这两个
+           字段，就复刻了 sub_agent 那次"required 里必填、description 里又禁止"
+           的自相矛盾事故（模型每次都必须违规）。
+        3. **description 必须写明"禁止索取敏感信息"**。这是唯一一个能把模型输出
+           直接引向用户的通道，凭证/隐私必须走别的路。
+        """
+        return {"type": "function", "function": {
+            "name": "ask_user",
+            "description": (
+                "向用户提出 1–4 个结构化选择题，并**阻塞等待**用户在前端作答；"
+                "答案会作为本工具的结果返回，你在**同一个回合内**据此继续。\n\n"
+                "【何时该用】仅当你确实无法从用户消息、工作空间文件、记忆或既有约定"
+                "中推断，且不同选择会导致**明显不同且代价高**的实现路径时。"
+                "例如：技术栈/存储方案二选一、删除还是保留、范围与优先级取舍。\n\n"
+                "【何时不该用】\n"
+                "- 用户已给出答案，或能从文件/约定推断出来 —— 直接推断并说明即可；\n"
+                "- 只是「确认我理解得对不对」这类客套确认 —— 直接干活并在回复里说明你的假设；\n"
+                "- 一次想问超过 4 个问题 —— 拆成多轮，或先做能确定的部分；\n"
+                "- 需要开放式的长文本回答 —— 那属于普通对话，不该用本工具。\n\n"
+                "【禁止】绝不用它索取任何敏感信息：密码、API Key/令牌、身份证/银行卡号、"
+                "私人联系方式、医疗隐私等。本工具**禁止用于收集凭据**。\n\n"
+                "【重要限制】本工具会**阻塞当前回合**直到用户点提交/取消/停止；"
+                "`run_in_background` / `parallel` 对它无效，它永远串行且独占执行"
+                "（你无需也不应传这两个字段）。用户也可能直接在输入框打字发送 —— "
+                "那会被当作本题的自由文本答案，此时你收到的结果形如"
+                "「用户没有选择选项，而是直接回复了：…」。"
+                "若当前没有可交互的前端（例如在子智能体/后台任务里），本工具会返回 "
+                "Error 文本，请改用普通提问并结束回合。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "1–4 个问题。前端**一题一屏、点「下一步」逐步作答**，"
+                                       "最后一题点提交时一次性回传全部答案。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "本题的稳定标识（小写英文+下划线，批内唯一），"
+                                                   "答案按它对号入座"},
+                                "header": {
+                                    "type": "string",
+                                    "description": "不超过 12 字的短标签，用于分屏步骤条与结果小结的标题；"
+                                                   "不要用整句"},
+                                "question": {
+                                    "type": "string",
+                                    "description": "完整问题，一句话说清要用户决定什么"},
+                                "multi_select": {
+                                    "type": "boolean", "default": False,
+                                    "description": "false=单选（点选项即选中）；true=多选（可勾多项）。"
+                                                   "默认单选"},
+                                "allow_custom": {
+                                    "type": "boolean", "default": True,
+                                    "description": "是否额外提供「其他」自由文本输入。默认 true"
+                                                   "（用户可能有你没想到的答案）；"
+                                                   "仅当你已穷举所有可能时才设为 false"},
+                                "custom_label": {
+                                    "type": "string",
+                                    "description": "自定义输入项的显示文案，默认「其他」"},
+                                "options": {
+                                    "type": "array", "minItems": 2, "maxItems": 4,
+                                    "description": "2–4 个候选。label 必须彼此可区分；"
+                                                   "description 写清该选项的后果/代价"
+                                                   "（用户看不懂的选项不如不提供）",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "description": "选项短文案（建议不超过 16 字），中文优先"},
+                                            "description": {
+                                                "type": "string",
+                                                "description": "一句话解释该选项的含义/影响，可省略"},
+                                        },
+                                        "required": ["label"],
+                                    },
+                                },
+                            },
+                            "required": ["id", "header", "question", "options"],
+                        },
+                    },
+                },
+                "required": ["questions"],
+            },
         }}
 
     # ═══════════════════════════════════════════════════════════

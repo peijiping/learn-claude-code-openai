@@ -26,6 +26,8 @@ import time
 from typing import Awaitable, Callable, Dict, Optional
 
 from agent_full_v2 import Agent
+from approval import ApprovalBroker
+from interaction import InteractionBroker
 from llm_config import (
     ENV_LLM_LOCK, apply_model_to_env, resolve_model_window, restore_llm_env,
     snapshot_llm_env,
@@ -94,7 +96,24 @@ class SessionRuntime:
         self.workspace = workspace
         self.busy = False  # 本会话当前是否有一个 turn 在跑（拒绝同会话并发）
         self.stop_evt = threading.Event()
+        # 交互提问 broker（2026-09-21）：会话级对象，天然持有 session_id 与事件
+        # 投递出口；在 build_agent() 里注入给该会话 Agent 的 ToolRegistry。
+        # 它自己管"在途提问"的生命周期（ask 阻塞 / resolve 唤醒 / cancel 解锁），
+        # 与 busy / stop_evt 正交 —— 但 request_stop 必须同步 cancel_all，
+        # 否则停止后 ask 线程会一直阻塞到用户再点一次。
+        self._interaction = InteractionBroker(sid, deliver)
+        # 权限审批 broker（2026-09-22 权限管控，docs/frontend/17 §4）：与
+        # interaction 同构的会话级阻塞通道（克隆其线程模型）。区别在语义：
+        # ask 是**范式 A**（答案进模型上下文），审批是**范式 C**（只有结局
+        # 文案回填，决定走 tool 行旁挂 approval 字段）。request_stop 同样
+        # 必须同步 cancel_all —— 否则停止后审批线程一直阻塞到超时。
+        self._approval = ApprovalBroker(sid, deliver)
         self._pending_overrides: tuple = (None, None)  # (reasoning_effort, max_context)
+        # 「本条消息就是目标指令」的条件文本（2026-09-30 目标可见化）。
+        # 由 ws_bridge 显式传入（它是唯一算得出"这条是目标指令"的地方），
+        # 只在本轮透传给 run_turn，用于给落盘的 user 行打 `goal` 标记。
+        # 非目标消息恒为 None —— agent 侧不做任何反查猜测。
+        self._pending_goal_instruction: Optional[str] = None
         self._bg_watch_task: Optional[asyncio.Task] = None  # 后台任务完成守望
         self._deliver = deliver
         self._reply_sessions = reply_sessions
@@ -170,6 +189,14 @@ class SessionRuntime:
         # 此处必须同步重绑，否则子智能体（含后台子任务）的 tool_call 事件
         # 只打印到后端 stdout，永远到不了前端 UI。
         agent.subagent_runner.sinks = [agent.stream_sink]
+        # 执行模式事件出口（2026-09-25 任务执行模式，docs/frontend/22 §4.3 P1-3）：
+        # `execution_mode_changed` 有**两个触发源** —— 用户点胶囊 tag（事件循环侧，
+        # 经命令分支）与 goal 达成/失败后自动回落（**工作线程**侧，Stop 边界）。
+        # 二者必须只有**一条投递路径**，否则两套口径会漂移（项目里踩过同类）。
+        # agent 侧没有 `hub`（全仓 `hub` 只在 ws_bridge），故注入 `self._deliver`
+        # —— 其内部是 `call_soon_threadsafe` + 广播全连接，**线程安全**。
+        # 形状固定为 `(kind, payload)`，与 hub.broadcast 同参。
+        agent.execution_mode_sink = self._deliver
 
     def _bind_subagent_store(self, agent: Agent) -> None:
         """把子智能体旁路记录存储绑给本会话 Agent 的 SessionManager。
@@ -248,6 +275,15 @@ class SessionRuntime:
             # 任务板推送必须在 switch_session 之后：set_scope 在 switch_session 里完成，
             # 而 TaskManager 的 scope 决定快照读哪个会话的文件。
             self._bind_task_board(self.agent)
+            # 交互提问 broker（会话级）注入给本会话 Agent 的工具注册表。
+            # 放这里而不是 Agent.__init__：broker 需要 session_id 与 deliver 出口，
+            # 都是 runtime 才知道的东西；Agent 侧因此零构造改动。
+            self.agent.tools.set_interaction_broker(self._interaction)
+            # 权限审批 broker 注入给本会话 Agent 的权限门（同上：会话级对象，
+            # 需要 session_id 与 deliver 出口）。注入后 gate 的审批分支从
+            # 「无 broker 回落」切到「阻塞等前端作答」；switch_session 已在此
+            # 之前完成 → 继承链恢复（模式/会话内允许）已生效。
+            self.agent.permission_gate.attach_broker(self._approval)
             log.info("session_%s agent 构建完成 (model=%s)",
                      self.sid, model_id or "global-default")
             return self.agent
@@ -270,8 +306,20 @@ class SessionRuntime:
            sub_agent 在迭代边界收束为 aborted；任务状态立即标 stopped，
            has_running() 变 False → bg watch 退出 → 状态收敛为 done，
            已被放弃的结果不会被复活注入。
+
+        另有第四件事（2026-09-21 起）：`ask_user` 正阻塞等用户作答时，必须
+        立刻结算为 stopped —— 否则那个工作线程会一直卡在 `done.wait()` 上，
+        直到用户再点一次提交/取消（停止按钮形同失效）。**放在 if 之外**：
+        agent 尚未构造（例如刚切进会话就被停）也可能有在途提问。
         """
         self.stop_evt.set()
+        # 在途提问立即结算为 stopped（返回"本轮已被用户停止"占位文本，
+        # 保证那个 tool_call 仍有 tool_result 回填，不留孤儿）。
+        self._interaction.cancel_all("stopped")
+        # 在途审批同样立即结算为 stopped（gate 回填"Permission denied
+        # (stopped by user)"，同样不留孤儿 tool_call）。放在 if 之外：
+        # agent 未构造也可能有在途审批（防御性对称，与 interaction 同）。
+        self._approval.cancel_all("stopped")
         if self.agent is not None:
             self.agent.request_stop()
             self.agent.background_manager.request_stop_all()
@@ -285,6 +333,57 @@ class SessionRuntime:
         if self.agent is not None and model_id is not None:
             self.agent.record_model_switch(model_id)
 
+    # ── 交互提问（ask_user）的会话级转发（2026-09-21）─────────────
+    def resolve_ask(self, request_id: str, answers: list) -> bool:
+        """前端提交答案 → 唤醒阻塞中的 ask_user。
+
+        幂等：迟到/重复提交（含"提交与停止同时到达"里后到的那个）返回 False，
+        broker 内部不会二次唤醒、也不会二次广播。
+        """
+        return self._interaction.resolve(request_id, answers)
+
+    def resolve_ask_free_text(self, text: str) -> bool:
+        """用户在输入框直接发消息 = 放弃选择题，把自由文本原样回填为答案。
+
+        **不另起 turn**：原 turn 的 ask() 拿到答案后在同一回合继续。
+        返回 False 表示当前并无在途提问 —— 调用方据此回落到正常 chat 流程。
+        """
+        return self._interaction.resolve_free_text_any(text)
+
+    def cancel_ask(self, request_id: str, reason: str = "cancelled") -> bool:
+        """用户点「取消」：按"未作答、请自行选最合理的默认方案继续"回填。"""
+        return self._interaction.cancel(request_id, reason)
+
+    def has_pending_interaction(self) -> bool:
+        """是否有在途提问（ws_bridge 的 chat 分支据此把消息转成自由作答）。"""
+        return self._interaction.has_pending()
+
+    def pending_interactions(self) -> list[dict]:
+        """新连接重放 / status_query 用：所有在途提问的 ask_request 载荷。"""
+        return self._interaction.pending_payloads()
+
+    # ── 权限审批（approval）的会话级转发（2026-09-22 权限管控）──────
+    def resolve_approval(self, request_id: str, decision: str) -> bool:
+        """前端三选一作答 → 唤醒阻塞中的审批。
+
+        幂等：迟到/重复/非法 decision（broker 内校验）返回 False，无副作用。
+        """
+        return self._approval.resolve(request_id, decision)
+
+    def pending_approvals(self) -> list[dict]:
+        """新连接重放 / status_query 用：所有在途审批的 approval_request 载荷。"""
+        return self._approval.pending_payloads()
+
+    def close(self) -> None:
+        """会话被移除时收尾：标记 broker 关闭并解锁所有阻塞中的 ask 线程。
+
+        不做这一步的话，删除会话时那个 ask 工作线程会永远卡在 done.wait() 上
+        （守护线程，进程结束时才被强杀），白白占着资源且日志里看不出原因。
+        """
+        self._interaction.close()
+        # 审批 broker 同理收尾：在途审批结算为 stopped，阻塞线程解锁。
+        self._approval.close()
+
     def current_status(self) -> Optional[str]:
         """新连接状态重放用（ws_bridge.handle）：
         running=turn 执行中；background=turn 已结束但后台任务仍在跑；None=空闲。"""
@@ -296,12 +395,17 @@ class SessionRuntime:
 
     async def start_turn(self, text: str | list,
                          reasoning_effort: Optional[str] = None,
-                         max_context: Optional[str] = None) -> None:
+                         max_context: Optional[str] = None,
+                         goal_instruction: Optional[str] = None) -> None:
         """派发一轮对话：后台线程跑 run_turn，事件循环保持可读。
 
         `text` 为**用户消息的 content**：无附件时是纯字符串（与改造前一致），
         带附件时是 `[文本块 + 附件引用块...]` 的多模态数组（由 ws_bridge 组装）。
         本层只做透传，不解释内容 —— 展开成语义线格式发生在 Agent 的发送边界。
+
+        `goal_instruction`（2026-09-30 目标可见化）：「本条消息就是被设为执行目标
+        的那条指令」时的目标条件文本，透传给 `run_turn` 用于给落盘的 user 行打
+        `goal` 标记（前端据此渲染徽标、回放同样可见）。非目标消息传 None。
 
         先发 running，结束后按终态发**一条**状态：
         - stopped：用户主动停止；
@@ -321,6 +425,7 @@ class SessionRuntime:
         # 下一轮正常结束会被误判成 stopped。
         self.stop_evt.clear()
         self._pending_overrides = (reasoning_effort, max_context)
+        self._pending_goal_instruction = goal_instruction
         self.busy = True
         self._turn_started = time.monotonic()
         self._push_status("running")
@@ -483,7 +588,7 @@ class SessionRuntime:
                     self._resolve_turn_context(max_context))
         except Exception:
             pass
-        agent.run_turn(text)
+        agent.run_turn(text, goal_instruction=self._pending_goal_instruction)
 
 
 class SessionRuntimeRegistry:
@@ -541,8 +646,14 @@ class SessionRuntimeRegistry:
         return rt.agent is not None and rt.agent.background_manager.has_running()
 
     def remove(self, sid: str) -> None:
-        """会话被删除/回收后移除其运行时（运行中会被上层拒绝后才到达这里）。"""
-        self._sessions.pop(sid, None)
+        """会话被删除/回收后移除其运行时（运行中会被上层拒绝后才到达这里）。
+
+        移除前先 `close()`：若有 ask_user 正阻塞等用户作答，必须先把那个工作
+        线程解锁（否则它永远卡在 done.wait()）。
+        """
+        rt = self._sessions.pop(sid, None)
+        if rt is not None:
+            rt.close()
 
     def reload_llm_bindings(self) -> None:
         """模型配置热切换后重绑所有已构造的运行时会话 Agent。

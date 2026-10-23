@@ -1,5 +1,5 @@
 import { app, shell, BrowserWindow, dialog, ipcMain, nativeImage, net, protocol } from 'electron'
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, sep } from 'path'
 import { pathToFileURL } from 'url'
@@ -18,6 +18,11 @@ const WS_PORT = Number(process.env.AGENT_WS_PORT || '8765')
 
 /** 附件缩略图自定义协议名（CSP 里 img-src 需放行同名 scheme） */
 const ATT_SCHEME = 'aigent-att'
+/** 工作空间文件流自定义协议（多格式预览，docs/frontend/21）。
+ *  图片 / PDF / Office 转出的 PDF 由渲染层 <img> / <embed> 直读磁盘，
+ *  **不经 WS 传字节**（websockets 帧上限 1 MiB，base64 必超）——与附件缩略图
+ *  同一条"主进程喂文件"的路线。CSP 的 img-src / object-src 需放行同名 scheme。 */
+const FILE_SCHEME = 'aigent-file'
 /** 后端附件目录名（与 agents/paths.ATTACHMENTS_DIRNAME 一致） */
 const ATTACHMENTS_DIRNAME = '.attachments'
 /** 未发送附件的草稿区（与 agents/paths.DRAFT_ATTACHMENTS_DIRNAME 一致） */
@@ -149,15 +154,124 @@ function sweepClipboardTemp(): void {
 
 // scheme 必须在 app ready **之前**声明为 privileged：否则渲染层的 <img src="aigent-att://…">
 // 会被当作不认识的 scheme 直接拦掉（standard=true 才能被 new URL 正常解析）。
+// aigent-file 同理，且 <embed type="application/pdf"> 需要 stream=true。
 protocol.registerSchemesAsPrivileged([
   {
     scheme: ATT_SCHEME,
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+  },
+  {
+    scheme: FILE_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
   }
 ])
 
-// 应用名称：macOS Dock / 菜单栏 / Cmd+Tab 等所有系统展示处统一命名为「个人AI助手」
+// ── aigent-file 协议（多格式预览，docs/frontend/21）────────────────────────
+// 扩展名 → Content-Type。**刻意只有一张白名单表**：不在表里的扩展名一律 403，
+// 绝不按"认不认识"猜测 —— 协议能读的文件种类必须与后端 `refs.classify_preview_kind`
+// 放行的 kind（image/pdf/office 产物）同域，多出来的种类就是多余的安全面。
+// ⚠️ 没有 .html/.htm/.js：工作空间里的 HTML/JS 只走文本预览，**绝不**作为文档喂给
+// 渲染引擎（同 refs.py 的取舍：把工作区 HTML 当网页渲染 = 点开就执行同源脚本）。
+const FILE_MIME_BY_EXT: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+  '.avif': 'image/avif',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff'
+}
+
+/** 流式文件字节上限 —— 与后端 `refs.stream_max_bytes()`（FILE_STREAM_MAX_BYTES）
+ *  同值同义：协议侧再卡一道，防一个 2GB 的 PDF 把主进程读爆内存。 */
+const FILE_STREAM_MAX_BYTES = 64 * 1024 * 1024
+
+/** 渲染层经 `agent:allowFileStream` 报备过的可读路径（realpath 归一后的绝对路径）。
+ *
+ *  为什么是"回执报备制"而不是协议侧自己校验工作空间：主进程**不知道**各项目的
+ *  workdir（那在后端的 projects.json 里），再开一条查询通道只为让协议能自己判定
+ *  得不偿失。报备制还有个额外好处：只有后端 `file_read` 回执**真正给出去过**的
+ *  路径（沙箱判定已经过了）才可能被读，白名单的边界与后端完全一致。
+ *  FIFO 上限防长会话无限累积。 */
+const streamAllowed: string[] = []
+const STREAM_ALLOWED_MAX = 200
+
+function allowFileStreamPath(raw: string): void {
+  const p = String(raw || '').trim()
+  if (!p) return
+  let real = p
+  try {
+    real = realpathSync(p) // 消掉 symlink 与 `..`；文件不存在时抛 → 下面拦
+  } catch {
+    return
+  }
+  try {
+    if (!statSync(real).isFile()) return
+  } catch {
+    return
+  }
+  const i = streamAllowed.indexOf(real)
+  if (i >= 0) streamAllowed.splice(i, 1)
+  streamAllowed.push(real)
+  if (streamAllowed.length > STREAM_ALLOWED_MAX) streamAllowed.shift()
+}
+
+/** 处理 `aigent-file://local/?path=<abs>`：白名单命中 → 按扩展名给 Content-Type。 */
+function handleFileStream(req: Request): Response {
+  let raw = ''
+  try {
+    raw = new URL(req.url).searchParams.get('path') ?? ''
+  } catch {
+    return new Response('bad request', { status: 400 })
+  }
+  if (!raw) return new Response('not found', { status: 404 })
+  let real: string
+  try {
+    real = realpathSync(raw)
+  } catch {
+    return new Response('not found', { status: 404 })
+  }
+  // 双重校验：报备的原样串与 realpath 各查一遍（报备前文件被改名/替换时仍能命中）
+  if (!streamAllowed.includes(real) && !streamAllowed.includes(raw)) {
+    return new Response('forbidden', { status: 403 })
+  }
+  let buf: Buffer
+  try {
+    const st = statSync(real)
+    if (!st.isFile() || st.size > FILE_STREAM_MAX_BYTES) {
+      return new Response('too large', { status: 413 })
+    }
+    buf = readFileSync(real)
+  } catch {
+    return new Response('not found', { status: 404 })
+  }
+  const ext = real.slice(real.lastIndexOf('.')).toLowerCase()
+  const mime = FILE_MIME_BY_EXT[ext]
+  if (!mime) return new Response('unsupported type', { status: 403 })
+  // SVG 走 <img> 不执行脚本，但若被误用 <embed>/<iframe> 加载就会 —— 响应头 CSP
+  // 直接禁掉该文档内的脚本，把这条路焊死（对 PDF viewer 无影响，它不是脚本）。
+  const headers: Record<string, string> = { 'Content-Type': mime }
+  if (mime === 'image/svg+xml') headers['Content-Security-Policy'] = "script-src 'none'"
+  // Electron 全局 Response（undici 类型）对 Buffer/Uint8Array 泛型较挑剔，
+  // 复制成独立 ArrayBuffer 再交（一次字节拷贝，64MB 上限内可接受）
+  const body = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+  return new Response(body, { headers })
+}
+
+// 应用名称：macOS Dock / 菜单栏 / Cmd+Tab 等所有系统展示处统一命名为「个人AI助手」。
+// ⚠️ 与渲染层的 `.titlebar`（`components/TitleBar/TitleBar.tsx` 的 APP_NAME）和
+// `src/renderer/index.html` 的 `<title>` 是同一个字符串的三处落点（原生标题栏隐去后，
+// 窗口里可见的那份由渲染层画，这里这处是系统展示位）。改名要三处一起改。
 app.setName('个人AI助手')
+
+// 自绘标题栏高度（px）。**跨进程常量**：渲染层同值见 `styles/tokens.css` 的
+// `--titlebar-height` —— 交通灯位置与 `titleBarOverlay` 高度都按它算，改一处必须改两处。
+const TITLEBAR_HEIGHT = 40
 
 // 应用图标：透明背景的浅蓝机器人头像（dev 下位于工程根 build/icon.png；打包后位于安装资源目录）
 const APP_ICON = join(app.getAppPath(), 'build/icon.png')
@@ -241,11 +355,26 @@ function createWindow(): void {
     minHeight: 600,
     show: false,
     icon: APP_ICON, // Windows/Linux 窗口与任务栏图标
+    // ── 自绘标题栏（2026-09-23）─────────────────────────────────────
+    // 右栏开关要落在"最外层窗体的右上角"（与窗口标题同层），而原生标题栏画不了
+    // 自绘控件 → 隐去原生标题栏，标题文字与拖拽区交给渲染层的 `.titlebar`
+    // （`-webkit-app-region: drag`，见 styles/layout.css）。
+    // · macOS：保留交通灯，位置显式对齐 TITLEBAR_HEIGHT 的中线（左 16 / 上 14）；
+    // · Windows / Linux：走 `titleBarOverlay`，系统的最小化/最大化/关闭按钮仍由
+    //   系统绘制在窗口右上角（渲染层按 UA 给它们留出 138px，见 lib/platform.ts）。
+    titleBarStyle: 'hidden',
+    ...(process.platform === 'darwin'
+      ? { trafficLightPosition: { x: 16, y: 14 } }
+      : { titleBarOverlay: { color: '#ffffff', symbolColor: '#1f1f1f', height: TITLEBAR_HEIGHT } }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      // Electron 内置 Chromium PDF viewer 的开关：<embed type="application/pdf">
+      // 能否被插件接管全看它（真机探针验证过，2026-09-23，docs/frontend/21）。
+      // 附件/预览之外不引入任何第三方插件，开启没有额外攻击面。
+      plugins: true
     }
   })
 
@@ -260,7 +389,7 @@ function createWindow(): void {
   const isTrustedSender = (event: Electron.IpcMainInvokeEvent): boolean =>
     event.sender === mainWindow?.webContents
 
-  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null; attachments?: unknown[] | null; refs?: unknown[] | null }) => {
+  ipcMain.handle('agent:send', (e, payload: { text?: string; session_id?: string | null; project_id?: string | null; overrides?: { thinking_strength?: string; max_context?: string } | null; model_id?: string | null; attachments?: unknown[] | null; refs?: unknown[] | null; exec_mode?: string | null; exec_condition?: string | null }) => {
     // ⚠️ 不能只判 text：**纯附件消息 / 纯引用消息（正文为空）都是合法发送**。
     // 历史 bug 就是这里把"只发了图片没打字"的消息静默丢掉；引用上线时同样
     // 必须把 `refs` 加进来，否则"只 @ 了一个文件就发送"会被无声丢弃。
@@ -270,6 +399,22 @@ function createWindow(): void {
     const sessionId = typeof payload.session_id === 'string' && payload.session_id ? payload.session_id : undefined
     // project_id：新建任务的归属工作空间（已有会话由后端按 session_id 解析归属）
     const projectId = typeof payload.project_id === 'string' && payload.project_id ? payload.project_id : undefined
+    // exec_mode：**目标模式 = 首条指令即目标**（2026-09-30，docs/frontend/22 §2.6）。
+    // 两种含义共用同一对字段：
+    //   · 新建任务（无 session_id）→ 预选执行模式草稿（2026-09-27 起）；
+    //   · **已有会话 + goal** → 目标模式的**武装位**：条件就是这条消息的正文，
+    //     随 `chat` 送到后端，由后端在**派发 turn 之前**落地（那时既有条件、又还
+    //     没 `rt.busy`）。这条路径必须放行 —— 拦截它 = 目标模式点了没反应。
+    // plan 仍只对新建生效：已有会话的 plan 切换走 `session_exec_mode`（plan 的真源
+    // 是后端 gate，必须即时生效；goal 则相反，它必须等条件）。
+    // 形状校验与前两处同款（白名单 + 非空），condition 仅在 goal 时透传。
+    const rawExecMode = String(payload.exec_mode ?? '')
+    const execMode =
+      rawExecMode === 'goal' || (sessionId === undefined && rawExecMode === 'plan')
+        ? rawExecMode
+        : undefined
+    const execCondition =
+      execMode === 'goal' && typeof payload.exec_condition === 'string' ? payload.exec_condition : undefined
     ws.send(JSON.stringify({
       kind: 'chat',
       payload: {
@@ -279,7 +424,9 @@ function createWindow(): void {
         ...(payload.overrides ? { overrides: payload.overrides } : {}),
         ...(payload.model_id ? { model_id: payload.model_id } : {}),
         ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
-        ...(payload.refs?.length ? { refs: payload.refs } : {})
+        ...(payload.refs?.length ? { refs: payload.refs } : {}),
+        ...(execMode !== undefined ? { exec_mode: execMode } : {}),
+        ...(execCondition !== undefined ? { exec_condition: execCondition } : {})
       }
     }))
   })
@@ -299,6 +446,109 @@ function createWindow(): void {
   ipcMain.handle('agent:stop', (e, payload: { session_id?: string }) => {
     if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
     ws.send(JSON.stringify({ kind: 'stop', payload: { session_id: payload.session_id } }))
+  })
+
+  // 结构化提问（ask_user）作答 / 取消 —— 2026-09-21。
+  // **fire-and-forget，不用 request()**：主进程 `pending` 表按 kind FIFO 配对、
+  // 不带 id，同类并发会串台；而且回执本来就走 `ask_resolved` **广播**，
+  // 主进程拿它没有意义（渲染层直接从 WS 广播收）。这里只做形状校验 + 转发。
+  ipcMain.handle('agent:answerAsk', (e, payload: { session_id?: string; request_id?: string; answers?: unknown[] }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) return
+    ws.send(JSON.stringify({
+      kind: 'ask_answer',
+      payload: {
+        session_id: payload.session_id,
+        request_id: payload.request_id,
+        // answers 的结构由后端 normalize_answers 收敛（脏值一律过滤），
+        // 主进程只保证是数组，不在这里重复实现一遍 schema 校验。
+        answers: Array.isArray(payload.answers) ? payload.answers : []
+      }
+    }))
+  })
+
+  ipcMain.handle('agent:cancelAsk', (e, payload: { session_id?: string; request_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) return
+    ws.send(JSON.stringify({
+      kind: 'ask_cancel',
+      payload: { session_id: payload.session_id, request_id: payload.request_id }
+    }))
+  })
+
+  // ── 权限管控（2026-09-22，docs/frontend/17）─────────────────────────
+  // 审批作答 / 切换会话权限档位 —— 与 ask_answer 同款 **fire-and-forget**：
+  // 回执走 `approval_resolved` / `permission_changed` 广播，主进程拿点对点
+  // 回包没有意义（渲染层直接从 WS 广播收）。这里只做形状校验 + 转发。
+  ipcMain.handle('agent:approvalAnswer', (e, payload: { session_id?: string; request_id?: string; decision?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) return
+    const decision = payload.decision
+    // 只放行三选一的合法裁决（后端也会再校验，这里先拦掉明显脏值）
+    if (decision !== 'allow_once' && decision !== 'allow_session' && decision !== 'deny') return
+    ws.send(JSON.stringify({
+      kind: 'approval_answer',
+      payload: { session_id: payload.session_id, request_id: payload.request_id, decision }
+    }))
+  })
+
+  ipcMain.handle('agent:sessionPermission', (e, payload: { session_id?: string; mode?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    const mode = payload.mode
+    if (mode !== 'default' && mode !== 'full_access') return
+    ws.send(JSON.stringify({
+      kind: 'session_permission',
+      payload: { session_id: payload.session_id, mode }
+    }))
+  })
+
+  // 新建任务（无会话）态切换目标工作空间权限档位：只写 projects.json「最后更改值」，
+  // 成功后后端广播 projects 刷新（无会话号，不走 permission_changed）。同样 fire-and-forget。
+  ipcMain.handle('agent:projectPermission', (e, payload: { project_id?: string; mode?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.project_id !== 'string' || !payload.project_id) return
+    const mode = payload.mode
+    if (mode !== 'default' && mode !== 'full_access') return
+    ws.send(JSON.stringify({
+      kind: 'project_permission',
+      payload: { project_id: payload.project_id, mode }
+    }))
+  })
+
+  // ── 任务执行模式（2026-09-25，docs/frontend/22）───────────────────────
+  // 与权限档位**正交**的另一条轴。三个命令：
+  //   session_exec_mode / plan_approve —— **fire-and-forget**（同 session_permission）：
+  //     回执走 `execution_mode_changed` **广播** / 既有 `error` 信封，主进程拿点对点
+  //     回包没有意义；而且 pending 表按 kind FIFO 配对、无 id，同 kind 并发会串台。
+  //   plan_read —— 有真回执（`plan_content` 点对点），走 request()（同 agent:readFile）。
+  ipcMain.handle('agent:sessionExecMode', (e, payload: { session_id?: string; mode?: string; condition?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    const mode = payload.mode
+    if (mode !== 'normal' && mode !== 'plan' && mode !== 'goal') return
+    // condition 只在 goal 时有意义：非 goal 一律不带（避免脏值落进 payload）。
+    // 内容校验（空 / 超 MAX_GOAL_LENGTH）由后端 GoalError 统一负责，文案原样回 error 信封。
+    const condition = mode === 'goal' && typeof payload.condition === 'string' ? payload.condition : undefined
+    ws.send(JSON.stringify({
+      kind: 'session_exec_mode',
+      payload: {
+        session_id: payload.session_id,
+        mode,
+        ...(condition !== undefined ? { condition } : {})
+      }
+    }))
+  })
+
+  ipcMain.handle('agent:planApprove', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    ws.send(JSON.stringify({
+      kind: 'plan_approve',
+      payload: { session_id: payload.session_id }
+    }))
+  })
+
+  ipcMain.handle('agent:planRead', (e, payload: { session_id?: string }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return null
+    // 点对点回执 `plan_content`（同 file_content 的配对方式）
+    return request('plan_read', 'plan_content', { session_id: payload.session_id })
   })
 
   ipcMain.handle('agent:switchSession', (e, payload: { session_id?: string }) => {
@@ -356,6 +606,72 @@ function createWindow(): void {
     )
   })
 
+  // ── 右侧面板（2026-09-23，docs/frontend/19）──────────────────────────
+  // 四个命令，全部按 `sessionId ?? projectId` 定位归属（与 listRefs 同口径）。
+  ipcMain.handle('agent:sessionUi', (e, payload: { session_id?: string; ui?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.session_id !== 'string' || !payload.session_id) return
+    // **fire-and-forget**：后端无点对点回包（同 agent:stop / agent:answerAsk）。
+    // ⚠️ 刻意**不走 request()** —— 主进程 pending 表按 kind 先进先出配对且没有
+    // request id，同 kind 并发会串台；而这个命令本来就允许丢（前端防抖上报，
+    // 状态以内存桶为准，落盘只是为了让"下次切回来"更准）。
+    ws.send(JSON.stringify({
+      kind: 'session_ui',
+      payload: { session_id: payload.session_id, ui: payload.ui ?? null }
+    }))
+  })
+
+  ipcMain.handle('agent:readFile', (e, payload: {
+    path?: string
+    sessionId?: string | null
+    projectId?: string | null
+  }) => {
+    if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) return null
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    // 超时给宽一点：大文件解码 + 二进制嗅探都在后端线程里做
+    return request('file_read', 'file_content', {
+      path: payload.path,
+      ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {})
+    }, 20000)
+  })
+
+  ipcMain.handle('agent:gitStatus', (e, payload?: {
+    sessionId?: string | null
+    projectId?: string | null
+  }) => {
+    if (!isTrustedSender(e)) return null
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    return request('git_status', 'git_status', {
+      ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {})
+    }, 20000)
+  })
+
+  ipcMain.handle('agent:gitDiff', (e, payload: {
+    path?: string
+    staged?: boolean
+    sessionId?: string | null
+    projectId?: string | null
+  }) => {
+    if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) return null
+    const sessionId =
+      typeof payload?.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined
+    const projectId =
+      typeof payload?.projectId === 'string' && payload.projectId ? payload.projectId : undefined
+    return request('git_diff', 'git_diff', {
+      path: payload.path,
+      ...(payload.staged ? { staged: true } : {}),
+      ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {})
+    }, 20000)
+  })
+
   ipcMain.handle('agent:openInFinder', async (e, payload: { path?: string }) => {
     if (!isTrustedSender(e) || typeof payload?.path !== 'string' || !payload.path) {
       return { ok: false, error: '空路径' }
@@ -363,6 +679,14 @@ function createWindow(): void {
     // openPath 在系统文件管理器中定位；失败返回非空错误串（不抛异常）
     const err = await shell.openPath(payload.path)
     return err ? { ok: false, error: err } : { ok: true }
+  })
+
+  // ── aigent-file 白名单报备（多格式预览，docs/frontend/21）────────────────
+  // 渲染层收到 file_content 回执且 kind 为 image/pdf（或 office 且转换成功）后，
+  // 把要展示的路径报备进来；协议 handler 只认报备过的路径。fire-and-forget。
+  ipcMain.handle('agent:allowFileStream', (e, payload: { paths?: string[] }) => {
+    if (!isTrustedSender(e) || !Array.isArray(payload?.paths)) return
+    for (const p of payload.paths) allowFileStreamPath(p)
   })
 
   // ── 会话附件（「添加文件或图片」）──────────────────────────────────
@@ -476,6 +800,327 @@ function createWindow(): void {
     if (!isTrustedSender(e) || payload?.config === undefined) return null
     return request('llm_config_save', 'llm_config', { config: payload.config })
   })
+  // 权限配置（设置弹窗「权限」页，docs/frontend/18）：读 / 保存。
+  // 只挡「不是对象」这类明显非法载荷 —— 字段级语义归一化是后端 `_normalize` 的职责
+  // （单一出处，与 llm_config_save 同策略）。
+  ipcMain.handle('agent:permissionConfigGet', (e) =>
+    isTrustedSender(e) ? request('permission_config_get', 'permission_config') : null
+  )
+  ipcMain.handle('agent:permissionConfigSave', (e, payload: { config?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.config !== 'object' || payload.config === null) {
+      return null
+    }
+    return request('permission_config_save', 'permission_config', { config: payload.config })
+  })
+  // 沙盒设置（设置弹窗「沙盒」页，docs/frontend/20）：读 / 保存（字段部分更新）。
+  // 字段级校验（占位符、reset 枚举）是后端 sandbox.py 的职责，桥层只透传。
+  ipcMain.handle('agent:sandboxConfigGet', (e) =>
+    isTrustedSender(e) ? request('sandbox_config_get', 'sandbox_config') : null
+  )
+  ipcMain.handle('agent:sandboxConfigSave', (e, payload: Record<string, unknown> | undefined) => {
+    if (!isTrustedSender(e) || typeof payload !== 'object' || payload === null) return null
+    return request('sandbox_config_save', 'sandbox_config', payload)
+  })
+  // MCP 服务管理（设置弹窗「MCP」页，docs/frontend/23）：读 / 单条增改 / 删除 / 试连。
+  // 单条 upsert 而非整份覆盖 —— MCP 是"多条目集合"，整份覆盖在多窗口下误伤面太大。
+  ipcMain.handle('agent:mcpConfigGet', (e) =>
+    isTrustedSender(e) ? request('mcp_config_get', 'mcp_config') : null
+  )
+  ipcMain.handle(
+    'agent:mcpServerUpsert',
+    (
+      e,
+      payload?: { name?: unknown; config?: unknown; original_name?: unknown; meta?: unknown }
+    ) => {
+      // 只挡「不是对象」这类明显非法载荷 —— 字段级校验是后端 mcp_store.validate 的职责
+      // （单一出处，与 permission_config_save 同策略）。
+      if (!isTrustedSender(e)) return null
+      if (typeof payload?.config !== 'object' || payload.config === null) return null
+      const out: Record<string, unknown> = {
+        name: typeof payload.name === 'string' ? payload.name : '',
+        config: payload.config
+      }
+      if (typeof payload.original_name === 'string') out.original_name = payload.original_name
+      if (typeof payload.meta === 'object' && payload.meta !== null) out.meta = payload.meta
+      // 回执要等后端 `_reload_mcp_all_runtimes` 跑完才发：对每个运行时 reconcile，
+      // 对启用中的条目 connect 握手最长 MCP_CONNECT_TIMEOUT（默认 15s）→ 默认 5s 会
+      // 稳定超时回 null，权威回执只能靠事件通道晚到（渲染层有乐观位兜着，但 promise
+      // 路径不该先断）。与 mcpServerTest 同理放宽到 30s。
+      return request('mcp_server_upsert', 'mcp_config', out, 30000)
+    }
+  )
+  ipcMain.handle('agent:mcpServerRemove', (e, payload?: { name?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.name !== 'string') return null
+    // 同 mcpServerUpsert：删除也触发全运行时热重载 → 放宽到 30s
+    return request('mcp_server_remove', 'mcp_config', { name: payload.name }, 30000)
+  })
+  ipcMain.handle(
+    'agent:mcpServerTest',
+    (e, payload?: { config?: unknown; name?: unknown }) => {
+      if (!isTrustedSender(e)) return null
+      const name = typeof payload?.name === 'string' ? payload.name : ''
+      // 两种寻址都要能透传（后端二选一）：
+      //  · config = 表单草稿里的真值；· name = 从磁盘读真实配置（含未脱敏密钥）。
+      const config =
+        typeof payload?.config === 'object' && payload.config !== null ? payload.config : null
+      if (!name && !config) return null
+      // 试连要真实起子进程 / 建连接并等握手，最长 MCP_CONNECT_TIMEOUT（默认 15s）
+      // → 必须放宽超时，用默认 5s 会稳定误报「超时」（同 llmModelsFetch 的 30s）。
+      //
+      // ⚠️ 45s 而非 30s（2026-10-08）：试连通过后后端会**顺势做一次定点重连**
+      // （`_mcp_reconnect_one_sync`），最坏路径 = 试连 15s + 重连 15s = 30s，
+      // 正好**贴死** 30s 边界 → 偶发 promise 回 null、回执被丢弃，
+      // 用户看到"点测试没反应"。与 mcpServerUpsert 的 30s 同源问题，
+      // 但这里要两次握手，只能再放宽一档。
+      return request(
+        'mcp_server_test',
+        'mcp_test',
+        { ...(config ? { config } : {}), ...(name ? { name } : {}) },
+        45000
+      )
+    }
+  )
+  // MCP 市场（官方 registry 代理）：搜索 / 把条目翻译成配置（不落盘）。
+  // 实测单次搜索 0.9s~17s → 同样放宽到 30s（默认 5s 会稳定误报超时）。
+  ipcMain.handle(
+    'agent:mcpMarketSearch',
+    (e, payload?: { query?: unknown; cursor?: unknown; limit?: unknown }) => {
+      if (!isTrustedSender(e)) return null
+      const out: Record<string, unknown> = {}
+      if (typeof payload?.query === 'string') out.query = payload.query
+      if (typeof payload?.cursor === 'string') out.cursor = payload.cursor
+      if (typeof payload?.limit === 'number') out.limit = payload.limit
+      return request('mcp_market_search', 'mcp_market', out, 30000)
+    }
+  )
+  ipcMain.handle('agent:mcpMarketResolve', (e, payload?: { item?: unknown }) => {
+    if (!isTrustedSender(e)) return null
+    if (typeof payload?.item !== 'object' || payload.item === null) return null
+    // 纯翻译，不打网络（item 里已带回 packages/remotes）→ 用默认超时足够
+    return request('mcp_market_resolve', 'mcp_market_plan', { item: payload.item })
+  })
+  // MCP 本地包（设置弹窗「MCP → 本地包」，docs/frontend/23 §本地安装）：
+  // 解析 / 下载 / 卸载 / 复核。**下载与写配置刻意分成两步** —— 这三条只负责
+  // 磁盘上的包，写条目仍走上面的 mcpServerUpsert（复用热重载与校验）。
+  ipcMain.handle('agent:mcpPkgResolve', (e, payload?: { name?: unknown; version?: unknown }) => {
+    if (!isTrustedSender(e)) return null
+    if (typeof payload?.name !== 'string' || !payload.name) return null
+    // 纯解析，但会打两次网络（npm view + dry-run 数依赖树），实测可达 20s+
+    // → 放宽到 30s（默认 5s 会稳定误报超时，同 mcpMarketSearch）。
+    return request(
+      'mcp_pkg_resolve',
+      'mcp_pkg_plan',
+      {
+        name: payload.name,
+        version: typeof payload.version === 'string' ? payload.version : ''
+      },
+      30000
+    )
+  })
+  ipcMain.handle(
+    'agent:mcpPkgInstall',
+    (
+      e,
+      payload?: { name?: unknown; version?: unknown; bin?: unknown; allow_scripts?: unknown }
+    ) => {
+      if (!isTrustedSender(e)) return null
+      if (typeof payload?.name !== 'string' || !payload.name) return null
+      if (typeof payload?.version !== 'string' || !payload.version) return null
+      const out: Record<string, unknown> = {
+        name: payload.name,
+        version: payload.version,
+        // 是否允许执行安装期脚本。**默认 false**（后端也以 false 兜底）：
+        // postinstall 是装包期任意代码执行，必须由用户在那个红字开关上显式开启。
+        allow_scripts: payload.allow_scripts === true
+      }
+      if (typeof payload.bin === 'string' && payload.bin) out.bin = payload.bin
+      // 真实下载整棵依赖树。npm install 在网络差时可轻松超过 60s
+      // → 放到 180s（与后端 MCP_INSTALL_TIMEOUT 默认值对齐），
+      //   否则主进程会先回 null、用户看到"安装失败"但后端其实装成功了。
+      return request('mcp_pkg_install', 'mcp_config', out, 180000)
+    }
+  )
+  ipcMain.handle('agent:mcpPkgRemove', (e, payload?: { slug?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.slug !== 'string') return null
+    // 删目录（可能几千个文件）是磁盘密集操作，但远不至于秒级 → 30s 足够
+    return request('mcp_pkg_remove', 'mcp_config', { slug: payload.slug }, 30000)
+  })
+  ipcMain.handle('agent:mcpPkgVerify', (e, payload?: { slug?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.slug !== 'string') return null
+    // 复核要遍历整棵 node_modules 算哈希 → 同样放宽
+    return request('mcp_pkg_verify', 'mcp_config', { slug: payload.slug }, 30000)
+  })
+  // ── 技能管理（设置弹窗「技能」页，docs/frontend/24）──────────────────────
+  // 六条状态命令共用 `skill_config` 回执（整份替换：拼接会留下已删技能的残影）；
+  // `skill_read` 另走 `skill_content`。全部点对点，只回发起窗口、不广播。
+  //
+  // 超时：`skillInstall` / `skillMarketResolve` 要扫一次仓库树 + 抓若干 SKILL.md
+  // （后端还有 20s 请求超时兜底），`skillMarketSearch` 走第三方 API 时实测可达十几秒
+  // → 三处都放宽，默认 5s 会稳定误报超时（同 mcpMarketSearch 的处理）。
+  ipcMain.handle('agent:skillConfigGet', (e) =>
+    isTrustedSender(e) ? request('skill_config_get', 'skill_config') : null
+  )
+  ipcMain.handle(
+    'agent:skillSetEnabled',
+    (e, payload?: { name?: unknown; enabled?: unknown }) => {
+      if (!isTrustedSender(e) || typeof payload?.name !== 'string' || !payload.name) return null
+      // `enabled` 必须是布尔：缺了它会被后端 `bool(None)` 读成 false，
+      // 于是「启用」按钮静默变成「禁用」—— 这正是最不该猜的字段。
+      if (typeof payload.enabled !== 'boolean') return null
+      return request('skill_set_enabled', 'skill_config', {
+        name: payload.name,
+        enabled: payload.enabled
+      })
+    }
+  )
+  ipcMain.handle('agent:skillRemove', (e, payload?: { name?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.name !== 'string' || !payload.name) return null
+    return request('skill_remove', 'skill_config', { name: payload.name })
+  })
+  ipcMain.handle(
+    'agent:skillInstall',
+    (e, payload?: { name?: unknown; item?: unknown }) => {
+      if (!isTrustedSender(e)) return null
+      if (typeof payload?.item !== 'object' || payload.item === null) return null
+      const name = typeof payload.name === 'string' ? payload.name : ''
+      if (!name) return null
+      // 现场抓取整个技能目录（含附属脚本）→ 60s：后端单请求 20s，逐个文件抓会累加
+      return request('skill_install', 'skill_config', { name, item: payload.item }, 60000)
+    }
+  )
+  ipcMain.handle('agent:skillRead', (e, payload?: { name?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.name !== 'string' || !payload.name) return null
+    return request('skill_read', 'skill_content', { name: payload.name })
+  })
+  ipcMain.handle(
+    'agent:skillCreate',
+    (
+      e,
+      payload?: { name?: unknown; description?: unknown; body?: unknown; tags?: unknown }
+    ) => {
+      if (!isTrustedSender(e)) return null
+      // 只挡「不是字符串」这类明显非法载荷 —— 名称白名单、description 必填这些
+      // 字段级规则是后端 skill_store 的职责（单一出处，与 mcp_server_upsert 同策略）。
+      const out: Record<string, unknown> = {
+        name: typeof payload?.name === 'string' ? payload.name : '',
+        description: typeof payload?.description === 'string' ? payload.description : '',
+        body: typeof payload?.body === 'string' ? payload.body : ''
+      }
+      if (Array.isArray(payload?.tags)) {
+        out.tags = payload.tags.filter((t): t is string => typeof t === 'string')
+      }
+      return request('skill_create', 'skill_config', out)
+    }
+  )
+  ipcMain.handle(
+    'agent:skillMarketSearch',
+    (
+      e,
+      payload?: { market_id?: unknown; query?: unknown; cursor?: unknown; limit?: unknown }
+    ) => {
+      if (!isTrustedSender(e)) return null
+      const out: Record<string, unknown> = {}
+      if (typeof payload?.market_id === 'string') out.market_id = payload.market_id
+      if (typeof payload?.query === 'string') out.query = payload.query
+      if (typeof payload?.cursor === 'string') out.cursor = payload.cursor
+      if (typeof payload?.limit === 'number') out.limit = payload.limit
+      return request('skill_market_search', 'skill_market', out, 30000)
+    }
+  )
+  ipcMain.handle(
+    'agent:skillMarketResolve',
+    (e, payload?: { market_id?: unknown; item?: unknown }) => {
+      if (!isTrustedSender(e)) return null
+      if (typeof payload?.item !== 'object' || payload.item === null) return null
+      const out: Record<string, unknown> = { item: payload.item }
+      if (typeof payload?.market_id === 'string') out.market_id = payload.market_id
+      return request('skill_market_resolve', 'skill_market_plan', out, 60000)
+    }
+  )
+  // 源增删：回 `skill_config`（源列表就在那份载荷里，不必单开信封 —— 少一个信封
+  // 就少一处"前端要自己把两份状态拼起来"的机会）。
+  ipcMain.handle('agent:skillMarketUpsert', (e, payload?: { entry?: unknown }) => {
+    if (!isTrustedSender(e)) return null
+    if (typeof payload?.entry !== 'object' || payload.entry === null) return null
+    return request('skill_market_upsert', 'skill_config', { entry: payload.entry })
+  })
+  ipcMain.handle('agent:skillMarketRemove', (e, payload?: { market_id?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.market_id !== 'string' || !payload.market_id) {
+      return null
+    }
+    return request('skill_market_remove', 'skill_config', { market_id: payload.market_id })
+  })
+  // ── 插件管理（设置弹窗「插件」页，docs/frontend/25）──────────────────────
+  // 命令集与技能侧一一对应，回执换成 `plugin_config` / `plugin_content`。
+  ipcMain.handle('agent:pluginConfigGet', (e) =>
+    isTrustedSender(e) ? request('plugin_config_get', 'plugin_config') : null
+  )
+  ipcMain.handle(
+    'agent:pluginSetEnabled',
+    (e, payload?: { name?: unknown; enabled?: unknown }) => {
+      if (!isTrustedSender(e) || typeof payload?.name !== 'string' || !payload.name) return null
+      if (typeof payload.enabled !== 'boolean') return null
+      return request('plugin_set_enabled', 'plugin_config', {
+        name: payload.name,
+        enabled: payload.enabled
+      })
+    }
+  )
+  ipcMain.handle('agent:pluginRemove', (e, payload?: { name?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.name !== 'string' || !payload.name) return null
+    return request('plugin_remove', 'plugin_config', { name: payload.name })
+  })
+  ipcMain.handle(
+    'agent:pluginInstall',
+    (e, payload?: { name?: unknown; item?: unknown }) => {
+      if (!isTrustedSender(e)) return null
+      if (typeof payload?.item !== 'object' || payload.item === null) return null
+      const name = typeof payload.name === 'string' ? payload.name : ''
+      if (!name) return null
+      // 拉下整个插件目录（可能含附属资源），上限 300 个文件 → 给足 60s
+      return request('plugin_install', 'plugin_config', { name, item: payload.item }, 60000)
+    }
+  )
+  ipcMain.handle('agent:pluginRead', (e, payload?: { name?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.name !== 'string' || !payload.name) return null
+    return request('plugin_read', 'plugin_content', { name: payload.name })
+  })
+  ipcMain.handle(
+    'agent:pluginMarketSearch',
+    (
+      e,
+      payload?: { market_id?: unknown; query?: unknown; cursor?: unknown; limit?: unknown }
+    ) => {
+      if (!isTrustedSender(e)) return null
+      const out: Record<string, unknown> = {}
+      if (typeof payload?.market_id === 'string') out.market_id = payload.market_id
+      if (typeof payload?.query === 'string') out.query = payload.query
+      if (typeof payload?.cursor === 'string') out.cursor = payload.cursor
+      if (typeof payload?.limit === 'number') out.limit = payload.limit
+      return request('plugin_market_search', 'plugin_market', out, 30000)
+    }
+  )
+  ipcMain.handle(
+    'agent:pluginMarketResolve',
+    (e, payload?: { market_id?: unknown; item?: unknown }) => {
+      if (!isTrustedSender(e)) return null
+      if (typeof payload?.item !== 'object' || payload.item === null) return null
+      const out: Record<string, unknown> = { item: payload.item }
+      if (typeof payload?.market_id === 'string') out.market_id = payload.market_id
+      return request('plugin_market_resolve', 'plugin_market_plan', out, 60000)
+    }
+  )
+  ipcMain.handle('agent:pluginMarketUpsert', (e, payload?: { entry?: unknown }) => {
+    if (!isTrustedSender(e)) return null
+    if (typeof payload?.entry !== 'object' || payload.entry === null) return null
+    return request('plugin_market_upsert', 'plugin_config', { entry: payload.entry })
+  })
+  ipcMain.handle('agent:pluginMarketRemove', (e, payload?: { market_id?: unknown }) => {
+    if (!isTrustedSender(e) || typeof payload?.market_id !== 'string' || !payload.market_id) {
+      return null
+    }
+    return request('plugin_market_remove', 'plugin_config', { market_id: payload.market_id })
+  })
   // 「刷新模型列表」：远端 GET /models 可能较慢，超时放宽到 30s
   ipcMain.handle(
     'agent:llmModelsFetch',
@@ -544,6 +1189,9 @@ app.whenReady().then(() => {
     if (!real) return new Response('not found', { status: 404 })
     return net.fetch(pathToFileURL(real).toString())
   })
+  // 工作空间文件流协议：图片 / PDF / Office 转出的 PDF 由此兑现。
+  // 只读白名单内（后端 file_read 回执给过、渲染层报备过）的文件，按扩展名定 MIME。
+  protocol.handle(FILE_SCHEME, (req) => handleFileStream(req as unknown as Request))
   sweepClipboardTemp()
   ensureAppIcon() // macOS Dock 图标
   createWindow()

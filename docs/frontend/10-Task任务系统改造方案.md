@@ -557,7 +557,7 @@ cd frontend && npm run typecheck
 **断层一：提醒断层** → `Agent._sync_task_board()`
 
 替代原 `_inject_todo_reminder`（尾注：原实现有两个硬伤 —— 只认 todo、
-且同会话续轮不经过它的触发点）。采用与 `<memory_index>` / `<env>` 相同的
+且同会话续轮不经过它的触发点）。采用与 `<memory_index>` 相同的
 「尾部注入 + 指纹去重」模式：
 
 - 注入条件：**存在未完成组** 且 **历史里找不到该 `group_id` 的 `<task_board>` 注入**

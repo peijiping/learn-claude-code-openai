@@ -1,5 +1,10 @@
 import { create } from 'zustand'
-import type { AgentEvent, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, HistoryMessage, MessageRef, ModelSwitch, ProjectMeta, ProjectsPayload, RefInput, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
+// 右栏（2026-09-23）：本文件是**单向**依赖右栏 store 的调用方 ——
+// `rightPanelStore` 绝不反向 import 本文件（那会形成循环依赖，见其文件头警告）。
+// 这里只用到三件事：接收 `session_history` 里的 right_panel、切会话时收尾、
+// 删会话/断线重连时清缓存。
+import { flushRightPanelPending, useRightPanelStore } from './rightPanelStore'
+import type { AgentEvent, ApprovalDecision, ApprovalInfo, ApprovalOutcome, AskAnswer, AskQuestion, AskStatus, AttachmentKind, AttachmentRef, AttachmentsStagedPayload, ChatAttachmentInput, ContextStats, ExecutionMode, ExecutionModeChangedPayload, GoalAction, GoalMarker, HistoryAskUser, HistoryMessage, McpConfigResult, McpMarketItem, McpMarketPlan, McpMarketResult, McpPkgActionResult, McpPkgPlan, McpTestResult, McpUpsertPayload, PluginConfigResult, PluginContentResult, PluginInstallPayload, PluginMarketEntry, PluginMarketItem, PluginMarketPlan, PluginMarketResult, SkillConfigResult, SkillContentResult, SkillCreatePayload, SkillInstallPayload, SkillMarketEntry, SkillMarketItem, SkillMarketPlan, SkillMarketResult, MessageRef, ModelSwitch, PermissionConfig, PermissionConfigResult, PermissionMode, PlanContentPayload, PlanStatus, ProjectMeta, ProjectsPayload, RefInput, RPanelPersist, SandboxConfigResult, SandboxConfigSavePayload, SessionMeta, SessionModelOverrides, SessionModelOverridesMap, SessionRunStatus, StagedAttachment, TaskBoardSnapshot, TurnModelInfo, UiEvent, UsageStats, UsageStatsEventUsage, LlmConfig, LlmConfigPayload, LlmConnectionModel, LlmModel, LlmModelsResult } from '@protocols/agentProtocol'
 
 // 会话级请求覆盖（模型下拉悬浮配置面板改动，仅本会话生效）
 export interface SessionOverrides {
@@ -12,9 +17,347 @@ export interface SessionOverrides {
 /** 按模型 id 分别保存的会话级参数覆盖（每个模型各自独立，互不串改） */
 export type SessionOverridesMap = Record<string, SessionOverrides>
 
+/** 计划卡片状态（2026-09-25，docs/frontend/22 §6.8）：**每会话一条**（单份覆盖）。
+ *
+ *  - 卡片**外壳**由 `status` + `path` 决定（`plan_ready` 广播 / `session_history`
+ *    / `sessions` 列表载荷都能重建）；**重建不无条件** —— 壳的存活另有判据
+ *    （见 `planShellAlive`）：`approved` 的壳不会从任何通道复活（2026-09-29 四次改版）。
+ *  - 正文**必须**经 `plan_read` 拉取后落在 `content` —— 信封与列表载荷都不带正文
+ *    （实时与回放共用同一条链路，避免两套口径）。 */
+export interface PlanState {
+  /** 文书落点。2026-09-29 起是**相对工作空间**的 `.aiagent/plan/<name>.md`
+   *  （右栏标签与 `file_read` 都用这个口径）；存量会话是旧的元数据目录绝对路径。
+   *  空串 = 未知（理论上不该发生：三条恢复通道都会带上它）。 */
+  path: string
+  status: PlanStatus
+  /** 正文（plan_read 回执填充）；`undefined` = 尚未拉取。 */
+  content?: string
+  /** 拉取失败原因（文件被清理 / 空间目录不可用）→ 卡片渲染占位块而非白屏。 */
+  reason?: string
+  /** 正文超限（`too_large`）整份拒绝：**宁可不给，不给半个**。 */
+  tooLarge?: boolean
+}
+
+/** 锚点行存活判据（2026-09-29 四次改版，docs/frontend/22 §7.5）：
+ *  **壳只在「有一份待批准的计划」期间存在** —— 即 `status === 'ready'`。
+ *
+ *  上一版让 `approved` 也恒留（理由是"作为历史"），但壳贴在消息流**末尾**、不锚定产出
+ *  它的那条消息（事件不带 `message_id`，这条链不存在）—— 于是它既不是历史（不跟着历史
+ *  走），也不是状态（`approve_plan` 的语义就是"落 approved + mode 回落 normal"，卡片上
+ *  那句"正在按计划执行"当场已经是错的），只剩一条过期横幅赖在流末尾直到会话结束。
+ *  用户实测报的就是这个（2026-09-29）：批准之后它再没有任何可做的事，却一直占着屏幕。
+ *
+ *  **为什么只看 `status`、不看 `mode`**：批准与"清空计划状态"在后端都伴随 mode 离开
+ *  plan，所以 `approved` 直接判死即可；而 `ready` 恒活 —— 若给 `ready` 也加上 mode
+ *  条件，前一条 `execution_mode_changed` 一旦丢失（断线），壳就永远建不出来。
+ *
+ *  ⚠️ 这条判据被**三条通道共用**：广播 `execution_mode_changed` / 回放 `session_history` /
+ *  列表重建 `mergeExecFromSessions`（断线重连 + 整页重载的唯一恢复源，而 `resetTransient`
+ *  并不清 `planBySession`）。**漏改任何一条，壳都会从那个入口复活** —— 上一版正是漏了
+ *  后两条，"批准后横幅赖着不走"因此不是修一处能好的。
+ *
+ *  返回值同时是一个**类型谓词**：为真时 `status` 必是 `'ready'`。 */
+function planShellAlive(status: PlanStatus | null | undefined): status is 'ready' {
+  return status === 'ready'
+}
+
+/** 常驻目标条的存活判据（2026-09-30 目标可见化，docs/frontend/22 §7.6）。
+ *
+ *  「目标模式的**唯一真相**是后端 `GoalController.active`，`execution_mode` 只是
+ *  它的投影」—— 所以目标条存在当且仅当 `mode === 'goal'` **且**条件非空。
+ *  两个条件都要：`mode` 说 goal 而条件为空，是投影与真相不一致的中间态（后端
+ *  `execution_state()` 的铁律校准就是干这个的），此时渲染一条没有目标的目标条
+ *  只会让用户困惑。
+ *
+ *  ⚠️ 与 `planShellAlive` 同款纪律：这条判据被**四条来源共用** ——
+ *  ① 广播 `execution_mode_changed`；② 回放 `session_history`；
+ *  ③ 列表重建 `mergeExecFromSessions`（断线重连 / 整页重载的**唯一**恢复源）；
+ *  ④ 实时 `goal_check`（只更新轮次，不改存亡）。
+ *  **漏改任何一条，目标条就会从那个入口复活或消失**。
+ *
+ *  返回值同时是一个**类型谓词**：为真时 `condition` 必是 string。 */
+export function goalBarAlive(
+  mode: ExecutionMode,
+  condition: string | null | undefined
+): condition is string {
+  return mode === 'goal' && !!condition
+}
+
+/** 常驻目标条的状态（**每会话一条**）。
+ *
+ *  `round` = 后端 `GoalController.active.iterations`（已完成的评估次数）；
+ *  条上显示 `round + 1`（当前进行 / 即将进行的那一轮）—— 这个 +1 只在这里做一次，
+ *  组件不得自算（两处口径分会打架：检查卡片显示的是 `round`，不是 `+1`）。 */
+export interface GoalBarState {
+  condition: string
+  /** 已完成的评估轮次（0 = 目标刚设、还没评估过）。 */
+  round: number
+  /** 目标设置时刻（Unix 秒）；缺省 = 不知道起点，不显示时长（不编假值）。 */
+  startedAt: number | null
+}
+
+/** 常驻目标条对外展示的轮次（**唯一口径**）：已完成的轮次 + 1。
+ *  无目标条时为 0（组件据 `goalBarAlive` 判存亡，不会渲染这个值）。 */
+export function goalBarRoundLabel(bar: GoalBarState | undefined): number {
+  return bar ? bar.round + 1 : 0
+}
+
+/** 目标指令徽标的**乐观态收敛**（2026-09-30 目标可见化）。
+ *
+ *  「这条是目标指令」这个事实，后端要等 `chat` 到达、算完条件才知道；而前端在
+ *  `send()` 那一刻就一清二楚 —— 所以徽标只能**乐观**打（否则要为一个纯展示需求
+ *  新增一条"这条消息已被确认为目标指令"的信封，不值当）。
+ *
+ *  代价是：后端若**静默忽略**整份目标预选（条件为空 / 超 `MAX_GOAL_LENGTH` /
+ *  被 busy 守卫拒掉，见 ws_bridge 的两处 `log.warning`），不会有任何回执 ——
+ *  那枚徽标就会一直挂着，让用户以为会话在目标模式下。
+ *
+ *  收敛点因此是**后端给出的权威模式**（判据与 `execution_mode` 同源）：
+ *  - `goal`     → 摘掉 `pending`，徽标留下（事实成立）；
+ *  - 非 `goal`  → **整枚撤掉**（这次预选没被接受）。
+ *
+ *  ⚠️ 只动 `pending === true` 的那些 —— **已确认**的历史徽标（早先那次目标指令）
+ *  绝不能被顺手清掉：目标达成后 mode 回落 normal，若按 mode 一刀切，
+ *  用户会看到"我刚才设的目标"徽标凭空消失。 */
+function settleGoalBadges(
+  prev: Record<string, Message[]>,
+  sids: string[],
+  inGoalMode: (sid: string) => boolean
+): Record<string, Message[]> {
+  let out = prev
+  for (const sid of sids) {
+    const buf = prev[sid]
+    if (!buf) continue
+    let hit = false
+    const next = buf.map((m) => {
+      if (m.goal?.kind !== 'instruction' || !m.goal.pending) return m
+      hit = true
+      if (inGoalMode(sid)) {
+        return { ...m, goal: { ...m.goal, pending: undefined } }
+      }
+      // 整枚撤掉：连 `goal` 键一起摘（而不是置 undefined），保持"无标记的消息
+      // 连字段都不多一个"这条形状约定。
+      const { goal: _droppedGoal, ...rest } = m
+      return rest
+    })
+    if (hit) out = { ...out, [sid]: next }
+  }
+  return out
+}
+
+/** 从 `sessions` 列表载荷同步执行模式两桶（2026-09-25，docs/frontend/22 §6.8 P1-13）。
+ *
+ *  ⚠️ **这是断线重连 / 整页重载后恢复 tag 与卡片壳的唯一通道**：连接重放序列
+ *  不含 `session_history`（它只在收到 `session_switch` 后才发），前端重连只做
+ *  `resetTransient()` + `listSessions()` —— 与 `permission_mode` / `unread` 同
+ *  通道即天然覆盖。
+ *
+ *  只覆盖列表里出现的会话（不删桶里其它键：可能有刚切走 / 在途的会话）；
+ *  无变化时**返回原引用**，避免 zustand 无谓重渲染。 */
+function mergeExecFromSessions(
+  prevMode: Record<string, ExecutionMode>,
+  prevPlan: Record<string, PlanState>,
+  prevBar: Record<string, GoalBarState>,
+  list: SessionMeta[]
+): {
+  executionModeBySession: Record<string, ExecutionMode>
+  planBySession: Record<string, PlanState>
+  goalBarBySession: Record<string, GoalBarState>
+} {
+  let mode = prevMode
+  let plan = prevPlan
+  let bar = prevBar
+  for (const x of list) {
+    const m = x.execution_mode ?? 'normal'
+    if (prevMode[x.id] !== m) mode = { ...mode, [x.id]: m }
+    const st = x.plan_status
+    if (planShellAlive(st)) {
+      const cur = prevPlan[x.id]
+      const path = x.plan_path ?? ''
+      if (!cur || cur.path !== path || cur.status !== st) {
+        plan = { ...plan, [x.id]: { ...(cur ?? {}), path, status: st } as PlanState }
+      }
+    } else if (m !== 'plan' && plan[x.id]) {
+      // 模式已离开 plan（含"已批准 + 回落 normal"）→ 撤壳。断线重连时内存里的旧壳
+      // 不会被 `resetTransient` 清掉（它只清 running/bg/isSending/interaction/approval），
+      // 这里是唯一的校准点：少了这一步，用户批准后一断线重连，横幅就从列表载荷里复活。
+      const { [x.id]: _dropped, ...rest } = plan
+      plan = rest
+    }
+    // 常驻目标条（2026-09-30）：判据 `goalBarAlive` 与广播 / 回放两条通道共用。
+    // 这条通道是**断线重连 / 整页重载的唯一恢复源** —— 少了它，目标条会消失
+    // （或带着旧条件复活），而 `resetTransient` 并不清这个桶。
+    const cond = x.goal_condition
+    if (goalBarAlive(m, cond)) {
+      const cur = prevBar[x.id]
+      const round = typeof x.goal_round === 'number' ? x.goal_round : 0
+      const startedAt = typeof x.goal_started_at === 'number' ? x.goal_started_at : null
+      if (!cur || cur.condition !== cond || cur.round !== round
+          || cur.startedAt !== startedAt) {
+        bar = { ...bar, [x.id]: { condition: cond, round, startedAt } }
+      }
+    } else if (bar[x.id]) {
+      // 目标已结束（achieved/failed/用户点 ×）或条件为空 → 撤条（同上面的撤壳语义）
+      const { [x.id]: _droppedBar, ...rest } = bar
+      bar = rest
+    }
+  }
+  return { executionModeBySession: mode, planBySession: plan, goalBarBySession: bar }
+}
+
+/** 从三桶里按会话 id 批量删除（**删会话 / 删工作空间时显式调用**）。
+ *
+ *  ⚠️ 刻意**不**照抄 `permissionModeBySession` —— 那个桶在 clearSession /
+ *  newSession / trashSession / deleteSessions / removeProject 五处都不删，属既有
+ *  泄漏（评审 P1-14）；新轴不继承这个缺陷（照 `rightPanelStore.dropSessions` 范式）。
+ *  `goalArmBySession`（目标模式武装态，2026-09-30）同批清 —— 会话都没了，
+ *  一条"等着下一条指令当目标"的孤儿草稿没有意义。
+ *  无实际删除时返回**原引用**，避免 zustand 无谓重渲染。 */
+function dropExecBuckets(
+  prevMode: Record<string, ExecutionMode>,
+  prevPlan: Record<string, PlanState>,
+  prevArm: Record<string, boolean>,
+  prevBar: Record<string, GoalBarState>,
+  ids: string[]
+): {
+  executionModeBySession: Record<string, ExecutionMode>
+  planBySession: Record<string, PlanState>
+  goalArmBySession: Record<string, boolean>
+  goalBarBySession: Record<string, GoalBarState>
+} {
+  const mode = { ...prevMode }
+  const plan = { ...prevPlan }
+  const arm = { ...prevArm }
+  const bar = { ...prevBar }
+  let changed = false
+  for (const id of ids) {
+    if (id in mode) {
+      delete mode[id]
+      changed = true
+    }
+    if (id in plan) {
+      delete plan[id]
+      changed = true
+    }
+    if (id in arm) {
+      delete arm[id]
+      changed = true
+    }
+    if (id in bar) {
+      delete bar[id]
+      changed = true
+    }
+  }
+  if (!changed) {
+    return {
+      executionModeBySession: prevMode,
+      planBySession: prevPlan,
+      goalArmBySession: prevArm,
+      goalBarBySession: prevBar
+    }
+  }
+  return {
+    executionModeBySession: mode,
+    planBySession: plan,
+    goalArmBySession: arm,
+    goalBarBySession: bar
+  }
+}
+
+/** 某会话当前的执行模式 —— tag 选中态的**唯一 fallback 链**（与权限 chip 同款）：
+ *  `executionModeBySession`（广播 / session_history / sessions 列表驱动）
+ *  → `sessions` 列表该会话的 `execution_mode` → `'normal'`（零占位）。 */
+function execModeOf(
+  s: { executionModeBySession: Record<string, ExecutionMode>; sessions: SessionMeta[] },
+  sid: string
+): ExecutionMode {
+  return s.executionModeBySession[sid] ?? s.sessions.find((x) => x.id === sid)?.execution_mode ?? 'normal'
+}
+
+/** 把 `plan_read` 回执合并进 plan 桶（**点对点路径的唯一写入口**）。
+ *
+ *  读不到是**常规降级**（文书被清理 / 空间目录不可用 / 超 512KB 整份拒绝）——
+ *  落 `reason` 让卡片渲染占位块，绝不抛、也绝不白屏。`reason` 与 `tooLarge`
+ *  语义不同但都表示"没有正文"：前者给用户看原因，后者供样式区分。
+ *
+ *  `path` **一律沿用外壳里的那一份**（来自 `plan_ready` / `session_history` /
+ *  `sessions` 列表，2026-09-29 起是**相对工作空间**的 `.aiagent/plan/<name>.md`）。
+ *  刻意**不**用回执里的 `payload.path`：那是后端解析出来的绝对路径，两者混进同一个
+ *  字段会让"用哪个路径开右栏"变成随机的 —— 右栏按 path 去重，两种形态会开出两枚标签。 */
+function mergePlanContent(
+  prev: Record<string, PlanState>,
+  sid: string,
+  payload: PlanContentPayload | null
+): Record<string, PlanState> {
+  const cur = prev[sid]
+  if (!cur) return prev
+  const ok = !!payload && !payload.reason && !payload.too_large
+  if (ok) {
+    const p = payload as PlanContentPayload
+    return { ...prev, [sid]: { path: cur.path, status: cur.status, content: p.text } }
+  }
+  return {
+    ...prev,
+    [sid]: {
+      path: cur.path,
+      status: cur.status,
+      ...(cur.content !== undefined ? { content: cur.content } : {}),
+      reason: payload?.reason || '计划文书暂时读不到',
+      tooLarge: Boolean(payload?.too_large)
+    }
+  }
+}
+
+/** 该计划文书路径能否在右栏打开 —— 即"是不是**工作空间相对**路径"。
+ *
+ *  2026-09-29 起新文书是相对路径（`.aiagent/plan/<name>.md`）；
+ *  **存量会话**（升级前产出）拿到的是旧的元数据目录**绝对路径**，右栏的
+ *  `resolve_within(workdir, …)` 会拒掉它（"路径不在当前工作空间内"）。
+ *  与其给用户一枚点下去必然失败的死按钮，不如只在新格式下显示它。
+ *
+ *  判据**只有这一处**：计划卡片（锚点）与计划操作栏都要决定"要不要给「打开文档」"，
+ *  两处各写一遍就会出现"其中一处漏了回退判断"的经典分叉。
+ */
+export function isPlanDocOpenable(path: string): boolean {
+  if (!path) return false
+  if (path.startsWith('/')) return false                    // POSIX 绝对路径
+  return !/^[A-Za-z]:[\\/]/.test(path)                      // Windows 盘符
+}
+
+/** 在右栏打开计划文书（`plan_ready` 自动展示 + 卡片点开后复用**同一入口**）。
+ *
+ *  为什么能这么简单：2026-09-29 起文书写在**工作空间内**，于是它天然落在
+ *  `file_read` 的沙箱根里 —— 直接复用既有的文件标签机制即可，不需要为"计划文书"
+ *  再开一条右栏通道（旧口径在元数据目录里，右栏根本读不到，这也是当初不做预览的原因）。
+ *
+ *  `origin='tree'` = 落**常驻位**（不复用预览位）：计划文书是"这一轮要看的东西"，
+ *  不该被随后点开的源码文件顶掉。
+ *
+ *  **不**主动调 `ensurePreview`：标签激活后 `FilePreview` 自己会发请求（见该组件
+ *  `useEffect`），这里再发一次只会被 `ensurePreview` 的"同 path 在途"短路吃掉。 */
+export function openPlanDocInPanel(sid: string, path: string, name = ''): void {
+  if (!sid || !path) return
+  useRightPanelStore.getState().openFileTab(sid, { path, name: name || undefined }, 'tree')
+}
+
 export type ConnState = 'connecting' | 'connected' | 'disconnected'
 export type PythonState = 'starting' | 'running' | 'crashed' | 'stopped'
-export type SettingsTab = 'general' | 'model' | 'trash' | 'about'
+export type SettingsTab =
+  | 'general'
+  | 'model'
+  | 'permission'
+  | 'sandbox'
+  /** MCP 服务管理（2026-09-30，docs/frontend/23）—— 排在「沙盒」之后，
+   *  与权限/沙盒同属"配置型"设置页（进页懒加载 + 回执整份替换）。 */
+  | 'mcp'
+  /** 技能管理（2026-09-30，docs/frontend/24）—— 排在「MCP」之后，与它同属
+   *  "配置型 + 市场可安装"的设置页（进页懒加载 + 回执整份替换）。 */
+  | 'skill'
+  /** 插件管理（2026-09-30，docs/frontend/25）—— Claude Code 插件规范：
+   *  一个插件可贡献 skills / commands / agents / hooks / MCP 服务器。 */
+  | 'plugin'
+  | 'trash'
+  | 'about'
 
 /** 会话显示名：无标题（未生成/老会话）回退 session_<id> */
 export function sessionDisplayName(s: SessionMeta): string {
@@ -33,6 +376,25 @@ export function projectDisplayName(projects: ProjectMeta[], id?: string | null):
 /** 会话所属工作空间 id（存量会话缺字段 → default） */
 export function sessionProjectId(s: SessionMeta): string {
   return s.project || DEFAULT_PROJECT_ID
+}
+
+/** 合并 `permission_config` 回执（get / save 两种回执各只带一半字段）。
+ *
+ * **不能整份替换**：get 回执带 `builtin`/`path`/`exists`，save 回执带 `applied`/`warnings`/`msg`。
+ * 整份覆盖会让保存后 `builtin` 变 `undefined` → 权限页 `if (!builtin)` 兜底分支直接塌回
+ * 「读取权限配置…」加载态（用户点一次保存页面就没了）。
+ *
+ * 反向也要清：get 回执不带 `applied`，若沿用上一次 save 的 `applied/warnings`，
+ * 「保存成功但被调整」的提示会挂在新加载的干净配置上（假告警）。 */
+function mergePermissionResult(
+  prev: PermissionConfigResult | null,
+  next: PermissionConfigResult
+): PermissionConfigResult {
+  const base: PermissionConfigResult = { ...(prev ?? {}), ...next }
+  if (next.applied === undefined) {
+    return { ...base, applied: undefined, warnings: undefined, msg: undefined }
+  }
+  return base
 }
 
 /** 每个空间默认最多展示的会话条数（超出折叠，末尾给"展开全部"入口） */
@@ -101,7 +463,7 @@ export function resolveOverridesPayload(
 
 /** 解析某模型的元数据（窗口 / 思考档位）：
  * 模型自身字段优先（后端归一化时已从预置目录继承过来，自定义模型则来自手动填写），
- * 回落预置目录（~/.aigent/providers.json）。都拿不到时返回 null（不渲染悬浮面板）。 */
+ * 回落预置目录（~/.aigent/config/providers.json）。都拿不到时返回 null（不渲染悬浮面板）。 */
 export function resolveModelMeta(
   llmConfig: LlmConfig | null,
   model: (LlmModel | LlmConnectionModel) | null | undefined
@@ -163,6 +525,10 @@ export interface ToolCallMsg {
   name: string
   args: string
   status: 'running' | 'done'
+  /** 审批结算元数据（2026-09-22 权限管控）：实时路径由 `approval_resolved` 旁挂、
+   *  回放路径由 HistoryToolCall.approval 映射而来。有值 → 工具条渲染审批徽标。
+   *  允许结局（allowed_*）只有实时路径可见（后端不落盘允许，回放自然没有）。 */
+  approval?: ApprovalInfo
 }
 
 /** 子智能体执行块：挂在 assistant 消息下，展示其思考过程与工具执行（可折叠） */
@@ -185,6 +551,78 @@ export interface SubAgentMsg {
   error?: string
 }
 
+/** 结构化提问（ask_user）在 assistant 消息下的**只读小结块**数据。
+ *
+ *  两条路径产出同一形状：
+ *  - **实时**：`tool_call_start` 时先建块（status='pending'，此期间**不渲染**，
+ *    由输入框上方的面板承载）→ `tool_call`（终态参数）补 questions →
+ *    `ask_resolved` 补 resultText/status（离开 pending → 渲染）。
+ *  - **回放**：assistant 行的 `askUsers[]` 一次到位（status 由后端反推；
+ *    resultText 为空 = 'incomplete'，如进程被杀）。
+ *
+ *  `resultText` 是**唯一展示载体**（与回填给模型的 tool_result 逐字节相同）：
+ *  前端**不做任何结构化解析**，只按行原样展示（`white-space: pre-wrap`）。 */
+export interface AskUserMsg {
+  /** 配对键：发起它的 tool_call id（实时/回放同一 id） */
+  toolCallId: string
+  /** 问题（实时取自 ask_request / 工具参数；回放由 `args` 解析）。解析失败为空数组 */
+  questions: AskQuestion[]
+  /** 后端 broker 生成的 result_text；空串 = 未完成 */
+  resultText: string
+  /** 'pending' = 实时在途（不渲染）；'incomplete' = 回放发现未完成 */
+  status: AskStatus | 'pending' | 'incomplete'
+  /** 发起本次提问时**本条消息正文的长度**（2026-09-22，实时路径在 `tool_call_start`
+   *  那一刻记录；回放缺省）。
+   *
+   *  用途：把正文切回它真正的位置。模型总是"先说一句话（先跟你确认几个关键项），
+   *  再提问"—— 这句话必须显示在提问卡片**上方**；而同一个气泡里提问之后续写的
+   *  正文（实时路径整轮合并进一条消息）仍留在卡片下方（见 MessageItem 的分段规则）。
+   *
+   *  缺省（回放路径）= 正文全在提问之前：jsonl 每次 LLM 调用一行，正文只可能出自
+   *  发起该 tool_call 的那一次响应，必然在提问之前，不存在"提问后还有正文"的同一行。 */
+  contentOffset?: number
+}
+
+/** 输入框上方「待确认」面板的实时状态（一个会话至多一条在途提问）。
+ *  纯 UI 态、不落盘 —— 由 `ask_request` 建立、`ask_resolved` 清除；
+ *  **不从 session_history 恢复**（重连时后端用 `_ask_snapshot_lines()` 重放）。 */
+export interface AskInteraction {
+  requestId: string
+  /** 发起它的 tool_call id（与消息下的只读小结块配对） */
+  toolCallId: string
+  questions: AskQuestion[]
+}
+
+/** 消息流中「在途审批卡片」的数据（2026-09-22 权限管控，范式 C）。
+ *  与 AskInteraction 同为纯 UI 态、不落盘 —— 由 `approval_request` 建立、
+ *  `approval_resolved` 清除；**不从 session_history 恢复**（断线重连时后端用
+ *  `_approval_snapshot_lines()` 重放在途审批，同 ask 机制）。
+ *  后端同会话至多一条在途审批，但仍按 request_id 键控存储 —— 迟到/乱序的
+ *  approval_resolved 只清自己那一条，且重连重放不会重置已点击的按钮。 */
+export interface ApprovalInteraction {
+  requestId: string
+  /** 发起审批的 tool_call id（卡片按它锚定到消息流的工具条） */
+  toolCallId: string
+  toolName: string
+  /** 工具参数对象（后端已把超长字符串值截断到 600 字，前端原样展示摘要） */
+  args: Record<string, unknown>
+  /** 触发类型（dangerous_pattern / bash_not_allowed / …） */
+  trigger: string
+  /** 给用户看的原因说明（后端生成，原样展示） */
+  reason: string
+  /** 「本次会话内允许」按钮的副文案（点前知道会记住什么账） */
+  sessionScopeHint: string
+  /** 发起审批时会话的权限档位 */
+  mode: string
+  /** 后端自结算超时（秒）；卡片据此显示倒计时 */
+  timeoutSeconds: number
+  /** 审批创建时间戳（秒，后端 created_at） */
+  createdAt: number
+  /** 用户已点击某个决定（命令已 fire-and-forget 发出，等广播收卡）：
+   *  置位后三按钮禁用；重连重放的 approval_request **不重置**它。 */
+  submitted: boolean
+}
+
 /** 消息 footer 的 token 统计：turn=本轮消耗（主 + 子智能体），
  *  session=turn 收尾时的会话级累计快照（实时事件携带；回放仅恢复 turn，缺省不显示第二段），
  *  model=本轮模型快照（usage_stats 事件 model 字段 / 回放 jsonl model_info 节点） */
@@ -196,7 +634,11 @@ export interface MessageUsage {
 
 export interface Message {
   id: string
-  role: 'user' | 'assistant'
+  /** `goal_check`（2026-09-30 目标可见化）：目标检查/设定的展示卡 —— 它不是
+   *  对话的一轮（没有 thinking / toolCalls / streaming 语义），`MessageItem`
+   *  对它单独走一条渲染分支。实时由 `goal_check` 信封 append，回放由
+   *  `historyToMessage` 从后端 `role:"goal_check"` 的历史项还原。 */
+  role: 'user' | 'assistant' | 'goal_check'
   content: string
   /** 消息记录时间：回放来自 jsonl created_at，实时消息在创建时本地打点
    *  （秒级 ISO 本地时间，与后端 _now_iso 同构；老会话行缺省不显示） */
@@ -210,6 +652,10 @@ export interface Message {
   /** 本消息内发起过的 sub_agent 工具调用 id（实时锚点：子智能体事件据此
    *  挂回"发起它的那条 assistant 消息"，与回放规则一致，切会话不跳位） */
   subAgentToolIds?: string[]
+  /** 本消息发起过的结构化提问（ask_user）：消息下方只读小结块的数据源。
+   *  与 subagents 同理，ask_user 调用**不进普通工具条**（避免与面板/小结块重复），
+   *  但必须记在消息上 —— 实时与回放共用同一挂载规则，切会话不跳位。 */
+  askUsers?: AskUserMsg[]
   activeToolId: string | null
   streaming: boolean
   usage: MessageUsage | null
@@ -222,6 +668,13 @@ export interface Message {
   /** user 消息引用的工作空间路径（实时由 `serializeDoc` 收集，回放由后端 harvest）。
    *  **只有引用没有正文也是合法发送**。与 attachments 是并列且独立的通道。 */
   refs?: MessageRef[]
+  /** 目标模式标记（2026-09-30 目标可见化，docs/frontend/22 §6.6）。
+   *  - `instruction`（user 消息上）：这条就是**被设为执行目标**的那条指令 →
+   *    气泡头部挂「已设为执行目标」徽标。实时由 `send()` 乐观打标（后端若因条件
+   *    非法静默忽略，`execution_mode_changed` 到达时会把徽标剥掉），回放来自 jsonl。
+   *  - `check` / `set`（`role === 'goal_check'` 的展示卡上）：检查结果 / 目标设定，
+   *    由 `GoalCheckCard` 渲染。 */
+  goal?: GoalMarker
 }
 
 /** 输入区的附件草稿项。
@@ -329,6 +782,63 @@ interface AgentState {
   settingsTab: SettingsTab
   llmConfig: LlmConfig | null
   llmSaving: boolean
+  /** 权限配置（设置页「权限」页）：get 回执整份结果（含内置清单 / 路径 / exists）。
+   *  只由设置页消费 —— 它是点对点回执，不参与全局广播状态。 */
+  permissionConfig: PermissionConfigResult | null
+  permissionSaving: boolean
+  /** 沙盒设置（设置页「沙盒」页，docs/frontend/20）：get/save 回执整份结果
+   *  （平台状态 + 开关 + 两个模板文件内容）。只由设置页消费 —— 点对点回执。 */
+  sandboxConfig: SandboxConfigResult | null
+  sandboxSaving: boolean
+  /** MCP 服务管理（设置页「MCP」页，docs/frontend/23）：`mcp_config` 回执整份结果
+   *  （原始条目 + 连接状态 + 路径 + errors/warnings）。
+   *  只由设置页消费 —— 点对点回执，不参与全局广播状态。 */
+  mcpConfig: McpConfigResult | null
+  mcpSaving: boolean
+  /** 「测试连接」的一次性结果（`mcp_test` 回执）。null = 尚未测过 / 已切换条目。
+   *  它**不属于 mcpConfig** —— 试连不落盘，不改变条目状态。 */
+  mcpTest: McpTestResult | null
+  mcpTesting: boolean
+  /** 市场搜索结果（**已按页累加**，docs/frontend/23）。
+   *  ⚠️ 它**不走事件分支** —— 与 mcpConfig 刻意不同：分页要累加，而事件分支只会
+   *  把已累加的多页覆盖成最后一页。与 `refs` / `file_content` 这些"点对点回执由
+   *  调用方后处理"的先例一致，这里由 `searchMcpMarket` 的 promise 路径负责。 */
+  mcpMarket: McpMarketResult | null
+  mcpMarketLoading: boolean
+  /** 安装确认所需的翻译结果（`mcp_market_plan` 回执）。**不落盘**。
+   *  同样由 promise 路径填充（一次性、无累加语义，无需事件分支）。 */
+  mcpMarketPlan: McpMarketPlan | null
+  mcpResolving: boolean
+  /** 本地包安装计划（`mcp_pkg_plan`）。**不落盘、不下载** —— 只用于
+   *  「下载到本地」确认区展示版本/哈希/依赖规模/脚本清单。 */
+  mcpPkgPlan: McpPkgPlan | null
+  /** 本地包在途操作。**必须区分是哪一种** —— 安装要等分钟级，
+   *  把 resolve 的转圈文案用在 install 上会让用户以为卡死。 */
+  mcpPkgBusy: 'resolve' | 'install' | 'remove' | 'verify' | null
+  /** 最近一次本地包动作的结果（install / remove / verify）。
+   *  与 `mcpConfig.pkg_action` **同源**：事件分支与 promise 分支都会写，
+   *  谁先到都不影响（内容相同）。页面用它内联展示结论，**不走 toast**。 */
+  mcpPkgAction: McpPkgActionResult | null
+  /** 技能管理（设置页「技能」页，docs/frontend/24）：`skill_config` 回执整份结果
+   *  （磁盘扫描的技能 + 市场源列表 + 路径 + errors/warnings）。
+   *  只由设置页消费 —— 点对点回执，不参与全局广播状态。 */
+  skillConfig: SkillConfigResult | null
+  skillSaving: boolean
+  /** 技能市场搜索结果（**已按页累加**）。
+   *  ⚠️ 与 skillConfig 不同，它**不走事件分支** —— 分页要累加，而事件分支只会把已
+   *  累加的多页覆盖成最后一页（同 mcpMarket 的坑）。由 promise 路径负责。 */
+  skillMarket: SkillMarketResult | null
+  skillMarketLoading: boolean
+  /** 安装确认所需的抓取结果（`skill_market_plan`）。**不落盘**。 */
+  skillMarketPlan: SkillMarketPlan | null
+  skillResolving: boolean
+  /** 插件管理（设置页「插件」页，docs/frontend/25）。结构同上。 */
+  pluginConfig: PluginConfigResult | null
+  pluginSaving: boolean
+  pluginMarket: PluginMarketResult | null
+  pluginMarketLoading: boolean
+  pluginMarketPlan: PluginMarketPlan | null
+  pluginResolving: boolean
   /** 当前激活会话的上下文统计（每轮 turn_end / 切会话时后端下发） */
   currentContextStats: ContextStats | null
   /** 各会话的 token 消耗累计（usage_stats 事件 / session_history.usage_totals 写入；
@@ -339,6 +849,72 @@ interface AgentState {
    *  注意 session_history 到来时会先置 null 再等随后的 task_board 覆盖 ——
    *  否则"切走再切回"会残留上一轮那版 done 快照。 */
   taskBoardBySession: Record<string, TaskBoardSnapshot | null>
+  /** 每个会话当前在途的结构化提问（ask_user）：输入框上方「待确认」面板的数据源。
+   *  null / 缺省 = 该会话没有待作答提问（面板不显示）。
+   *  **不落盘、不从 session_history 恢复** —— 断线重连时由后端重放 ask_request
+   *  （`_ask_snapshot_lines()`），所以在 setConnection('connected') 时整体清空，
+   *  避免断连期间已被结算的提问留下永不消失的僵尸面板。 */
+  interactionBySession: Record<string, AskInteraction | null>
+  /** 每个会话当前在途的权限审批（PreToolUse 判定 ask，范式 C）：消息流审批
+   *  卡片的数据源。按 request_id 键控（后端同会话至多一条在途，但迟到/乱序的
+   *  approval_resolved 只清对应条目）。空对象/缺条目 = 无在途审批。
+   *  **不落盘、不从 session_history 恢复** —— 断线重连时后端重放 approval_request
+   *  （`_approval_snapshot_lines()`），所以 setConnection('connected') 时整体清空，
+   *  避免断连期间已被结算的审批留下永不消失的僵尸卡片（同 interactionBySession）。 */
+  approvalBySession: Record<string, Record<string, ApprovalInteraction>>
+  /** 每个会话当前的权限档位（盾牌 chip 的选中态）：由 `permission_changed` 广播
+   *  与 `session_history.permission_mode` 恢复驱动。缺条目时 chip 落
+   *  sessions 列表 → 所属工作空间 → 'default' 的 fallback 链。 */
+  permissionModeBySession: Record<string, PermissionMode>
+  /** 每个会话当前的**任务执行模式**（胶囊 tag 的选中态，2026-09-25 docs/frontend/22）。
+   *  与权限档位**正交**：由 `execution_mode_changed` 广播、`session_history` 的
+   *  `execution_mode`、以及 **`sessions` 列表载荷**（断线重连 / 整页重载的唯一
+   *  恢复通道，P1-13）三处驱动。缺条目视作 `'normal'` → **零占位**（不渲染任何元素）。 */
+  executionModeBySession: Record<string, ExecutionMode>
+  /** 每个会话的计划卡片状态（每会话一条，单份覆盖）。**只装"待批准"（`ready`）的壳**
+   *  —— 2026-09-29 四次改版：`approved` 不再留在消息流里当"历史"（判据见 `planShellAlive`；
+   *  批准后 mode 回落 normal，卡片上那句"正在按计划执行"当场就是错的）。 */
+  planBySession: Record<string, PlanState>
+  /** ── 目标模式的**武装态**（2026-09-30，docs/frontend/22 §2.6）──────────
+   *  「点目标模式不再弹框问条件」：前端只把意图记在这里（true = 武装），条件取
+   *  **下一条指令的正文**，随那条 `chat.exec_condition` 一起交给后端，由后端在
+   *  派发 turn **之前**落地（那时才既有条件、又不撞 `rt.busy`）。
+   *
+   *  为什么条件必须等指令到达：`GoalController.set_goal` 拒绝空条件，点选那一刻
+   *  根本没有条件可写；而 `session_exec_mode` 是"即时生效"语义，改不了这个事实。
+   *
+   *  **按会话存**（`activeSession` 为键）：与 `pendingExecMode`（无会话草稿）语义
+   *  等价但归属不同 —— 后者属于"还没建出来的新会话"，不合并成一条真值来源。
+   *  清理：发送时随 `chat` 交出、`execution_mode_changed` 广播到达时兜底清、
+   *  `clearSession` / 删会话 / 删空间时随执行模式两桶一并清。 */
+  goalArmBySession: Record<string, boolean>
+  /** ── 常驻目标条（2026-09-30 目标可见化，docs/frontend/22 §7.6）────────────
+   *  目标全程激活期间，输入区上方常驻一行「🎯 当前目标：xxx · 第 N 轮」。
+   *  目标可能连跑很多轮 —— 没有这条，用户只有在胶囊 tag 上才看得出"还开着"。
+   *
+   *  **四条来源**（与 `planBySession` 同款纪律，判据一律 `goalBarAlive`）：
+   *  ① 广播 `execution_mode_changed`；② 回放 `session_history`；
+   *  ③ 列表重建 `mergeExecFromSessions`（断线重连 / 整页重载的唯一恢复源）；
+   *  ④ 实时 `goal_check`（只更新 `round`，不改存亡）。
+   *  清理：`dropExecBuckets` 第 4 桶 + `clearSession`。 */
+  goalBarBySession: Record<string, GoalBarState>
+  /** ── 新建任务（无会话）态的**预选**执行模式草稿（2026-09-27）───────────
+   *  无会话时「执行方式」两项**不再置灰**：点选先记在这里（胶囊 tag 立即显示），
+   *  随首条消息经 `chat.exec_mode` 交给后端，由后端在**建会话时**写进该会话 meta，
+   *  Agent 构造时 `_restore_execution_state` 读回 → 对**首轮即生效**。
+   *
+   *  为什么必须随 `chat` 带、而不是等 `session` 信封回来再发 `session_exec_mode`：
+   *  那时 turn 已经 `rt.busy`，goal 会被评审 P1-5 的守卫拒掉（见 docs/frontend/22 §2.4）。
+   *
+   *  **仅在 `activeSession === null` 时被读取**；`newSession()` 重置（新任务默认
+   *  normal —— 执行模式是会话级状态，无继承源，不照抄权限档位的"空间默认值"）。
+   *  已有会话的执行模式**不走这里**：goal 走 `goalArmBySession`，plan 直接发命令。 */
+  pendingExecMode: ExecutionMode
+  /** 无会话态预选的目标条件：**恒空串**（2026-09-30 起点「目标模式」不再弹框填条件
+   *  —— 条件改由首条消息的正文充当，见 `chat.exec_condition` 与 §2.6）。
+   *  字段保留：后端 `exec_condition` 的语义（"显式条件优先"）仍需一个入口，
+   *  且旧客户端可能仍带值。 */
+  pendingExecGoalCondition: string
   /** 当前激活会话的按模型参数覆盖（仅本会话生效，不写配置；按模型 id 分别保存） */
   overridesByModel: SessionOverridesMap
   /** 当前激活会话（或新建任务）绑定/选择的模型 id（区别于全局 active_model_id） */
@@ -367,6 +943,40 @@ interface AgentState {
   /** 清空附件草稿（发送后 / 切会话 / 新建任务时调用） */
   clearDraftAttachments: () => void
   stop: () => void
+  /** 提交选择题作答（ask_user）。**fire-and-forget**：不乐观关面板，
+   *  面板由随后广播的 `ask_resolved` 关闭 —— 与后端 `resolve()` 的
+   *  「迟到/重复提交无副作用」语义一致（否则会出现"面板已消失但后端丢弃了作答"）。 */
+  answerAsk: (requestId: string, answers: AskAnswer[]) => void
+  /** 取消本次提问（用户点「取消」）：同上 fire-and-forget，回执走 `ask_resolved`。 */
+  cancelAsk: (requestId: string) => void
+  /** 提交审批裁决（允许一次 / 本次会话内允许 / 拒绝）。**fire-and-forget**：
+   *  只置 submitted 禁用三按钮，卡片由随后广播的 `approval_resolved` 收掉 ——
+   *  与 answerAsk 同款语义（后端对迟到/重复提交幂等丢弃，乐观收卡会在
+   *  "后端丢弃作答"时造成已批准的假象）。 */
+  answerApproval: (requestId: string, decision: ApprovalDecision) => void
+  /** 切换当前会话的权限档位（默认 / 完全访问）。fire-and-forget：**不乐观更新**，
+   *  chip 选中态只认后端广播的 `permission_changed`（传输丢失时乐观 UI 会说谎）。 */
+  switchPermission: (mode: PermissionMode) => void
+  /** 新建任务（无会话）态切换**目标工作空间**的权限档位（默认 / 完全访问）。
+   *  只写 projects.json 的「最后更改值」，作为该空间新会话的默认档位 ——
+   *  fire-and-forget：chip 选中态由随后的 `projects` 广播驱动（不乐观更新）。 */
+  switchProjectPermission: (mode: PermissionMode) => void
+  /** ── 任务执行模式（2026-09-25，docs/frontend/22）─────────────────────
+   * 切换当前会话的执行模式。**fire-and-forget、不乐观更新** —— tag 选中态只认
+   * 后端 `execution_mode_changed` 广播（与 switchPermission 同口径：传输丢失时
+   *  乐观 UI 会说谎）。`condition` 仅 `mode === 'goal'` 时有意义；后端校验失败
+   *  （空 / 超 4000 字）回既有 `error` 信封，文案原样 toast。plan ↔ goal 属
+   *  **跨模式直接切换**（2026-09-27），前端不做互斥预检。
+   *
+   * **无会话（新建任务）时不再拒绝**（2026-09-27）：改写 `pendingExecMode` 草稿
+   * （见 AgentState 上该字段的注释）—— 任何情况下都点得动。 */
+  switchExecMode: (mode: ExecutionMode, condition?: string) => void
+  /** 批准当前会话的计划文书（fire-and-forget）。后端在空闲时自动起一轮执行；
+   *  忙碌 / 有待答提问时只落状态并回 `error` 信封提示。卡片转只读等广播。 */
+  approvePlan: () => void
+  /** 拉取某会话的计划文书正文（`plan_read`）→ 填进 `planBySession[sid]`。
+   *  文件被清理 / 空间目录不可用时落 `reason`（**不抛**），卡片渲染占位块。 */
+  fetchPlanContent: (sid: string) => Promise<void>
   handleEvent: (ev: UiEvent) => void
   refreshSessions: () => Promise<void>
   /** 主动拉取工作空间列表（后端收到后广播 `projects`，渲染层经同管道更新） */
@@ -400,6 +1010,101 @@ interface AgentState {
   closeSettings: () => void
   loadLlConfig: () => Promise<void>
   saveLlConfig: (config: LlmConfigPayload) => Promise<boolean>
+  /** 拉取权限配置（进「权限」页时懒加载；后端未就绪静默忽略） */
+  loadPermissionConfig: () => Promise<void>
+  /** 保存权限配置，返回 applied（false = 写盘失败）。
+   *  归一化 warnings / 权威值由 `permissionConfig` 回写，页面自行读取展示。 */
+  savePermissionConfig: (config: PermissionConfig) => Promise<boolean>
+  /** 拉取沙盒设置（进「沙盒」页时懒加载；后端未就绪静默忽略） */
+  loadSandboxConfig: () => Promise<void>
+  /** 保存沙盒设置（**字段部分更新**：开关 / 模板内容 / 恢复默认）。
+   *  权威值由 `sandboxConfig` 回执回写；返回 applied（false = 有字段校验失败）。 */
+  saveSandboxConfig: (payload: SandboxConfigSavePayload) => Promise<boolean>
+  /** 拉取 MCP 条目列表（进「MCP」页时懒加载；后端未就绪静默忽略） */
+  loadMcpConfig: () => Promise<void>
+  /** 新增 / 编辑 / 重命名 / 启停一条 MCP 条目（`original_name` 不同 = 改名）。
+   *  返回 applied；权威值由 `mcpConfig` 回写，errors/warnings 由页面内联展示。 */
+  upsertMcpServer: (payload: McpUpsertPayload) => Promise<boolean>
+  /** 删除一条 MCP 条目（含旁路元数据）。 */
+  removeMcpServer: (name: string) => Promise<boolean>
+  /** 一次性试连（**不落盘**）：结果写 `mcpTest`，供列表行 / 表单「先验证再保存」。
+   *  `name` → 测磁盘上已保存的条目（取真实密钥）；`config` → 测表单草稿。
+   *  失败也返回结果对象（`ok=false` + error 文案），只有链路级异常才返回合成结果。 */
+  testMcpServer: (target: {
+    config?: Record<string, unknown>
+    name?: string
+  }) => Promise<McpTestResult | null>
+  /** 清掉上一次试连结果（表单弹窗打开/切换条目时调用，避免显示陈旧结论）。 */
+  clearMcpTest: () => void
+  /** 搜索市场（官方 registry）。`cursor` 非空 = 翻下一页，结果**追加**；
+   *  空 = 换关键词/重新搜，结果**整份替换**。失败也写 `mcpMarket`（带 `error`），
+   *  页面据此区分「搜失败」与「搜不到」—— 两者含义完全不同。 */
+  searchMcpMarket: (query: string, cursor?: string) => Promise<void>
+  /** 把市场条目翻译成将写入的配置（**不落盘**），结果写 `mcpMarketPlan`，
+   *  供安装确认弹窗展示 command/args 原文。 */
+  resolveMcpInstall: (item: McpMarketItem) => Promise<McpMarketPlan | null>
+  /** 关掉安装确认页时清掉翻译结果（避免下次打开显示上一条目的配置）。 */
+  clearMcpMarketPlan: () => void
+  /** MCP 本地包（docs/frontend/23 §本地安装）：问 registry 要版本/哈希/依赖树/脚本
+   *  清单（**不落盘、不下载**），结果写 `mcpPkgPlan`。
+   *  ⚠️ `version` 为空时后端会问一次 latest **并钉死** —— 返回值里的 `version`
+   *  才是真正要装的那个，UI 必须以它为准。 */
+  resolveMcpPkg: (name: string, version?: string) => Promise<McpPkgPlan | null>
+  /** 关掉确认区 / 切换包时清掉解析结果。 */
+  clearMcpPkgPlan: () => void
+  /** 下载并校验一个包到 `~/.aigent/mcp/pkgs/`。**不写配置** —— 拿到 `command`
+   *  后再走 `upsertMcpServer`（复用热重载与校验，装坏了也不会留下死条目）。 */
+  installMcpPkg: (payload: {
+    name: string
+    version: string
+    bin?: string
+    allow_scripts?: boolean
+  }) => Promise<McpPkgActionResult | null>
+  /** 卸载一个本地包（只删 `pkgs/` 下的那个目录，**不动引用它的条目**）。 */
+  removeMcpPkg: (slug: string) => Promise<McpPkgActionResult | null>
+  /** 复核一个本地包（哈希对账 + 可执行文件是否还在目录内）。 */
+  verifyMcpPkg: (slug: string) => Promise<McpPkgActionResult | null>
+  /** 拉取技能列表（进「技能」页时懒加载；后端未就绪静默忽略） */
+  loadSkillConfig: () => Promise<void>
+  /** 启用 / 禁用技能。**只写旁路元数据**（不改 SKILL.md 正文），后端会顺带刷新
+   *  各会话的 system prompt，所以切回对话立刻生效。 */
+  setSkillEnabled: (name: string, enabled: boolean) => Promise<boolean>
+  /** 删除技能（目录 + 元数据）。 */
+  removeSkill: (name: string) => Promise<boolean>
+  /** 从市场安装：只回传「哪一条 + 叫什么名」，文件由后端自己抓。
+   *  返回 applied；失败原因由 `skillConfig.errors` 内联展示。 */
+  installSkill: (payload: SkillInstallPayload) => Promise<boolean>
+  /** 手动新建技能（`{name, description, tags?, body}`）。返回 applied。 */
+  createSkill: (payload: SkillCreatePayload) => Promise<boolean>
+  /** 读单个技能的 SKILL.md 全文（一次性读取，只写返回值、不进全局状态）。 */
+  readSkill: (name: string) => Promise<SkillContentResult | null>
+  /** 新增 / 更新技能源（内置源只能改启用状态）。 */
+  upsertSkillMarket: (entry: Record<string, unknown>) => Promise<boolean>
+  /** 删除自定义技能源（内置源会被拒，原因走 `errors` 内联展示）。 */
+  removeSkillMarket: (marketId: string) => Promise<boolean>
+  /** 在指定源里搜索技能。`cursor` 非空 = 翻下一页（结果**追加**）；空 = 整份替换。 */
+  searchSkillMarket: (marketId: string, query: string, cursor?: string) => Promise<void>
+  /** 抓取安装计划（**不落盘**）→ 安装确认页展示 SKILL.md 全文。 */
+  resolveSkillInstall: (
+    marketId: string,
+    item: SkillMarketItem
+  ) => Promise<SkillMarketPlan | null>
+  clearSkillMarketPlan: () => void
+  /** 插件管理（docs/frontend/25）：与技能侧一一对应。 */
+  loadPluginConfig: () => Promise<void>
+  setPluginEnabled: (name: string, enabled: boolean) => Promise<boolean>
+  removePlugin: (name: string) => Promise<boolean>
+  installPlugin: (payload: PluginInstallPayload) => Promise<boolean>
+  /** 读单个插件的 plugin.json 原文 + 文件清单（一次性读取）。 */
+  readPlugin: (name: string) => Promise<PluginContentResult | null>
+  upsertPluginMarket: (entry: Record<string, unknown>) => Promise<boolean>
+  removePluginMarket: (marketId: string) => Promise<boolean>
+  searchPluginMarket: (marketId: string, query: string, cursor?: string) => Promise<void>
+  resolvePluginInstall: (
+    marketId: string,
+    item: PluginMarketItem
+  ) => Promise<PluginMarketPlan | null>
+  clearPluginMarketPlan: () => void
   /** 刷新某连接可用模型列表（GET {base_url}{models_path}），返回模型 id 列表（失败返回空） */
   fetchModels: (payload: {
     base_url?: string
@@ -530,6 +1235,136 @@ function stagedToDraft(it: StagedAttachment): DraftAttachment {
   }
 }
 
+/** 解析 `ask_user` 工具参数里的 `questions`（参数是 JSON 文本）。
+ *  **失败返回 null**（不是空数组）—— 调用方据此保留已有值，
+ *  绝不能用"解析失败"的空数组覆盖掉从 `ask_request` 拿到的真实问题。 */
+function parseAskQuestions(args: string): AskQuestion[] | null {
+  try {
+    const parsed = JSON.parse(args || '{}')
+    const qs = parsed?.questions
+    if (!Array.isArray(qs) || qs.length === 0) return null
+    return qs as AskQuestion[]
+  } catch {
+    return null
+  }
+}
+
+/** 在指定消息上按 toolCallId 建/取「只读小结块」占位（已存在则原样返回）。
+ *  `tool_call_start` 到达时调用：此时参数可能还没流完，questions 先留空。
+ *  `contentOffset` = 此刻的正文长度（提问卡片要插在正文的这个位置之后）。 */
+function upsertAskBlock(
+  msgs: Message[],
+  msgId: string,
+  toolCallId: string,
+  contentOffset: number
+): Message[] {
+  return msgs.map((m) => {
+    if (m.id !== msgId) return m
+    const list = m.askUsers ?? []
+    if (list.some((a) => a.toolCallId === toolCallId)) return m
+    return {
+      ...m,
+      askUsers: [
+        ...list,
+        { toolCallId, questions: [], resultText: '', status: 'pending' as const, contentOffset }
+      ]
+    }
+  })
+}
+
+/** 按 toolCallId 打补丁到已存在的块（跨消息查找）。找不到时返回原数组。 */
+function patchAskBlock(msgs: Message[], toolCallId: string, patch: Partial<AskUserMsg>): Message[] {
+  if (!toolCallId) return msgs
+  return msgs.map((m) => {
+    const idx = (m.askUsers ?? []).findIndex((a) => a.toolCallId === toolCallId)
+    if (idx < 0) return m
+    const askUsers = (m.askUsers ?? []).slice()
+    askUsers[idx] = { ...askUsers[idx], ...patch }
+    return { ...m, askUsers }
+  })
+}
+
+/** `ask_resolved` → 把结果落进「发起它的那条 assistant 消息」的只读小结块。
+ *
+ *  找不到块时回落到**末尾那条 assistant 消息**（例如工具参数流被中断、
+ *  `tool_call_start` 丢失）；连 assistant 都没有就原样返回 —— **绝不凭空新建气泡**
+ *  （否则会出现一条只有提问、没有上下文的消息）。
+ */
+function appendAskResult(
+  msgs: Message[],
+  toolCallId: string,
+  data: { questions: AskQuestion[] | null; resultText: string; status: AskStatus }
+): Message[] {
+  const tcid = toolCallId || ''
+  if (tcid && msgs.some((m) => (m.askUsers ?? []).some((a) => a.toolCallId === tcid))) {
+    return msgs.map((m) => {
+      const idx = (m.askUsers ?? []).findIndex((a) => a.toolCallId === tcid)
+      if (idx < 0) return m
+      const askUsers = (m.askUsers ?? []).slice()
+      const prev = askUsers[idx]
+      askUsers[idx] = {
+        ...prev,
+        // 已有问题（ask_request / 工具参数）优先，只在为空时用兜底值
+        questions: prev.questions.length ? prev.questions : (data.questions ?? []),
+        resultText: data.resultText,
+        status: data.status
+      }
+      return { ...m, askUsers }
+    })
+  }
+  // 兜底：挂到末尾那条 assistant
+  let lastAssistant = -1
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') {
+      lastAssistant = i
+      break
+    }
+  }
+  if (lastAssistant < 0) return msgs
+  const block: AskUserMsg = {
+    toolCallId: tcid,
+    questions: data.questions ?? [],
+    resultText: data.resultText,
+    status: data.status
+  }
+  return msgs.map((m, idx) =>
+    idx === lastAssistant ? { ...m, askUsers: [...(m.askUsers ?? []), block] } : m
+  )
+}
+
+/** `approval_resolved` → 把结算徽标旁挂到 tool_call_id 匹配的工具行（范式 C：
+ *  决定不进模型上下文，只落 UI 元数据）。主 toolCalls 与 subagents[].toolCalls
+ *  都要查 —— 审批可能拦在子智能体的工具上。找不到匹配行时原样返回
+ *  （工具条可能还在流式中未建出；此时徽标不补，回放时后端落盘字段会补上）。 */
+function patchToolApproval(
+  msgs: Message[],
+  toolCallId: string,
+  approval: ApprovalInfo
+): Message[] {
+  if (!toolCallId) return msgs
+  return msgs.map((m) => {
+    let mainHit = false
+    const toolCalls = m.toolCalls.map((t) => {
+      if (t.id !== toolCallId) return t
+      mainHit = true
+      return { ...t, approval }
+    })
+    let subHit = false
+    const subagents = m.subagents.map((s) => {
+      let hit = false
+      const subCalls = s.toolCalls.map((t) => {
+        if (t.id !== toolCallId) return t
+        hit = true
+        return { ...t, approval }
+      })
+      if (hit) subHit = true
+      return hit ? { ...s, toolCalls: subCalls } : s
+    })
+    if (!mainHit && !subHit) return m
+    return { ...m, ...(mainHit ? { toolCalls } : {}), ...(subHit ? { subagents } : {}) }
+  })
+}
+
 function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
   return hist.map((m, i) => {
     // 子智能体卡片：优先用后端 role=subagent 挂载的完整记录；若缺失（老会话/
@@ -545,7 +1380,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
         id: t.tool_id || `h${sid}_${i}_s${k}_${l}`,
         name: t.name,
         args: t.args,
-        status: t.status === 'running' ? ('running' as const) : ('done' as const)
+        status: t.status === 'running' ? ('running' as const) : ('done' as const),
+        // 审批结算元数据（拒绝/超时/停止才落盘；无字段 = 正常流，按普通工具条渲染）
+        ...(t.approval ? { approval: t.approval } : {})
       })),
       activeToolId: null,
       streaming: false,
@@ -567,6 +1404,19 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
     }))
     const subagents = backendSubs.length ? backendSubs : derivedSubs
     const normalCalls = (m.toolCalls ?? []).filter((t) => t.name !== 'sub_agent')
+    // 结构化提问（ask_user）：不进普通工具条，改由消息下的只读小结块承载。
+    // 后端的 `_history_to_ui` 已把它从 toolCalls 里摘出放进 askUsers[]（问题=工具参数，
+    // 结果=配对上的 tool 行 content），这里只做形状映射 + 兜底过滤（老后端/旁路数据）。
+    const askUsers: AskUserMsg[] = (m.askUsers ?? [])
+      .filter((a) => !!a && typeof a.tool_call_id === 'string')
+      .map((a: HistoryAskUser) => ({
+        toolCallId: a.tool_call_id,
+        questions: parseAskQuestions(a.args) ?? [],
+        resultText: a.result ?? '',
+        // status 由后端 `interaction.status_of_result()` 反推；老后端缺字段时按
+        // "有结果=已作答 / 无结果=未完成"退化（**不在前端猜具体是哪一种结局**）
+        status: a.status ?? (a.result ? ('answered' as const) : ('incomplete' as const))
+      }))
     return {
       id: `h${sid}_${i}`,
       role: m.role,
@@ -579,7 +1429,9 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
         id: `h${sid}_${i}_${j}`,
         name: t.name,
         args: t.args,
-        status: t.status === 'running' ? ('running' as const) : ('done' as const)
+        status: t.status === 'running' ? ('running' as const) : ('done' as const),
+        // 审批结算元数据（拒绝/超时/停止才落盘；无字段 = 正常流，按普通工具条渲染）
+        ...(t.approval ? { approval: t.approval } : {})
       })),
       activeToolId: null,
       streaming: false,
@@ -599,7 +1451,13 @@ function historyToMessage(sid: string, hist: HistoryMessage[]): Message[] {
       // 回放：user 消息携带的附件（后端从 content 引用块 harvest；无附件不带该字段）
       ...(m.attachments && m.attachments.length ? { attachments: m.attachments } : {}),
       // 回放：user 消息引用的工作空间路径（同上，无引用时后端连字段都不发）
-      ...(m.refs && m.refs.length ? { refs: m.refs } : {})
+      ...(m.refs && m.refs.length ? { refs: m.refs } : {}),
+      // 回放：结构化提问的只读小结块（无提问时连字段都不多一个）
+      ...(askUsers.length ? { askUsers } : {}),
+      // 回放：目标模式标记（2026-09-30）——`instruction` 挂「已设为执行目标」徽标，
+      // `check`/`set` 由 `GoalCheckCard` 渲染。**无标记的老消息连字段都不多一个**，
+      // 与改造前的回放形状逐字节一致。
+      ...(m.goal ? { goal: m.goal } : {})
     }
   })
 }
@@ -679,6 +1537,18 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
         )
         return msgs
       }
+      // ask_user 同理不进主工具条：提问由输入框上方的面板承载、结果由消息下的
+      // 只读小结块承载。这里先按 tool_call_id 建块占位（status='pending' →
+      // 在途期间**不渲染**，避免与面板重复），问题/结果随后由 `tool_call`
+      // 与 `ask_resolved` 补齐。**必须记锚点**：ask_resolved 据此落回本条消息。
+      if (ev.tool_name === 'ask_user') {
+        const tcid = ev.tool_id || ''
+        if (!tcid) return msgs
+        // 记录"此刻正文有多长"：提问卡片要插在正文的这个位置之后 ——
+        // 模型先说的那句话属于卡片上方，提问后（同轮）续写的正文留在卡片下方。
+        msgs = upsertAskBlock(msgs, id, tcid, current(id).content.length)
+        return msgs
+      }
       msgs = msgs.map((m) => {
         if (m.id !== id) return m
         const hasRunning = m.toolCalls.some((t) => t.status === 'running')
@@ -703,6 +1573,15 @@ function applyAgentEventBuffer(buffer: Message[], ev: AgentEvent): Message[] {
       })
       break
     case 'tool_call':
+      // ask_user 终态：参数已完整，补进只读小结块（流式下 tool_call_start 时
+      // 参数可能只到了一半，解析不出问题，所以在这里补一次）。
+      // `ask_resolved` 通常**先于**本事件到达（broker 在工具返回前就广播了结果），
+      // 因此这里是"事后补问题"而不是"覆盖结果"—— patch 只带 questions。
+      if (ev.tool_name === 'ask_user') {
+        const qs = parseAskQuestions(ev.args ?? '')
+        if (qs) msgs = patchAskBlock(msgs, ev.tool_id || '', { questions: qs })
+        break
+      }
       msgs = msgs.map((m) => ({
         ...m,
         toolCalls: m.toolCalls.map((t) =>
@@ -950,9 +1829,45 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   settingsTab: 'model',
   llmConfig: null,
   llmSaving: false,
+  permissionConfig: null,
+  permissionSaving: false,
+  sandboxConfig: null,
+  sandboxSaving: false,
+  mcpConfig: null,
+  mcpSaving: false,
+  mcpTest: null,
+  mcpTesting: false,
+  mcpMarket: null,
+  mcpMarketLoading: false,
+  mcpMarketPlan: null,
+  mcpResolving: false,
+  mcpPkgPlan: null,
+  mcpPkgBusy: null,
+  mcpPkgAction: null,
+  skillConfig: null,
+  skillSaving: false,
+  skillMarket: null,
+  skillMarketLoading: false,
+  skillMarketPlan: null,
+  skillResolving: false,
+  pluginConfig: null,
+  pluginSaving: false,
+  pluginMarket: null,
+  pluginMarketLoading: false,
+  pluginMarketPlan: null,
+  pluginResolving: false,
   currentContextStats: null,
   sessionUsageBySession: {},
   taskBoardBySession: {},
+  interactionBySession: {},
+  approvalBySession: {},
+  permissionModeBySession: {},
+  executionModeBySession: {},
+  planBySession: {},
+  goalArmBySession: {},
+  goalBarBySession: {},
+  pendingExecMode: 'normal',
+  pendingExecGoalCondition: '',
   overridesByModel: {},
   sessionModelId: null,
   lastSessionModelId: null,
@@ -967,8 +1882,22 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 断线重连（→ connected）：清空陈旧运行态。后端会在新连接上重放
       // 仍在运行会话的 session_status（running/background），重新点亮真实
       // 运行指示；清空防止断连期间的状态残留（如永远转圈的僵尸会话）。
+      // 待作答的提问 / 待裁决的审批同理清空：重连时后端会重放 ask_request
+      // 与 approval_request 快照（`_ask_snapshot_lines()` / `_approval_snapshot_lines()`）
+      // —— 不断连期间若已被结算，前端拿不到 resolved 广播，留下的面板/卡片会永远消不掉。
       if (c === 'connected' && s.connection !== 'connected') {
-        return { ...s, connection: c, runningSessions: [], bgSessions: [], isSending: false }
+        // 断线重连：右栏只清**在途标志**（loading / pendingReveal），
+        // **不清 layoutBySession** —— 标签栏是用户的意图，不是可恢复的瞬时态。
+        useRightPanelStore.getState().resetTransient()
+        return {
+          ...s,
+          connection: c,
+          runningSessions: [],
+          bgSessions: [],
+          isSending: false,
+          interactionBySession: {},
+          approvalBySession: {}
+        }
       }
       return { ...s, connection: c }
     }),
@@ -999,10 +1928,37 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       seenRefs.add(path)
       msgRefs.push({ path, name: String(r?.name ?? ''), is_dir: !!r?.is_dir })
     }
+    // ── 目标指令判定（2026-09-30，docs/frontend/22 §2.6/§6.6）──
+    // 提到 userMsg 构造**之前**：徽标要在造出这条消息的那一刻就挂上。
+    // 两条来源：无会话读 `pendingExecMode` 草稿；已有会话读 `goalArmBySession` 武装位。
+    // ⚠️ 在途提问（ask_user）期间发消息 = **作答**（后端把正文原样回填、不另起
+    // turn，见 ws_bridge 的 `resolve_ask_free_text`）—— 那不是"第一条指令"，
+    // 拿它当目标会当场设错。故此时**不交棒**，武装位留到真正的下一条指令。
+    const askPending = sid !== null && !!get().interactionBySession[sid]
+    const pend =
+      sid === null
+        ? get().pendingExecMode
+        : get().goalArmBySession[sid] && !askPending
+          ? 'goal'
+          : 'normal'
+    const armedGoal = pend === 'goal'
+    // 目标条件**就是本条消息的正文**（`t`）——显式填过的条件（`pendingExecGoalCondition`，
+    // 无会话的老入口）优先；正文为空（纯附件 / 纯引用）由后端用 `[附件] 文件名` /
+    // `[引用] 文件名` 兜底（`_goal_condition_from_message`）。
+    const goalCondition = armedGoal
+      ? get().pendingExecGoalCondition || t
+      : null
     const userMsg: Message = {
       id: mid(), role: 'user', content: t, thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: false, usage: null, created_at: nowLocalIso(),
       ...(attRefs.length ? { attachments: attRefs } : {}),
-      ...(msgRefs.length ? { refs: msgRefs } : {})
+      ...(msgRefs.length ? { refs: msgRefs } : {}),
+      // 乐观打标（**唯一一处乐观更新**，2026-09-30）：发送那一刻前端就知道这条
+      // 是目标指令（后端要等命令到达、算完条件才知道），所以徽标当场亮。
+      // `pending: true` 标记"未经后端确认" —— 后端若因条件非法**静默忽略**整份
+      // 预选（不回复执），靠 `settleGoalBadges` 在后端给出权威模式时撤掉它。
+      ...(goalCondition
+        ? { goal: { kind: 'instruction' as const, condition: goalCondition, pending: true } }
+        : {})
     }
     const assMsg: Message = {
       id: mid(), role: 'assistant', content: '', thinking: '', thinkingActive: false, toolCalls: [], subagents: [], activeToolId: null, streaming: true, usage: null, created_at: nowLocalIso()
@@ -1023,8 +1979,30 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     // projectId 只在新建任务时带（已有会话由后端按 session_id 解析归属）；
     // attachments 只带 att_id 与线索，文件由后端按 att_id 从草稿区归位；
     // refs 只带路径，后端做越界校验后挂中性引用块（**不复制、不读内容**）。
+    // ── execMode：「目标模式 = 首条指令即目标」（2026-09-30，docs/frontend/22 §2.6）──
+    // `askPending` / `pend` / `armedGoal` / 条件都已在**上方**算出（造 userMsg 时要挂
+    // 徽标），这里只负责组装载荷。plan 模式无条件，直接透传。
+    const execMode =
+      pend === 'normal'
+        ? null
+        : pend === 'goal'
+          ? { mode: 'goal' as const, condition: goalCondition ?? t }
+          : { mode: 'plan' as const }
+    if (armedGoal && sid !== null) {
+      // 武装态**已交出**：清掉它，并顺手把选中态登记进该会话桶 —— 目的只是"草稿已清、
+      // 广播未到"的那几毫秒不闪一下胶囊（与 `session` 事件的 `handed` 同款：
+      // **不是乐观更新**，真值随后由 `execution_mode_changed` / `sessions` 广播校准；
+      // 后端若忽略整个预选，这里会被纠正回 normal）。
+      set((s) => {
+        const { [sid]: _handed, ...goalArmBySession } = s.goalArmBySession
+        return {
+          goalArmBySession,
+          executionModeBySession: { ...s.executionModeBySession, [sid]: 'goal' }
+        }
+      })
+    }
     window.agent
-      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs)
+      .send(t, sid, ov, modelId, projectId, atts.map(draftToInput), refs, execMode)
       .catch(() => set({ isSending: false }))
   },
 
@@ -1107,6 +2085,136 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         isSending: false
       }
     })
+    // 面板**不在此处本地清空**：停止会走后端 `request_stop()` → `cancel_all()`
+    // → 广播 `ask_resolved`（status='stopped'）→ 由该事件清面板并落只读小结。
+    // 本地清会让随后到达的 ask_resolved 找不到 in-flight 的问题文本
+    //（小结块只剩结果行、丢标题），所以坚持"单一出口"。
+    // 在途审批卡片同理**不本地清**：停止路径由后端广播 `approval_resolved`
+    //（status='stopped'）收卡并落「已停止」徽标 —— 本地清会丢失 trigger/mode
+    // 等结算徽标所需的在途元数据。
+  },
+
+  /** 提交选择题作答。fire-and-forget —— 见 AgentState 上的注释。 */
+  answerAsk: (requestId, answers) => {
+    const sid = get().activeSession
+    if (!sid || !requestId) return
+    window.agent.answerAsk(sid, requestId, answers)
+  },
+
+  /** 取消本次提问。fire-and-forget —— 见 AgentState 上的注释。 */
+  cancelAsk: (requestId) => {
+    const sid = get().activeSession
+    if (!sid || !requestId) return
+    window.agent.cancelAsk(sid, requestId)
+  },
+
+  /** 提交审批裁决。fire-and-forget —— 见 AgentState 上的注释。
+   *  submitted 只在本地置位（禁按钮防重复提交），卡片与徽标的结算出口
+   *  唯一：`approval_resolved` 广播（含 timeout / stopped 的后端自结算）。 */
+  answerApproval: (requestId, decision) => {
+    const sid = get().activeSession
+    if (!sid || !requestId) return
+    set((s) => {
+      const cur = s.approvalBySession[sid]
+      const entry = cur?.[requestId]
+      if (!entry || entry.submitted) return s
+      return {
+        ...s,
+        approvalBySession: {
+          ...s.approvalBySession,
+          [sid]: { ...cur, [requestId]: { ...entry, submitted: true } }
+        }
+      }
+    })
+    window.agent.approvalAnswer(sid, requestId, decision)
+  },
+
+  /** 切换权限档位。fire-and-forget —— chip 只认 `permission_changed` 广播。 */
+  switchPermission: (mode) => {
+    const sid = get().activeSession
+    if (!sid) return
+    window.agent.sessionPermission(sid, mode)
+  },
+
+  /** 新建任务（无会话）态切换目标工作空间的权限档位。目标空间 = 「+」/chip
+   *  选定的 pendingProjectId（缺省跟随后端活动空间）。fire-and-forget ——
+   *  chip 只认随后的 `projects` 广播。 */
+  switchProjectPermission: (mode) => {
+    const pid = get().pendingProjectId ?? get().activeProject
+    if (!pid) return
+    window.agent.projectPermission(pid, mode)
+  },
+
+  /** 切换执行模式。fire-and-forget、**不乐观更新**（tag 只认广播）。
+   *
+   *  **无会话 = 记草稿，不拒绝**（2026-09-27 改）：执行模式是会话级状态、此刻确实
+   *  没有归属，但"选不了"比"选了待落地"差得多 —— 草稿由 `send()` 随首条消息
+   *  交给后端在**建会话时**落 meta（见 `pendingExecMode` 的注释）。原先那条
+   *  「请先发送一条消息创建会话」的 toast 与 `+` 菜单的对应置灰一并删除：**
+   *  两项在任何情况下都可选**。
+   *
+   *  **已有会话的 goal = 只记"武装位"**（2026-09-30，§2.6）：点「目标模式」不再弹框
+   *  问条件 —— 条件由**下一条指令的正文**充当，因此这一刻**不发任何后端命令**
+   *  （空条件必被 `GoalController` 拒；改发 normal 又会把用户的 plan 顺手杀掉）。
+   *  真值落地在 `send()` 随 `chat.exec_mode/exec_condition` 走的路径上。 */
+  switchExecMode: (mode, condition) => {
+    const s = get()
+    const sid = s.activeSession
+    const cond = mode === 'goal' ? (condition ?? '') : ''
+    if (!sid) {
+      if (s.pendingExecMode === mode && s.pendingExecGoalCondition === cond) return
+      set({ pendingExecMode: mode, pendingExecGoalCondition: cond })
+      return
+    }
+    if (mode === 'goal') {
+      // 幂等短路：已武装 / 后端已是 goal（后者连条件都不用问）
+      if (s.goalArmBySession[sid] || execModeOf(s, sid) === 'goal') return
+      set({ goalArmBySession: { ...s.goalArmBySession, [sid]: true } })
+      return
+    }
+    if (s.goalArmBySession[sid]) {
+      // 撤武装：**只清本地位**。后端此刻仍是武装前那个模式（武装从未落地），
+      // 胶囊随 fallback 链自动回到真值（normal / plan），不必也不该发命令。
+      const { [sid]: _disarmed, ...goalArmBySession } = s.goalArmBySession
+      set({ goalArmBySession })
+      // 唯一例外：用户直接点了「计划模式」（跨模式意图）—— plan 的真源在后端，
+      // 必须真发一条；后端若本来就在 plan，这条是幂等空操作。
+      if (mode === 'plan') window.agent.sessionExecMode(sid, mode)
+      return
+    }
+    // 同模式重复点击 = 幂等短路（少一次往返）。**跨模式直接切换**（2026-09-27 改）：
+    // plan ↔ goal 不再要求"先关闭再切换"—— 后端 `set_execution_mode` 是唯一权威，
+    // 被让位那一方的状态（目标 / plan 状态）由后端一并清理（plans/ 下的文书文件
+    // 保留），前端不再拦截、也不再弹"请先关闭…"的提示。
+    // 注意 `mode` 到此已被收窄成 `'normal' | 'plan'`（goal 在上面两条分支里就已经
+    // 返回了）—— 所以这里**不带 condition**：goal 的条件只走"武装 → 首条指令"那条路。
+    if (execModeOf(s, sid) === mode) return
+    window.agent.sessionExecMode(sid, mode)
+  },
+
+  /** 批准计划文书。fire-and-forget：卡片转只读等 `execution_mode_changed` 广播
+   *  （后端 `approve_plan` 内部落盘 + 推送）；续跑由后端在空闲时自动发起。 */
+  approvePlan: () => {
+    const sid = get().activeSession
+    if (!sid) return
+    window.agent.approvePlan(sid)
+  },
+
+  /** 拉取计划文书正文。**点对点**（同右栏 `readFile`）：结果只由这里的返回值落库，
+   *  `handleEvent` 不为 `plan_content` 设分支 —— 与 `file_content` 同一条既有约定。 */
+  fetchPlanContent: async (sid) => {
+    if (!sid) return
+    let payload: PlanContentPayload | null = null
+    try {
+      payload = (await window.agent.planRead(sid)) as PlanContentPayload | null
+    } catch {
+      payload = null
+    }
+    set((s) => {
+      // 卡片壳已不在（切走 / 被清理 / 已批准后又换了会话）→ 丢弃迟到回执
+      if (!s.planBySession[sid]) return s
+      return { ...s, planBySession: mergePlanContent(s.planBySession, sid, payload) }
+    })
   },
 
   handleEvent: (ev) => {
@@ -1159,10 +2267,29 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         // 显示成另一个空间，接下来的「+」会把新任务建到那个空间去。
         const cur = get().activeSession
         const curPid = cur ? list.find((x) => x.id === cur)?.project : undefined
-        set((s) => ({
-          sessions: list,
-          ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
-        }))
+        set((s) => {
+          // 乐观徽标收敛（2026-09-30）：这条也是权威模式来源之一 —— 首条消息就
+          // 预选 goal 的**新会话**路径不推 `execution_mode_changed`（它靠
+          // `_restore_execution_state` 生效），确认/撤销只能在这里落地。
+          const messagesBySession = settleGoalBadges(
+            s.messagesBySession,
+            list.map((x) => x.id),
+            (sid) => list.find((x) => x.id === sid)?.execution_mode === 'goal'
+          )
+          return {
+            sessions: list,
+            // 执行模式 4 字段随列表一起恢复（**断线重连 / 整页重载的唯一通道**，
+            // P1-13）—— 与 permission_mode / unread 同通道，见 mergeExecFromSessions。
+            ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, s.goalBarBySession, list),
+            messagesBySession,
+            // `messages` 是 activeSession 的投影快照（不是 getter）→ 徽标被撤掉时
+            // 必须一并刷新，否则用户要切一次会话才看到变化。
+            messages: s.activeSession
+              ? (messagesBySession[s.activeSession] ?? s.messages)
+              : s.messages,
+            ...(curPid && curPid !== s.activeProject ? { activeProject: curPid } : {})
+          }
+        })
         break
       }
       case 'projects': {
@@ -1190,6 +2317,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (typeof sid !== 'string' || !sid) break
         const newPid = typeof sp?.project_id === 'string' && sp.project_id ? sp.project_id : null
         const wasFresh = get().pendingFresh !== null
+        // 预选执行模式的**交接**（2026-09-27）：草稿已随首条 chat 交出去（`chat.exec_mode`
+        // → 后端建会话时写 meta），这里把它的值登记进新会话桶并清空草稿。
+        // **不是乐观更新**：真值由紧随其后的 `sessions` 广播校准（后端忽略非法值时
+        // 这里会被纠正回 normal）；登记只是为了"草稿已清、会话态未到"的那几毫秒
+        // 不闪一下胶囊。非 fresh（别的窗口建的会话）不动本窗口草稿。
+        const handed = wasFresh ? get().pendingExecMode : 'normal'
         set((s) => {
           // 新建任务的草稿缓冲迁移到正式会话缓冲（拿到后端分配的会话 id）
           let messagesBySession = s.messagesBySession
@@ -1204,7 +2337,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             messages: messagesBySession[sid] ?? [],
       isSending: s.runningSessions.includes(sid) || s.bgSessions.includes(sid),
       // 活动空间对齐到新会话的归属（点空间 B 的「+」新建时，活动空间可能还停在 A）
-            ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {})
+            ...(newPid ? { activeProject: newPid, pendingProjectId: newPid } : {}),
+            ...(handed !== 'normal'
+              ? { executionModeBySession: { ...s.executionModeBySession, [sid]: handed } }
+              : {}),
+            ...(wasFresh
+              ? { pendingExecMode: 'normal' as ExecutionMode, pendingExecGoalCondition: '' }
+              : {})
           }
         })
         // 新建会话由首条消息落号：把当前选定的模型与按模型参数覆盖写入该会话元数据
@@ -1298,23 +2437,77 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         break
       }
       case 'session_history': {
-        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null } | null
+        const payload = ev.payload as { session_id?: string; messages?: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null; goal_round?: number | null; goal_started_at?: number | null } | null
         if (typeof payload?.session_id !== 'string' || !payload.session_id || !Array.isArray(payload.messages)) break
+        // 右栏状态：**在 `set(...)` 之外**调用。两个理由：
+        // ① 它是另一个 store 的 action，放进更新函数会破坏"更新函数必须纯"的前提
+        //    （StrictMode / 并发渲染下可能被调用两次）；
+        // ② `applySessionUi` 自带"内存桶已存在则整条忽略"的守卫（19 篇 §2.5 纪律 1）——
+        //    落盘是防抖异步的，回读可能滞后于用户刚做的操作，整份替换会把刚开的标签吃掉。
+        useRightPanelStore.getState().applySessionUi(payload.session_id, payload.right_panel)
         set((s) => {
           // 回调内 payload 的窄化丢失，重断言为已校验形状
-          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null }
+          const p = payload as { session_id: string; messages: HistoryMessage[]; model_id?: string | null; overrides?: SessionModelOverridesMap | null; usage_totals?: UsageStats | null; permission_mode?: PermissionMode; right_panel?: RPanelPersist | null; execution_mode?: ExecutionMode; plan_status?: PlanStatus | null; plan_path?: string | null; goal_condition?: string | null; goal_round?: number | null; goal_started_at?: number | null }
           // 任务面板：先把本会话 board 清空，等紧随其后的 task_board 事件覆盖。
           // 必须清 —— 后端回放只发"未完成组"，已结束的组不再下发；不清的话
           // "看到完成的组 → 切走 → 切回"会残留上一轮那版 done 快照，
           // 违反"会话切换/复现时仅显示正在执行的组"。
           const taskBoardBySession = { ...s.taskBoardBySession, [p.session_id]: null }
+          // 权限档位：session_history 带上时落进 permissionModeBySession
+          //（盾牌 chip 的权威源；缺字段 = 老后端，chip 走 fallback 链）
+          const permissionModeBySession = p.permission_mode
+            ? { ...s.permissionModeBySession, [p.session_id]: p.permission_mode }
+            : s.permissionModeBySession
+          // 任务执行模式（2026-09-25）：切会话 / 回放时恢复胶囊 tag 与计划卡片**外壳**。
+          // 正文不在这里 —— 由紧随 `set()` 之后的 `plan_read` 拉取（同一份数据两个
+          // 消费者会分叉，故只留一条链路）。缺字段（老后端 / 老会话）视作 normal。
+          const executionModeBySession = p.execution_mode
+            ? { ...s.executionModeBySession, [p.session_id]: p.execution_mode }
+            : s.executionModeBySession
+          const planBySession =
+            planShellAlive(p.plan_status)
+              ? {
+                  ...s.planBySession,
+                  [p.session_id]: {
+                    ...(s.planBySession[p.session_id] ?? {}),
+                    path: p.plan_path ?? s.planBySession[p.session_id]?.path ?? '',
+                    status: p.plan_status
+                  } as PlanState
+                }
+              : p.execution_mode !== 'plan' && s.planBySession[p.session_id]
+                ? // 回放通道的同一条纪律（判据见 `planShellAlive`，与 `execution_mode_changed`
+                  // 分支一致）：模式不是 plan（normal / **goal**）→ 撤壳。既覆盖"meta 里
+                  // 已无计划状态"（旧壳会变成一张点不动的卡片），也覆盖"**已批准**后切进
+                  // 这个会话"（决策已作出，壳不该跟着回放回来）。
+                  (({ [p.session_id]: _dropped, ...rest }) => rest)(s.planBySession)
+                : s.planBySession
+          // 常驻目标条（2026-09-30 目标可见化）：回放通道的同一条判据（`goalBarAlive`，
+          // 与广播 / 列表重建共用）。**必须与上面的撤壳同款处理"反向"分支** ——
+          // 回放一个已结束目标的会话时，内存里的旧目标条要撤掉，否则它会带着
+          // 上一个目标的条件赖在输入区上方。
+          const goalBarBySession = goalBarAlive(p.execution_mode ?? 'normal', p.goal_condition)
+            ? {
+                ...s.goalBarBySession,
+                [p.session_id]: {
+                  condition: p.goal_condition as string,
+                  round: typeof p.goal_round === 'number' ? p.goal_round : 0,
+                  startedAt: typeof p.goal_started_at === 'number'
+                    ? p.goal_started_at
+                    : null
+                }
+              }
+            : s.goalBarBySession[p.session_id]
+              ? (({ [p.session_id]: _droppedBar, ...rest }) => rest)(s.goalBarBySession)
+              : s.goalBarBySession
           // 运行中（turn 或后台任务）的会话以实时缓冲为准，不回放磁盘快照
           // （避免丢失未落盘/已后台产出的分流增量）
           const buf = s.messagesBySession[p.session_id] ?? []
           const hasLive =
             (s.runningSessions.includes(p.session_id) || s.bgSessions.includes(p.session_id)) &&
             buf.length > 0
-          if (hasLive) return { ...s, taskBoardBySession }
+          if (hasLive) {
+            return { ...s, taskBoardBySession, executionModeBySession, planBySession, goalBarBySession }
+          }
           const histBuf = historyToMessage(p.session_id, p.messages)
           const messagesBySession = { ...s.messagesBySession, [p.session_id]: histBuf }
           const messages = s.activeSession === p.session_id ? histBuf : s.messages
@@ -1329,7 +2522,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           // 切到 / 打开该会话时，按元数据恢复其绑定的模型与按模型参数覆盖
           const overridesByModel = fromBackendOverrides(p.overrides) ?? {}
           if (s.activeSession !== p.session_id) {
-            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession }
+            return { ...s, messagesBySession, messages, sessionUsageBySession, taskBoardBySession, permissionModeBySession, executionModeBySession, planBySession, goalBarBySession }
           }
           return {
             ...s,
@@ -1339,8 +2532,85 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             sessionModelId: p.model_id || s.sessionModelId,
             overridesByModel,
             taskBoardBySession,
+            permissionModeBySession,
+            executionModeBySession,
+            planBySession,
+            goalBarBySession,
             lastSessionModelId: p.model_id || s.lastSessionModelId,
             lastOverridesByModel: overridesByModel,
+          }
+        })
+        // 计划卡片正文：**必须放在 `set()` 之外**（副作用，不是纯更新；StrictMode 下
+        // 放进更新函数会发两次请求）。仅在"有卡片壳但还没正文"时拉一次，避免每次
+        // 切会话都重复请求。用 `plan_read` 而非 `file_read`：文书在元数据目录里，
+        // 后者被 `resolve_within(workdir)` 钉死在工作区 → 越界（docs/frontend/22 §4.5）。
+        const sid = payload.session_id
+        if (planShellAlive(payload.plan_status) && get().planBySession[sid]?.content === undefined) {
+          void get().fetchPlanContent(sid)
+        }
+        break
+      }
+      case 'goal_check': {
+        // 目标检查结果（2026-09-30 目标可见化，docs/frontend/22 §6.2）：把这一轮的
+        // Stop 裁决按时间顺序 append 进该会话的消息流，渲染成一张检查卡。
+        //
+        // 为什么 append 一条 Message 而不是另起一个面板/横幅：用户要的是「每轮执行完
+        // 的偏差输出到**对话界面**」—— 它就该长在对话流里、跟着历史走。落盘的 jsonl
+        // 记录与这里同源同形（都由 `GoalState.snapshot()` + action/reason 组成），
+        // 切会话回放由 `_history_to_ui` + `historyToMessage` 重建同一条消息对象，
+        // **实时与回放共用 `GoalCheckCard` 一套渲染**，不存在两套口径。
+        const p = ev.payload as {
+          session_id?: string
+          kind?: string
+          action?: GoalAction
+          round?: number
+          reason?: string
+          condition?: string
+          elapsed?: number
+          tokens?: number
+          at?: string
+        } | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid || !p?.action) break
+        const marker: GoalMarker = {
+          kind: 'check',
+          action: p.action,
+          round: typeof p.round === 'number' ? p.round : 0,
+          reason: p.reason ?? '',
+          condition: p.condition ?? '',
+          elapsed: typeof p.elapsed === 'number' ? p.elapsed : 0,
+          tokens: typeof p.tokens === 'number' ? p.tokens : 0,
+          at: p.at
+        }
+        const card: Message = {
+          id: mid(),
+          role: 'goal_check',
+          content: '',
+          created_at: p.at,
+          thinking: '',
+          thinkingActive: false,
+          toolCalls: [],
+          subagents: [],
+          activeToolId: null,
+          streaming: false,
+          usage: null,
+          goal: marker
+        }
+        set((s) => {
+          const buf = [...(s.messagesBySession[sid] ?? []), card]
+          const messagesBySession = { ...s.messagesBySession, [sid]: buf }
+          // 常驻目标条的轮次随之推进（`round` = 后端已完成的评估次数）。
+          // 这里**只管数字，不管存亡** —— 目标成没成由 `execution_mode_changed` 决定
+          // （判据 `goalBarAlive` 只在该通道与另外两条恢复通道里用）。
+          const cur = s.goalBarBySession[sid]
+          const goalBarBySession = cur
+            ? { ...s.goalBarBySession, [sid]: { ...cur, round: marker.round ?? cur.round } }
+            : s.goalBarBySession
+          return {
+            ...s,
+            messagesBySession,
+            messages: s.activeSession === sid ? buf : s.messages,
+            goalBarBySession
           }
         })
         break
@@ -1354,6 +2624,63 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         const payload = ev.payload as { config?: LlmConfig; applied?: boolean; msg?: string }
         if (payload?.config) set({ llmConfig: payload.config })
         if (payload?.msg) showToast(payload.msg, 'info')
+        break
+      }
+      case 'permission_config': {
+        // 点对点回执（只回发起窗口、**不广播**）：整份存 store，权限页按需渲染。
+        // 刻意不 toast —— warnings 与 msg 要由页面内联展示，用户得对着它们改配置，
+        // toast 一闪而过等于没提示（见 18 篇 §3.3）。
+        const payload = ev.payload as PermissionConfigResult
+        if (payload?.config) {
+          set({ permissionConfig: mergePermissionResult(get().permissionConfig, payload) })
+        }
+        break
+      }
+      case 'sandbox_config': {
+        // 点对点回执（同 permission_config）：get/save 回执同构，整份替换。
+        // 校验错误由沙盒页内联展示，不 toast（同上理由）。
+        const payload = ev.payload as SandboxConfigResult
+        if (payload?.platform) set({ sandboxConfig: payload })
+        break
+      }
+      case 'mcp_config': {
+        // 点对点回执（同 permission_config / sandbox_config）：get / upsert / remove
+        // 三条**共用同一信封**，每次都回读全量 → 整份替换，不做增量拼接。
+        // 刻意不 toast：errors / warnings 要由 MCP 页内联展示，用户得对着它们改配置。
+        const payload = ev.payload as McpConfigResult
+        if (payload && Array.isArray(payload.servers)) set({ mcpConfig: payload })
+        // 本地包动作（install / remove / verify）也挂在这封回执上 —— 顺手存一份给
+        // 页面内联展示。**只写不 toast**（同上）。
+        if (payload?.pkg_action) set({ mcpPkgAction: payload.pkg_action })
+        break
+      }
+      case 'mcp_pkg_plan': {
+        // 本地安装计划（点对点，**不落盘、不下载**）。与 mcp_market 同理：
+        // 它不走 promise 归属，事件分支与 promise 分支写的是同一份内容。
+        const payload = ev.payload as McpPkgPlan
+        if (payload) set({ mcpPkgPlan: payload })
+        break
+      }
+      case 'mcp_test': {
+        // 试连结果（点对点）：只写 mcpTest，**不动 mcpConfig** —— 试连不落盘，
+        // 条目状态不因此改变（避免"测了一下就显示已连接"的假象）。
+        const payload = ev.payload as McpTestResult
+        if (payload) set({ mcpTest: payload })
+        break
+      }
+      case 'skill_config': {
+        // 点对点回执（同 mcp_config）：get / set_enabled / remove / install /
+        // market_upsert / market_remove **六条共用同一信封**，每次都回读全量
+        // → 整份替换，不做增量拼接（拼接会留下已删技能的残影）。
+        // 刻意不 toast：errors / warnings 要由技能页内联展示，用户得对着它们改。
+        const payload = ev.payload as SkillConfigResult
+        if (payload && Array.isArray(payload.skills)) set({ skillConfig: payload })
+        break
+      }
+      case 'plugin_config': {
+        // 同 skill_config：六条命令共用，整份替换。
+        const payload = ev.payload as PluginConfigResult
+        if (payload && Array.isArray(payload.plugins)) set({ pluginConfig: payload })
         break
       }
       case 'context_stats': {
@@ -1386,9 +2713,325 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         })
         break
       }
+      case 'ask_request': {
+        // 模型发起结构化提问（ask_user）→ 弹「待确认」面板（输入框上方）。
+        // 这是桥层聚合出的 UI 产物事件（同 task_board），**不是流式增量**。
+        // 纯 UI 态：不落盘、不进 messages —— 消息里只有 tool_call_start 建好的
+        // 只读小结块占位（status='pending' 期间不渲染，避免与面板重复）。
+        const p = ev.payload as
+          | { session_id?: string; request_id?: string; tool_call_id?: string; questions?: AskQuestion[] }
+          | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid || !p?.request_id) break
+        set((s) => ({
+          ...s,
+          interactionBySession: {
+            ...s.interactionBySession,
+            [sid]: {
+              requestId: p.request_id as string,
+              toolCallId: typeof p.tool_call_id === 'string' ? p.tool_call_id : '',
+              questions: Array.isArray(p.questions) ? p.questions : []
+            }
+          }
+        }))
+        break
+      }
+      case 'ask_resolved': {
+        // 提问已结算（作答 / 取消 / 被停止）：清面板 + 把结果落进消息下的只读小结块。
+        // **result_text 原样展示**（与回填给模型的 tool_result 逐字节相同），
+        // 前端不做任何结构化解析。
+        const p = ev.payload as
+          | {
+              session_id?: string
+              request_id?: string
+              tool_call_id?: string
+              status?: AskStatus
+              answers?: AskAnswer[]
+              result_text?: string
+            }
+          | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const cur = s.interactionBySession[sid] ?? null
+          const sameRequest = cur !== null && (!p?.request_id || cur.requestId === p.request_id)
+          const interactionBySession = { ...s.interactionBySession }
+          // 只清「同一条请求」：迟到/重复的 ask_resolved（例如作答后又被停止路径
+          // 结算）不能误清新发起的提问面板。
+          if (sameRequest || cur === null) interactionBySession[sid] = null
+          const buf = appendAskResult(s.messagesBySession[sid] ?? [], p?.tool_call_id ?? '', {
+            questions: sameRequest && cur ? cur.questions : null,
+            resultText: p?.result_text ?? '',
+            status: p?.status ?? 'answered'
+          })
+          const messagesBySession = { ...s.messagesBySession, [sid]: buf }
+          return {
+            ...s,
+            interactionBySession,
+            messagesBySession,
+            messages: s.activeSession === sid ? buf : s.messages
+          }
+        })
+        break
+      }
+      case 'approval_request': {
+        // 工具执行前的审批下发（PreToolUse 判定 ask，范式 C）→ 消息流里弹审批
+        // 卡片（锚定 tool_call 折叠条，见 docs/frontend/17 §4）。纯 UI 态：
+        // 不落盘、不进 messages —— 决定不进模型上下文，只影响工具执行。
+        const p = ev.payload as
+          | {
+              session_id?: string
+              request_id?: string
+              tool_call_id?: string
+              tool_name?: string
+              args?: Record<string, unknown>
+              trigger?: string
+              reason?: string
+              session_scope_hint?: string
+              mode?: string
+              timeout_seconds?: number
+              created_at?: number
+            }
+          | null
+        const sid = p?.session_id
+        const rid = p?.request_id
+        if (typeof sid !== 'string' || !sid || typeof rid !== 'string' || !rid) break
+        set((s) => {
+          const cur = s.approvalBySession[sid] ?? {}
+          // 幂等：同 request_id 已存在（断线重连重放）→ 保留原条目 ——
+          // 尤其不能重置 submitted（用户刚点过按钮，重放把禁用态弹回去等于引诱重复提交）
+          if (cur[rid]) return s
+          const entry: ApprovalInteraction = {
+            requestId: rid,
+            toolCallId: typeof p?.tool_call_id === 'string' ? p.tool_call_id : '',
+            toolName: typeof p?.tool_name === 'string' ? p.tool_name : '',
+            args: p?.args && typeof p.args === 'object' && !Array.isArray(p.args) ? p.args : {},
+            trigger: typeof p?.trigger === 'string' ? p.trigger : '',
+            reason: typeof p?.reason === 'string' ? p.reason : '',
+            sessionScopeHint: typeof p?.session_scope_hint === 'string' ? p.session_scope_hint : '',
+            mode: typeof p?.mode === 'string' ? p.mode : 'default',
+            timeoutSeconds: typeof p?.timeout_seconds === 'number' ? p.timeout_seconds : 0,
+            createdAt: typeof p?.created_at === 'number' ? p.created_at : 0,
+            submitted: false
+          }
+          return {
+            ...s,
+            approvalBySession: { ...s.approvalBySession, [sid]: { ...cur, [rid]: entry } }
+          }
+        })
+        break
+      }
+      case 'approval_resolved': {
+        // 审批已结算（作答 / 超时 / 停止）：清在途卡片 + 在对应工具条上落结算徽标。
+        // 与 ask_resolved 完全同构：多窗口一致 + fire-and-forget 提交的唯一出口。
+        const p = ev.payload as
+          | {
+              session_id?: string
+              request_id?: string
+              tool_call_id?: string
+              status?: ApprovalOutcome
+              at?: number
+            }
+          | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        set((s) => {
+          const cur = s.approvalBySession[sid] ?? {}
+          const rid = typeof p?.request_id === 'string' ? p.request_id : ''
+          const entry = rid ? cur[rid] : undefined
+          // 只清「同一条请求」；request_id 缺失（不该发生）时整表清空兜底
+          const next = rid ? { ...cur } : {}
+          if (rid) delete next[rid]
+          // 结算徽标：outcome + 在途条目的 trigger/mode 写进 tool_call_id 匹配的
+          // 工具行。允许结局（allowed_*）也写 —— 徽标只进内存 UI 态，回放是否
+          // 带它由后端落盘口径决定（只落 denied/timeout/stopped）。
+          const tcid = entry?.toolCallId || (typeof p?.tool_call_id === 'string' ? p.tool_call_id : '')
+          const buf = tcid
+            ? patchToolApproval(s.messagesBySession[sid] ?? [], tcid, {
+                decision: p?.status ?? 'denied',
+                trigger: entry?.trigger,
+                mode: entry?.mode
+              })
+            : (s.messagesBySession[sid] ?? [])
+          const messagesBySession = { ...s.messagesBySession, [sid]: buf }
+          return {
+            ...s,
+            approvalBySession: { ...s.approvalBySession, [sid]: next },
+            messagesBySession,
+            messages: s.activeSession === sid ? buf : s.messages
+          }
+        })
+        break
+      }
+      case 'permission_changed': {
+        // 会话权限档位已切换（session_permission 的回执广播）→ 同步盾牌 chip
+        // 选中态与 sessions 列表条目（chip 的 fallback 链读它，两处必须同时更新）。
+        const p = ev.payload as { session_id?: string; mode?: PermissionMode } | null
+        const sid = p?.session_id
+        const mode = p?.mode
+        if (typeof sid !== 'string' || !sid || (mode !== 'default' && mode !== 'full_access')) break
+        set((s) => ({
+          ...s,
+          permissionModeBySession: { ...s.permissionModeBySession, [sid]: mode },
+          sessions: s.sessions.map((x) => (x.id === sid ? { ...x, permission_mode: mode } : x))
+        }))
+        break
+      }
       case 'error': {
         const msg = (ev.payload as { msg?: string })?.msg ?? '未知错误'
         showToast(msg, 'error', 4000)
+        break
+      }
+      case 'execution_mode_changed': {
+        // 执行模式已切换（2026-09-25，docs/frontend/22）：**三条来源共用同一条投递
+        // 路径** —— 用户点 tag 切模式 / goal 达成自动回落 / plan 批准续跑。与
+        // permission_changed 同款：以广播为准，**不做乐观更新**（传输丢失时乐观 UI
+        // 会说谎）。plan 与 goal 互斥判定的唯一权威也在后端，这里只负责投影。
+        const p = ev.payload as ExecutionModeChangedPayload | null
+        const sid = p?.session_id
+        const mode = p?.mode
+        if (typeof sid !== 'string' || !sid) break
+        if (mode !== 'normal' && mode !== 'plan' && mode !== 'goal') break
+        set((s) => {
+          // ── 锚点行的存活判据（2026-09-29 四次改版，docs/frontend/22 §7.5）──────────
+          // 唯一的判据在 `planShellAlive`（三条通道共用）：**壳只在"有待批准的计划"
+          // 期间存在**。`approved` 不再恒留 —— 用户实测"批准后横幅赖在消息流末尾不走"。
+          // 这里因此只剩两条支路：
+          //   ① 判据为真 → 建 / 更新壳；
+          //   ② 判据为假且模式已不是 plan → 撤壳。
+          // 支路 ② 顺带兜住 `plan_status` 也为空的场景（回落 normal，或**跨模式直接
+          // 切到 goal**，2026-09-25 实施期修正 / 2026-09-27 扩展）：否则卡片会留在
+          // 消息流里显示"待批准"+ 可点的「批准执行」，而后端已把 plan 状态清空、
+          // 点下去只会换来一句 `当前没有待批准的计划文书。` 的 error toast ——
+          // 死按钮 + 内存与磁盘背离。
+          const st = p.plan_status
+          // 武装态兜底清（2026-09-30，§2.6）：本条广播是"本会话模式的唯一权威"——
+          // 无论它来自首条指令落地（我们已在前一刻清过）、别的窗口的操作、还是
+          // goal 达成后的自动回落，留着一枚武装位都会让胶囊与真值打架。
+          let goalArmBySession = s.goalArmBySession
+          if (goalArmBySession[sid]) {
+            const { [sid]: _settled, ...rest } = goalArmBySession
+            goalArmBySession = rest
+          }
+          // ── 常驻目标条（2026-09-30，docs/frontend/22 §7.6）───────────────────
+          // 判据 `goalBarAlive`（与回放 / 列表重建两条通道共用）：mode=goal **且**
+          // 条件非空才存在。撤条覆盖三种情形：目标达成/失败（mode 回落 normal）、
+          // 用户点胶囊 ×、跨模式切到 plan。
+          let goalBarBySession = s.goalBarBySession
+          if (goalBarAlive(mode, p.goal_condition)) {
+            const cur = s.goalBarBySession[sid]
+            goalBarBySession = {
+              ...goalBarBySession,
+              [sid]: {
+                condition: p.goal_condition,
+                // 轮次缺省沿用本地值：`execution_mode_changed` 多数由"模式刚切换"
+                // 触发（那一刻后端还没评估过），真正的推进靠 `goal_check` 事件。
+                round: typeof p.goal_round === 'number'
+                  ? p.goal_round
+                  : (cur?.round ?? 0),
+                startedAt: typeof p.goal_started_at === 'number'
+                  ? p.goal_started_at
+                  : (cur?.startedAt ?? null)
+              }
+            }
+          } else if (goalBarBySession[sid]) {
+            const { [sid]: _droppedBar, ...rest } = goalBarBySession
+            goalBarBySession = rest
+          }
+          // 乐观徽标收敛（见 `settleGoalBadges`）：本广播是"本会话模式的唯一权威"，
+          // 据此确认（mode=goal）或撤销（其余）这次预选打下的徽标。
+          const messagesBySession = settleGoalBadges(
+            s.messagesBySession,
+            [sid],
+            () => mode === 'goal'
+          )
+          let planBySession = s.planBySession
+          if (planShellAlive(st)) {
+            const cur = s.planBySession[sid]
+            planBySession = {
+              ...planBySession,
+              [sid]: {
+                path: p.plan_path ?? cur?.path ?? '',
+                status: st,
+                ...(cur?.content !== undefined ? { content: cur.content } : {}),
+                ...(cur?.reason ? { reason: cur.reason } : {}),
+                ...(cur?.tooLarge ? { tooLarge: true } : {})
+              }
+            }
+          } else if (mode !== 'plan' && s.planBySession[sid]) {
+            // 「已批准 + 模式回落」（判据为假的主路径）与"plan_status 已清空"（normal /
+            // **goal**）都要撤：前者决策已作出、壳的职责已尽；后者壳留着就是死按钮。
+            const { [sid]: _dropped, ...rest } = s.planBySession
+            planBySession = rest
+          }
+          return {
+            ...s,
+            executionModeBySession: { ...s.executionModeBySession, [sid]: mode },
+            planBySession,
+            goalArmBySession,
+            goalBarBySession,
+            messagesBySession,
+            messages: s.activeSession === sid
+              ? (messagesBySession[sid] ?? s.messages)
+              : s.messages,
+            // `sessions` 列表条目同步：tag 的 fallback 链读它；也保证多窗口一致。
+            sessions: s.sessions.map((x) =>
+              x.id === sid
+                ? {
+                    ...x,
+                    execution_mode: mode,
+                    // 列表条目**忠实镜像**后端 meta（含 `approved`）—— 撤不撤壳是消费端
+                    // 的事（`mergeExecFromSessions` 用 `planShellAlive` 判）。这里若也
+                    // 收窄成只写 `ready`，断线重连那边就少了一份"该撤壳"的依据。
+                    ...(st === 'ready' || st === 'approved'
+                      ? { plan_status: st, plan_path: p.plan_path ?? null }
+                      : {}),
+                    goal_condition: p.goal_condition ?? null
+                  }
+                : x
+            )
+          }
+        })
+        break
+      }
+      case 'plan_ready': {
+        // 计划文书已产出：**只记卡片壳，正文另拉**。信封刻意不带正文（避免"实时
+        // 与回放"两套数据口径）。推送顺序契约保证前一条 `execution_mode_changed`
+        // 已带 `plan_status="ready"`，但这里不依赖它 —— 重复写同值无害，反而能兜住
+        // 广播丢失。拉正文是异步副作用 → 必须在 `set()` 之外。
+        const p = ev.payload as {
+          session_id?: string
+          plan_status?: PlanStatus
+          plan_path?: string | null
+          plan_name?: string | null
+        } | null
+        const sid = p?.session_id
+        if (typeof sid !== 'string' || !sid) break
+        const docPath = typeof p?.plan_path === 'string' ? p.plan_path : ''
+        set((s) => {
+          const cur = s.planBySession[sid]
+          return {
+            ...s,
+            planBySession: {
+              ...s.planBySession,
+              [sid]: {
+                path: docPath || cur?.path || '',
+                status: 'ready' as const,
+                ...(cur?.content !== undefined ? { content: cur.content } : {})
+              }
+            }
+          }
+        })
+        void get().fetchPlanContent(sid)
+        // **主动把产出物摆到眼前**（2026-09-29 需求）：文书在工作空间里，右栏直接
+        // 打开一枚常驻标签。两条纪律：
+        //   ① 只对**当前会话**开 —— 后台会话产出计划不该抢走用户眼前的视图；
+        //   ② 副作用放 `set()` 之外（与 fetchPlanContent 同款）。
+        // 这里不受"不乐观更新"约束：它不改 tag/卡片的选中态，只是替用户开一扇看得见
+        // 产出物的窗（随时可关）；面板开合本身有既有持久化，不该由这条件去猜测。
+        if (docPath && get().activeSession === sid) {
+          openPlanDocInPanel(sid, docPath, p?.plan_name || '')
+        }
         break
       }
     }
@@ -1398,7 +3041,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     try {
       const list = (await window.agent.listSessions()) as SessionMeta[]
       if (!Array.isArray(list)) return
-      set({ sessions: list })
+      // 与 `sessions` 信封同口径：列表是执行模式（tag / 卡片壳）的恢复通道之一
+      set((s) => ({ sessions: list, ...mergeExecFromSessions(s.executionModeBySession, s.planBySession, s.goalBarBySession, list) }))
     } catch {
       /* 忽略 */
     }
@@ -1439,6 +3083,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       sessionModelId: s.lastSessionModelId,
       overridesByModel: s.lastOverridesByModel,
       pendingProjectId: projectId ?? s.pendingProjectId ?? s.activeProject,
+      // 预选执行模式**不跨新任务继承**（执行模式是会话级状态、无继承源；带过去等于
+      // 让用户在下一条任务里"莫名开着计划模式"）。模型继承是另一条轴，见上一行。
+      pendingExecMode: 'normal',
+      pendingExecGoalCondition: '',
       // 新建任务 = 换一条消息，附件草稿必须跟着清（否则会把上一个任务的附件带过去）。
       // 未发送的草稿文件由后端 GC 兜底回收。
       draftAttachments: []
@@ -1528,7 +3176,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       if (!payload?.projects) return  // 被拒（空间有会话在跑 / 删 default）时后端回 error 信封
       set({ projects: payload.projects, activeProject: payload.active || DEFAULT_PROJECT_ID })
       // 该空间的会话已随目录消失：本地列表里清掉，避免点进去报"会话不存在"
-      set((s) => ({ sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId) }))
+      const gone = get()
+        .sessions.filter((x) => sessionProjectId(x) === projectId)
+        .map((x) => x.id)
+      set((s) => ({
+        sessions: s.sessions.filter((x) => sessionProjectId(x) !== projectId),
+        // 执行模式三桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
+        ...dropExecBuckets(s.executionModeBySession, s.planBySession, s.goalArmBySession, s.goalBarBySession, gone)
+      }))
+      // 右栏：被删会话的内存桶一起清掉。**这是既有分桶的缺口**
+      // （`sessions` 过滤了但 messagesBySession 等没有人清），本 store 不照抄这个缺陷。
+      useRightPanelStore.getState().dropSessions(gone)
       if (get().pendingProjectId === projectId) await get().newSession(DEFAULT_PROJECT_ID)
       showToast('已删除工作空间（仅元数据，真实目录已保留）', 'info', 4000)
     } catch {
@@ -1546,6 +3204,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     if (r && !r.ok) showToast(`无法打开目录：${r.error ?? ''}`, 'error', 4000)
   },
   switchSession: async (sid) => {
+    // ── 右栏：**先落盘，再切**（19 篇 §2.5 纪律 3）──────────────────
+    // 把上一个会话还压在防抖窗口里的写盘立刻发出去。放在最前面是刻意的：
+    // 只要"切会话"这件事一旦发生，任何"还欠着没发"的状态都有写错会话的风险，
+    // 所以不依赖任何后续顺序。payload 里带的是**当时的 sid**，与当前会话无关。
+    flushRightPanelPending()
     // 进入会话 = 已读。先本地即时置已读（即时反馈），再持久化到后端元数据。
     void get().setSessionUnread(sid, false)
     // 立即高亮 + 切换到该会话缓冲（后台会话继续执行不受影响，仅换投影）。
@@ -1564,6 +3227,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       //（文本草稿沿用既有行为不清，差异见 docs/frontend/12 的取舍一节）
       draftAttachments: []
     }))
+    // ── 右栏：丢掉别的会话的大块数据缓存（树 / 预览 / diff）────────
+    // 只留新会话那一份（与 `currentContextStats` 同范式：树可能 3000 条、
+    // diff 可能几百 KB，N 个会话累积明显吃内存，且天然易过期）。
+    // `layoutBySession` **不丢**：它要长期留着，切回来时标签栏才能同步恢复、不闪动。
+    useRightPanelStore.getState().keepOnly(sid)
     // 后端回放该会话历史并刷新列表；运行中的话由实时缓冲覆盖（见 session_history 处理）
     // 切到别的空间时同步后端"活动空间"：否则下一次 projects 广播会把 chip 拉回去
     if (pid && pid !== prevPid) void window.agent.openProject(pid)
@@ -1588,7 +3256,22 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       delete messagesBySession[sid]
       // 清空会话同步清掉 token 统计（后端 meta 的 usage_totals 已一并清除）
       const { [sid]: _drop, ...sessionUsageBySession } = s.sessionUsageBySession
-      return { ...s, messagesBySession, messages: [], activeSession: sid, sessionUsageBySession }
+      // 武装态一并清（2026-09-30）：后端把执行模式四字段归零了，"等下一条指令当目标"
+      // 这条本地位自然也该没了 —— 留着就会给一个已经归零的会话点亮目标模式胶囊。
+      const { [sid]: _disarmed, ...goalArmBySession } = s.goalArmBySession
+      // 常驻目标条一并清（2026-09-30）：后端把 goal 四字段（含新增的
+      // goal_round/goal_started_at）全归零了，条再留着就会变成一条"目标为空"
+      // 的幽灵横幅 —— 而它的关闭按钮点了也没用（后端已无目标可清）。
+      const { [sid]: _droppedBar, ...goalBarBySession } = s.goalBarBySession
+      return {
+        ...s,
+        messagesBySession,
+        messages: [],
+        activeSession: sid,
+        sessionUsageBySession,
+        goalArmBySession,
+        goalBarBySession
+      }
     })
     get().refreshSessions()
   },
@@ -1646,15 +3329,45 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set((s) => ({
         sessions: s.sessions.filter((x) => !remove.has(x.id)),
         trashSessions: s.trashSessions.filter((x) => !remove.has(x.id)),
+        // 执行模式三桶一并清（P1-14：新轴不继承 permissionModeBySession 的泄漏）
+        ...dropExecBuckets(s.executionModeBySession, s.planBySession, s.goalArmBySession, s.goalBarBySession, deleted)
       }))
+      // 右栏：同步丢内存桶（含把该 sid 还压着的待写盘条目一并撤掉，
+      // 否则防抖定时器到点会往一个已删除的会话写 meta）
+      useRightPanelStore.getState().dropSessions(deleted)
     }
   },
 
   openSettings: (tab = 'model') => {
     set({ settingsOpen: true, settingsTab: tab })
     if (tab === 'model' && !get().llmConfig) void get().loadLlConfig()
+    if (tab === 'permission' && !get().permissionConfig) void get().loadPermissionConfig()
+    if (tab === 'sandbox' && !get().sandboxConfig) void get().loadSandboxConfig()
+    if (tab === 'mcp' && !get().mcpConfig) void get().loadMcpConfig()
+    if (tab === 'skill' && !get().skillConfig) void get().loadSkillConfig()
+    if (tab === 'plugin' && !get().pluginConfig) void get().loadPluginConfig()
   },
-  closeSettings: () => set({ settingsOpen: false }),
+  // 关闭时清掉权限/沙盒/MCP/技能/插件配置缓存：配置可能被另一个窗口改过，重进必须
+  // 重新拉取（未保存的 draft 在组件内 state，随组件卸载自然丢弃）
+  closeSettings: () =>
+    set({
+      settingsOpen: false,
+      permissionConfig: null,
+      sandboxConfig: null,
+      mcpConfig: null,
+      mcpTest: null,
+      // 市场结果也一起清：市场内容随时间变化，重进必须重新搜（缓存 TTL 在后端）
+      mcpMarket: null,
+      mcpMarketPlan: null,
+      mcpPkgPlan: null,
+      mcpPkgAction: null,
+      skillConfig: null,
+      skillMarket: null,
+      skillMarketPlan: null,
+      pluginConfig: null,
+      pluginMarket: null,
+      pluginMarketPlan: null
+    }),
   loadLlConfig: async () => {
     try {
       const res = (await window.agent.llmConfigGet()) as { config?: LlmConfig } | null
@@ -1681,6 +3394,715 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set({ llmSaving: false })
     }
   },
+  loadPermissionConfig: async () => {
+    try {
+      const res = (await window.agent.permissionConfigGet()) as PermissionConfigResult | null
+      if (res?.config) {
+        set({ permissionConfig: mergePermissionResult(get().permissionConfig, res) })
+      }
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  savePermissionConfig: async (config) => {
+    set({ permissionSaving: true })
+    try {
+      const res = (await window.agent.permissionConfigSave(config)) as
+        | PermissionConfigResult
+        | null
+      // 以后端回执为准回填（含归一化修正后的权威值与 warnings）：
+      // 保留本地 draft 会让界面显示的内容与磁盘实际存的不一致。
+      // 用 merge 而非整份替换 —— save 回执不带 builtin，替换会让权限页塌回加载态。
+      if (res?.config) {
+        set({ permissionConfig: mergePermissionResult(get().permissionConfig, res) })
+      }
+      return res?.applied ?? false
+    } catch {
+      showToast('保存权限配置失败', 'error', 4000)
+      return false
+    } finally {
+      set({ permissionSaving: false })
+    }
+  },
+  loadSandboxConfig: async () => {
+    try {
+      const res = (await window.agent.sandboxConfigGet()) as SandboxConfigResult | null
+      if (res?.platform) set({ sandboxConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  saveSandboxConfig: async (payload) => {
+    set({ sandboxSaving: true })
+    try {
+      const res = (await window.agent.sandboxConfigSave(payload)) as
+        | SandboxConfigResult
+        | null
+      // 以后端回执为准回填（权威值）：开关状态 / 模板内容以磁盘实际为准，
+      // 校验错误由沙盒页读 res.errors 内联展示。
+      if (res?.platform) set({ sandboxConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存沙盒设置失败', 'error', 4000)
+      return false
+    } finally {
+      set({ sandboxSaving: false })
+    }
+  },
+  loadMcpConfig: async () => {
+    try {
+      const res = (await window.agent.mcpConfigGet()) as McpConfigResult | null
+      // `servers` 必须是数组才算有效回执 —— 读配置失败时后端回的是 `servers: [] + errors`，
+      // 空数组是合法值，不能当"没拿到"处理（否则页面会一直停在加载态）。
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  upsertMcpServer: async (payload) => {
+    set({ mcpSaving: true })
+    try {
+      const res = (await window.agent.mcpServerUpsert({
+        name: payload.name,
+        config: payload.config,
+        // 只在真有值时才带字段：后端把"字段存在"当语义（original_name 存在 = 要改名），
+        // 传 undefined/空串会把「新增」误判成「改名」。
+        ...(payload.original_name ? { original_name: payload.original_name } : {}),
+        ...(payload.meta ? { meta: payload.meta } : {})
+      })) as McpConfigResult | null
+      // 权威值以回执为准：**校验失败（applied=false）也回全量** —— 页面据此重绘，
+      // 并从 res.errors / res.warnings 内联展示（不 toast，见 23 篇 §前端约束）。
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存 MCP 服务失败', 'error', 4000)
+      return false
+    } finally {
+      set({ mcpSaving: false })
+    }
+  },
+  removeMcpServer: async (name) => {
+    set({ mcpSaving: true })
+    try {
+      const res = (await window.agent.mcpServerRemove({ name })) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除 MCP 服务失败', 'error', 4000)
+      return false
+    } finally {
+      set({ mcpSaving: false })
+    }
+  },
+  testMcpServer: async (target) => {
+    // 先清上一次结果：留着会让新开的表单弹窗 / 另一行显示无关的试连结论。
+    set({ mcpTesting: true, mcpTest: null })
+    try {
+      const res = (await window.agent.mcpServerTest(
+        // 只带有值的那一路：`name` 走磁盘真实配置（含未脱敏密钥），
+        // `config` 走表单草稿。两个都带时后端优先用 config。
+        target.name && !target.config
+          ? { name: target.name }
+          : { config: target.config ?? {} }
+      )) as McpTestResult | null
+      if (res) set({ mcpTest: res })
+      return res
+    } catch {
+      // 链路级异常（后端未就绪 / IPC 失败）：**不 toast**，合成一个失败结果走同一条
+      // 内联展示路径 —— 与后端校验失败同款式，用户看到的位置与措辞一致。
+      const fallback: McpTestResult = {
+        ok: false,
+        error: '请求失败：后端未连接或已超时',
+        tools: [],
+        tool_count: 0,
+        resource_count: 0,
+        elapsed_ms: 0
+      }
+      set({ mcpTest: fallback })
+      return fallback
+    } finally {
+      set({ mcpTesting: false })
+    }
+  },
+  clearMcpTest: () => set({ mcpTest: null }),
+  searchMcpMarket: async (query, cursor) => {
+    set({ mcpMarketLoading: true })
+    try {
+      const res = (await window.agent.mcpMarketSearch({
+        query,
+        ...(cursor ? { cursor } : {})
+      })) as McpMarketResult | null
+      if (!res) {
+        // IPC 超时（25s 未回）：官方 registry 慢起来能到 17s，别谎报"没有结果"
+        set({
+          mcpMarket: {
+            items: [], next_cursor: '', query, cached: false, elapsed_ms: 0,
+            error: '请求超时：市场响应过慢，请重试或改用「手动添加」'
+          }
+        })
+        return
+      }
+      const prev = get().mcpMarket
+      if (cursor && prev && !res.error) {
+        // 翻页**追加**；按 id 去重 —— registry 的游标分页在同一 server 有多版本时
+        // 可能重复返回，重复的 React key 会引发渲染异常。
+        const seen = new Set(prev.items.map((i) => i.id))
+        set({
+          mcpMarket: {
+            ...res,
+            items: [...prev.items, ...res.items.filter((i) => !seen.has(i.id))]
+          }
+        })
+      } else {
+        set({ mcpMarket: res })
+      }
+    } catch {
+      set({
+        mcpMarket: {
+          items: [], next_cursor: '', query, cached: false, elapsed_ms: 0,
+          error: '搜索失败：后端未连接'
+        }
+      })
+    } finally {
+      set({ mcpMarketLoading: false })
+    }
+  },
+  resolveMcpInstall: async (item) => {
+    set({ mcpResolving: true, mcpMarketPlan: null })
+    try {
+      const res = (await window.agent.mcpMarketResolve({ item })) as McpMarketPlan | null
+      if (res) {
+        set({ mcpMarketPlan: res })
+        return res
+      }
+      // null（IPC 超时）必须合成失败计划，理由同 resolveSkillInstall
+      const fallback: McpMarketPlan = {
+        ok: false, name: '', config: {}, env_required: [], package_args: [], pkg: null,
+        warnings: [], unsupported: '翻译超时：请返回市场重试', error: ''
+      }
+      set({ mcpMarketPlan: fallback })
+      return fallback
+    } catch {
+      const fallback: McpMarketPlan = {
+        ok: false, name: '', config: {}, env_required: [], package_args: [], pkg: null,
+        warnings: [], unsupported: '翻译失败：后端未连接或已超时', error: ''
+      }
+      set({ mcpMarketPlan: fallback })
+      return fallback
+    } finally {
+      set({ mcpResolving: false })
+    }
+  },
+  clearMcpMarketPlan: () => set({ mcpMarketPlan: null }),
+  resolveMcpPkg: async (name, version) => {
+    set({ mcpPkgBusy: 'resolve', mcpPkgPlan: null, mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgResolve({
+        name,
+        ...(version ? { version } : {})
+      })) as McpPkgPlan | null
+      if (res) {
+        set({ mcpPkgPlan: res })
+        return res
+      }
+      // null（IPC 超时）**必须合成失败计划** —— `if (res)` 跳过会让确认区掉进
+      // "解析结果为空"的死端（同 resolveSkillInstall / resolveMcpInstall 的坑）。
+      const fallback: McpPkgPlan = {
+        ok: false, spec: '', name, version: version ?? '', slug: '', dir: '',
+        registry: '', integrity: '', shasum: '', tarball: '', description: '',
+        direct_dep_count: 0, dep_count: null, scripts: {}, install_hooks: {},
+        has_scripts: false, bins: [], default_bin: '', pinned_from_latest: false,
+        already_installed: null, warnings: [],
+        error: '解析超时：registry 可能不可达，请重试或改用 npx 方式'
+      }
+      set({ mcpPkgPlan: fallback })
+      return fallback
+    } catch {
+      const fallback: McpPkgPlan = {
+        ok: false, spec: '', name, version: version ?? '', slug: '', dir: '',
+        registry: '', integrity: '', shasum: '', tarball: '', description: '',
+        direct_dep_count: 0, dep_count: null, scripts: {}, install_hooks: {},
+        has_scripts: false, bins: [], default_bin: '', pinned_from_latest: false,
+        already_installed: null, warnings: [],
+        error: '解析失败：后端未连接'
+      }
+      set({ mcpPkgPlan: fallback })
+      return fallback
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  clearMcpPkgPlan: () => set({ mcpPkgPlan: null, mcpPkgAction: null }),
+  installMcpPkg: async (payload) => {
+    set({ mcpPkgBusy: 'install', mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgInstall(payload)) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      const action = res?.pkg_action ?? null
+      if (action) set({ mcpPkgAction: action })
+      return action
+    } catch {
+      // 异常（多半是 IPC 180s 超时）：**先重拉一次配置** —— 后端可能其实装完了，
+      // 只是回执没赶上；不重拉的话用户会看到"失败"却在本地包列表里发现它。
+      const action: McpPkgActionResult = {
+        action: 'install', ok: false,
+        error: '安装请求超时或后端未连接。请查看下方「本地包」列表确认是否已装好'
+      }
+      set({ mcpPkgAction: action })
+      void get().loadMcpConfig()
+      return action
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  removeMcpPkg: async (slug) => {
+    set({ mcpPkgBusy: 'remove', mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgRemove({ slug })) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      const action = res?.pkg_action ?? null
+      if (action) set({ mcpPkgAction: action })
+      return action
+    } catch {
+      const action: McpPkgActionResult = {
+        action: 'remove', ok: false, slug, error: '卸载失败：后端未连接或已超时'
+      }
+      set({ mcpPkgAction: action })
+      return action
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  verifyMcpPkg: async (slug) => {
+    set({ mcpPkgBusy: 'verify', mcpPkgAction: null })
+    try {
+      const res = (await window.agent.mcpPkgVerify({ slug })) as McpConfigResult | null
+      if (res && Array.isArray(res.servers)) set({ mcpConfig: res })
+      const action = res?.pkg_action ?? null
+      if (action) set({ mcpPkgAction: action })
+      return action
+    } catch {
+      const action: McpPkgActionResult = {
+        action: 'verify', ok: false, slug, errors: ['复核失败：后端未连接或已超时']
+      }
+      set({ mcpPkgAction: action })
+      return action
+    } finally {
+      set({ mcpPkgBusy: null })
+    }
+  },
+  loadSkillConfig: async () => {
+    try {
+      const res = (await window.agent.skillConfigGet()) as SkillConfigResult | null
+      // `skills` 必须是数组才算有效回执 —— 读失败时后端回的是 `skills: [] + errors`，
+      // 空数组是合法值，不能当"没拿到"处理（否则页面会一直停在加载态）。
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  setSkillEnabled: async (name, enabled) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillSetEnabled({ name, enabled })) as
+        | SkillConfigResult
+        | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('切换技能状态失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  removeSkill: async (name) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillRemove({ name })) as SkillConfigResult | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除技能失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  installSkill: async (payload) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillInstall({
+        name: payload.name,
+        item: payload.item as unknown as object
+      })) as SkillConfigResult | null
+      // 权威值以回执为准：**校验失败（applied=false）也回全量** —— 页面据此重绘，
+      // 并从 res.errors / res.warnings 内联展示（不 toast）。
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      // 链路级异常（后端未就绪 / IPC 超时）：**不 toast**，合成一条 applied=false 的
+      // 回执走同一条内联展示路径 —— 与后端校验失败同款式，用户看到的位置与措辞一致。
+      const prev = get().skillConfig
+      if (prev) {
+        set({
+          skillConfig: {
+            ...prev,
+            applied: false,
+            errors: ['安装失败：后端未连接或已超时'],
+            msg: '安装失败'
+          }
+        })
+      }
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  createSkill: async (payload) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillCreate({
+        name: payload.name,
+        description: payload.description,
+        body: payload.body,
+        ...(payload.tags?.length ? { tags: payload.tags } : {})
+      })) as SkillConfigResult | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('新建技能失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  readSkill: async (name) => {    try {
+      return (await window.agent.skillRead({ name })) as SkillContentResult | null
+    } catch {
+      return { name, text: '', error: '请求失败：后端未连接或已超时' }
+    }
+  },
+  upsertSkillMarket: async (entry) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillMarketUpsert({ entry })) as SkillConfigResult | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存技能源失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  removeSkillMarket: async (marketId) => {
+    set({ skillSaving: true })
+    try {
+      const res = (await window.agent.skillMarketRemove({ market_id: marketId })) as
+        | SkillConfigResult
+        | null
+      if (res && Array.isArray(res.skills)) set({ skillConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除技能源失败', 'error', 4000)
+      return false
+    } finally {
+      set({ skillSaving: false })
+    }
+  },
+  searchSkillMarket: async (marketId, query, cursor) => {
+    set({ skillMarketLoading: true })
+    try {
+      const res = (await window.agent.skillMarketSearch({
+        market_id: marketId,
+        query,
+        ...(cursor ? { cursor } : {})
+      })) as SkillMarketResult | null
+      if (!res) {
+        // IPC 超时（30s 未回）：git 源要扫仓库树、第三方 API 实测能到 17s，
+        // 别谎报"没有结果"。
+        set({
+          skillMarket: {
+            items: [],
+            next_cursor: '',
+            market_id: marketId,
+            query,
+            total: 0,
+            cached: false,
+            elapsed_ms: 0,
+            error: '请求超时：市场响应过慢，请重试或换一个源'
+          }
+        })
+        return
+      }
+      const prev = get().skillMarket
+      if (cursor && prev && !res.error && prev.market_id === res.market_id) {
+        // 翻页**追加**；按 id 去重 —— 重复的 React key 会引发渲染异常。
+        const seen = new Set(prev.items.map((i) => i.id))
+        set({
+          skillMarket: {
+            ...res,
+            items: [...prev.items, ...res.items.filter((i) => !seen.has(i.id))]
+          }
+        })
+      } else {
+        set({ skillMarket: res })
+      }
+    } catch {
+      set({
+        skillMarket: {
+          items: [],
+          next_cursor: '',
+          market_id: marketId,
+          query,
+          total: 0,
+          cached: false,
+          elapsed_ms: 0,
+          error: '搜索失败：后端未连接'
+        }
+      })
+    } finally {
+      set({ skillMarketLoading: false })
+    }
+  },
+  resolveSkillInstall: async (marketId, item) => {
+    set({ skillResolving: true, skillMarketPlan: null })
+    // null（IPC 60s 超时）与异常（后端未连接）都**必须**合成失败计划：
+    // 把 null 落成"无结果"会让确认页掉进"安装信息已失效"死端 —— 用户看起来
+    // 就是永久坏了，而真实原因（源慢 / 网络抖动）重试就能过。
+    const failPlan = (msg: string): SkillMarketPlan => ({
+      ok: false,
+      name: '',
+      skill_name: '',
+      description: '',
+      skill_md: '',
+      files: [],
+      file_count: 0,
+      total_bytes: 0,
+      tags: [],
+      version: '',
+      warnings: [],
+      unsupported: msg,
+      error: '',
+      meta: {}
+    })
+    try {
+      const res = (await window.agent.skillMarketResolve({
+        market_id: marketId,
+        item: item as unknown as object
+      })) as SkillMarketPlan | null
+      if (res) {
+        set({ skillMarketPlan: res })
+        return res
+      }
+      const fallback = failPlan('抓取超时：市场源响应过慢或网络不稳，请返回市场重试')
+      set({ skillMarketPlan: fallback })
+      return fallback
+    } catch {
+      const fallback = failPlan('抓取失败：后端未连接或已超时')
+      set({ skillMarketPlan: fallback })
+      return fallback
+    } finally {
+      set({ skillResolving: false })
+    }
+  },
+  clearSkillMarketPlan: () => set({ skillMarketPlan: null }),
+  loadPluginConfig: async () => {
+    try {
+      const res = (await window.agent.pluginConfigGet()) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+    } catch {
+      /* 后端未就绪时静默忽略 */
+    }
+  },
+  setPluginEnabled: async (name, enabled) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginSetEnabled({ name, enabled })) as
+        | PluginConfigResult
+        | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('切换插件状态失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  removePlugin: async (name) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginRemove({ name })) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除插件失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  installPlugin: async (payload) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginInstall({
+        name: payload.name,
+        item: payload.item as unknown as object
+      })) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      const prev = get().pluginConfig
+      if (prev) {
+        set({
+          pluginConfig: {
+            ...prev,
+            applied: false,
+            errors: ['安装失败：后端未连接或已超时'],
+            msg: '安装失败'
+          }
+        })
+      }
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  readPlugin: async (name) => {
+    try {
+      return (await window.agent.pluginRead({ name })) as PluginContentResult | null
+    } catch {
+      return { name, plugin_json: '', files: [], error: '请求失败：后端未连接或已超时' }
+    }
+  },
+  upsertPluginMarket: async (entry) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginMarketUpsert({ entry })) as PluginConfigResult | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('保存插件市场失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  removePluginMarket: async (marketId) => {
+    set({ pluginSaving: true })
+    try {
+      const res = (await window.agent.pluginMarketRemove({ market_id: marketId })) as
+        | PluginConfigResult
+        | null
+      if (res && Array.isArray(res.plugins)) set({ pluginConfig: res })
+      return res?.applied ?? false
+    } catch {
+      showToast('删除插件市场失败', 'error', 4000)
+      return false
+    } finally {
+      set({ pluginSaving: false })
+    }
+  },
+  searchPluginMarket: async (marketId, query, cursor) => {
+    set({ pluginMarketLoading: true })
+    try {
+      const res = (await window.agent.pluginMarketSearch({
+        market_id: marketId,
+        query,
+        ...(cursor ? { cursor } : {})
+      })) as PluginMarketResult | null
+      if (!res) {
+        set({
+          pluginMarket: {
+            items: [],
+            next_cursor: '',
+            market_id: marketId,
+            query,
+            total: 0,
+            elapsed_ms: 0,
+            error: '请求超时：市场响应过慢，请重试'
+          }
+        })
+        return
+      }
+      const prev = get().pluginMarket
+      if (cursor && prev && !res.error && prev.market_id === res.market_id) {
+        const seen = new Set(prev.items.map((i) => i.id))
+        set({
+          pluginMarket: {
+            ...res,
+            items: [...prev.items, ...res.items.filter((i) => !seen.has(i.id))]
+          }
+        })
+      } else {
+        set({ pluginMarket: res })
+      }
+    } catch {
+      set({
+        pluginMarket: {
+          items: [],
+          next_cursor: '',
+          market_id: marketId,
+          query,
+          total: 0,
+          elapsed_ms: 0,
+          error: '搜索失败：后端未连接'
+        }
+      })
+    } finally {
+      set({ pluginMarketLoading: false })
+    }
+  },
+  resolvePluginInstall: async (marketId, item) => {
+    set({ pluginResolving: true, pluginMarketPlan: null })
+    // null（IPC 超时）与异常都必须合成失败计划，理由同 resolveSkillInstall
+    const failPlan = (msg: string): PluginMarketPlan => ({
+      ok: false,
+      name: '',
+      plugin_name: '',
+      display_name: '',
+      description: '',
+      version: '',
+      author: '',
+      homepage: '',
+      plugin_json: '',
+      components: {},
+      component_counts: {},
+      wired: [],
+      skill_previews: [],
+      files: [],
+      file_count: 0,
+      total_bytes: 0,
+      source_kind: '',
+      repo: '',
+      warnings: [],
+      unsupported: msg,
+      error: '',
+      meta: {}
+    })
+    try {
+      const res = (await window.agent.pluginMarketResolve({
+        market_id: marketId,
+        item: item as unknown as object
+      })) as PluginMarketPlan | null
+      if (res) {
+        set({ pluginMarketPlan: res })
+        return res
+      }
+      const fallback = failPlan('抓取超时：市场源响应过慢或网络不稳，请返回市场重试')
+      set({ pluginMarketPlan: fallback })
+      return fallback
+    } catch {
+      const fallback = failPlan('抓取失败：后端未连接或已超时')
+      set({ pluginMarketPlan: fallback })
+      return fallback
+    } finally {
+      set({ pluginResolving: false })
+    }
+  },
+  clearPluginMarketPlan: () => set({ pluginMarketPlan: null }),
   fetchModels: async (payload) => {
     try {
       const res = (await window.agent.llmModelsFetch(payload)) as LlmModelsResult | null
