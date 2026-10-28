@@ -1,7 +1,8 @@
-# TRAE 复刻桌面端 · 智能体工具
+# Aigent · 会写代码，也能辅助工作的桌面智能体
 
-> 从一个「从 0 到 1 学习 Coding Agent Harness」的个人仓库，**转变为一个功能完整的桌面智能体工具**。
+> 一个**初具雏形的完整功能工具型智能体**：能读写代码、执行命令、检索联网、编排任务，也能接住日常工作中的文档与自动化杂活。
 > 前端做壳，Python 后端做脑：所有 Agent 逻辑、工具执行、流式生成都在后端，前端只负责「渲染 + 交互 + 转发」。
+> 它不是一开始就这么大的——**每一步都是从原始教程里一步步学习、思考、改造、进化而来**。感谢原作者。
 
 ![智能体桌面端界面](docs/assets/agent-desktop.png)
 
@@ -11,8 +12,22 @@
 
 ## 这个项目是什么
 
-沿 **v1 → v2 → v2.1** 的学习脉络，我自研了一套 **OpenAI SDK 版 Coding Agent**，并统一改造为**流式输出**。
-现在把这套智能体能力包装成一个 **Electron 桌面应用**，复刻 TraeWork 式的交互界面，并逐步补齐商用 Agent 桌面产品的核心能力。
+起点是一份教程：跟着 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 从 v1 → v2 → v2.1，逐课把 Coding Agent 的核心机制自己造一遍。教程原用 **Anthropic SDK**，我先用 **LangChain** 学了一遍，后来嫌抽象层太厚，又换成 **OpenAI SDK** 的 `chat.completions.create()` + function calling 重写，并统一改造成流式输出——三代实现都完整留在 `history/` 里，看得出演化顺序。
+
+学完、想清楚、动手改造之后，这套 Harness 没有停在「教学示例」：
+
+- **CLI 版**：`python agents/agent_cli.py` —— 一个能读写文件、跑命令、派子智能体、管任务与记忆的终端智能体。
+- **桌面版**：`frontend/`（Electron + TS + React）—— 把同一套引擎包成三栏工作台，逐步补齐商用 Agent 桌面产品的核心能力。
+
+所以现在的定位是：**一个真能拿来干活的工具型智能体**。它还粗糙，但功能链路已经闭环——剩下的是一步步打磨。
+
+**它能帮你做的事**：
+
+| 场景 | 具体能力 |
+|------|---------|
+| 写代码 | 读改代码库、跨文件编辑、跑构建与测试、看 git 变更、修 bug、做重构，改坏能被沙盒与审批挡住 |
+| 辅助工作 | 检索联网取资料、读 PDF/Office/图片并总结、写文档与报告、批量整理文件、定时任务、多轮任务拆解与推进 |
+| 长期用下去 | 多工作空间隔离、会话归档与回放、记忆持久化、子智能体并行、扩展生态（MCP / 技能 / 插件）接入任意外部能力 |
 
 **核心心法**：
 
@@ -37,7 +52,7 @@
 - **用户确认选项（`ask_user`）**：模型在对话中抛出选项卡片，输入区让位、选择结果回填为工具结果继续执行
 
 ### 权限与安全
-- **两档权限模式**：默认（逐项审批）/ 完全访问，对齐 WorkBuddy；会话 chip 与工作空间默认权限可分别设置
+- **两档权限模式**：默认（逐项审批）/ 完全访问；会话 chip 与工作空间默认权限可分别设置
 - **审批流**：范式 C 审批弹窗，静态分析工具参数（写文件/执行命令/删改等）后决定放行或询问，支持「本会话允许」记忆
 - **权限管理设置页**：八分区规则配置，按命令/路径/工具粒度定制
 - **沙盒隔离**：`run_bash` 经 `agents/sandbox.py` 执行隔离（macOS Seatbelt / Linux bwrap，其他平台降级裸跑），策略模板用户可编辑，配置热生效
@@ -127,6 +142,7 @@
 |------|------|------|
 | 桌面壳 | **Electron** | 渲染 + 主进程分离 |
 | 语言 | **TypeScript** | 编译期类型安全 |
+| Agent 引擎 | **Python + OpenAI SDK** | 直接用 `chat.completions` + function calling，不套框架（曾用 LangChain 学习，后弃用以保留底层可见性） |
 | UI | **React**（Hooks）+ **Zustand** | 数据驱动，贴流式渲染 |
 | 构建 | **Vite + electron-vite** | 主 / 预加载 / 渲染三端一体化 |
 | 样式 | 原生 CSS 变量（design tokens） | 轻量、无重型框架 |
@@ -183,7 +199,7 @@ learn-claude-code-main/
 ├── anthropic/                    # ✅ v1 教程（只读）
 ├── anthropic_v2/                 # ✅ v2 教程（只读）
 ├── anthropic_v2.1/               # 🚧 v2.1 教程更新版（只读）
-├── history/                      # 早期版本留档（流式版备份见 history/v2/openai流式版本/）
+├── history/                      # 早期版本留档（Anthropic → LangChain → OpenAI 三代快照，v2 下含 langchain版本备份 / openai非流式 / openai流式）
 ├── skills/ mcp_servers/ tests/   # 学习资源 / 本地 MCP 测试 / 单元测试
 ├── WorkSpace/                    # agent 跑过的实际任务留档
 ├── requirements.txt              # 后端依赖（含 openai / mcp / websockets）
@@ -312,7 +328,7 @@ REPL 命令：直接输入对话；`/tasks` 任务看板 · `/compact` 压缩 ·
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | P0 | electron-vite 骨架 + 三栏空布局 | ✅ |
-| P1 | TraeWork 静态界面复刻（design tokens） | ✅ |
+| P1 | 三栏工作台界面（design tokens） | ✅ |
 | P2 | 后端桥 + 流式打字机主链路 | ✅ |
 | P3 | 工具调用可视化 + 断线重连 + 会话操作 | ✅ |
 | P4 | 目标 / 待办 / 技能浅接入 | ✅ |
@@ -336,12 +352,19 @@ REPL 命令：直接输入对话；`/tasks` 任务看板 · `/compact` 压缩 ·
 
 ---
 
-## 学习脉络（仓库由来）
+## 学习脉络（仓库由来与致谢）
 
-这不是单纯的工程，而是一条学习轨迹：跟着 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 从 v1 → v2 → v2.1，**用 OpenAI SDK 自研复刻** Coding Agent 的核心机制。教程代码（`anthropic*`）只读留档，自己的实现（`agents/` + `frontend/`）持续演进。流式版早期快照见 [`history/v2/openai流式版本/`](history/v2/openai流式版本)。
+这不是单纯的工程，而是一条**学习 → 思考 → 改造 → 进化**的轨迹：
+
+1. **学习**：跟着 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 把 v1（12 课）、v2（20 课）、v2.1 逐课读完。教程用 **Anthropic SDK** 写的，原样保留在 `anthropic/`、`anthropic_v2/`、`anthropic_v2.1/`（只读留档）。
+2. **思考**：每课问一遍「这个机制为什么这样设计、换个 SDK 还成立吗」。我先用 **LangChain** 把 v1/v2 实现了一遍（`history/v1/`、`history/v2/langchain版本备份-20260722/`），学着学着觉得不太对——`ChatOpenAI` + `.bind_tools()` 把 tool schema、stop reason、原始 usage 全裹进抽象层里，**看到的是 LangChain 的接口，不是 Harness 的骨架**。
+3. **改造**：于是换成 **OpenAI SDK** 的 `chat.completions.create()` + function calling 再重写一遍（`history/v2/openai非流式版本/`），逐块改造成流式（`history/v2/openai流式版本/`）；工具注册、会话隔离、配置分层、权限与沙盒这些教程留白的地方，按自己的场景重做。
+4. **进化**：这套 Harness 先长出 CLI 版，再长出桌面版；`agents/` 是当前的 OpenAI SDK 流式实现，`history/` 留着 Anthropic → LangChain → OpenAI 三代旧快照，演化顺序随时可查。
+
+**致谢**：感谢 [shareAI-lab / learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 的原作者。把 Claude Code 这类产品背后的 Harness 拆成一堂堂能跟着做的课，是一件很慷慨的事——**没有这条路，就没有现在这个能干活的智能体**。换 SDK、改流式是我自己的选择，教程是原作者的；本仓库的问题与 bug 也都算我自己的。
 
 ---
 
 > **Bash is all you need. Real agents are all the universe needs.**
 >
-> **这不是"抄源码"，是"抓住关键设计，自己造一遍"。**
+> **这不是"抄源码"，是"抓住关键设计，自己造一遍"——再把它长成能天天用的工具。**
